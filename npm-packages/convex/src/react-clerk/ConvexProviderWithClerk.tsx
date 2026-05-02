@@ -22,6 +22,7 @@ type UseAuth = () => {
   // We don't use these properties but they should trigger a new token fetch.
   orgId: string | undefined | null;
   orgRole: string | undefined | null;
+  sessionClaims: Record<string, unknown> | undefined | null;
 };
 
 /**
@@ -29,7 +30,7 @@ type UseAuth = () => {
  * authenticated with Clerk.
  *
  * It must be wrapped by a configured `ClerkProvider`, from
- * `@clerk/clerk-react`, `@clerk/clerk-expo`, `@clerk/nextjs` or
+ * `@clerk/react`, `@clerk/clerk-expo`, `@clerk/nextjs` or
  * another React-based Clerk client library and have the corresponding
  * `useAuth` hook passed in.
  *
@@ -59,14 +60,29 @@ function useUseAuthFromClerk(useAuth: UseAuth) {
   return useMemo(
     () =>
       function useAuthFromClerk() {
-        const { isLoaded, isSignedIn, getToken, orgId, orgRole } = useAuth();
+        const {
+          isLoaded,
+          isSignedIn,
+          getToken,
+          orgId,
+          orgRole,
+          sessionClaims,
+        } = useAuth();
         const fetchAccessToken = useCallback(
           async ({ forceRefreshToken }: { forceRefreshToken: boolean }) => {
             try {
-              return getToken({
-                template: "convex",
-                skipCache: forceRefreshToken,
-              });
+              if (sessionClaims?.aud === "convex") {
+                // Using the Convex integration
+                return await getToken({
+                  skipCache: forceRefreshToken,
+                });
+              } else {
+                // Using the JWT token template
+                return await getToken({
+                  template: "convex",
+                  skipCache: forceRefreshToken,
+                });
+              }
             } catch {
               return null;
             }

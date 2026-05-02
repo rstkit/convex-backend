@@ -1,5 +1,5 @@
 import { jsonToConvex } from "../../values/index.js";
-import { Long } from "../long.js";
+import { Long } from "../../vendor/long.js";
 import { logForFunction, Logger } from "../logging.js";
 import { QueryId, StateVersion, Transition } from "./protocol.js";
 import { FunctionResult } from "./function_result.js";
@@ -7,6 +7,12 @@ import { FunctionResult } from "./function_result.js";
 /**
  * A represention of the query results we've received on the current WebSocket
  * connection.
+ *
+ * Queries you won't find here include:
+ * - queries which have been requested, but no query transition has been received yet for
+ * - queries which are populated only though active optimistic updates, but are not subscribed to
+ * - queries which have already been removed by the server (which it shouldn't do unless that's
+ *   been requested by the client)
  */
 export class RemoteQuerySet {
   private version: StateVersion;
@@ -29,7 +35,7 @@ export class RemoteQuerySet {
       this.version.identity !== start.identity
     ) {
       throw new Error(
-        `Invalid start version: ${start.ts.toString()}:${start.querySet}`,
+        `Invalid start version: ${start.ts.toString()}:${start.querySet}:${start.identity}, transitioning from ${this.version.ts.toString()}:${this.version.querySet}:${this.version.identity}`,
       );
     }
     for (const modification of transition.modifications) {
@@ -72,7 +78,7 @@ export class RemoteQuerySet {
         }
         default: {
           // Enforce that the switch-case is exhaustive.
-          const _: never = modification;
+          modification satisfies never;
           throw new Error(`Invalid modification ${(modification as any).type}`);
         }
       }

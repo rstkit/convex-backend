@@ -44,7 +44,7 @@ export function DeploymentSettingsLayout({
         {/* Make space for the header above */}
         <div className="flex h-full w-full overflow-y-hidden">
           {isWide && sidebar}
-          <div className="flex w-full min-w-[22rem] grow overflow-auto scrollbar">
+          <div className="scrollbar flex w-full min-w-[22rem] grow overflow-auto">
             <div className="flex h-fit grow flex-col gap-6 p-6 sm:max-w-[65rem]">
               {children}
             </div>
@@ -81,6 +81,8 @@ function SettingsMenuButton({ open }: { open: boolean }) {
 }
 
 function DeploymentSettingsText() {
+  // TODO(ENG-10340) Include the deployment ref here
+
   const { useCurrentDeployment } = useContext(DeploymentInfoContext);
   const deployment = useCurrentDeployment();
   const ref = useRef<HTMLDivElement>(null);
@@ -93,6 +95,8 @@ function DeploymentSettingsText() {
       return <>Production Deployment Settings</>;
     case "dev":
       return <>Personal Deployment Settings</>;
+    case "custom":
+      return <>Custom Deployment Settings</>;
     case "preview":
       if (deployment.previewIdentifier !== null) {
         return (
@@ -103,7 +107,7 @@ function DeploymentSettingsText() {
               ) : undefined
             }
           >
-            <div className="flex gap-2">
+            <div className="flex items-baseline gap-2">
               <code className="max-w-md truncate" ref={ref}>
                 {deployment.previewIdentifier}
               </code>{" "}
@@ -114,7 +118,7 @@ function DeploymentSettingsText() {
       }
       return <>Preview Deployment Settings</>;
     default: {
-      const _typecheck: never = deployment.deploymentType;
+      deployment.deploymentType satisfies never;
       throw new Error("Unknown deployment type");
     }
   }

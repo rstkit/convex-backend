@@ -10,15 +10,7 @@ use ::errors::{
 use anyhow::Context as _;
 use axum::{
     body::Bytes,
-    extract::{
-        ws::{
-            CloseFrame,
-            Message,
-            WebSocket,
-            WebSocketUpgrade,
-        },
-        State,
-    },
+    extract::State,
     response::IntoResponse,
 };
 use common::{
@@ -27,14 +19,28 @@ use common::{
         report_error_sync,
     },
     http::{
+        websocket::{
+            CloseFrame,
+            Message,
+            WebSocket,
+            WebSocketUpgrade,
+        },
         ExtractClientVersion,
+        ExtractRequestMetadata,
         ExtractResolvedHostname,
         HttpResponseError,
         ResolvedHostname,
     },
     runtime::Runtime,
-    version::ClientVersion,
+    try_anyhow,
+    value::heap_size::HeapSize,
+    version::{
+        self,
+        ClientType,
+        ClientVersion,
+    },
     ws::is_connection_closed_error,
+    RequestMetadata,
 };
 use futures::{
     select_biased,
@@ -54,6 +60,7 @@ use sync::{
     SyncWorkerConfig,
 };
 use sync_types::{
+    ClientMessage,
     IdentityVersion,
     SessionId,
 };
@@ -62,7 +69,6 @@ use tokio::sync::mpsc;
 mod metrics;
 
 use metrics::{
-    log_debug_sync_protocol_websockets_total,
     log_sync_protocol_websockets_total,
     log_websocket_client_timeout,
     log_websocket_closed,
@@ -76,45 +82,31 @@ use metrics::{
     websocket_upgrade_timer,
 };
 
-use crate::RouterState;
+use crate::{
+    subs::metrics::log_websocket_client_message_bytes,
+    RouterState,
+};
 
 /// How often heartbeat pings are sent.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long before lack of client response causes a timeout.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
-struct SyncSocketDropToken {}
+struct SyncSocketDropToken {
+    partition_id_label: String,
+}
 
 /// Tracker that exists for the lifetime of a run_sync_socket.
 impl SyncSocketDropToken {
-    fn new() -> Self {
-        log_sync_protocol_websockets_total(1);
-        SyncSocketDropToken {}
+    fn new(partition_id_label: String) -> Self {
+        log_sync_protocol_websockets_total(&partition_id_label, 1);
+        SyncSocketDropToken { partition_id_label }
     }
 }
 
 impl Drop for SyncSocketDropToken {
     fn drop(&mut self) {
-        log_sync_protocol_websockets_total(-1);
-    }
-}
-
-// TODO(presley): Remove. Used for debugging.
-struct DebugSyncSocketDropToken {
-    tag: &'static str,
-}
-
-/// Tracker that exists for the lifetime of a run_sync_socket.
-impl DebugSyncSocketDropToken {
-    fn new(tag: &'static str) -> Self {
-        log_debug_sync_protocol_websockets_total(tag, 1);
-        DebugSyncSocketDropToken { tag }
-    }
-}
-
-impl Drop for DebugSyncSocketDropToken {
-    fn drop(&mut self) {
-        log_debug_sync_protocol_websockets_total(self.tag, -1);
+        log_sync_protocol_websockets_total(&self.partition_id_label, -1);
     }
 }
 
@@ -133,12 +125,19 @@ impl Drop for DebugSyncSocketDropToken {
 async fn run_sync_socket(
     st: RouterState,
     host: ResolvedHostname,
+    request_metadata: RequestMetadata,
     config: SyncWorkerConfig,
     socket: WebSocket,
     sentry_scope: sentry::Scope,
     on_connect: Box<dyn FnOnce(SessionId) + Send>,
 ) {
-    let _drop_token = SyncSocketDropToken::new();
+    // For segmenting metrics
+    let partition_id = st.api.partition_id(&host).await;
+    let partition_id_label = partition_id
+        .as_ref()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let _drop_token = SyncSocketDropToken::new(partition_id_label.clone());
 
     let (mut tx, mut rx) = socket.split();
 
@@ -147,7 +146,6 @@ async fn run_sync_socket(
 
     let (client_tx, client_rx) = mpsc::unbounded_channel();
     let receive_messages = async {
-        let _receive_message_drop_token = DebugSyncSocketDropToken::new("receive_message");
         while let Some(message_r) = rx.next().await {
             let message = match message_r {
                 Ok(message) => message,
@@ -161,7 +159,8 @@ async fn run_sync_socket(
 
             match message {
                 Message::Text(s) => {
-                    let body = serde_json::from_str::<JsonValue>(&s)
+                    let client_message_size = s.len();
+                    let body: ClientMessage = serde_json::from_str::<JsonValue>(&s)
                         .map_err(|e| anyhow::anyhow!(e))
                         .and_then(|body| body.try_into())
                         .map_err(|e| {
@@ -170,6 +169,10 @@ async fn run_sync_socket(
                                 format!("Received Invalid JSON on websocket: {e}"),
                             ))
                         })?;
+                    log_websocket_client_message_bytes(
+                        client_message_size,
+                        body.as_ref().to_string(),
+                    );
                     log_websocket_message_in();
                     if client_tx.send((body, st.runtime.monotonic_now())).is_err() {
                         break;
@@ -196,7 +199,6 @@ async fn run_sync_socket(
 
     let (server_tx, mut server_rx) = measurable_unbounded_channel();
     let send_messages = async {
-        let _send_message_drop_token = DebugSyncSocketDropToken::new("send_message");
         let mut ping_ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         'top: loop {
             select_biased! {
@@ -214,15 +216,20 @@ async fn run_sync_socket(
                     }
                 },
                 maybe_message = server_rx.next().fuse() => {
-                    let (message, send_time) = match maybe_message {
+                    let (mut message, send_time) = match maybe_message {
                         Some(m) => m,
                         None => break 'top,
                     };
-                    let delay = st.runtime.monotonic_now() - send_time;
-                    log_websocket_message_out(&message, delay);
-                    let serialized = serde_json::to_string(&JsonValue::from(message))?;
-                    if tx.send(Message::Text(serialized.into())).await.is_err() {
-                        break 'top;
+                    message.inject_server_ts(st.runtime.generate_timestamp()?);
+                    let messages =
+                        maybe_split_transition(message, config.supports_transition_chunks)?;
+                    for msg in messages {
+                        let delay = st.runtime.monotonic_now() - send_time;
+                        log_websocket_message_out(&msg, delay);
+                        let serialized = serde_json::to_string(&JsonValue::from(msg))?;
+                        if tx.send(Message::Text(serialized.into())).await.is_err() {
+                            break 'top;
+                        }
                     }
                 },
             }
@@ -231,7 +238,6 @@ async fn run_sync_socket(
     };
     let mut identity_version: Option<IdentityVersion> = None;
     let sync_worker_go = async {
-        let _sync_worker_drop_token = DebugSyncSocketDropToken::new("sync_worker");
         let mut sync_worker = SyncWorker::new(
             st.api.clone(),
             st.runtime.clone(),
@@ -240,6 +246,8 @@ async fn run_sync_socket(
             client_rx,
             server_tx,
             on_connect,
+            partition_id?,
+            request_metadata,
         );
         let r = sync_worker.go().await;
         identity_version = Some(sync_worker.identity_version());
@@ -289,13 +297,13 @@ async fn run_sync_socket(
             });
             // Only do a best-effort send of the final application message.
             if let Some(final_message) = final_message {
-                let r: anyhow::Result<_> = try {
+                let r: anyhow::Result<_> = try_anyhow!({
                     let serialized = serde_json::to_string(&JsonValue::from(final_message))?;
                     socket.send(Message::Text(serialized.into())).await?;
-                };
+                });
                 if let Err(mut e) = r {
                     if is_connection_closed_error(&*e) {
-                        log_websocket_closed_error_not_reported()
+                        log_websocket_closed_error_not_reported(partition_id_label.clone())
                     } else {
                         report_error(&mut e).await;
                     }
@@ -303,7 +311,7 @@ async fn run_sync_socket(
             }
             sentry::with_scope(|s| *s = sentry_scope, || report_error_sync(&mut err));
             if let Some(label) = err.metric_server_error_label() {
-                log_websocket_server_error(label);
+                log_websocket_server_error(label, partition_id_label.clone());
             }
             // Convert from tungstenite::Message to axum::Message
             let close_frame = err.close_frame().map(|cf| CloseFrame {
@@ -314,14 +322,14 @@ async fn run_sync_socket(
         },
     };
     // Similarly, only do a best effort send of the close message.
-    if let Some(close_msg) = close_msg {
-        if let Err(e) = socket.send(close_msg).await {
-            if is_connection_closed_error(&e) {
-                log_websocket_closed_error_not_reported()
-            } else {
-                let msg = format!("Failed to gracefully close WebSocket: {e:?}");
-                report_error(&mut anyhow::anyhow!(e).context(msg)).await;
-            }
+    if let Some(close_msg) = close_msg
+        && let Err(e) = socket.send(close_msg).await
+    {
+        if is_connection_closed_error(&e) {
+            log_websocket_closed_error_not_reported(partition_id_label.clone())
+        } else {
+            let msg = format!("Failed to gracefully close WebSocket: {e:?}");
+            report_error(&mut anyhow::anyhow!(e).context(msg)).await;
         }
     }
 
@@ -329,22 +337,86 @@ async fn run_sync_socket(
     // automatically sent by Tungstenite (the underlying WebSocket library)
     // isn't actually sent until flush.
     // This is visible in Wireshark.
-    if let Err(e) = socket.flush().await {
-        if !is_connection_closed_error(&e) {
-            let msg = format!("Failed to flush WebSocket: {e:?}");
-            report_error(&mut anyhow::anyhow!(e).context(msg)).await;
-        }
+    if let Err(e) = socket.flush().await
+        && !is_connection_closed_error(&e)
+    {
+        let msg = format!("Failed to flush WebSocket: {e:?}");
+        report_error(&mut anyhow::anyhow!(e).context(msg)).await;
     }
-    log_websocket_closed();
+    log_websocket_closed(partition_id_label.clone());
 }
 
 fn new_sync_worker_config(client_version: ClientVersion) -> anyhow::Result<SyncWorkerConfig> {
-    Ok(SyncWorkerConfig { client_version })
+    let supports_transition_chunks = match client_version.client() {
+        ClientType::NPM => match client_version.version() {
+            version::ClientVersionIdent::Semver(v) => {
+                v >= &*version::MIN_NPM_VERSION_FOR_TRANSITION_CHUNKS
+            },
+            version::ClientVersionIdent::Unrecognized(_) => false,
+        },
+        _ => false,
+    };
+    Ok(SyncWorkerConfig {
+        client_version,
+        supports_transition_chunks,
+    })
+}
+
+// Maximum size of a single message before splitting into chunks (5MB)
+const MAX_MESSAGE_SIZE: usize = 5_000_000;
+
+/// Split a large Transition message into TransitionChunk messages if needed.
+fn maybe_split_transition(
+    message: ServerMessage,
+    supports_chunks: bool,
+) -> anyhow::Result<Vec<ServerMessage>> {
+    if !supports_chunks {
+        return Ok(vec![message]);
+    }
+
+    let transition = match message {
+        ServerMessage::Transition { .. } => message,
+        other => return Ok(vec![other]),
+    };
+
+    // heap_size is just a (low) estimate of the serialized size
+    if transition.heap_size() <= MAX_MESSAGE_SIZE {
+        return Ok(vec![transition]);
+    }
+
+    let transition_json = serde_json::to_string(&JsonValue::from(transition))?;
+
+    // Careful with UTF-8, use valid boundaries
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < transition_json.len() {
+        let mut end = (start + MAX_MESSAGE_SIZE).min(transition_json.len());
+        while end > start && !transition_json.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(transition_json[start..end].to_string());
+        start = end;
+    }
+
+    let total_parts = chunks.len() as u32;
+    let transition_id = transition_json.len().to_string();
+
+    Ok(chunks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, chunk)| ServerMessage::TransitionChunk {
+            chunk,
+            part_number: idx as u32,
+            total_parts,
+            transition_id: transition_id.clone(),
+        })
+        .collect())
 }
 
 pub async fn sync_handler(
     st: RouterState,
     host: ResolvedHostname,
+    request_metadata: RequestMetadata,
     client_version: ClientVersion,
     ws: WebSocketUpgrade,
     on_connect: Box<dyn FnOnce(SessionId) + Send>,
@@ -359,7 +431,16 @@ pub async fn sync_handler(
         upgrade_timer.finish();
         let monitor = ProdRuntime::task_monitor("sync_socket");
         monitor.instrument(
-            run_sync_socket(st, host, config, ws, sentry_scope, on_connect).bind_hub(hub),
+            run_sync_socket(
+                st,
+                host,
+                request_metadata,
+                config,
+                ws,
+                sentry_scope,
+                on_connect,
+            )
+            .bind_hub(hub),
         )
     }))
 }
@@ -367,98 +448,17 @@ pub async fn sync_handler(
 pub async fn sync(
     State(st): State<RouterState>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractClientVersion(client_version): ExtractClientVersion,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    sync_handler(st, host, client_version, ws, Box::new(|_session_id| ())).await
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::{
-        extract::{
-            ws::{
-                Message,
-                WebSocket,
-            },
-            State,
-            WebSocketUpgrade,
-        },
-        routing::get,
-        Router,
-    };
-    use common::http::ConvexHttpService;
-    use tokio::sync::{
-        mpsc,
-        oneshot,
-    };
-    use tokio_tungstenite::connect_async;
-    use tungstenite::error::Error as TungsteniteError;
-
-    use super::is_connection_closed_error;
-
-    /// Test that the axum tungstenite matches the tungstenite we're using in
-    /// backend in `is_connection_closed_error` to work around axum sloppiness.
-    #[tokio::test]
-    async fn test_ws_tungstenite_version_match() -> anyhow::Result<()> {
-        let (ws_shutdown_tx, mut ws_shutdown_rx) = mpsc::channel(1);
-
-        async fn ws_handler(
-            ws: WebSocketUpgrade,
-            st: State<mpsc::Sender<bool>>,
-        ) -> axum::response::Response {
-            ws.on_upgrade(move |mut ws: WebSocket| async move {
-                let ws_shutdown_tx = st.0;
-                assert_eq!(ws.recv().await.unwrap().unwrap(), Message::Close(None));
-                let e = ws
-                    .send(Message::Text("Hello".into()))
-                    .await
-                    .expect_err("Should not be able to send");
-
-                if is_connection_closed_error(&e) {
-                    ws_shutdown_tx.send(true).await.unwrap();
-                    return;
-                }
-
-                ws_shutdown_tx.send(false).await.unwrap();
-                panic!(
-                    "Got {e:?}. Expected {:?}. Wrong tungstenite version?",
-                    TungsteniteError::ConnectionClosed
-                );
-            })
-        }
-
-        let app = ConvexHttpService::new_for_test(
-            Router::new()
-                .route("/test", get(ws_handler))
-                .with_state(ws_shutdown_tx),
-        );
-        let port = portpicker::pick_unused_port().expect("No ports free");
-        let addr = format!("127.0.0.1:{port}").parse()?;
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let proxy_server = tokio::spawn(app.serve(addr, async move {
-            shutdown_rx.await.unwrap();
-        }));
-
-        let (mut websocket, _) = loop {
-            match connect_async(format!("ws://{addr}/test")).await {
-                Ok(r) => break r,
-                Err(e) => {
-                    // Can take a moment after the server spawn to connect to it.
-                    println!("Got error {e}. Retrying");
-                    tokio::task::yield_now().await;
-                },
-            }
-        };
-
-        // close websocket - make sure server handles it ok
-        websocket.close(None).await?;
-        let closed = ws_shutdown_rx.recv().await.unwrap();
-        assert!(closed);
-
-        // server shutdown
-        shutdown_tx.send(()).unwrap();
-        proxy_server.await??;
-        Ok(())
-    }
+    sync_handler(
+        st,
+        host,
+        request_metadata,
+        client_version,
+        ws,
+        Box::new(|_session_id| ()),
+    )
+    .await
 }

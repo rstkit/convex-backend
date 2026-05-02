@@ -17,6 +17,7 @@ import {
   ValidFilterByBuiltin,
   ValidFilterByOr,
   applyIndexFilters,
+  applySearchIndexFilters,
   applyTypeFilters,
   findErrorsInFilters,
   findIndexByName,
@@ -24,6 +25,7 @@ import {
   isValidFilter,
   partitionFiltersByOperator,
   validateIndexFilter,
+  validateSearchIndexFilter,
 } from "./lib/filters";
 import { queryGeneric } from "../secretSystemTables";
 import { getSchemaByState } from "./getSchemas";
@@ -32,9 +34,10 @@ import { jsonToConvex, v } from "convex/values";
 import { Expression } from "convex/server";
 import { ExpressionOrValue } from "convex/server";
 import { Value } from "convex/values";
-import { UNDEFINED_PLACEHOLDER } from "./patchDocumentsFields";
+import { UNDEFINED_PLACEHOLDER } from "./lib/values";
+import { SearchIndex } from "../../../../convex/dist/internal-cjs-types/server";
 
-export default queryGeneric({
+export default queryGeneric("ViewData")({
   args: {
     paginationOpts: paginationOptsValidator,
     table: v.string(),
@@ -61,7 +64,9 @@ export default queryGeneric({
     // This will throw an error if parsedFilters does not match the filter expression schema,
     // which should only happens if a dashboard user manually edits the `filters` query parameter
     // the dashboard should not allow this to happen by deleting the query parameter if it is invalid.
-    parsedFilters && FilterExpressionSchema.parse(parsedFilters);
+    if (parsedFilters) {
+      FilterExpressionSchema.parse(parsedFilters);
+    }
 
     if (parsedFilters && parsedFilters.clauses?.length) {
       const errors = await findErrorsInFilters(parsedFilters);
@@ -87,7 +92,9 @@ export default queryGeneric({
 
     const indexFilter = parsedFilters?.index;
     const hasIndexFilter =
-      indexFilter && indexFilter.clauses.filter((c) => c.enabled).length > 0;
+      indexFilter &&
+      ("search" in indexFilter ||
+        indexFilter.clauses.filter((c) => c.enabled).length > 0);
     if (indexFilter) {
       // Let's find out if we can use an index from the schema.
       const schemaData = await getSchemaByState(
@@ -101,12 +108,20 @@ export default queryGeneric({
       // Find the selected index by name
       const selectedIndex = findIndexByName(indexFilter.name, indexes);
 
-      // Validate the index filter
-      const validationError = validateIndexFilter(
-        indexFilter.name,
-        indexFilter.clauses,
-        selectedIndex,
-      );
+      // Validate the filter filter
+      const isSearchIndex = "search" in indexFilter;
+      const validationError = isSearchIndex
+        ? validateSearchIndexFilter(
+            indexFilter.name,
+            indexFilter.clauses,
+            selectedIndex,
+            order,
+          )
+        : validateIndexFilter(
+            indexFilter.name,
+            indexFilter.clauses,
+            selectedIndex,
+          );
 
       if (validationError) {
         return {
@@ -116,11 +131,20 @@ export default queryGeneric({
         };
       }
 
-      query = queryInitializer
-        .withIndex(indexFilter.name, (q) =>
-          applyIndexFilters(q, indexFilter.clauses, selectedIndex as Index),
-        )
-        .order(order);
+      query = isSearchIndex
+        ? queryInitializer.withSearchIndex(indexFilter.name, (q) =>
+            applySearchIndexFilters(
+              q,
+              indexFilter.search,
+              indexFilter.clauses,
+              selectedIndex as SearchIndex,
+            ),
+          )
+        : queryInitializer
+            .withIndex(indexFilter.name, (q) =>
+              applyIndexFilters(q, indexFilter.clauses, selectedIndex as Index),
+            )
+            .order(order);
     }
 
     const [builtinFilters, typeFilters] =
@@ -160,9 +184,9 @@ export default queryGeneric({
         };
       }
 
-      query = (query || queryInitializer.order(order)).filter((q) =>
-        applyBuiltinFilters(q, builtinFilters),
-      );
+      query = (query || queryInitializer.order(order))
+        // eslint-disable-next-line @convex-dev/no-filter-in-query -- we allow filtering by multiple fields/operators
+        .filter((q) => applyBuiltinFilters(q, builtinFilters));
     }
 
     const internalPaginateOpts = {

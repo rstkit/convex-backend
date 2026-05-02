@@ -1,5 +1,6 @@
 #![feature(never_type)]
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
 
 use std::{
     collections::{
@@ -17,7 +18,7 @@ use std::{
 };
 
 use common::{
-    bootstrap_model::index::text_index::DeveloperTextIndexConfig,
+    bootstrap_model::index::text_index::TextIndexSpec,
     document::{
         CreationTime,
         ResolvedDocument,
@@ -92,7 +93,7 @@ impl Dataset {
         };
         let index_name: IndexName = "messages.by_body".parse()?;
         let Ok(index_name) = index_name.map_table(&|_| Ok::<_, !>(table_id.tablet_id));
-        let config = DeveloperTextIndexConfig {
+        let config = TextIndexSpec {
             search_field: "body".parse()?,
             filter_fields: BTreeSet::new(),
         };

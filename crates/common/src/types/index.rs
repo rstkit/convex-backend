@@ -6,7 +6,6 @@ use std::{
         Display,
     },
     str::FromStr,
-    sync::LazyLock,
 };
 
 use anyhow::Context;
@@ -26,8 +25,7 @@ use value::{
 use crate::{
     bootstrap_model::index::{
         index_validation_error,
-        IndexMetadata,
-        TabletIndexMetadata,
+        DeveloperIndexMetadata,
     },
     document::ParsedDocument,
     index::IndexKey,
@@ -42,8 +40,8 @@ impl IndexDescriptor {
     pub const MIN: Self = IndexDescriptor(Cow::Borrowed(MIN_IDENTIFIER));
 
     pub fn is_reserved(&self) -> bool {
-        self == &*INDEX_BY_ID_DESCRIPTOR
-            || self == &*INDEX_BY_CREATION_TIME_DESCRIPTOR
+        *self == INDEX_BY_ID_DESCRIPTOR
+            || *self == INDEX_BY_CREATION_TIME_DESCRIPTOR
             || self.0.starts_with('_')
     }
 
@@ -80,21 +78,6 @@ impl HeapSize for IndexDescriptor {
 impl From<IndexDescriptor> for FieldName {
     fn from(desc: IndexDescriptor) -> Self {
         desc.0.parse().expect("IndexDescriptor not valid FieldName")
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for IndexDescriptor {
-    type Parameters = ();
-
-    type Strategy = impl proptest::strategy::Strategy<Value = IndexDescriptor>;
-
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-
-        use crate::identifier::arbitrary_regexes::USER_IDENTIFIER_REGEX;
-        USER_IDENTIFIER_REGEX
-            .prop_filter_map("Invalid IndexDescriptor", |s| IndexDescriptor::new(s).ok())
     }
 }
 
@@ -175,14 +158,37 @@ impl<T: IndexTableIdentifier + FromStr<Err = anyhow::Error>> FromStr for Generic
     }
 }
 
+/// Diff of the indexes between two versions of schema.ts
+/// Index can be
+/// - missing (not present in schema.ts)
+/// - staged (exists with { staged: true })
+/// - exist (exists with { staged: false } or without the staged field)
+///
+/// Note that this is unrelated to the storage state
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct IndexDiff {
-    pub added: Vec<IndexMetadata<TableName>>,
-    /// The set of indexes whose developer configurations (but maybe not
-    /// states!) match those in storage
-    pub identical: Vec<ParsedDocument<TabletIndexMetadata>>,
-    pub dropped: Vec<ParsedDocument<IndexMetadata<TableName>>>,
+    /// missing -> exists
+    /// missing -> staged
+    pub added: Vec<DeveloperIndexMetadata>,
+    /// staged -> staged
+    /// exist -> exist
+    pub identical: Vec<ParsedDocument<DeveloperIndexMetadata>>,
+    /// staged -> missing
+    /// exist -> missing
+    pub dropped: Vec<ParsedDocument<DeveloperIndexMetadata>>,
+    /// staged -> exist
+    pub enabled: Vec<ParsedDocument<DeveloperIndexMetadata>>,
+    /// exist -> staged
+    pub disabled: Vec<ParsedDocument<DeveloperIndexMetadata>>,
+}
+
+impl IndexDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.dropped.is_empty()
+            && self.enabled.is_empty()
+            && self.disabled.is_empty()
+    }
 }
 
 impl<T: IndexTableIdentifier> fmt::Display for GenericIndexName<T> {
@@ -197,11 +203,9 @@ impl<T: IndexTableIdentifier> fmt::Debug for GenericIndexName<T> {
     }
 }
 
-pub static INDEX_BY_ID_DESCRIPTOR: LazyLock<IndexDescriptor> =
-    LazyLock::new(|| IndexDescriptor::new("by_id").unwrap());
-
-pub static INDEX_BY_CREATION_TIME_DESCRIPTOR: LazyLock<IndexDescriptor> =
-    LazyLock::new(|| IndexDescriptor::new("by_creation_time").unwrap());
+pub const INDEX_BY_ID_DESCRIPTOR: IndexDescriptor = IndexDescriptor(Cow::Borrowed("by_id"));
+pub const INDEX_BY_CREATION_TIME_DESCRIPTOR: IndexDescriptor =
+    IndexDescriptor(Cow::Borrowed("by_creation_time"));
 
 impl<T: IndexTableIdentifier> GenericIndexName<T> {
     /// Create a new index name for the table and given descriptor,
@@ -229,7 +233,7 @@ impl<T: IndexTableIdentifier> GenericIndexName<T> {
     pub fn by_id(table: T) -> Self {
         Self {
             table,
-            descriptor: INDEX_BY_ID_DESCRIPTOR.clone(),
+            descriptor: INDEX_BY_ID_DESCRIPTOR,
         }
     }
 
@@ -237,7 +241,7 @@ impl<T: IndexTableIdentifier> GenericIndexName<T> {
     pub fn by_creation_time(table: T) -> Self {
         Self {
             table,
-            descriptor: INDEX_BY_CREATION_TIME_DESCRIPTOR.clone(),
+            descriptor: INDEX_BY_CREATION_TIME_DESCRIPTOR,
         }
     }
 
@@ -261,12 +265,12 @@ impl<T: IndexTableIdentifier> GenericIndexName<T> {
 
     /// Is the index name for the by_id index?
     pub fn is_by_id(&self) -> bool {
-        self.descriptor == *INDEX_BY_ID_DESCRIPTOR
+        self.descriptor == INDEX_BY_ID_DESCRIPTOR
     }
 
     /// Is the index name for the creation time index?
     pub fn is_creation_time(&self) -> bool {
-        self.descriptor == *INDEX_BY_CREATION_TIME_DESCRIPTOR
+        self.descriptor == INDEX_BY_CREATION_TIME_DESCRIPTOR
     }
 
     /// Is this index reserved? The system automatically defines these indexes
@@ -313,22 +317,6 @@ impl IndexName {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl<T: IndexTableIdentifier + proptest::arbitrary::Arbitrary> proptest::arbitrary::Arbitrary
-    for GenericIndexName<T>
-{
-    type Parameters = ();
-
-    type Strategy = impl proptest::strategy::Strategy<Value = GenericIndexName<T>>;
-
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        any::<(T, IndexDescriptor)>().prop_filter_map("Invalid IndexName", |(t, d)| {
-            GenericIndexName::new(t, d).ok()
-        })
-    }
-}
-
 pub type IndexId = InternalId;
 
 #[derive(Eq, PartialEq, Clone, Debug, Ord, PartialOrd)]
@@ -353,32 +341,5 @@ pub enum DatabaseIndexValue {
 impl DatabaseIndexValue {
     pub fn is_delete(&self) -> bool {
         matches!(self, DatabaseIndexValue::Deleted)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    mod test_min_index_descriptor {
-        use cmd_util::env::env_config;
-        use proptest::prelude::*;
-
-        use super::super::IndexDescriptor;
-
-        proptest! {
-            #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-            #[test]
-            fn proptest(index_name in any::<IndexDescriptor>()) {
-                assert!(IndexDescriptor::MIN <= index_name);
-            }
-        }
-
-        #[test]
-        fn proptest_trophies() {
-            // #2716: `IndexDescriptor::min` was "a", where "A" < "a".
-            assert!(IndexDescriptor::MIN <= IndexDescriptor::new("B").unwrap());
-        }
     }
 }

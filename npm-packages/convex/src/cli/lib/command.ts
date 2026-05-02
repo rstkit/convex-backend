@@ -1,4 +1,4 @@
-import { Command, Option } from "@commander-js/extra-typings";
+import { Command, Option, OptionValues } from "@commander-js/extra-typings";
 import { OneoffCtx } from "../../bundler/context.js";
 import { LogMode } from "./logs.js";
 import {
@@ -8,6 +8,7 @@ import {
   parseInteger,
   parsePositiveInteger,
 } from "./utils/utils.js";
+import { INLINE_QUERY_DESCRIPTION } from "./runTestFunction.js";
 
 declare module "@commander-js/extra-typings" {
   interface Command<Args extends any[] = [], Opts extends OptionValues = {}> {
@@ -25,8 +26,15 @@ declare module "@commander-js/extra-typings" {
      * NOTE: This method only exists at runtime if this file is imported.
      * To help avoid this bug, this method takes in an `ActionDescription` which
      * can only be constructed via `actionDescription` from this file.
+     *
+     * @param action - The action description
+     * @param options - Optional settings
+     * @param options.showUrlHelp - If true, show the --url option in help output
      */
-    addDeploymentSelectionOptions(action: ActionDescription): Command<
+    addDeploymentSelectionOptions(
+      action: ActionDescription,
+      options?: { showUrlHelp?: boolean },
+    ): Command<
       Args,
       Opts & {
         envFile?: string;
@@ -35,6 +43,7 @@ declare module "@commander-js/extra-typings" {
         prod?: boolean;
         previewName?: string;
         deploymentName?: string;
+        deployment?: string;
       }
     >;
 
@@ -75,11 +84,12 @@ declare module "@commander-js/extra-typings" {
      * Adds options and arguments for the `run` command.
      */
     addRunOptions(): Command<
-      [...Args, string, string | undefined],
+      [...Args, string | undefined, string | undefined],
       Opts & {
         watch?: boolean;
         push?: boolean;
         identity?: string;
+        inlineQuery?: string;
         typecheck: "enable" | "try" | "disable";
         typecheckComponents: boolean;
         codegen: "enable" | "disable";
@@ -124,6 +134,7 @@ declare module "@commander-js/extra-typings" {
         limit: number;
         order: "asc" | "desc";
         component?: string;
+        format?: "json" | "jsonArray" | "jsonLines" | "jsonl" | "pretty";
       }
     >;
 
@@ -135,6 +146,7 @@ declare module "@commander-js/extra-typings" {
       Opts & {
         history: number;
         success: boolean;
+        jsonl: boolean;
       }
     >;
 
@@ -154,38 +166,71 @@ declare module "@commander-js/extra-typings" {
 
 Command.prototype.addDeploymentSelectionOptions = function (
   action: ActionDescription,
+  options?: { showUrlHelp?: boolean },
 ) {
-  return this.addOption(
-    new Option("--url <url>")
-      .conflicts(["--prod", "--preview-name", "--deployment-name"])
-      .hideHelp(),
-  )
+  const urlOption = new Option(
+    "--url <url>",
+    options?.showUrlHelp
+      ? action + " the deployment at the given URL."
+      : undefined,
+  ).conflicts([
+    "--prod",
+    "--preview-name",
+    "--deployment-name",
+    "--deployment",
+  ]);
+  if (!options?.showUrlHelp) {
+    urlOption.hideHelp();
+  }
+  return this.addOption(urlOption)
     .addOption(new Option("--admin-key <adminKey>").hideHelp())
+    .addOption(
+      new Option(
+        "--prod",
+        action + " this project's default production deployment.",
+      ).conflicts([
+        "--preview-name",
+        "--deployment-name",
+        "--url",
+        "--deployment",
+      ]),
+    )
+    .addOption(
+      new Option(
+        "--preview-name <previewName>",
+        action + " the preview deployment with the given name.",
+      )
+        .conflicts(["--prod", "--deployment-name", "--url", "--deployment"])
+        .hideHelp(),
+    )
+    .addOption(
+      new Option(
+        "--deployment-name <deploymentName>",
+        action + " the specified deployment.",
+      )
+        .conflicts(["--prod", "--preview-name", "--url", "--deployment"])
+        .hideHelp(),
+    )
+    .addOption(
+      new Option(
+        "--deployment <deployment>",
+        action +
+          " a specific deployment. Accepts:\n" +
+          "• a deployment name (e.g. joyful-capybara-123)\n" +
+          "• a deployment reference (e.g. dev/james, staging)\n" +
+          "• `dev` (for your personal dev deployment)\n" +
+          "• `prod` (for your project’s default production deployment)\n" +
+          "• `local` (for your local dev deployment)." +
+          "\nYou can also select deployments in other projects with `project-slug:reference` or `team-slug:project-slug:reference`.",
+      ).conflicts(["--prod", "--preview-name", "--deployment-name", "--url"]),
+    )
     .addOption(
       new Option(
         "--env-file <envFile>",
         `Path to a custom file of environment variables, for choosing the \
 deployment, e.g. ${CONVEX_DEPLOYMENT_ENV_VAR_NAME} or ${CONVEX_SELF_HOSTED_URL_VAR_NAME}. \
 Same format as .env.local or .env files, and overrides them.`,
-      ),
-    )
-    .addOption(
-      new Option(
-        "--prod",
-        action + " this project's production deployment.",
-      ).conflicts(["--preview-name", "--deployment-name", "--url"]),
-    )
-    .addOption(
-      new Option(
-        "--preview-name <previewName>",
-        action + " the preview deployment with the given name.",
-      ).conflicts(["--prod", "--deployment-name", "--url"]),
-    )
-    .addOption(
-      new Option(
-        "--deployment-name <deploymentName>",
-        action + " the specified deployment.",
-      ).conflicts(["--prod", "--preview-name", "--url"]),
+      ).hideHelp(),
     ) as any;
 };
 
@@ -204,13 +249,16 @@ export async function normalizeDevOptions(
     codegen: "enable" | "disable";
     once?: boolean;
     untilSuccess: boolean;
-    run?: string;
+    start?: string;
     runSh?: string;
+    run?: string | undefined;
     runComponent?: string;
     tailLogs?: string | true;
     traceEvents: boolean;
-    debugBundlePath?: string;
+    debugBundlePath?: string | undefined;
+    debugNodeApis?: boolean;
     liveComponentSources?: boolean;
+    pushAllModules?: boolean;
     while?: string;
   },
 ): Promise<{
@@ -221,12 +269,15 @@ export async function normalizeDevOptions(
   once: boolean;
   untilSuccess: boolean;
   run?:
-    | { kind: "function"; name: string; component?: string }
-    | { kind: "shell"; command: string };
+    | { kind: "function"; name: string; component?: string | undefined }
+    | { kind: "shell"; command: string }
+    | undefined;
   tailLogs: LogMode;
   traceEvents: boolean;
-  debugBundlePath?: string;
+  debugBundlePath?: string | undefined;
+  debugNodeApis: boolean;
   liveComponentSources: boolean;
+  pushAllModules: boolean;
 }> {
   if (cmdOptions.runComponent && !cmdOptions.run) {
     return await ctx.crash({
@@ -241,6 +292,13 @@ export async function normalizeDevOptions(
       exitCode: 1,
       errorType: "fatal",
       printedMessage: "`--debug-bundle-path` can only be used with `--once`.",
+    });
+  }
+  if (cmdOptions.debugNodeApis && !cmdOptions.once) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "fatal",
+      printedMessage: "`--debug-node-apis` can only be used with `--once`.",
     });
   }
 
@@ -258,10 +316,10 @@ export async function normalizeDevOptions(
             name: cmdOptions.run,
             component: cmdOptions.runComponent,
           }
-        : cmdOptions.runSh !== undefined
+        : (cmdOptions.start ?? cmdOptions.runSh) !== undefined
           ? {
               kind: "shell",
-              command: cmdOptions.runSh,
+              command: (cmdOptions.start ?? cmdOptions.runSh)!,
             }
           : undefined,
     tailLogs:
@@ -270,7 +328,9 @@ export async function normalizeDevOptions(
         : "pause-on-deploy",
     traceEvents: cmdOptions.traceEvents,
     debugBundlePath: cmdOptions.debugBundlePath,
+    debugNodeApis: !!cmdOptions.debugNodeApis,
     liveComponentSources: !!cmdOptions.liveComponentSources,
+    pushAllModules: !!cmdOptions.pushAllModules,
   };
 }
 
@@ -280,7 +340,12 @@ Command.prototype.addDeployOptions = function () {
       "--dry-run",
       "Print out the generated configuration without deploying to your Convex deployment",
     )
-    .option("-y, --yes", "Skip confirmation prompt when running locally")
+    .addOption(
+      new Option(
+        "-y, --yes",
+        "Skip confirmation prompt when running interactively. Warning: this deploys to PRODUCTION. To deploy to your current dev environment, run npx convex dev --once",
+      ).hideHelp(),
+    )
     .addOption(
       new Option(
         "--typecheck <mode>",
@@ -317,7 +382,15 @@ Command.prototype.addDeployOptions = function () {
     .addOption(new Option("--debug-bundle-path <path>").hideHelp())
     .addOption(new Option("--debug").hideHelp())
     .addOption(new Option("--write-push-request <writePushRequest>").hideHelp())
-    .addOption(new Option("--live-component-sources").hideHelp());
+    .addOption(new Option("--live-component-sources").hideHelp())
+    .addOption(
+      new Option(
+        "--push-all-modules",
+        "Push all modules without checking for unchanged module hashes from the server",
+      )
+        .default(false)
+        .hideHelp(),
+    );
 };
 
 Command.prototype.addSelfHostOptions = function () {
@@ -338,7 +411,7 @@ Command.prototype.addSelfHostOptions = function () {
 Command.prototype.addRunOptions = function () {
   return (
     this.argument(
-      "functionName",
+      "[functionName]",
       "identifier of the function to run, like `listMessages` or `dir/file:myFunction`",
     )
       .argument(
@@ -348,6 +421,12 @@ Command.prototype.addRunOptions = function () {
       .option(
         "-w, --watch",
         "Watch a query, printing its result if the underlying data changes. Given function must be a query.",
+      )
+      .addOption(
+        new Option(
+          "--inline-query <query>",
+          INLINE_QUERY_DESCRIPTION,
+        ).conflicts("--watch"),
       )
       .option("--push", "Push code to deployment before running the function.")
       .addOption(
@@ -383,8 +462,7 @@ Command.prototype.addRunOptions = function () {
       .addOption(
         new Option(
           "--component <path>",
-          "Path to the component in the component tree defined in convex.config.ts. " +
-            "Components are a beta feature. This flag is unstable and may change in subsequent releases.",
+          "Path to the component in the component tree defined in convex.config.ts.",
         ),
       )
       .addOption(new Option("--live-component-sources").hideHelp())
@@ -439,7 +517,7 @@ Command.prototype.addImportOptions = function () {
     .addOption(
       new Option(
         "--component <path>",
-        "Path to the component in the component tree defined in convex.config.ts",
+        "Path to the component in the component tree defined in convex.config.ts.",
       ),
     );
 };
@@ -476,9 +554,17 @@ Command.prototype.addDataOptions = function () {
     .addOption(
       new Option(
         "--component <path>",
-        "Path to the component in the component tree defined in convex.config.ts.\n" +
-          "  By default, inspects data in the root component",
-      ).hideHelp(),
+        "Path to the component in the component tree defined in convex.config.ts.",
+      ),
+    )
+    .addOption(
+      new Option(
+        "--format <format>",
+        "Format to print the data in. This flag is only required if the filename is missing an extension.\n" +
+          "- jsonArray (aka json): print the data as a JSON array of objects.\n" +
+          "- jsonLines (aka jsonl): print the data as a JSON object per line.\n" +
+          "- pretty: print the data in a human-readable format.",
+      ).choices(["jsonArray", "json", "jsonLines", "jsonl", "pretty"]),
     )
     .argument("[table]", "If specified, list documents in this table.");
 };
@@ -488,11 +574,13 @@ Command.prototype.addLogsOptions = function () {
     "--history [n]",
     "Show `n` most recent logs. Defaults to showing all available logs.",
     parseInteger,
-  ).option(
-    "--success",
-    "Print a log line for every successful function execution",
-    false,
-  );
+  )
+    .option(
+      "--success",
+      "Print a log line for every successful function execution",
+      false,
+    )
+    .option("--jsonl", "Output raw log events as JSONL", false);
 };
 
 Command.prototype.addNetworkTestOptions = function () {

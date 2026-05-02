@@ -1,12 +1,10 @@
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
     fmt::{
         Debug,
         Display,
     },
     marker::PhantomData,
-    sync::Arc,
 };
 
 use common::{
@@ -22,7 +20,7 @@ use common::{
         IndexName,
         IndexTableIdentifier,
     },
-    virtual_system_mapping::VirtualSystemDocMapper,
+    virtual_system_mapping::AssociatedVirtualTable,
 };
 use value::{
     heap_size::HeapSize,
@@ -30,7 +28,7 @@ use value::{
     TableName,
 };
 
-/// Represents a system table.
+/// Represents a system table. This is never a virtual table.
 ///
 /// This trait is not dyn-compatible because it has a `Metadata` associated
 /// type.
@@ -39,15 +37,16 @@ pub trait SystemTable: Send + Sync + Sized + 'static {
     fn table_name() -> &'static TableName;
     /// List of indexes for the system table
     fn indexes() -> Vec<SystemIndex<Self>>;
-    fn virtual_table() -> Option<(
-        &'static TableName,
-        BTreeMap<IndexName, IndexName>,
-        Arc<dyn VirtualSystemDocMapper>,
-    )> {
+    fn virtual_table() -> Option<AssociatedVirtualTable> {
         None
     }
 
-    type Metadata: SystemTableMetadata;
+    type Metadata: SystemTableMetadata + Send + Sync + 'static;
+
+    /// SystemTable types defined in `migrations_model` should set this. This
+    /// turns off typed caching which avoids polluting the database cache with
+    /// migration-only metadata types.
+    const FOR_MIGRATION: bool = false;
 }
 
 pub trait SystemTableMetadata: Sized {
@@ -68,13 +67,7 @@ where
 pub trait ErasedSystemTable: Send + Sync {
     fn table_name(&self) -> &'static TableName;
     fn indexes(&self) -> Vec<ErasedSystemIndex>;
-    fn virtual_table(
-        &self,
-    ) -> Option<(
-        &'static TableName,
-        BTreeMap<IndexName, IndexName>,
-        Arc<dyn VirtualSystemDocMapper>,
-    )>;
+    fn virtual_table(&self) -> Option<AssociatedVirtualTable>;
 
     /// Check that a document is valid for this system table.
     /// We can't return the parsed document struct because its type might not
@@ -91,13 +84,7 @@ impl<T: SystemTable> ErasedSystemTable for T {
         T::indexes().into_iter().map(SystemIndex::erase).collect()
     }
 
-    fn virtual_table(
-        &self,
-    ) -> Option<(
-        &'static TableName,
-        BTreeMap<IndexName, IndexName>,
-        Arc<dyn VirtualSystemDocMapper>,
-    )> {
+    fn virtual_table(&self) -> Option<AssociatedVirtualTable> {
         T::virtual_table()
     }
 
@@ -175,6 +162,13 @@ impl<T: SystemTable> SystemIndex<T> {
         SystemIndex {
             name: GenericIndexName::by_id(SystemTableName::new()),
             fields: IndexedFields::by_id(),
+        }
+    }
+
+    pub fn by_creation_time() -> Self {
+        SystemIndex {
+            name: GenericIndexName::by_creation_time(SystemTableName::new()),
+            fields: IndexedFields::creation_time(),
         }
     }
 

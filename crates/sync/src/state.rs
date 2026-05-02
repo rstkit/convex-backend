@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     hash::Hash,
     mem,
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -57,7 +58,7 @@ pub struct SyncedQuery {
     /// - Starts `None`: Query is newly inserted.
     /// - `None -> Some(subscription)`: `SyncState::complete_fetch`.
     /// - `Some(..) -> None`: `SyncState::prune_invalidated_queries`.
-    subscription: Option<Box<dyn SubscriptionTrait>>,
+    subscription: Option<Arc<dyn SubscriptionTrait>>,
 
     /// What was the hash of the last successful return value? This allows us to
     /// deduplicate transitions for queries whose results haven't actually
@@ -143,10 +144,12 @@ pub struct SyncState {
     pending_identity: Option<Identity>,
     /// These are the query set version and identity according to the client.
     received_client_version: ClientVersion,
+
+    partition_id: u64,
 }
 
 impl SyncState {
-    pub fn new() -> Self {
+    pub fn new(partition_id: u64) -> Self {
         Self {
             session_id: None,
             current_version: StateVersion::initial(),
@@ -160,6 +163,8 @@ impl SyncState {
             pending_query_updates: vec![],
             pending_identity: None,
             received_client_version: ClientVersion::initial(),
+
+            partition_id,
         }
     }
 
@@ -184,7 +189,7 @@ impl SyncState {
             new_version
         );
         if self.current_version == new_version {
-            metrics::log_empty_transition();
+            metrics::log_empty_transition(self.partition_id);
         }
         self.current_version = new_version;
         Ok(())
@@ -328,7 +333,7 @@ impl SyncState {
         Ok(())
     }
 
-    pub fn take_subscriptions(&mut self) -> BTreeMap<QueryId, Box<dyn SubscriptionTrait>> {
+    pub fn take_subscriptions(&mut self) -> BTreeMap<QueryId, Arc<dyn SubscriptionTrait>> {
         let mut newly_invalidated = BTreeMap::new();
 
         for (query_id, query) in self.queries.iter_mut() {
@@ -356,7 +361,7 @@ impl SyncState {
     pub fn refill_subscription(
         &mut self,
         query_id: QueryId,
-        subscription: Box<dyn SubscriptionTrait>,
+        subscription: Arc<dyn SubscriptionTrait>,
     ) -> anyhow::Result<()> {
         // Per the state machine, we should only be refilling subscriptions if we
         // had a valid subscription before, which means the query is non-pending
@@ -380,7 +385,7 @@ impl SyncState {
         result: Result<JsonPackedValue, RedactedJsError>,
         log_lines: RedactedLogLines,
         journal: SerializedQueryJournal,
-        subscription: Box<dyn SubscriptionTrait>,
+        subscription: Arc<dyn SubscriptionTrait>,
     ) -> anyhow::Result<Option<StateModification<JsonPackedValue>>> {
         if let Some(query) = self.in_progress_queries.remove(&query_id) {
             let sq = SyncedQuery {
@@ -416,7 +421,7 @@ impl SyncState {
 
         let new_hash = hash_result(&result, &log_lines);
         let same_result = query.result_hash.as_ref() == Some(&new_hash);
-        metrics::log_query_result_dedup(same_result);
+        metrics::log_query_result_dedup(self.partition_id, same_result);
 
         query.result_hash = Some(new_hash);
         query.subscription = Some(subscription);
@@ -432,7 +437,7 @@ impl SyncState {
                     journal,
                 },
                 Err(error) => {
-                    metrics::log_query_failed();
+                    metrics::log_query_failed(self.partition_id);
                     StateModification::QueryFailed {
                         query_id,
                         error_message: error.to_string(),
@@ -449,6 +454,8 @@ impl SyncState {
 
     /// Resubscribe queries that don't have an active invalidation future.
     pub fn fill_invalidation_futures(&mut self) -> anyhow::Result<()> {
+        let mut created = 0;
+
         for (&query_id, sq) in &mut self.queries {
             if sq.invalidation_future.is_some() {
                 continue;
@@ -458,11 +465,15 @@ impl SyncState {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Missing subscription for {}", query_id))?
                 .wait_for_invalidation()
-                .map(move |r| r.map(move |()| query_id));
+                .map(move |r| r.map(move |_| query_id));
             let (future, handle) = future::abortable(future);
             sq.invalidation_future = Some(handle);
             self.invalidation_futures.push(future.boxed());
+            created += 1;
         }
+
+        metrics::log_create_invalidation_futures(self.partition_id, created);
+
         self.refill_needed = false;
         Ok(())
     }
@@ -506,84 +517,5 @@ fn hash_log_lines(hasher: &mut Sha256, log_lines: &RedactedLogLines) {
         // prefix but has a different length.
         hasher.update(&line.len().to_le_bytes());
         hasher.update(line.as_bytes());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use application::redaction::RedactedLogLines;
-    use cmd_util::env::env_config;
-    use common::{
-        log_lines::{
-            LogLevel,
-            LogLine,
-            LogLines,
-        },
-        runtime::UnixTimestamp,
-        value::{
-            ConvexValue,
-            JsonPackedValue,
-        },
-    };
-    use proptest::prelude::*;
-
-    use crate::state::udf_result_sha256;
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_sha256_deterministic(v in any::<ConvexValue>(), logs in any::<LogLines>()) {
-            let logs = RedactedLogLines::from_log_lines(logs, false);
-            let v = JsonPackedValue::pack(v);
-            let digest = udf_result_sha256(&v, &logs);
-            assert_eq!(udf_result_sha256(&v, &logs), digest);
-        }
-
-        #[test]
-        fn test_sha256_collisions(
-            v1 in any::<ConvexValue>(),
-            v1_logs in any::<LogLines>(),
-            v2 in any::<ConvexValue>(),
-            v2_logs in any::<LogLines>()
-        ) {
-            if v1 != v2 {
-                let v1_logs = RedactedLogLines::from_log_lines(v1_logs, false);
-                let v2_logs = RedactedLogLines::from_log_lines(v2_logs, false);
-                let v1 = JsonPackedValue::pack(v1);
-                let v2 = JsonPackedValue::pack(v2);
-                assert_ne!(udf_result_sha256(&v1, &v1_logs), udf_result_sha256(&v2, &v2_logs));
-            }
-        }
-    }
-
-    #[test]
-    fn test_sha256_does_not_collide_with_similar_logs() {
-        let v = ConvexValue::from(42);
-        let ts = UnixTimestamp::from_millis(1715980547440);
-        let v_logs = RedactedLogLines::from_log_lines(
-            vec![LogLine::new_developer_log_line(
-                LogLevel::Log,
-                vec!["foobar".to_string()],
-                ts,
-            )]
-            .into(),
-            false,
-        );
-        let v2_logs = RedactedLogLines::from_log_lines(
-            vec![
-                LogLine::new_developer_log_line(LogLevel::Log, vec!["foo".to_string()], ts),
-                LogLine::new_developer_log_line(LogLevel::Log, vec!["bar".to_string()], ts),
-            ]
-            .into(),
-            false,
-        );
-        let v = JsonPackedValue::pack(v);
-        assert_ne!(
-            udf_result_sha256(&v, &v_logs),
-            udf_result_sha256(&v, &v2_logs)
-        );
     }
 }

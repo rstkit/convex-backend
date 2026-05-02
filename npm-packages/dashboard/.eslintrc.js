@@ -9,10 +9,11 @@ module.exports = {
   },
   plugins: ["boundaries"],
   settings: {
-    tailwindcss: {
-      config: "../@convex-dev/design-system/src/tailwind.config.ts",
-    },
     "boundaries/elements": [
+      {
+        type: "docs",
+        pattern: "docs/*",
+      },
       {
         type: "hooks",
         pattern: "hooks/*",
@@ -40,7 +41,8 @@ module.exports = {
       },
       {
         type: "pages",
-        pattern: "pages/*",
+        pattern: "pages/**",
+        mode: "full",
       },
       {
         type: "layouts",
@@ -90,6 +92,10 @@ module.exports = {
               "lib",
               "elements",
             ],
+          },
+          {
+            from: "docs",
+            allow: ["pages", "lib", "components"],
           },
         ],
       },

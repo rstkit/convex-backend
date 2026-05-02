@@ -15,13 +15,14 @@ import {
   useConfigurePeriodicBackup,
 } from "api/backups";
 import { useCurrentProject } from "api/projects";
-import { useId, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
 import {
-  DeploymentResponse,
-  Team,
+  PeriodicBackupConfig,
+  TeamResponse,
   TeamEntitlementsResponse,
 } from "generatedApi";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { useQuery } from "convex/react";
 import udfs from "@common/udfs";
 import { useHasProjectAdminPermissions } from "api/roles";
@@ -36,8 +37,8 @@ export function Backups({
   deployment,
   entitlements,
 }: {
-  team: Team;
-  deployment: DeploymentResponse;
+  team: TeamResponse;
+  deployment: PlatformDeploymentResponse;
   entitlements: TeamEntitlementsResponse;
 }) {
   const project = useCurrentProject();
@@ -52,23 +53,40 @@ export function Backups({
   const canPerformActions =
     deployment.deploymentType !== "prod" || hasAdminPermissions;
 
+  if (deployment.kind === "cloud" && deployment.class.startsWith("d")) {
+    return (
+      <div className="flex h-full flex-col gap-4">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <h3 className="min-w-fit">Backup & Restore</h3>
+        </div>
+        <Callout className="max-w-prose">
+          <span>
+            Backups for {deployment.class.toUpperCase()} deployments are
+            produced every 24 hours and retained for 7 days. Contact the Convex
+            team to restore from a backup{" "}
+            <Link href="https://docs.convex.dev/database/backup-restore">
+              Learn more about backups
+            </Link>
+          </span>
+        </Callout>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col gap-4">
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <h3 className="min-w-fit">Backup & Restore</h3>
         <span className="text-sm">
           Use this page to automatically or manually backup and restore your
           deployment data.{" "}
-          <Link
-            href="https://docs.convex.dev/database/backup-restore"
-            className="text-content-link"
-          >
-            Learn more
+          <Link href="https://docs.convex.dev/database/backup-restore">
+            Learn more about backups
           </Link>
         </span>
       </div>
-      <div className="flex grow flex-col gap-8 overflow-auto pl-1 pt-1 scrollbar lg:flex-row lg:overflow-hidden">
-        <div className="flex shrink-0 flex-col lg:w-60">
+      <div className="scrollbar flex grow flex-col gap-4 overflow-auto pt-1 pl-1 xl:flex-row xl:overflow-hidden">
+        <Sheet className="flex h-fit w-full shrink-0 flex-col items-start gap-6 xl:w-60 xl:items-center">
           {periodicBackupsEnabled ? (
             <AutomaticBackupSelector
               deployment={deployment}
@@ -76,27 +94,26 @@ export function Backups({
             />
           ) : (
             <Tooltip
-              tip="Automatic backups are only available on paid plans."
-              className="flex gap-1"
+              tip="Automatic backups are only available on the Pro plan."
+              className="flex items-center gap-3"
             >
-              <label className="flex cursor-not-allowed items-center gap-2 text-sm">
-                <Checkbox disabled checked={false} onChange={() => {}} />
-                Backup Automatically
+              <label className="flex cursor-not-allowed items-start gap-2 text-start text-sm">
+                <div className="flex min-h-[1lh] items-center">
+                  <Checkbox disabled checked={false} onChange={() => {}} />
+                </div>
+                <span>Backup automatically</span>
               </label>
               <span
-                className="rounded bg-util-accent px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-white"
-                title="Only available in paid plans"
+                className="h-fit rounded-sm bg-util-accent px-1.5 py-1 text-xs font-semibold tracking-wider text-white uppercase"
+                title="Only available on the Pro plan"
               >
                 Pro
               </span>
             </Tooltip>
           )}
-
-          <hr className="my-6 w-full" />
-
+          <hr className="w-full" />
           <BackupNowButton
             deployment={deployment}
-            team={team}
             maxCloudBackups={maxCloudBackups}
             canPerformActions={canPerformActions}
           />
@@ -105,9 +122,16 @@ export function Backups({
             periodicBackupsEnabled={periodicBackupsEnabled}
             maxCloudBackups={maxCloudBackups}
           />
-        </div>
+          <p className="text-xs text-content-secondary">
+            Backups generation incurs{" "}
+            <Link href="https://docs.convex.dev/database/backup-restore#how-are-they-priced">
+              storage and bandwidth usage
+            </Link>
+            .
+          </p>
+        </Sheet>
 
-        <div className="flex flex-col gap-4 pb-8 lg:grow lg:pb-0">
+        <div className="flex flex-col gap-4 pb-8 xl:grow xl:pb-0">
           {existingExport &&
             existingExport._creationTime < new Date("2024-11-15").getTime() &&
             existingExport.state === "completed" &&
@@ -120,7 +144,6 @@ export function Backups({
                   your last snapshot{" "}
                   <Link
                     href={`/t/${team.slug}/${project?.slug}/${deployment.name}/settings/snapshots`}
-                    className="text-content-link hover:underline"
                   >
                     here
                   </Link>
@@ -128,7 +151,7 @@ export function Backups({
                 </div>
               </Callout>
             )}
-          <BackupRestoreStatus deployment={deployment} team={team} />
+          <BackupRestoreStatus deployment={deployment} />
 
           <Sheet padding={false} className="min-h-72">
             <BackupList
@@ -149,7 +172,7 @@ function BackupProCallouts({
   periodicBackupsEnabled,
   maxCloudBackups,
 }: {
-  team: Team;
+  team: TeamResponse;
   periodicBackupsEnabled: boolean;
   maxCloudBackups: number;
 }) {
@@ -159,30 +182,31 @@ function BackupProCallouts({
         <LocalDevCallout
           className="mt-6 flex-col"
           tipText="Tip: Run this to enable automatic backups locally:"
-          command={`cargo run --bin big-brain-tool -- --dev grant-entitlement --team-entitlement periodic_backups_enabled --team-id ${team?.id} --reason "local" true --for-real`}
+          command={`cargo run --bin big-brain-tool -- --dev entitlement grant --team-entitlement periodic_backups_enabled --team-id ${team?.id} --reason "local" true --for-real`}
         />
       )}
       {maxCloudBackups <= 2 && (
         <LocalDevCallout
           className="mt-6 flex-col"
           tipText="Tip: Run this to increase the backup limit locally:"
-          command={`cargo run --bin big-brain-tool -- --dev grant-entitlement --team-entitlement max_cloud_backups --team-id ${team?.id} --reason "local" 50 --for-real`}
+          command={`cargo run --bin big-brain-tool -- --dev entitlement grant --team-entitlement max_cloud_backups --team-id ${team?.id} --reason "local" 50 --for-real`}
         />
       )}
     </>
   );
 }
 
-function AutomaticBackupSelector({
+export function AutomaticBackupSelector({
   deployment,
   canPerformActions,
 }: {
-  deployment: DeploymentResponse;
+  deployment: PlatformDeploymentResponse;
   canPerformActions: boolean;
 }) {
-  const periodicBackup = useGetPeriodicBackupConfig(deployment.id);
-  const configurePeriodicBackup = useConfigurePeriodicBackup(deployment.id);
-  const disablePeriodicBackup = useDisablePeriodicBackup(deployment.id);
+  const deploymentId = deployment.kind === "cloud" ? deployment.id : undefined;
+  const periodicBackup = useGetPeriodicBackupConfig(deploymentId);
+  const configurePeriodicBackup = useConfigurePeriodicBackup(deploymentId);
+  const disablePeriodicBackup = useDisablePeriodicBackup(deploymentId);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -194,7 +218,7 @@ function AutomaticBackupSelector({
           : undefined
       }
     >
-      <div className="flex flex-col gap-2">
+      <div className="flex w-full flex-col gap-2">
         <label className="mb-1 flex items-center gap-2 text-sm">
           <Checkbox
             checked={!!periodicBackup}
@@ -206,8 +230,16 @@ function AutomaticBackupSelector({
               try {
                 if (periodicBackup === null) {
                   // Enable automatic backups
-                  const defaultCronspec = "0 0 * * *";
-                  await configurePeriodicBackup({ cronspec: defaultCronspec });
+
+                  // We randomize the default cron spec to spread out the backups
+                  // of users that don’t specify a custom time
+                  const randomHour = Math.floor(Math.random() * 24);
+                  const randomMinute = Math.floor(Math.random() * 60);
+                  const defaultCronspec = `${randomMinute} ${randomHour} * * *`;
+                  await configurePeriodicBackup({
+                    cronspec: defaultCronspec,
+                    includeStorage: false,
+                  });
                 } else {
                   // Disable automatic backups
                   await disablePeriodicBackup();
@@ -241,10 +273,83 @@ function AutomaticBackupSelector({
                 {localTimezoneName()})
               </p>
             </div>
+            <BackupIncludeStorageSelector
+              periodicBackup={periodicBackup}
+              deployment={deployment}
+              disabled={!canPerformActions}
+            />
           </>
         )}
       </div>
     </Tooltip>
+  );
+}
+
+export function BackupIncludeStorageSelector({
+  periodicBackup,
+  deployment,
+  disabled,
+}: {
+  periodicBackup: PeriodicBackupConfig;
+  deployment: PlatformDeploymentResponse;
+  disabled: boolean;
+}) {
+  const configurePeriodicBackup = useConfigurePeriodicBackup(
+    deployment.kind === "cloud" ? deployment.id : undefined,
+  );
+
+  const includeStorageCheckboxId = useId();
+
+  const [includeStorage, setIncludeStorage] = useState(
+    periodicBackup.includeStorage,
+  );
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Sync local state when server state updates (after mutation refetches)
+  useEffect(() => {
+    setIncludeStorage(periodicBackup.includeStorage);
+  }, [periodicBackup.includeStorage]);
+
+  const handleChange = async () => {
+    const newValue = !includeStorage;
+    setIncludeStorage(newValue); // Optimistic update
+    setIsSubmitting(true);
+
+    try {
+      await configurePeriodicBackup({
+        ...periodicBackup,
+        includeStorage: newValue,
+      });
+    } catch {
+      // Revert on error
+      setIncludeStorage(!newValue);
+    } finally {
+      setIsSubmitting(false);
+      toast(
+        "success",
+        `Updated automatic backups to include ${newValue ? "file storage" : "tables only"}.`,
+      );
+    }
+  };
+
+  return (
+    <label
+      className="flex items-center gap-2 text-sm"
+      htmlFor={includeStorageCheckboxId}
+    >
+      <Checkbox
+        id={includeStorageCheckboxId}
+        checked={includeStorage}
+        disabled={disabled || isSubmitting}
+        onChange={handleChange}
+      />
+      Include file storage{" "}
+      {isSubmitting && (
+        <div>
+          <Spinner />
+        </div>
+      )}
+    </label>
   );
 }
 
@@ -254,13 +359,20 @@ export function BackupScheduleSelector({
   disabled,
 }: {
   cronspec: string;
-  deployment: DeploymentResponse;
+  deployment: PlatformDeploymentResponse;
   disabled: boolean;
 }) {
   const parts = cronspec.split(" ");
   const [minutesUtc, hoursUtc, , , dayOfWeekPart = "*"] = parts;
   const isWeekly = dayOfWeekPart !== "*";
   const dayOfWeekNum = isWeekly ? Number(dayOfWeekPart) : null;
+  const defaultDayOfWeek = useMemo(
+    () =>
+      // We randomize the default day of week to spread out the backups
+      // of users that don’t specify a custom time
+      Math.floor(Math.random() * 7),
+    [],
+  );
   const date = new Date();
   date.setUTCHours(+hoursUtc, +minutesUtc);
 
@@ -269,7 +381,7 @@ export function BackupScheduleSelector({
       button={
         <Button
           variant="neutral"
-          className="relative w-full pl-3 pr-10 font-normal"
+          className="relative w-full pr-10 pl-3 font-normal"
           disabled={disabled}
         >
           <span className="flex flex-col truncate">
@@ -307,7 +419,7 @@ export function BackupScheduleSelector({
         <BackupScheduleSelectorInner
           defaultValue={date}
           defaultPeriodicity={isWeekly ? "weekly" : "daily"}
-          defaultDayOfWeek={dayOfWeekNum ?? 0}
+          defaultDayOfWeek={dayOfWeekNum ?? defaultDayOfWeek}
           onClose={close}
           deployment={deployment}
         />
@@ -327,9 +439,11 @@ export function BackupScheduleSelectorInner({
   defaultPeriodicity: "daily" | "weekly";
   defaultDayOfWeek: number;
   onClose: () => void;
-  deployment: DeploymentResponse;
+  deployment: PlatformDeploymentResponse;
 }) {
-  const configurePeriodicBackup = useConfigurePeriodicBackup(deployment.id);
+  const configurePeriodicBackup = useConfigurePeriodicBackup(
+    deployment.kind === "cloud" ? deployment.id : undefined,
+  );
 
   const initialValue = `${defaultValue.getHours().toString().padStart(2, "0")}:${defaultValue.getMinutes().toString().padStart(2, "0")}`;
   const [value, setValue] = useState(initialValue);

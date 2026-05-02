@@ -1,54 +1,61 @@
-use std::collections::BTreeMap;
-
-pub use common::types::BackendState;
-use value::{
-    obj,
-    ConvexObject,
-    ConvexValue,
+pub use common::types::{
+    BackendState,
+    OldBackendState,
 };
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use value::codegen_convex_serialization;
 
 #[derive(Debug, PartialEq, Clone)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
-pub struct PersistedBackendState(pub BackendState);
-
-impl TryFrom<PersistedBackendState> for ConvexObject {
-    type Error = anyhow::Error;
-
-    fn try_from(state: PersistedBackendState) -> anyhow::Result<Self> {
-        obj!("state" => state.0.to_string())
-    }
+pub enum PersistedBackendState {
+    Old(OldBackendState),
+    New(BackendState),
 }
 
-impl TryFrom<ConvexObject> for PersistedBackendState {
-    type Error = anyhow::Error;
-
-    fn try_from(object: ConvexObject) -> anyhow::Result<Self> {
-        let mut fields: BTreeMap<_, _> = object.into();
-        let state = match fields.remove("state") {
-            Some(ConvexValue::String(s)) => s.parse()?,
-            _ => anyhow::bail!("Missing state field for BackendState: {fields:?}"),
-        };
-        Ok(Self(state))
-    }
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SerializedBackendState {
+    Old { state: String },
+    New { system: String, user: String },
 }
 
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-    use sync_types::testing::assert_roundtrips;
-    use value::ConvexObject;
-
-    use crate::backend_state::types::PersistedBackendState;
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_using_proptest(v in any::<PersistedBackendState>()) {
-            assert_roundtrips::<PersistedBackendState, ConvexObject>(v);
+impl From<PersistedBackendState> for SerializedBackendState {
+    fn from(state: PersistedBackendState) -> Self {
+        match state {
+            PersistedBackendState::Old(state) => Self::Old {
+                state: state.to_string(),
+            },
+            PersistedBackendState::New(state) => Self::New {
+                system: state.system.to_string(),
+                user: state.user.to_string(),
+            },
         }
     }
 }
+
+impl TryFrom<SerializedBackendState> for PersistedBackendState {
+    type Error = anyhow::Error;
+
+    fn try_from(object: SerializedBackendState) -> anyhow::Result<Self> {
+        Ok(match object {
+            SerializedBackendState::Old { state } => Self::Old(state.parse()?),
+            SerializedBackendState::New { system, user } => Self::New(BackendState {
+                system: system.parse()?,
+                user: user.parse()?,
+            }),
+        })
+    }
+}
+
+impl PersistedBackendState {
+    pub fn to_old_lossy(&self) -> OldBackendState {
+        match self {
+            PersistedBackendState::Old(old_backend_state) => *old_backend_state,
+            PersistedBackendState::New(backend_state) => backend_state.to_old_lossy(),
+        }
+    }
+}
+
+codegen_convex_serialization!(PersistedBackendState, SerializedBackendState);

@@ -93,7 +93,7 @@ impl<RT: Runtime> TaskExecutor<RT> {
                 sha256,
             )
             .await
-            .track_storage_ingress_size(component_path, "store".to_string(), size as u64)
+            .track_storage_ingress(component_path, "store".to_string(), size as u64)
             .await;
 
         Ok(storage_doc_id)
@@ -156,12 +156,13 @@ impl<RT: Runtime> TaskExecutor<RT> {
             .get_file_stream(component_path, file_entry, self.usage_tracker.clone())
             .await?;
 
-        let stream = file_stream.stream.map_err(|e| e.into()).boxed();
-
+        let content_length = file_stream.content_length.0;
+        let content_type = file_stream.content_type.as_ref().map(|c| c.to_string());
+        let stream = file_stream.map_err(|e| e.into()).boxed();
         let r = FileResponse {
             body_stream_id: stream_id,
-            content_length: file_stream.content_length.0,
-            content_type: file_stream.content_type.map(|c| c.to_string()),
+            content_length,
+            content_type,
         };
         Ok(Some((stream, r)))
     }

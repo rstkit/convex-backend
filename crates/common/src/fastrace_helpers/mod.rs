@@ -50,17 +50,11 @@ impl EncodedSpan {
 
 /// Given an instance name returns a span with the sample percentage specified
 /// in `knobs.rs`
-pub fn get_sampled_span<R: Rng>(
-    instance_name: &str,
-    name: &str,
-    rng: &mut R,
-    properties: BTreeMap<String, String>,
-) -> Span {
+pub fn get_sampled_span<R: Rng>(instance_name: &str, name: &str, rng: &mut R) -> Span {
     let sample_ratio = get_sampling_ratio(instance_name, name);
     let should_sample = rng.random_bool(sample_ratio);
     match should_sample {
         true => Span::root(name.to_owned(), SpanContext::random())
-            .with_properties(|| properties)
             .with_property(|| ("dev.convex.instance_name", instance_name.to_owned())),
         false => Span::noop(),
     }
@@ -73,7 +67,6 @@ pub fn get_keyed_sampled_span<K: Hash + std::fmt::Debug>(
     instance_name: &str,
     name: &str,
     span_ctx: SpanContext,
-    properties: BTreeMap<String, String>,
 ) -> Span {
     let mut hasher = FnvHasher::default();
     key.hash(&mut hasher);
@@ -83,7 +76,6 @@ pub fn get_keyed_sampled_span<K: Hash + std::fmt::Debug>(
     if hash < threshold {
         tracing::info!("Sampling span for {key:?}: {name}");
         Span::root(name.to_owned(), span_ctx)
-            .with_properties(|| properties)
             .with_property(|| ("dev.convex.instance_name", instance_name.to_owned()))
     } else {
         tracing::info!("Not sampling span for {key:?}: {name}");
@@ -93,16 +85,9 @@ pub fn get_keyed_sampled_span<K: Hash + std::fmt::Debug>(
 
 /// Sets the sampling configuration to be used by the `get_sampled_span`
 /// function
-pub fn set_sampling_config(config_str: &str) {
-    match config_str.parse() {
-        Ok(config) => {
-            *SAMPLING_CONFIG_FROM_LOADER.lock() = Some(config);
-            tracing::info!("Sampling config set to: {}", config_str.replace("\n", ""));
-        },
-        Err(e) => {
-            tracing::error!("Failed to parse sampling config: {}", e);
-        },
-    }
+pub fn set_sampling_config(config: SamplingConfig) {
+    tracing::info!("Sampling config set to: {config:?}");
+    *SAMPLING_CONFIG_FROM_LOADER.lock() = Some(config);
 }
 
 fn get_sampling_ratio(instance_name: &str, name: &str) -> f64 {
@@ -117,7 +102,7 @@ fn get_sampling_ratio(instance_name: &str, name: &str) -> f64 {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SamplingConfig {
     by_regex: Vec<(Option<String>, Regex, f64)>,
 }
@@ -139,10 +124,10 @@ impl SamplingConfig {
         self.by_regex
             .iter()
             .find_map(|(rule_instance_name, name_regex, sample_ratio)| {
-                if let Some(rule_instance_name) = rule_instance_name {
-                    if rule_instance_name != instance_name {
-                        return None;
-                    }
+                if let Some(rule_instance_name) = rule_instance_name
+                    && rule_instance_name != instance_name
+                {
+                    return None;
                 }
                 if name_regex.is_match(name) {
                     Some(*sample_ratio)
@@ -262,10 +247,10 @@ impl FromStr for SamplingConfig {
 
 /// Creates a root span from an encoded parent trace
 pub fn initialize_root_from_parent(span_name: &str, encoded_parent: EncodedSpan) -> Span {
-    if let Some(p) = encoded_parent.0 {
-        if let Some(ctx) = SpanContext::decode_w3c_traceparent(p.as_str()) {
-            return Span::root(span_name.to_string(), ctx);
-        }
+    if let Some(p) = encoded_parent.0
+        && let Some(ctx) = SpanContext::decode_w3c_traceparent(p.as_str())
+    {
+        return Span::root(span_name.to_string(), ctx);
     }
     Span::noop()
 }
@@ -307,7 +292,7 @@ impl<T: Future> Future for TraceIfPending<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let _guard;
-        if let TraceIfPendingState::Tracing(ref span) = this.state {
+        if let &mut TraceIfPendingState::Tracing(ref span) = this.state {
             _guard = span.set_local_parent();
         }
         let result = this.future.poll(cx);
@@ -317,147 +302,5 @@ impl<T: Future> Future for TraceIfPending<T> {
             *this.state = TraceIfPendingState::Tracing(Span::enter_with_local_parent(name));
         }
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::fastrace_helpers::SamplingConfig;
-
-    #[test]
-    fn test_parse_sampling_config() -> anyhow::Result<()> {
-        let config: SamplingConfig = "1".parse()?;
-        assert_eq!(config.by_regex.len(), 1);
-        assert_eq!(config.sample_ratio("carnitas", "a"), 1.0);
-
-        let config: SamplingConfig = "a=0.5,b=0.15".parse()?;
-        assert_eq!(config.by_regex.len(), 2);
-        assert_eq!(config.sample_ratio("carnitas", "a"), 0.5);
-        assert_eq!(config.sample_ratio("carnitas", "b"), 0.15);
-        assert_eq!(config.sample_ratio("carnitas", "c"), 0.0);
-
-        let config: SamplingConfig = "a=0.5,b=0.15,0.01".parse()?;
-        assert_eq!(config.by_regex.len(), 3);
-        assert_eq!(config.sample_ratio("carnitas", "a"), 0.5);
-        assert_eq!(config.sample_ratio("carnitas", "b"), 0.15);
-        assert_eq!(config.sample_ratio("carnitas", "c"), 0.01);
-
-        let config: SamplingConfig = "/f/.*=0.5".parse()?;
-        assert_eq!(config.by_regex.len(), 1);
-        assert_eq!(config.sample_ratio("carnitas", "/f/a"), 0.5);
-        assert_eq!(config.sample_ratio("carnitas", "/f/b"), 0.5);
-        assert_eq!(config.sample_ratio("carnitas", "c"), 0.0);
-
-        // Instance overrides.
-        let config: SamplingConfig = "alpastor:a=0.5,b=0.15,carnitas:0.01,1.0".parse()?;
-        assert_eq!(config.by_regex.len(), 4);
-        assert_eq!(config.sample_ratio("carnitas", "a"), 0.01);
-        assert_eq!(config.sample_ratio("carnitas", "b"), 0.15);
-        assert_eq!(config.sample_ratio("carnitas", "c"), 0.01);
-        assert_eq!(config.sample_ratio("alpastor", "a"), 0.5);
-        assert_eq!(config.sample_ratio("alpastor", "b"), 0.15);
-        assert_eq!(config.sample_ratio("alpastor", "c"), 1.0);
-        assert_eq!(config.sample_ratio("chorizo", "a"), 1.0);
-        assert_eq!(config.sample_ratio("chorizo", "b"), 0.15);
-        assert_eq!(config.sample_ratio("chorizo", "c"), 1.0);
-
-        // Invalid configs.
-        let err = "a=a".parse::<SamplingConfig>().unwrap_err();
-        assert!(format!("{}", err).contains("Failed to parse sampling rate"));
-
-        let err = "a:a:a=1.0".parse::<SamplingConfig>().unwrap_err();
-        assert!(format!("{}", err).contains("Too many parts"));
-
-        let err = "a:a=a=1.0".parse::<SamplingConfig>().unwrap_err();
-        assert!(format!("{}", err).contains("Too many parts"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_parse_sampling_config_json() -> anyhow::Result<()> {
-        let config: SamplingConfig = r#"{ "defaultFraction": 1.0 }"#.parse()?;
-        assert_eq!(config.by_regex.len(), 1);
-        assert_eq!(config.sample_ratio("carnitas", "a"), 1.0);
-
-        let config: SamplingConfig = r#"{
-            "routeOverrides": [
-                { "routeRegexp": "a", "fraction": 0.5 },
-                { "routeRegexp": "b", "fraction": 0.15 }
-            ],
-            "defaultFraction": 0.0
-        }"#
-        .parse()?;
-        assert_eq!(config.by_regex.len(), 3);
-        assert_eq!(config.sample_ratio("carnitas", "a"), 0.5);
-        assert_eq!(config.sample_ratio("carnitas", "b"), 0.15);
-        assert_eq!(config.sample_ratio("carnitas", "c"), 0.0);
-
-        let config: SamplingConfig = r#"{
-            "routeOverrides": [
-                { "routeRegexp": "a", "fraction": 0.5 },
-                { "routeRegexp": "b", "fraction": 0.15 }
-            ],
-            "defaultFraction": 0.01
-        }"#
-        .parse()?;
-        assert_eq!(config.sample_ratio("carnitas", "a"), 0.5);
-        assert_eq!(config.sample_ratio("carnitas", "b"), 0.15);
-        assert_eq!(config.sample_ratio("carnitas", "c"), 0.01);
-
-        let config: SamplingConfig = r#"{
-            "routeOverrides": [
-                { "routeRegexp": "/f/.*", "fraction": 0.5 }
-            ],
-            "defaultFraction": 0.0
-        }"#
-        .parse()?;
-        assert_eq!(config.sample_ratio("carnitas", "/f/a"), 0.5);
-        assert_eq!(config.sample_ratio("carnitas", "/f/b"), 0.5);
-        assert_eq!(config.sample_ratio("carnitas", "c"), 0.0);
-
-        // Instance overrides.
-        let config: SamplingConfig = r#"{
-            "instanceOverrides": {
-                "alpastor": [
-                    { "routeRegexp": "a", "fraction": 0.5 },
-                    { "routeRegexp": "c", "fraction": 0.5 }
-                ],
-                "carnitas": [ { "routeRegexp": ".*", "fraction": 0.01 } ]
-            },
-            "routeOverrides": [
-                { "routeRegexp": "b", "fraction": 0.15 }
-            ],
-            "defaultFraction": 1.0
-        }"#
-        .parse()?;
-        assert_eq!(config.sample_ratio("carnitas", "a"), 0.01);
-        assert_eq!(config.sample_ratio("carnitas", "b"), 0.01);
-        assert_eq!(config.sample_ratio("carnitas", "c"), 0.01);
-        assert_eq!(config.sample_ratio("alpastor", "a"), 0.5);
-        assert_eq!(config.sample_ratio("alpastor", "b"), 0.15);
-        assert_eq!(config.sample_ratio("alpastor", "c"), 0.5);
-        assert_eq!(config.sample_ratio("chorizo", "a"), 1.0);
-        assert_eq!(config.sample_ratio("chorizo", "b"), 0.15);
-        assert_eq!(config.sample_ratio("chorizo", "c"), 1.0);
-
-        // Invalid configs.
-        let err = "{ defaultFraction: 1.0 }"
-            .parse::<SamplingConfig>()
-            .unwrap_err();
-        assert!(format!("{}", err).contains("Failed to parse sampling config as JSON"));
-
-        let err = r#"{ "defaultFraction": 4.0 }"#.parse::<SamplingConfig>().unwrap_err();
-        assert!(format!("{}", err).contains("Invalid fraction 4 in default"));
-
-        let err = r#"{
-            "defaultFraction": 1.0,
-            "routeOverrides": [{ "routeRegexp": "(", "fraction": 0.5 }]
-        }"#
-        .parse::<SamplingConfig>()
-        .unwrap_err();
-        assert!(format!("{}", err).contains("Invalid route regexp"));
-
-        Ok(())
     }
 }

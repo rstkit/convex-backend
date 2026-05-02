@@ -1,15 +1,18 @@
 import path from "path";
+import { Context } from "../../bundler/context.js";
 import {
-  Context,
   changeSpinner,
   logFinishedStep,
   logMessage,
-} from "../../bundler/context.js";
+} from "../../bundler/log.js";
 import {
   ProjectConfig,
   configFromProjectConfig,
+  debugIsolateEndpointBundles,
   getFunctionsDirectoryPath,
   readProjectConfig,
+  pullConfig,
+  diffConfig,
 } from "./config.js";
 import {
   finishPush,
@@ -18,7 +21,6 @@ import {
   waitForSchema,
 } from "./deploy2.js";
 import { version } from "../version.js";
-import { PushOptions, runNonComponentsPush } from "./push.js";
 import { ensureHasConvexDependency, functionsDir } from "./utils/utils.js";
 import {
   bundleDefinitions,
@@ -30,7 +32,7 @@ import {
   doFinalComponentCodegen,
   doInitialComponentCodegen,
   CodegenOptions,
-  doInitCodegen,
+  doInitConvexFolder,
   doCodegen,
 } from "./codegen.js";
 import {
@@ -40,38 +42,45 @@ import {
 import { typeCheckFunctionsInMode, TypeCheckMode } from "./typecheck.js";
 import { withTmpDir } from "../../bundler/fs.js";
 import { handleDebugBundlePath } from "./debugBundlePath.js";
-import chalk from "chalk";
+import { chalkStderr } from "chalk";
 import { StartPushRequest, StartPushResponse } from "./deployApi/startPush.js";
-import {
-  deploymentSelectionWithinProjectFromOptions,
-  loadSelectedDeploymentCredentials,
-} from "./api.js";
-import {
-  FinishPushDiff,
-  DeveloperIndexConfig,
-} from "./deployApi/finishPush.js";
+import { DetailedDeploymentCredentials } from "./api.js";
+import { FinishPushDiff } from "./deployApi/finishPush.js";
 import { Reporter, Span } from "./tracing.js";
-import {
-  DEFINITION_FILENAME_JS,
-  DEFINITION_FILENAME_TS,
-} from "./components/constants.js";
-import { DeploymentSelection } from "./deploymentSelection.js";
-async function findComponentRootPath(ctx: Context, functionsDir: string) {
-  // Default to `.ts` but fallback to `.js` if not present.
-  let componentRootPath = path.resolve(
-    path.join(functionsDir, DEFINITION_FILENAME_TS),
-  );
-  if (!ctx.fs.exists(componentRootPath)) {
-    componentRootPath = path.resolve(
-      path.join(functionsDir, DEFINITION_FILENAME_JS),
-    );
-  }
-  return componentRootPath;
-}
+import { DEFINITION_FILENAME_TS } from "./components/constants.js";
+import { DeploymentType } from "./api.js";
+import { deploymentDashboardUrlPage } from "./dashboard.js";
+import { formatIndex, LargeIndexDeletionCheck } from "./indexes.js";
+import { checkForLargeIndexDeletion } from "./checkForLargeIndexDeletion.js";
+import { LogManager } from "./logs.js";
+import { createHash } from "crypto";
+import { Bundle, BundleHash } from "../../bundler/index.js";
+import { ModuleHashConfig } from "./deployApi/modules.js";
+
+export type PushOptions = {
+  adminKey: string;
+  verbose: boolean;
+  dryRun: boolean;
+  typecheck: "enable" | "try" | "disable";
+  typecheckComponents: boolean;
+  debug: boolean;
+  debugBundlePath?: string | undefined;
+  debugNodeApis: boolean;
+  codegen: boolean;
+  url: string;
+  deploymentName: string | null;
+  deploymentType?: DeploymentType;
+  writePushRequest?: string | undefined;
+  liveComponentSources: boolean;
+  pushAllModules: boolean;
+  logManager?: LogManager | undefined;
+  largeIndexDeletionCheck: LargeIndexDeletionCheck;
+  message: string | null;
+};
 
 export async function runCodegen(
   ctx: Context,
-  deploymentSelection: DeploymentSelection,
+  credentials: DetailedDeploymentCredentials | null,
   options: CodegenOptions,
 ) {
   // This also ensures the current directory is the project root.
@@ -80,19 +89,17 @@ export async function runCodegen(
   const { configPath, projectConfig } = await readProjectConfig(ctx);
   const functionsDirectoryPath = functionsDir(configPath, projectConfig);
 
-  const componentRootPath = await findComponentRootPath(
-    ctx,
-    functionsDirectoryPath,
-  );
+  if (options.init) {
+    await doInitConvexFolder(ctx, functionsDirectoryPath, {
+      dryRun: options.dryRun,
+      debug: options.debug,
+    });
+  }
 
-  if (ctx.fs.exists(componentRootPath)) {
-    const selectionWithinProject =
-      await deploymentSelectionWithinProjectFromOptions(ctx, options);
-    const credentials = await loadSelectedDeploymentCredentials(
-      ctx,
-      deploymentSelection,
-      selectionWithinProject,
-    );
+  if (!options.systemUdfs) {
+    if (credentials === null) {
+      return;
+    }
 
     await startComponentsPushAndCodegen(
       ctx,
@@ -102,25 +109,22 @@ export async function runCodegen(
       {
         ...options,
         deploymentName: credentials.deploymentFields?.deploymentName ?? null,
+        ...(credentials.deploymentFields?.deploymentType !== undefined
+          ? { deploymentType: credentials.deploymentFields.deploymentType }
+          : {}),
         url: credentials.url,
         adminKey: credentials.adminKey,
         generateCommonJSApi: options.commonjs,
-        verbose: options.dryRun,
+        verbose: !!process.env.CONVEX_VERBOSE,
         codegen: true,
         liveComponentSources: options.liveComponentSources,
         typecheckComponents: false,
+        debugNodeApis: options.debugNodeApis,
       },
     );
   } else {
-    if (options.init) {
-      await doInitCodegen(ctx, functionsDirectoryPath, false, {
-        dryRun: options.dryRun,
-        debug: options.debug,
-      });
-    }
-
     if (options.typecheck !== "disable") {
-      logMessage(ctx, chalk.gray("Running TypeScript typecheck…"));
+      logMessage(chalkStderr.gray("Running TypeScript typecheck…"));
     }
 
     await doCodegen(ctx, functionsDirectoryPath, options.typecheck, {
@@ -133,13 +137,73 @@ export async function runCodegen(
 
 export async function runPush(ctx: Context, options: PushOptions) {
   const { configPath, projectConfig } = await readProjectConfig(ctx);
-  const convexDir = functionsDir(configPath, projectConfig);
-  const componentRootPath = await findComponentRootPath(ctx, convexDir);
-  if (ctx.fs.exists(componentRootPath)) {
-    await runComponentsPush(ctx, options, configPath, projectConfig);
-  } else {
-    await runNonComponentsPush(ctx, options, configPath, projectConfig);
-  }
+  await runComponentsPush(ctx, options, configPath, projectConfig);
+}
+
+export function hash(bundle: Bundle) {
+  return createHash("sha256")
+    .update(bundle.source)
+    .update(bundle.sourceMap || "")
+    .digest("hex");
+}
+
+function isModuleTheSame(newBundle: Bundle, oldBundleHash: BundleHash) {
+  return (
+    newBundle.environment === oldBundleHash.environment &&
+    hash(newBundle) === oldBundleHash.hash
+  );
+}
+
+export function partitionModulesByChanges(
+  functions: Bundle[],
+  remoteHashesByPath: Map<string, BundleHash>,
+): {
+  unchangedModuleHashes: ModuleHashConfig[];
+  changedModules: Bundle[];
+} {
+  // Partition modules based on whether they match the existing modules
+  const unchangedModuleHashes = functions
+    .filter((newBundle) => {
+      const oldBundleHash = remoteHashesByPath.get(newBundle.path);
+      return oldBundleHash && isModuleTheSame(newBundle, oldBundleHash);
+    })
+    .map((func) => ({
+      path: func.path,
+      environment: func.environment,
+      sha256: hash(func),
+    }));
+  const changedModules = functions.filter((newBundle) => {
+    const oldBundleHash = remoteHashesByPath.get(newBundle.path);
+    return !oldBundleHash || !isModuleTheSame(newBundle, oldBundleHash);
+  });
+  return { unchangedModuleHashes, changedModules };
+}
+
+async function getUnchangedModuleHashesFromServer(
+  ctx: Context,
+  appImplementation: { functions: Bundle[] },
+  options: { url: string; adminKey: string },
+): Promise<{
+  unchangedModuleHashes: ModuleHashConfig[];
+  changedModules: Bundle[];
+}> {
+  const remoteConfigWithModuleHashes = await pullConfig(
+    ctx,
+    undefined,
+    undefined,
+    options.url,
+    options.adminKey,
+  );
+  const remoteHashesByPath = new Map(
+    remoteConfigWithModuleHashes.moduleHashes.map((moduleHash) => [
+      moduleHash.path,
+      moduleHash,
+    ]),
+  );
+  return partitionModulesByChanges(
+    appImplementation.functions,
+    remoteHashesByPath,
+  );
 }
 
 async function startComponentsPushAndCodegen(
@@ -153,14 +217,19 @@ async function startComponentsPushAndCodegen(
     adminKey: string;
     url: string;
     deploymentName: string | null;
+    deploymentType?: DeploymentType;
     verbose: boolean;
-    debugBundlePath?: string;
+    debugBundlePath?: string | undefined;
     dryRun: boolean;
     generateCommonJSApi?: boolean;
     debug: boolean;
-    writePushRequest?: string;
+    writePushRequest?: string | undefined;
     codegen: boolean;
     liveComponentSources?: boolean;
+    pushAllModules?: boolean;
+    debugNodeApis: boolean;
+    largeIndexDeletionCheck: LargeIndexDeletionCheck;
+    codegenOnlyThisComponent?: string | undefined;
   },
 ): Promise<StartPushResponse | null> {
   const convexDir = await getFunctionsDirectoryPath(ctx);
@@ -180,9 +249,36 @@ async function startComponentsPushAndCodegen(
       printedMessage: `Invalid component root directory (${isComponent.why}): ${convexDir}`,
     });
   }
-  const rootComponent = isComponent.component;
 
-  changeSpinner(ctx, "Finding component definitions...");
+  let rootComponent = isComponent.component;
+  if (options.codegenOnlyThisComponent) {
+    const absolutePath = path.resolve(options.codegenOnlyThisComponent);
+    let componentConfigPath: string;
+
+    // Must be a directory containing a convex.config.ts
+    componentConfigPath = path.join(absolutePath, DEFINITION_FILENAME_TS);
+    if (!ctx.fs.exists(componentConfigPath)) {
+      return await ctx.crash({
+        exitCode: 1,
+        errorType: "invalid filesystem data",
+        printedMessage: `Only directories with convex.config.ts files are supported, this directory does not: ${absolutePath}`,
+      });
+    }
+
+    const syntheticConfigPath = path.join(
+      rootComponent.path,
+      DEFINITION_FILENAME_TS,
+    );
+    rootComponent = {
+      isRoot: true,
+      path: rootComponent.path,
+      definitionPath: syntheticConfigPath,
+      isRootWithoutConfig: false,
+      syntheticComponentImport: componentConfigPath,
+    };
+  }
+
+  changeSpinner("Finding component definitions...");
   // Create a list of relevant component directories. These are just for knowing
   // while directories to bundle in bundleDefinitions and bundleImplementations.
   // This produces a bundle in memory as a side effect but it's thrown away.
@@ -198,19 +294,36 @@ async function startComponentsPushAndCodegen(
       ),
   );
 
+  // Initial codegen is everything we need to get code runnable:
+  // root components and other components need a basic _generated/api.ts etc.
+  // just to make the code bundleable and runnable so we can analyze.
   if (options.codegen) {
-    changeSpinner(ctx, "Generating server code...");
+    changeSpinner("Generating server code...");
     await parentSpan.enterAsync("doInitialComponentCodegen", () =>
       withTmpDir(async (tmpDir) => {
-        await doInitialComponentCodegen(ctx, tmpDir, rootComponent, options);
+        // Skip the root in component cases
+        if (!rootComponent.syntheticComponentImport) {
+          // Do root first so if a component fails, we'll at least have a working root.
+          await doInitialComponentCodegen(ctx, tmpDir, rootComponent, options);
+        }
         for (const directory of components.values()) {
+          if (directory.isRoot) {
+            continue;
+          }
+          // When --component-dir is used, only generate code for the target component
+          if (
+            rootComponent.syntheticComponentImport &&
+            directory.definitionPath !== rootComponent.syntheticComponentImport
+          ) {
+            continue;
+          }
           await doInitialComponentCodegen(ctx, tmpDir, directory, options);
         }
       }),
     );
   }
 
-  changeSpinner(ctx, "Bundling component definitions...");
+  changeSpinner("Bundling component definitions...");
   // This bundles everything but the actual function definitions
   const {
     appDefinitionSpecWithoutImpls,
@@ -224,20 +337,36 @@ async function startComponentsPushAndCodegen(
       // Note that this *includes* the root component.
       [...components.values()],
       !!options.liveComponentSources,
+      options.verbose,
     ),
   );
 
-  changeSpinner(ctx, "Bundling component schemas and implementations...");
+  if (options.debugNodeApis) {
+    await debugIsolateEndpointBundles(ctx, projectConfig, configPath);
+    logFinishedStep(
+      "All non-'use node' entry points successfully bundled. Skipping rest of push.",
+    );
+    return null;
+  }
+
+  changeSpinner("Bundling component schemas and implementations...");
   const { appImplementation, componentImplementations } =
     await parentSpan.enterAsync("bundleImplementations", () =>
-      bundleImplementations(
+      bundleImplementations({
         ctx,
-        rootComponent,
-        [...components.values()],
-        projectConfig.node.externalPackages,
-        options.liveComponentSources ? ["@convex-dev/component-source"] : [],
-        options.verbose,
-      ),
+        rootComponentDirectory: rootComponent,
+        // When running codegen for a specific component, don't bundle the root.
+        componentDirectories: [...components.values()].filter(
+          (dir) => !dir.isRoot && !dir.syntheticComponentImport,
+        ),
+        nodeExternalPackages: projectConfig.node.externalPackages,
+        extraConditions: options.liveComponentSources
+          ? ["@convex-dev/component-source"]
+          : [],
+        verbose: options.verbose,
+        includeSourcesContent:
+          projectConfig.bundler?.includeSourcesContent ?? false,
+      }),
     );
   if (options.debugBundlePath) {
     const { config: localConfig } = await configFromProjectConfig(
@@ -249,7 +378,6 @@ async function startComponentsPushAndCodegen(
     // TODO(ENG-6972): Actually write the bundles for components.
     await handleDebugBundlePath(ctx, options.debugBundlePath, localConfig);
     logMessage(
-      ctx,
       `Wrote bundle and metadata for modules in the root to ${options.debugBundlePath}. Skipping rest of push.`,
     );
     return null;
@@ -262,9 +390,20 @@ async function startComponentsPushAndCodegen(
   // component, and may be different for each component.
   const udfServerVersion = version;
 
+  const { unchangedModuleHashes, changedModules } = options.pushAllModules
+    ? {
+        unchangedModuleHashes: [],
+        changedModules: appImplementation.functions,
+      }
+    : await parentSpan.enterAsync("getUnchangedModuleHashesFromServer", () =>
+        getUnchangedModuleHashesFromServer(ctx, appImplementation, options),
+      );
+
   const appDefinition: AppDefinitionConfig = {
     ...appDefinitionSpecWithoutImpls,
-    ...appImplementation,
+    schema: appImplementation.schema,
+    changedModules,
+    unchangedModuleHashes,
     udfServerVersion,
   };
 
@@ -293,6 +432,7 @@ async function startComponentsPushAndCodegen(
     appDefinition,
     componentDefinitions,
     nodeDependencies: appImplementation.externalNodeDependencies,
+    nodeVersion: projectConfig.node.nodeVersion,
   };
   if (options.writePushRequest) {
     const pushRequestPath = path.resolve(options.writePushRequest);
@@ -304,34 +444,64 @@ async function startComponentsPushAndCodegen(
   }
   logStartPushSizes(parentSpan, startPushRequest);
 
-  changeSpinner(ctx, "Uploading functions to Convex...");
+  if (options.largeIndexDeletionCheck !== "no verification") {
+    await parentSpan.enterAsync("checkForLargeIndexDeletion", (span) =>
+      checkForLargeIndexDeletion({
+        ctx,
+        span,
+        request: startPushRequest,
+        options,
+        askForConfirmation:
+          options.largeIndexDeletionCheck === "ask for confirmation",
+      }),
+    );
+  }
+
+  changeSpinner("Uploading functions to Convex...");
   const startPushResponse = await parentSpan.enterAsync("startPush", (span) =>
     startPush(ctx, span, startPushRequest, options),
   );
 
   if (options.verbose) {
-    logMessage(ctx, "startPush: " + JSON.stringify(startPushResponse, null, 2));
+    logMessage("startPush: " + JSON.stringify(startPushResponse, null, 2));
   }
 
   if (options.codegen) {
-    changeSpinner(ctx, "Generating TypeScript bindings...");
+    changeSpinner("Generating TypeScript bindings...");
     await parentSpan.enterAsync("doFinalComponentCodegen", () =>
       withTmpDir(async (tmpDir) => {
-        await doFinalComponentCodegen(
-          ctx,
-          tmpDir,
-          rootComponent,
-          rootComponent,
-          startPushResponse,
-          options,
-        );
+        // TODO generating code for the root component last might be better DX
+        // When running codegen for a specific component, don't generate types for the root
+        if (!rootComponent.syntheticComponentImport) {
+          // Do the root first
+          await doFinalComponentCodegen(
+            ctx,
+            tmpDir,
+            rootComponent,
+            rootComponent,
+            startPushResponse,
+            components,
+            options,
+          );
+        }
         for (const directory of components.values()) {
+          if (directory.isRoot) {
+            continue;
+          }
+          // When --component-dir is used, only generate code for the target component
+          if (
+            rootComponent.syntheticComponentImport &&
+            directory.definitionPath !== rootComponent.syntheticComponentImport
+          ) {
+            continue;
+          }
           await doFinalComponentCodegen(
             ctx,
             tmpDir,
             rootComponent,
             directory,
             startPushResponse,
+            components,
             options,
           );
         }
@@ -339,11 +509,35 @@ async function startComponentsPushAndCodegen(
     );
   }
 
-  changeSpinner(ctx, "Running TypeScript...");
+  changeSpinner("Running TypeScript...");
   await parentSpan.enterAsync("typeCheckFunctionsInMode", async () => {
-    await typeCheckFunctionsInMode(ctx, options.typecheck, rootComponent.path);
+    // When running codegen for a specific component, don't typecheck the root
+    if (!rootComponent.syntheticComponentImport) {
+      await typeCheckFunctionsInMode(
+        ctx,
+        options.typecheck,
+        rootComponent.path,
+      );
+    }
     if (options.typecheckComponents) {
       for (const directory of components.values()) {
+        if (!directory.isRoot) {
+          await typeCheckFunctionsInMode(
+            ctx,
+            options.typecheck,
+            directory.path,
+          );
+        }
+      }
+    } else if (rootComponent.syntheticComponentImport) {
+      // When running codegen for a specific component, only typecheck that component.
+      for (const directory of components.values()) {
+        if (
+          directory.isRoot ||
+          directory.definitionPath !== rootComponent.syntheticComponentImport
+        ) {
+          continue;
+        }
         await typeCheckFunctionsInMode(ctx, options.typecheck, directory.path);
       }
     }
@@ -384,6 +578,7 @@ export async function runComponentsPush(
   const reporter = new Reporter();
   const pushSpan = Span.root(reporter, "runComponentsPush");
   pushSpan.setProperty("cli_version", version);
+  const verbose = options.verbose || options.dryRun;
 
   await ensureHasConvexDependency(ctx, "push");
 
@@ -406,10 +601,40 @@ export async function runComponentsPush(
     waitForSchema(ctx, span, startPushResponse, options),
   );
 
+  if (verbose) {
+    const remoteConfigWithModuleHashes = await pullConfig(
+      ctx,
+      undefined,
+      undefined,
+      options.url,
+      options.adminKey,
+    );
+
+    const { config: localConfig } = await configFromProjectConfig(
+      ctx,
+      projectConfig,
+      configPath,
+      options.verbose,
+    );
+
+    changeSpinner("Diffing local code and deployment state...");
+    const { diffString } = diffConfig(
+      remoteConfigWithModuleHashes,
+      localConfig,
+    );
+
+    logFinishedStep(
+      `Remote config ${
+        options.dryRun ? "would" : "will"
+      } be overwritten with the following changes:\n  ` +
+        diffString.replace(/\n/g, "\n  "),
+    );
+  }
+
   const finishPushResponse = await pushSpan.enterAsync("finishPush", (span) =>
     finishPush(ctx, span, startPushResponse, options),
   );
-  printDiff(ctx, finishPushResponse, options);
+  printDiff(startPushResponse, finishPushResponse, options);
   pushSpan.end();
 
   // Asynchronously report that the push completed.
@@ -419,41 +644,76 @@ export async function runComponentsPush(
 }
 
 function printDiff(
-  ctx: Context,
+  startPushResponse: StartPushResponse,
   finishPushResponse: FinishPushDiff,
-  opts: { verbose: boolean; dryRun: boolean },
+  opts: { verbose: boolean; dryRun: boolean; deploymentName: string | null },
 ) {
   if (opts.verbose) {
     const diffString = JSON.stringify(finishPushResponse, null, 2);
-    logMessage(ctx, diffString);
+    logMessage(diffString);
     return;
   }
+  const indexDiffs = startPushResponse.schemaChange.indexDiffs;
   const { componentDiffs } = finishPushResponse;
 
   // Print out index diffs for the root component.
-  let rootDiff = componentDiffs[""];
-  if (rootDiff && rootDiff.indexDiff) {
-    if (rootDiff.indexDiff.removed_indexes.length > 0) {
+  let rootDiff = indexDiffs?.[""] || componentDiffs[""]?.indexDiff;
+  if (rootDiff) {
+    if (rootDiff.removed_indexes.length > 0) {
       let msg = `${opts.dryRun ? "Would delete" : "Deleted"} table indexes:\n`;
-      for (let i = 0; i < rootDiff.indexDiff.removed_indexes.length; i++) {
-        const index = rootDiff.indexDiff.removed_indexes[i];
-        if (i > 0) {
-          msg += "\n";
-        }
-        msg += `  [-] ${formatIndex(index)}`;
+      for (const index of rootDiff.removed_indexes) {
+        msg += `  [-] ${formatIndex(index)}\n`;
       }
-      logFinishedStep(ctx, msg);
+      msg = msg.slice(0, -1); // strip last new line
+      logFinishedStep(msg);
     }
-    if (rootDiff.indexDiff.added_indexes.length > 0) {
+
+    const addedEnabled = rootDiff.added_indexes.filter((i) => !i.staged);
+    if (addedEnabled.length > 0) {
       let msg = `${opts.dryRun ? "Would add" : "Added"} table indexes:\n`;
-      for (let i = 0; i < rootDiff.indexDiff.added_indexes.length; i++) {
-        const index = rootDiff.indexDiff.added_indexes[i];
-        if (i > 0) {
-          msg += "\n";
-        }
-        msg += `  [+] ${formatIndex(index)}`;
+      for (const index of addedEnabled) {
+        msg += `  [+] ${formatIndex(index)}\n`;
       }
-      logFinishedStep(ctx, msg);
+      msg = msg.slice(0, -1); // strip last new line
+      logFinishedStep(msg);
+    }
+
+    const addedStaged = rootDiff.added_indexes.filter((i) => i.staged);
+    if (addedStaged.length > 0) {
+      let msg = `${opts.dryRun ? "Would add" : "Added"} staged table indexes:\n`;
+      for (const index of addedStaged) {
+        const table = index.name.split(".")[0];
+        const progressLink = deploymentDashboardUrlPage(
+          opts.deploymentName,
+          `/data?table=${table}&showIndexes=true`,
+        );
+        msg += `  [+] ${formatIndex(index)}\n`;
+        msg += `      See progress: ${progressLink}\n`;
+      }
+      msg = msg.slice(0, -1); // strip last new line
+      logFinishedStep(msg);
+    }
+
+    if (rootDiff.enabled_indexes && rootDiff.enabled_indexes.length > 0) {
+      let msg = opts.dryRun
+        ? `These indexes would be enabled:\n`
+        : `These indexes are now enabled:\n`;
+      for (const index of rootDiff.enabled_indexes) {
+        msg += `  [*] ${formatIndex(index)}\n`;
+      }
+      msg = msg.slice(0, -1); // strip last new line
+      logFinishedStep(msg);
+    }
+
+    if (rootDiff.disabled_indexes && rootDiff.disabled_indexes.length > 0) {
+      let msg = opts.dryRun
+        ? `These indexes would be staged:\n`
+        : `These indexes are now staged:\n`;
+      for (const index of rootDiff.disabled_indexes) {
+        msg += `  [*] ${formatIndex(index)}\n`;
+      }
+      msg = msg.slice(0, -1); // strip last new line
+      logFinishedStep(msg);
     }
   }
 
@@ -463,17 +723,13 @@ function printDiff(
       continue;
     }
     if (componentDiff.diffType.type === "create") {
-      logFinishedStep(ctx, `Installed component ${componentPath}.`);
+      logFinishedStep(`Installed component ${componentPath}.`);
     }
     if (componentDiff.diffType.type === "unmount") {
-      logFinishedStep(ctx, `Unmounted component ${componentPath}.`);
+      logFinishedStep(`Unmounted component ${componentPath}.`);
     }
     if (componentDiff.diffType.type === "remount") {
-      logFinishedStep(ctx, `Remounted component ${componentPath}.`);
+      logFinishedStep(`Remounted component ${componentPath}.`);
     }
   }
-}
-
-function formatIndex(index: DeveloperIndexConfig) {
-  return `${index.name}`;
 }

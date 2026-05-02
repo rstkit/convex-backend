@@ -1,5 +1,8 @@
 use std::{
-    fmt::Display,
+    fmt::{
+        self,
+        Display,
+    },
     ops::Deref,
     str::FromStr,
 };
@@ -28,11 +31,11 @@ pub const IDENTIFIER_REQUIREMENTS: &str =
 /// [^3]: <https://util.unicode.org/UnicodeJsps/list-unicodeset.jsp?a=%5B%3AXID_START%3A%5D&g=&i=>
 /// [^4]: <https://util.unicode.org/UnicodeJsps/list-unicodeset.jsp?a=%5B%3AXID_CONTINUE%3A%5D&g=&i=>
 pub fn check_valid_identifier(s: &str) -> anyhow::Result<()> {
-    check_valid_identifier_inner(s).map_err(|e| anyhow::anyhow!(e))
+    check_valid_identifier_inner(s, |e| anyhow::anyhow!(e.to_string()))
 }
 
 pub fn is_valid_identifier(s: &str) -> bool {
-    check_valid_identifier_inner(s).is_ok()
+    check_valid_identifier_inner(s, |_| ()).is_ok()
 }
 
 #[derive(Clone, Debug, PartialEq, PartialOrd, Ord, Eq, Hash)]
@@ -77,38 +80,41 @@ impl Deref for Identifier {
     }
 }
 
-fn check_valid_identifier_inner(s: &str) -> Result<(), String> {
+fn check_valid_identifier_inner<E>(
+    s: &str,
+    error: impl FnOnce(fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() => (),
         Some('_') => (),
         Some(c) => {
-            return Err(format!(
-                "Invalid first character '{c}' in {s}: Identifiers must start with an alphabetic \
+            return Err(error(format_args!(
+                "Invalid first character {c:?} in {s}: Identifiers must start with an alphabetic \
                  character or underscore"
-            ))
+            )))
         },
-        None => return Err(format!("Identifier cannot be empty")),
+        None => return Err(error(format_args!("Identifier cannot be empty"))),
     };
     for c in chars {
         if !c.is_ascii_alphanumeric() && c != '_' {
-            return Err(format!(
-                "Identifier {s} has invalid character '{c}': Identifiers can only contain \
+            return Err(error(format_args!(
+                "Identifier {s} has invalid character {c:?}: Identifiers can only contain \
                  alphanumeric characters or underscores"
-            ));
+            )));
         }
     }
     if s.len() > MAX_IDENTIFIER_LEN {
-        return Err(format!(
+        return Err(error(format_args!(
             "Identifier is too long ({} > maximum {})",
             s.len(),
             MAX_IDENTIFIER_LEN
-        ));
+        )));
     }
     if s.chars().all(|c| c == '_') {
-        return Err(format!(
+        return Err(error(format_args!(
             "Identifier {s} cannot have exclusively underscores"
-        ));
+        )));
     }
     Ok(())
 }
@@ -122,82 +128,58 @@ pub const MAX_FIELD_NAME_LENGTH: usize = 1024;
 /// Field names cannot start with '$', must contain only non-control ASCII
 /// characters, and must be at most 1024 characters long.
 pub fn check_valid_field_name(s: &str) -> anyhow::Result<()> {
-    check_valid_field_name_inner(s).map_err(|e| anyhow::anyhow!(e))
+    if is_valid_field_name(s) {
+        return Ok(());
+    }
+    check_valid_field_name_slow(s)
 }
 
 pub fn is_valid_field_name(s: &str) -> bool {
-    check_valid_field_name_inner(s).is_ok()
+    if s.starts_with('$') {
+        return false;
+    }
+    if s.len() > MAX_FIELD_NAME_LENGTH {
+        return false;
+    }
+    // Ideally this should use slice::as_chunks, but MSRV is 1.85 and that method is
+    // only in 1.88
+    let mut chunks = s.as_bytes().chunks_exact(16);
+    for chunk in &mut chunks {
+        let chunk = <[u8; 16]>::try_from(chunk).unwrap();
+        // this strange construction convinces LLVM to vectorize the check
+        if chunk.map(|c| !c.is_ascii() || c.is_ascii_control()) != [false; 16] {
+            return false;
+        }
+    }
+    if chunks
+        .remainder()
+        .iter()
+        .any(|c| !c.is_ascii() || c.is_ascii_control())
+    {
+        return false;
+    }
+    true
 }
 
-fn check_valid_field_name_inner(s: &str) -> Result<(), String> {
+#[cold]
+fn check_valid_field_name_slow(s: &str) -> anyhow::Result<()> {
     if s.starts_with('$') {
-        return Err(format!(
-            "Field name {s} starts with '$', which is reserved."
-        ));
+        anyhow::bail!("Field name {s} starts with '$', which is reserved.");
     }
     for c in s.chars() {
         if !c.is_ascii() || c.is_ascii_control() {
-            return Err(format!(
-                "Field name {s} has invalid character '{c}': Field names can only contain \
+            anyhow::bail!(
+                "Field name {s} has invalid character {c:?}: Field names can only contain \
                  non-control ASCII characters"
-            ));
+            );
         }
     }
     if s.len() > MAX_FIELD_NAME_LENGTH {
-        return Err(format!(
+        anyhow::bail!(
             "Field name is too long ({} > maximum {})",
             s.len(),
             MAX_FIELD_NAME_LENGTH
-        ));
+        );
     }
     Ok(())
-}
-
-#[cfg(any(test, feature = "testing"))]
-pub mod arbitrary_regexes {
-    use proptest::prelude::*;
-
-    use super::Identifier;
-
-    pub const IDENTIFIER_REGEX: &str = "[a-zA-Z_][a-zA-Z][a-zA-Z0-9_]{0,62}";
-    pub const USER_IDENTIFIER_REGEX: &str = "[a-zA-Z][a-zA-Z0-9_]{0,63}";
-    pub const SYSTEM_IDENTIFIER_REGEX: &str = "_[a-zA-Z][a-zA-Z0-9_]{0,62}";
-    // ' ' through ~ is all non-control ASCII. First character cannot be `$` or
-    // `_`. These can be longer, but keep them shorter for the sake of tests.
-    pub const USER_FIELD_NAME_REGEX: &str = "[ -#%-^`-~][ -~]{0,63}";
-    // Technically this can be broader, but system fields are usually valid
-    // identifiers
-    pub const SYSTEM_FIELD_NAME_REGEX: &str = "_[a-zA-Z][a-zA-Z0-9_]{0,62}";
-
-    impl Arbitrary for Identifier {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
-
-        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-            prop_oneof![USER_IDENTIFIER_REGEX, SYSTEM_IDENTIFIER_REGEX]
-                .prop_map(Identifier)
-                .boxed()
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use proptest::prelude::*;
-
-    use super::{
-        arbitrary_regexes::IDENTIFIER_REGEX,
-        MIN_IDENTIFIER,
-    };
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_min_identifier(ident in IDENTIFIER_REGEX) {
-            assert!(MIN_IDENTIFIER <= &ident[..]);
-        }
-    }
 }

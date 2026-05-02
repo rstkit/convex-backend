@@ -41,11 +41,6 @@ pub enum ReducedShape {
     Bytes,
     Object(BTreeMap<FieldName, ReducedField>),
     Array(Box<ReducedShape>),
-    Set(Box<ReducedShape>),
-    Map {
-        key_shape: Box<ReducedShape>,
-        value_shape: Box<ReducedShape>,
-    },
     Record {
         key_shape: Box<ReducedShape>,
         value_shape: Box<ReducedField>,
@@ -54,7 +49,6 @@ pub enum ReducedShape {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct ReducedField {
     pub optional: bool,
     pub shape: ReducedShape,
@@ -88,7 +82,7 @@ impl ReducedShape {
                 has_special_values: false,
             }),
             ShapeEnum::Boolean => ReducedShape::Boolean,
-            ShapeEnum::StringLiteral(ref s) => {
+            ShapeEnum::StringLiteral(s) => {
                 if let Ok(id) = DeveloperDocumentId::decode(s)
                     && table_exists(id.table())
                 {
@@ -111,14 +105,6 @@ impl ReducedShape {
                 array_type.element(),
                 table_exists,
             ))),
-            ShapeEnum::Set(set_type) => ReducedShape::Set(Box::new(ReducedShape::from_type(
-                set_type.element(),
-                table_exists,
-            ))),
-            ShapeEnum::Map(map_type) => ReducedShape::Map {
-                key_shape: Box::new(ReducedShape::from_type(map_type.key(), table_exists)),
-                value_shape: Box::new(ReducedShape::from_type(map_type.value(), table_exists)),
-            },
             ShapeEnum::Object(object_type) => {
                 let reduced_fields = object_type
                     .fields()
@@ -242,18 +228,12 @@ impl ReducedShape {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct ReducedFloatRange {
     // -inf, inf, -0.0, NaN
     pub has_special_values: bool,
 }
 
 impl ReducedFloatRange {
-    /// Create a floating point multiset with a single value.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn new(has_special_values: bool) -> Self {
-        Self { has_special_values }
-    }
 }
 
 impl TryFrom<JsonValue> for ReducedFloatRange {
@@ -277,22 +257,5 @@ impl From<&ReducedFloatRange> for JsonValue {
         json!({
             "hasSpecialValues": range.has_special_values,
         })
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for ReducedShape {
-    type Parameters = ();
-
-    type Strategy = impl proptest::strategy::Strategy<Value = ReducedShape>;
-
-    // We could try to generate an arbitrary shape,
-    // but there are several implicit constraints that can make such shapes invalid.
-    // So instead we construct a reduced shape from a valid shape or valid type.
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        use shape_inference::testing::TestConfig;
-
-        any::<CountedShape<TestConfig>>().prop_map(|t| ReducedShape::from_type(&t, &|_| true))
     }
 }

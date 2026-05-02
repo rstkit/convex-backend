@@ -216,7 +216,7 @@ export class Walker {
             this.validator = undefined;
             break;
           default: {
-            const _typeCheck: never = originalValidator;
+            originalValidator satisfies never;
           }
         }
       }
@@ -436,7 +436,7 @@ export class Walker {
     try {
       const bytes = Base64.toByteArray(value);
       return {
-        value: bytes.buffer,
+        value: bytes.buffer as ArrayBuffer,
         errors,
       };
     } catch (e: any) {

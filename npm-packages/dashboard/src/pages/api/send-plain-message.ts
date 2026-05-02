@@ -6,7 +6,8 @@ import {
 import type { NextApiRequest, NextApiResponse } from "next";
 import { z } from "zod";
 import { captureException, captureMessage } from "@sentry/nextjs";
-import { Team, ProjectDetails, DeploymentResponse } from "generatedApi";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
+import { TeamResponse, ProjectDetails } from "generatedApi";
 import { retryingFetch } from "lib/ssr";
 
 const apiKey = process.env.PLAIN_API_KEY;
@@ -29,12 +30,6 @@ const RequestBodySchema = z.object({
   teamId: z.number(),
   projectId: z.number().optional(),
   deploymentName: z.string().optional(),
-  user: z.object({
-    email: z.string(),
-    email_verified: z.boolean(),
-    name: z.string().optional(),
-    nickname: z.string().optional(),
-  }),
 });
 
 export default async function handler(
@@ -66,7 +61,11 @@ export default async function handler(
       throw new Error(`Couldn't fetch profile data: ${responseText}`);
     }
 
-    const { id, email: profileEmail } = await profileDataResp.json();
+    const {
+      id,
+      email: profileEmail,
+      name: profileName,
+    } = await profileDataResp.json();
 
     const memberDataResp = await retryingFetch(
       `${process.env.NEXT_PUBLIC_BIG_BRAIN_URL}/api/dashboard/member_data`,
@@ -85,11 +84,11 @@ export default async function handler(
       projects,
       deployments,
     }: {
-      teams: Team[];
+      teams: TeamResponse[];
       projects: ProjectDetails[];
-      deployments: DeploymentResponse[];
+      deployments: PlatformDeploymentResponse[];
     } = await memberDataResp.json();
-    const { teamId, projectId, deploymentName, user } = body;
+    const { teamId, projectId, deploymentName } = body;
 
     let customerId: string | null = null;
 
@@ -99,7 +98,7 @@ export default async function handler(
       },
       id,
       profileEmail,
-      user,
+      profileName,
     );
 
     if (upsertCustomerRes.error) {
@@ -112,7 +111,7 @@ export default async function handler(
           { emailAddress: profileEmail },
           id,
           profileEmail,
-          user,
+          profileName,
         );
 
         if (upsertCustomerWithEmailIdentifierRes.error) {
@@ -210,7 +209,6 @@ export default async function handler(
     captureException(error, {
       extra: {
         requestBody: body,
-        user: body.user,
       },
     });
     return res.status(500).json({ error: "Internal Server Error" });
@@ -221,12 +219,12 @@ function upsertPlainCustomer(
   customerIdentifier: UpsertCustomerInput["identifier"],
   memberId: number,
   profileEmail: string,
-  validatedUser: z.infer<typeof RequestBodySchema>["user"],
+  profileName: string | null,
 ) {
   return client.upsertCustomer({
     identifier: customerIdentifier,
     onCreate: {
-      fullName: validatedUser.name || validatedUser.nickname || profileEmail,
+      fullName: profileName || profileEmail,
       externalId: memberId.toString(),
       email: {
         email: profileEmail,
@@ -239,7 +237,7 @@ function upsertPlainCustomer(
         isVerified: true,
       },
       fullName: {
-        value: validatedUser.name || validatedUser.nickname || profileEmail,
+        value: profileName || profileEmail,
       },
     },
   });
@@ -247,7 +245,7 @@ function upsertPlainCustomer(
 
 async function upsertPlainTenant(
   plainClient: PlainClient,
-  team: Team,
+  team: TeamResponse,
   accessToken: string,
 ) {
   const upsertTenantRes = await plainClient.upsertTenant({
@@ -260,7 +258,10 @@ async function upsertPlainTenant(
   });
 
   if (upsertTenantRes.error) {
-    captureMessage(`Couldn't upsert tenant: ${upsertTenantRes.error.message}`);
+    captureMessage(
+      `Couldn't upsert tenant: ${upsertTenantRes.error.message}`,
+      "error",
+    );
     return;
   }
 
@@ -275,7 +276,7 @@ async function upsertPlainTenant(
 
   if (!subscriptionResp.ok) {
     const responseText = await subscriptionResp.text();
-    captureMessage(`Couldn't fetch subscription: ${responseText}`);
+    captureMessage(`Couldn't fetch subscription: ${responseText}`, "error");
     return;
   }
 
@@ -286,7 +287,7 @@ async function upsertPlainTenant(
       const { planType } = subscription.plan;
       tier = planType;
     }
-  } catch (error) {
+  } catch {
     // Do nothing
   }
 
@@ -302,6 +303,7 @@ async function upsertPlainTenant(
   if (updateTenantTierRes.error) {
     captureMessage(
       `Couldn't update tenant tier: ${updateTenantTierRes.error.message}`,
+      "error",
     );
   }
 }
@@ -309,7 +311,7 @@ async function upsertPlainTenant(
 async function setPlainCustomerTenants(
   plainClient: PlainClient,
   customerId: string,
-  teams: Team[],
+  teams: TeamResponse[],
 ) {
   const setCustomerTenantsRes = await plainClient.setCustomerTenants({
     customerIdentifier: {
@@ -323,6 +325,7 @@ async function setPlainCustomerTenants(
   if (setCustomerTenantsRes.error) {
     captureMessage(
       `Couldn't set customer tenants: ${setCustomerTenantsRes.error.message}`,
+      "error",
     );
   }
 }

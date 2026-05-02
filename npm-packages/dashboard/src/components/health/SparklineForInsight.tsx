@@ -31,7 +31,7 @@ export function SparklineForInsight({ insight }: { insight: Insight }) {
     case "occRetried":
       return <OCCSparkline insight={insight} />;
     default: {
-      const _exhaustiveCheck: never = insight;
+      insight satisfies never;
       return null;
     }
   }
@@ -40,12 +40,14 @@ export function SparklineForInsight({ insight }: { insight: Insight }) {
 function Sparkline({
   data,
   height = 36,
-  color = "rgb(var(--chart-line-1))",
+  width = 240,
+  color = "var(--chart-line-1)",
   min = 0,
   max,
 }: {
   data?: number[];
   height?: number;
+  width?: number;
   color?: string;
   min?: number;
   max?: number;
@@ -58,7 +60,14 @@ function Sparkline({
       }}
     >
       {data && (
-        <Sparklines data={data} height={height} margin={0} min={min} max={max}>
+        <Sparklines
+          data={data}
+          height={height}
+          width={width}
+          margin={0}
+          min={min}
+          max={max}
+        >
           <SparklinesCurve color={color} />
         </Sparklines>
       )}

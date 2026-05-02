@@ -8,14 +8,11 @@ use metrics::{
     register_convex_counter,
     register_convex_gauge,
     register_convex_histogram,
-    IntoLabel,
+    register_convex_int_gauge,
     StaticMetricLabel,
     Timer,
 };
-use prometheus::{
-    VMHistogram,
-    VMHistogramVec,
-};
+use prometheus::VMHistogram;
 
 register_convex_counter!(
     COMMON_UNDEFINED_FILTER_TOTAL,
@@ -60,22 +57,6 @@ pub fn log_codel_queue_time_since_empty(duration: Duration) {
 }
 
 register_convex_counter!(
-    CHECKED_INDEX_EXPIRATION_DOCUMENTS,
-    "Count of documents checked for index expiration",
-    &["expired", "reason"]
-);
-pub fn log_index_expiration_checked(expired: bool, reason: &'static str) {
-    log_counter_with_labels(
-        &CHECKED_INDEX_EXPIRATION_DOCUMENTS,
-        1,
-        vec![
-            StaticMetricLabel::new("expired", expired.as_label()),
-            StaticMetricLabel::new("reason", reason),
-        ],
-    );
-}
-
-register_convex_counter!(
     CLIENT_VERSION_UNSUPPORTED_TOTAL,
     "Count of requests with an unsupported client version",
     &["version"]
@@ -86,20 +67,6 @@ pub fn log_client_version_unsupported(version: String) {
         1,
         vec![StaticMetricLabel::new("version", version)],
     );
-}
-
-register_convex_histogram!(
-    STATIC_REPEATABLE_TS_SECONDS,
-    "Time taken for a timestamp to be repeatable",
-    &["recent"]
-);
-pub fn static_repeatable_ts_timer(is_recent: bool) -> Timer<VMHistogramVec> {
-    let mut timer = Timer::new_with_labels(&STATIC_REPEATABLE_TS_SECONDS);
-    timer.add_label(StaticMetricLabel::new(
-        "recent",
-        if is_recent { "recent" } else { "at_ts" },
-    ));
-    timer
 }
 
 register_convex_counter!(ERRORS_REPORTED_TOTAL, "Count of errors reported", &["type"]);
@@ -115,4 +82,19 @@ pub fn load_id_tracker_timer() -> Timer<VMHistogram> {
 register_convex_histogram!(ID_TRACKER_SIZE_BYTES, "IdTracker file size");
 pub fn log_id_tracker_size(size: usize) {
     log_distribution(&ID_TRACKER_SIZE_BYTES, size as f64);
+}
+
+register_convex_int_gauge!(
+    HTTP_SERVICE_MAX_CONCURRENT_REQUESTS,
+    "Maximum number of concurrent requests for an HTTP service",
+    &["service_name"]
+);
+
+pub fn log_http_service_max_concurrent_requests(
+    service_name: &'static str,
+    max_concurrent_requests: usize,
+) {
+    HTTP_SERVICE_MAX_CONCURRENT_REQUESTS
+        .with_label_values(&[service_name])
+        .set(max_concurrent_requests as i64);
 }

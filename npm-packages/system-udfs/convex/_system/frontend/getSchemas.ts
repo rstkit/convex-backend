@@ -14,7 +14,7 @@ export const getSchemaByState = async (
     .withIndex("by_state", (q) => q.eq("state", { state }))
     .unique();
 
-export default queryPrivateSystem({
+export default queryPrivateSystem("ViewData")({
   args: { componentId: v.optional(v.union(v.string(), v.null())) },
   handler: async function ({ db }): Promise<{
     active?: string;
@@ -31,6 +31,31 @@ export default queryPrivateSystem({
     return {
       active: active?.schema,
       inProgress: pending?.schema || validated?.schema,
+    };
+  },
+});
+
+export const schemaValidationProgress = queryPrivateSystem("ViewData")({
+  args: { componentId: v.optional(v.union(v.string(), v.null())) },
+  handler: async function ({
+    db,
+  }): Promise<{ numDocsValidated: number; totalDocs: number | null } | null> {
+    const pending = await getSchemaByState(db, "pending");
+    if (!pending) {
+      return null;
+    }
+    const schemaValidationProgressDoc = await db
+      .query("_schema_validation_progress")
+      .withIndex("by_schema_id", (q) => q.eq("schemaId", pending._id))
+      .unique();
+    if (!schemaValidationProgressDoc) {
+      return null;
+    }
+    return {
+      numDocsValidated: Number(schemaValidationProgressDoc.numDocsValidated),
+      totalDocs: schemaValidationProgressDoc.totalDocs
+        ? Number(schemaValidationProgressDoc.totalDocs)
+        : null,
     };
   },
 });

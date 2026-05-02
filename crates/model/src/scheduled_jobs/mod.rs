@@ -1,16 +1,18 @@
 use std::{
-    collections::BTreeMap,
+    cmp,
     sync::{
         Arc,
         LazyLock,
     },
 };
 
+use anyhow::Context;
 use common::{
     components::CanonicalizedComponentFunctionPath,
     document::{
         ParseDocument,
         ParsedDocument,
+        MAX_USER_SIZE,
     },
     execution_context::ExecutionContext,
     knobs::{
@@ -33,7 +35,7 @@ use common::{
         GenericIndexName,
         IndexName,
     },
-    virtual_system_mapping::VirtualSystemDocMapper,
+    virtual_system_mapping::AssociatedVirtualTable,
 };
 use database::{
     unauthorized_error,
@@ -42,7 +44,7 @@ use database::{
     Transaction,
 };
 use errors::ErrorMetadata;
-use maplit::btreemap;
+use imbl::ordmap;
 use sync_types::Timestamp;
 use value::{
     id_v6::DeveloperDocumentId,
@@ -57,17 +59,28 @@ use value::{
 
 use self::{
     types::{
-        ScheduledJob,
         ScheduledJobAttempts,
+        ScheduledJobMetadata,
         ScheduledJobState,
     },
     virtual_table::ScheduledJobsDocMapper,
 };
 use crate::{
+    scheduled_jobs::{
+        args::{
+            ScheduledJobArgsTable,
+            SCHEDULED_JOBS_ARGS_TABLE,
+        },
+        types::{
+            ScheduledJob,
+            ScheduledJobArgs,
+        },
+    },
     SystemIndex,
     SystemTable,
 };
 
+pub mod args;
 pub mod types;
 pub mod virtual_table;
 
@@ -120,7 +133,7 @@ static COMPONENT_PATH_FIELD: LazyLock<FieldPath> =
 
 pub struct ScheduledJobsTable;
 impl SystemTable for ScheduledJobsTable {
-    type Metadata = ScheduledJob;
+    type Metadata = ScheduledJobMetadata;
 
     fn table_name() -> &'static TableName {
         &SCHEDULED_JOBS_TABLE
@@ -134,21 +147,17 @@ impl SystemTable for ScheduledJobsTable {
         ]
     }
 
-    fn virtual_table() -> Option<(
-        &'static TableName,
-        BTreeMap<IndexName, IndexName>,
-        Arc<dyn VirtualSystemDocMapper>,
-    )> {
-        Some((
-            &SCHEDULED_JOBS_VIRTUAL_TABLE,
-            btreemap! {
+    fn virtual_table() -> Option<AssociatedVirtualTable> {
+        Some(AssociatedVirtualTable::Primary {
+            virtual_table_name: SCHEDULED_JOBS_VIRTUAL_TABLE.clone(),
+            virtual_to_system_indexes: ordmap! {
                 SCHEDULED_JOBS_VIRTUAL_INDEX_BY_CREATION_TIME.clone() =>
                     SCHEDULED_JOBS_INDEX_BY_CREATION_TIME.clone(),
                 SCHEDULED_JOBS_VIRTUAL_INDEX_BY_ID.clone() =>
-                    SCHEDULED_JOBS_INDEX_BY_ID.clone(),
+                    SCHEDULED_JOBS_INDEX_BY_ID.clone()
             },
-            Arc::new(ScheduledJobsDocMapper),
-        ))
+            doc_mapper: Arc::new(ScheduledJobsDocMapper),
+        })
     }
 }
 
@@ -164,6 +173,7 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
     }
 
     fn check_scheduling_limits(&mut self, args: &ConvexArray) -> anyhow::Result<()> {
+        let size = args.size();
         // Limit how much you can schedule from a single transaction.
         anyhow::ensure!(
             self.tx.scheduled_size.num_writes < *TRANSACTION_MAX_NUM_SCHEDULED,
@@ -175,9 +185,8 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
                 )
             )
         );
-        self.tx.scheduled_size.num_writes += 1;
         anyhow::ensure!(
-            self.tx.scheduled_size.size + args.size()
+            self.tx.scheduled_size.size + size
                 <= *TRANSACTION_MAX_SCHEDULED_TOTAL_ARGUMENT_SIZE_BYTES,
             ErrorMetadata::bad_request(
                 "ScheduledFunctionsArgumentsTooLarge",
@@ -188,8 +197,54 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
                 )
             ),
         );
-        self.tx.scheduled_size.size += args.size();
+        if size > MAX_USER_SIZE {
+            tracing::warn!("Scheduling a job with argument size {size}");
+        }
+        // TODO: hard-enforce MAX_SCHEDULED_JOB_ARGUMENT_SIZE_BYTES
+        self.tx.scheduled_size.num_writes += 1;
+        self.tx.scheduled_size.size += size;
+        self.tx.scheduled_size.max_args_size = cmp::max(self.tx.scheduled_size.max_args_size, size);
         Ok(())
+    }
+
+    /// Join with the `_scheduled_jobs_args` table in this namespace to get the
+    /// arguments for the job.
+    pub async fn scheduled_job_from_metadata(
+        &mut self,
+        job_id: ResolvedDocumentId,
+        metadata: ScheduledJobMetadata,
+    ) -> anyhow::Result<ScheduledJob> {
+        let scheduled_job = if let Some(args_id) = metadata.args_id {
+            let doc = self
+                .tx
+                .get_system::<ScheduledJobArgsTable>(self.namespace, args_id)
+                .await?
+                .with_context(|| format!("Missing scheduled job args document for id {args_id}"))?;
+            let args = Arc::unwrap_or_clone(doc);
+            ScheduledJob {
+                path: metadata.path,
+                udf_args_bytes: args.into_value().args,
+                state: metadata.state,
+                next_ts: metadata.next_ts,
+                completed_ts: metadata.completed_ts,
+                original_scheduled_ts: metadata.original_scheduled_ts,
+                attempts: metadata.attempts,
+            }
+        } else {
+            let args = metadata.udf_args_bytes.with_context(|| {
+                format!("Missing udf_args_bytes in scheduled job metadata with id {job_id}",)
+            })?;
+            ScheduledJob {
+                path: metadata.path,
+                udf_args_bytes: args,
+                state: metadata.state,
+                next_ts: metadata.next_ts,
+                completed_ts: metadata.completed_ts,
+                original_scheduled_ts: metadata.original_scheduled_ts,
+                attempts: metadata.attempts,
+            }
+        };
+        Ok(scheduled_job)
     }
 
     pub async fn schedule(
@@ -209,9 +264,18 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
 
         let now: Timestamp = self.tx.runtime().generate_timestamp()?;
         let original_scheduled_ts: Timestamp = ts.as_system_time().try_into()?;
-        let scheduled_job = ScheduledJob::new(
+        let args_id = {
+            let mut model = SystemMetadataModel::new(self.tx, self.namespace);
+            model
+                .insert_metadata(
+                    &SCHEDULED_JOBS_ARGS_TABLE,
+                    ScheduledJobArgs::try_from(args)?.try_into()?,
+                )
+                .await?
+        };
+        let scheduled_job = ScheduledJobMetadata::new(
             path.clone(),
-            args.clone(),
+            args_id.developer_id,
             ScheduledJobState::Pending,
             // Don't set next_ts in the past to avoid scheduler incorrectly logging
             // it is falling behind. We should keep `original_scheduled_ts` intact
@@ -251,9 +315,9 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
                     | ScheduledJobState::Success => scheduled_job,
                     ScheduledJobState::Canceled => {
                         let scheduled_ts = self.tx.begin_timestamp();
-                        ScheduledJob::new(
+                        ScheduledJobMetadata::new(
                             path,
-                            args,
+                            args_id.developer_id,
                             ScheduledJobState::Canceled,
                             None,
                             Some(*scheduled_ts),
@@ -278,7 +342,7 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
     pub async fn replace(
         &mut self,
         id: ResolvedDocumentId,
-        job: ScheduledJob,
+        job: ScheduledJobMetadata,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(self
             .tx
@@ -307,7 +371,7 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
         let Some(job) = self.tx.get(id).await? else {
             anyhow::bail!("scheduled job not found")
         };
-        let job: ParsedDocument<ScheduledJob> = job.parse()?;
+        let job: ParsedDocument<ScheduledJobMetadata> = job.parse()?;
         match job.state {
             ScheduledJobState::Pending | ScheduledJobState::InProgress { .. } => {},
             ScheduledJobState::Canceled => {
@@ -323,7 +387,7 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
             },
         }
 
-        let mut job: ScheduledJob = job.into_value();
+        let mut job: ScheduledJobMetadata = job.into_value();
         job.state = state;
         // Remove next_ts and set completed_ts so the scheduler knows that the
         // job has already been processed
@@ -360,7 +424,17 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
             .table_mapping()
             .namespace(self.namespace)
             .tablet_matches_name(id.tablet_id, &SCHEDULED_JOBS_TABLE));
-        self.tx.delete_inner(id).await?;
+        let doc: ParsedDocument<ScheduledJobMetadata> = self.tx.delete_inner(id).await?.parse()?;
+        if let Some(args_id) = doc.args_id {
+            let scheduled_args_tablet = self
+                .tx
+                .table_mapping()
+                .namespace(self.namespace)
+                .number_to_tablet()(args_id.table())?;
+            self.tx
+                .delete_inner(ResolvedDocumentId::new(scheduled_args_tablet, args_id))
+                .await?;
+        }
         Ok(())
     }
 
@@ -440,17 +514,6 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
         Ok(count)
     }
 
-    pub async fn list(&mut self) -> anyhow::Result<Vec<ParsedDocument<ScheduledJob>>> {
-        let scheduled_query = Query::full_table_scan(SCHEDULED_JOBS_TABLE.clone(), Order::Asc);
-        let mut query_stream = ResolvedQuery::new(self.tx, self.namespace, scheduled_query)?;
-        let mut scheduled_jobs = Vec::new();
-        while let Some(job) = query_stream.next(self.tx, None).await? {
-            let job: ParsedDocument<ScheduledJob> = job.parse()?;
-            scheduled_jobs.push(job);
-        }
-        Ok(scheduled_jobs)
-    }
-
     /// Checks the status of the scheduled job. If it has been garbage collected
     /// and the scheduled job is no longer in the table, it returns None.
     pub async fn check_status(
@@ -461,7 +524,7 @@ impl<'a, RT: Runtime> SchedulerModel<'a, RT> {
             .tx
             .get(job_id)
             .await?
-            .map(ParseDocument::<ScheduledJob>::parse)
+            .map(ParseDocument::<ScheduledJobMetadata>::parse)
             .transpose()?
             .map(|job| job.state.clone());
         Ok(state)

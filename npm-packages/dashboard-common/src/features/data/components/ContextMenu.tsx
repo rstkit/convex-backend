@@ -35,11 +35,18 @@ import {
   useMergeRefs,
 } from "@floating-ui/react";
 import classNames from "classnames";
-import { ChevronRightIcon } from "@radix-ui/react-icons";
+import { ChevronDownIcon, ChevronRightIcon } from "@radix-ui/react-icons";
+import { Cross2Icon } from "@radix-ui/react-icons";
 import { UrlObject } from "url";
 import { Button } from "@ui/Button";
 import { TooltipSide } from "@ui/Tooltip";
 import { Key, KeyboardShortcut } from "@ui/KeyboardShortcut";
+import { useWindowSize } from "react-use";
+
+function useIsMobile() {
+  const { width } = useWindowSize();
+  return width < 640;
+}
 
 const ContextMenuContext = React.createContext<{
   getItemProps: (
@@ -73,6 +80,7 @@ export function ContextMenu(props: ContextMenuProps) {
 }
 
 function ContextMenuInner({ target, onClose, children }: ContextMenuProps) {
+  const isMobile = useIsMobile();
   const isOpen = target !== null;
   const onOpenChange = useCallback(
     (newIsOpen: boolean) => {
@@ -173,20 +181,70 @@ function ContextMenuInner({ target, onClose, children }: ContextMenuProps) {
     [activeIndex, setActiveIndex, getItemProps, isOpen],
   );
 
+  if (isMobile) {
+    return (
+      <FloatingNode id={nodeId}>
+        <ContextMenuContext.Provider value={contextValue}>
+          <FloatingList elementsRef={listItemsRef} labelsRef={listContentRef}>
+            {isOpen && (
+              <FloatingPortal>
+                <FloatingFocusManager
+                  context={context}
+                  initialFocus={refs.floating}
+                >
+                  <div className="fixed inset-0 z-50" role="dialog">
+                    {/* Backdrop — keyboard dismiss handled by FloatingFocusManager/useDismiss */}
+                    {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions */}
+                    <div
+                      className="fixed inset-0 animate-fadeInFromLoading bg-black/50"
+                      onClick={onClose}
+                    />
+                    {/* Bottom sheet */}
+                    <div
+                      className="fixed inset-x-0 bottom-0 z-50 flex animate-slideUp flex-col rounded-t-xl bg-background-secondary shadow-xl dark:border dark:border-b-0"
+                      ref={refs.setFloating}
+                      {...getFloatingProps()}
+                    >
+                      {/* Close button */}
+                      <div className="flex justify-end px-3 pt-3">
+                        <Button
+                          onClick={onClose}
+                          aria-label="Close menu"
+                          icon={<Cross2Icon aria-hidden="true" />}
+                          variant="neutral"
+                          inline
+                          size="xs"
+                        />
+                      </div>
+                      {/* Scrollable menu content */}
+                      <div className="max-h-[80dvh] overflow-y-auto px-1 pb-[env(safe-area-inset-bottom)] text-xs">
+                        <div className="py-2">{children}</div>
+                      </div>
+                    </div>
+                  </div>
+                </FloatingFocusManager>
+              </FloatingPortal>
+            )}
+          </FloatingList>
+        </ContextMenuContext.Provider>
+      </FloatingNode>
+    );
+  }
+
   return (
     <FloatingNode id={nodeId}>
       <ContextMenuContext.Provider value={contextValue}>
         <FloatingList elementsRef={listItemsRef} labelsRef={listContentRef}>
           <FloatingPortal>
             {isOpen && (
-              <FloatingOverlay className="z-40">
+              <FloatingOverlay className="z-50">
                 <FloatingFocusManager
                   context={context}
                   initialFocus={refs.floating}
                 >
                   {/* 20px = twice the padding in the `shift` middleware (https://floating-ui.com/docs/misc#handling-large-content) */}
                   <div
-                    className="flex max-h-[calc(100vh-20px)] flex-col overflow-y-auto overflow-x-hidden whitespace-nowrap rounded-lg border bg-background-secondary/85 py-2 text-xs shadow-sm outline-none backdrop-blur-[2px] dark:border"
+                    className="flex max-h-[calc(100vh-20px)] animate-fadeInFromLoading flex-col overflow-x-hidden overflow-y-auto rounded-lg border bg-background-secondary py-2 text-xs whitespace-nowrap shadow-xs outline-hidden dark:border"
                     ref={refs.setFloating}
                     style={floatingStyles}
                     {...getFloatingProps()}
@@ -212,16 +270,19 @@ function ContextMenuItem({
   shortcut,
   tip,
   tipSide,
+  blankTarget = true,
 }: {
   icon?: ReactNode;
   label: ReactNode;
-  action: (() => void) | UrlObject;
+  action: (() => void) | UrlObject | string;
   disabled?: boolean;
   variant?: "neutral" | "danger";
   shortcut?: Key[];
   tip?: ReactNode;
   tipSide?: TooltipSide;
+  blankTarget?: boolean;
 }) {
+  const isMobile = useIsMobile();
   const menu = useContext(ContextMenuContext);
   const { itemRef: labelRef, itemText: labelText } = useTextContent();
   const item = useListItem({ label: disabled ? null : labelText });
@@ -232,8 +293,9 @@ function ContextMenuItem({
     <Button
       variant="unstyled"
       className={classNames(
-        "w-full flex max-w-xs gap-2 items-center px-3 py-1.5 text-left",
-        "active:bg-background-tertiary focus:bg-background-tertiary outline-none",
+        "w-full flex gap-2 items-center px-3 py-1.5 text-left",
+        !isMobile && "max-w-xs",
+        "active:bg-background-tertiary disabled:active:bg-background-secondary focus:bg-background-tertiary disabled:focus:bg-background-secondary outline-hidden",
         disabled
           ? "cursor-not-allowed fill-content-tertiary text-content-tertiary"
           : variant === "danger"
@@ -244,20 +306,46 @@ function ContextMenuItem({
       ref={item.ref}
       tabIndex={isActive ? 0 : -1}
       href={typeof action !== "function" ? action : undefined}
-      target={typeof action !== "function" ? "_blank" : undefined}
+      target={
+        typeof action !== "function"
+          ? blankTarget
+            ? "_blank"
+            : undefined
+          : undefined
+      }
       {...menu.getItemProps({
         onClick: () => {
-          typeof action === "function" && action();
+          if (typeof action === "function") {
+            action();
+          }
           setTimeout(() => {
             tree?.events.emit("click");
           }, 0);
         },
+        onKeyDown: (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            if (typeof action === "function") {
+              action();
+            } else {
+              e.currentTarget.click();
+            }
+            setTimeout(() => {
+              tree?.events.emit("click");
+            }, 0);
+          }
+        },
       })}
+      onClickOfAnchorLink={(e) => {
+        e.stopPropagation();
+        setTimeout(() => {
+          tree?.events.emit("click");
+        }, 0);
+      }}
       tip={tip}
       tipSide={tipSide}
     >
       {icon ?? null}
-      <span className="flex-1 overflow-hidden truncate" ref={labelRef}>
+      <span className="flex-1 truncate overflow-hidden" ref={labelRef}>
         {label}
       </span>
       {shortcut && (
@@ -271,16 +359,21 @@ function ContextMenuItem({
 }
 ContextMenu.Item = ContextMenuItem;
 
+type ContextMenuSubmenuProps = React.PropsWithChildren<{
+  icon?: ReactNode;
+  label: ReactNode;
+  action?: () => void;
+  disabled?: boolean;
+}>;
+
 function ContextMenuSubmenu({
   icon,
   label,
   children,
   action,
-}: React.PropsWithChildren<{
-  icon?: ReactNode;
-  label: ReactNode;
-  action: () => void;
-}>) {
+  disabled = false,
+}: ContextMenuSubmenuProps) {
+  const isMobile = useIsMobile();
   // Item in the parent menu
   const parent = useContext(ContextMenuContext);
   const { itemRef: labelRef, itemText: labelText } = useTextContent();
@@ -310,14 +403,14 @@ function ContextMenuSubmenu({
 
   // Interactions
   const hover = useHover(context, {
-    enabled: true,
+    enabled: !isMobile,
     delay: { open: 75 },
     handleClose: safePolygon({ blockPointerEvents: true }),
   });
   const click = useClick(context, {
     event: "mousedown",
-    toggle: false,
-    ignoreMouse: true,
+    toggle: isMobile,
+    ignoreMouse: !isMobile,
   });
   const role = useRole(context, { role: "menu" });
   const dismiss = useDismiss(context, { bubbles: true });
@@ -370,6 +463,8 @@ function ContextMenuSubmenu({
     [activeIndex, setActiveIndex, getItemProps, isOpen],
   );
 
+  const isClickable = action !== undefined;
+
   return (
     <FloatingNode id={nodeId}>
       <Button
@@ -377,46 +472,71 @@ function ContextMenuSubmenu({
         ref={useMergeRefs([refs.setReference, item.ref])}
         variant="unstyled"
         className={classNames(
-          "w-full flex max-w-xs gap-2 items-center px-3 py-1.5 text-left",
-          "outline-none text-content-primary",
+          "w-full flex gap-2 items-center px-3 py-1.5 text-left",
+          !isMobile && "max-w-xs",
+          "outline-hidden text-content-primary",
           "active:bg-background-tertiary focus:bg-background-tertiary",
+          !isClickable && "cursor-default hover:bg-background-tertiary",
+          "disabled:text-content-tertiary disabled:hover:bg-background-secondary disabled:cursor-not-allowed",
         )}
+        disabled={disabled}
         tabIndex={item.index === parent.activeIndex ? 0 : -1}
         {...getReferenceProps(parent.getItemProps())}
-        onClick={() => {
-          action();
-          tree?.events.emit("click");
-        }}
+        onClick={
+          isClickable && !isMobile
+            ? () => {
+                action?.();
+                tree?.events.emit("click");
+              }
+            : undefined
+        }
       >
         {icon ?? null}
-        <span className="flex-1 overflow-hidden truncate" ref={labelRef}>
+        <span className="flex-1 truncate overflow-hidden" ref={labelRef}>
           {label}
         </span>
-        <span className="ml-auto shrink-0 text-content-primary">
-          <ChevronRightIcon className="ml-2" />
-        </span>
+        {!disabled && (
+          <span className="ml-auto shrink-0 text-content-primary">
+            {isMobile && isOpen ? (
+              <ChevronDownIcon className="ml-2" />
+            ) : (
+              <ChevronRightIcon className="ml-2" />
+            )}
+          </span>
+        )}
       </Button>
 
       <ContextMenuContext.Provider value={contextValue}>
         <FloatingList elementsRef={elementsRef} labelsRef={labelsRef}>
-          {isOpen && (
-            <FloatingPortal>
-              {/* 20px = twice the padding in the `shift` middleware (https://floating-ui.com/docs/misc#handling-large-content) */}
-              <div
-                className="z-40 flex max-h-[calc(100vh-20px)] flex-col overflow-y-auto overflow-x-hidden whitespace-nowrap rounded-lg border bg-background-secondary/85 py-2 text-xs shadow-md outline-none backdrop-blur-[2px]"
-                ref={refs.setFloating}
-                style={floatingStyles}
-                {...getFloatingProps()}
-              >
-                {children}
-              </div>
-            </FloatingPortal>
-          )}
+          {isMobile
+            ? !disabled &&
+              isOpen && (
+                <div className="pl-4 text-xs" ref={refs.setFloating}>
+                  {children}
+                </div>
+              )
+            : !disabled &&
+              isOpen && (
+                <FloatingPortal>
+                  {/* 20px = twice the padding in the `shift` middleware (https://floating-ui.com/docs/misc#handling-large-content) */}
+                  <div
+                    className="z-50 overflow-hidden rounded-lg border bg-background-secondary shadow-md outline-hidden"
+                    ref={refs.setFloating}
+                    style={floatingStyles}
+                    {...getFloatingProps()}
+                  >
+                    <div className="flex max-h-[calc(100vh-20px)] flex-col overflow-x-hidden overflow-y-auto py-2 text-xs whitespace-nowrap">
+                      {children}
+                    </div>
+                  </div>
+                </FloatingPortal>
+              )}
         </FloatingList>
       </ContextMenuContext.Provider>
     </FloatingNode>
   );
 }
+ContextMenuSubmenu.displayName = "ContextMenuSubmenu";
 ContextMenu.Submenu = ContextMenuSubmenu;
 
 function useTextContent(): {

@@ -1,4 +1,4 @@
-import { useAuth0 } from "hooks/useAuth0";
+import { useWorkOS } from "hooks/useWorkOS";
 import { ChevronLeftIcon } from "@radix-ui/react-icons";
 import { BreadcrumbLink } from "components/header/BreadcrumbLink/BreadcrumbLink";
 import { Header } from "components/header/Header/Header";
@@ -6,7 +6,7 @@ import { NavBar } from "components/header/NavBar/NavBar";
 import { CreateTeamModal } from "components/header/CreateTeamModal";
 import { logEvent } from "convex-analytics";
 import { useTeams } from "api/teams";
-import { useProjects } from "api/projects";
+import { useProjectBySlug } from "api/projects";
 import {
   useRememberLastViewedProject,
   useRememberLastViewedTeam,
@@ -17,9 +17,12 @@ import { useEffect, useState } from "react";
 import { useAccessToken } from "hooks/useServerSideData";
 import { ProjectSelector } from "components/header/ProjectSelector/ProjectSelector";
 import { useCreateProjectModal } from "hooks/useCreateProjectModal";
-import { Team } from "generatedApi";
+import { TeamResponse } from "generatedApi";
 
-import { PROVISION_PROD_PAGE_NAME } from "@common/lib/deploymentContext";
+import {
+  PROVISION_PROD_PAGE_NAME,
+  PROVISION_DEV_PAGE_NAME,
+} from "@common/lib/deploymentContext";
 import { UsageBanner, useCurrentUsageBanner } from "./UsageBanner";
 import {
   FailedPaymentBanner,
@@ -42,27 +45,25 @@ const NO_TEAM_ROUTES = [
   "/accept",
   "/suspended",
   "/verify",
+  "/join-vercel-team",
 ];
 
-const NO_HEADER_ROUTES = ["/oauth/authorize/project", "/oauth/register"];
+const NO_HEADER_ROUTES = ["/oauth/authorize/project", "/oauth/authorize/team"];
 
 function DashboardHeaderWhenLoggedIn() {
-  const { user } = useAuth0();
+  const { user } = useWorkOS();
   const router = useRouter();
 
   const projectSlug = router?.query.project as string;
   const { teams, selectedTeamSlug } = useTeams();
   const team = teams?.find((t) => t.slug === selectedTeamSlug);
-  const projects = useProjects(team?.id);
-
-  const selectedProject =
-    projects && projects.find((project) => project.slug === projectSlug);
+  const selectedProject = useProjectBySlug(team?.id, projectSlug);
 
   useEffect(() => {
-    if (projects && projectSlug && !selectedProject) {
+    if (projectSlug && selectedProject === null) {
       void router.push("/404");
     }
-  }, [projects, selectedProject, projectSlug, router]);
+  }, [selectedProject, projectSlug, router]);
 
   const [showCreateTeamModal, setShowCreateTeamModal] = useState(false);
 
@@ -74,13 +75,13 @@ function DashboardHeaderWhenLoggedIn() {
   const projectSelector = (
     <ProjectSelector
       teams={teams}
-      selectedProject={selectedProject}
+      selectedProject={projectSlug ? (selectedProject ?? undefined) : undefined}
       selectedTeamSlug={selectedTeamSlug}
       onCreateTeamClick={() => {
         logEvent("view create team modal");
         setShowCreateTeamModal(true);
       }}
-      onCreateProjectClick={(t: Team) => {
+      onCreateProjectClick={(t: TeamResponse) => {
         logEvent("view create project modal");
         showCreateProjectModal(t);
       }}
@@ -97,7 +98,7 @@ function DashboardHeaderWhenLoggedIn() {
         <div className="flex items-center gap-2">
           <Link
             href="/"
-            className="flex items-center gap-1 rounded px-1 py-1.5 text-xs text-content-secondary hover:bg-background-tertiary"
+            className="flex items-center gap-1 rounded-sm px-1 py-1.5 text-xs text-content-secondary hover:bg-background-tertiary"
           >
             <ChevronLeftIcon />
             Back
@@ -113,7 +114,8 @@ function DashboardHeaderWhenLoggedIn() {
       router.route.endsWith("/[project]/settings") ||
       router.route.endsWith("/[project]") ||
       router.route.includes("/[project]/[deploymentName]") ||
-      router.route.includes(`/[project]/${PROVISION_PROD_PAGE_NAME}`)
+      router.route.includes(`/[project]/${PROVISION_PROD_PAGE_NAME}`) ||
+      router.route.includes(`/[project]/${PROVISION_DEV_PAGE_NAME}`)
     ) {
       return (
         <div className="flex items-center gap-4">
@@ -127,7 +129,7 @@ function DashboardHeaderWhenLoggedIn() {
         {projectSelector}
         <NavBar
           items={[
-            { label: "Projects", href: `/t/${selectedTeamSlug}` },
+            { label: "Home", href: `/t/${selectedTeamSlug}` },
             {
               label: "Team Settings",
               href: `/t/${selectedTeamSlug}/settings`,
@@ -136,7 +138,7 @@ function DashboardHeaderWhenLoggedIn() {
           activeLabel={
             router.asPath.startsWith(`/t/${selectedTeamSlug}/settings`)
               ? "Team Settings"
-              : "Projects"
+              : "Home"
           }
         />
       </div>

@@ -12,7 +12,7 @@ use ::metrics::StatusTimer;
 use async_broadcast::Receiver as BroadcastReceiver;
 use common::{
     codel_queue::{
-        new_codel_queue_async,
+        CoDelQueue,
         CoDelQueueReceiver,
         CoDelQueueSender,
     },
@@ -143,6 +143,16 @@ pub trait SizedValue {
     fn size(&self) -> u64;
 }
 
+/// Wrapper struct when you're inserting values into the LRU that should always
+/// be considered to be 1 unit in size.
+pub struct UnitSizedValue<T>(pub T);
+
+impl<T> SizedValue for UnitSizedValue<T> {
+    fn size(&self) -> u64 {
+        1
+    }
+}
+
 impl<Value: SizedValue> SizedValue for Arc<Value> {
     fn size(&self) -> u64 {
         Value::size(self)
@@ -213,24 +223,25 @@ impl<
     /// concurrency - The number of values that can be concurrently generated.
     /// This should be set based on system values.
     pub fn new(rt: RT, max_size: u64, concurrency: usize, label: &'static str) -> Self {
-        Self::_new(rt, LruCache::unbounded(), max_size, concurrency, label)
-    }
-
-    #[cfg(test)]
-    #[allow(unused)]
-    fn new_for_tests(rt: RT, max_size: u64, label: &'static str) -> Self {
-        let lru = LruCache::unbounded();
-        Self::_new(rt, lru, max_size, 1, label)
+        Self::_new(
+            CoDelQueue::new(rt.clone(), 200),
+            rt,
+            LruCache::unbounded(),
+            max_size,
+            concurrency,
+            label,
+        )
     }
 
     fn _new(
+        queue: CoDelQueue<RT, BuildValueRequest<Key, Value>>,
         rt: RT,
         cache: LruCache<Key, CacheResult<Value>>,
         max_size: u64,
         concurrency: usize,
         label: &'static str,
     ) -> Self {
-        let (tx, rx) = new_codel_queue_async(rt.clone(), 200);
+        let (tx, rx) = queue.into_sender_and_receiver();
         let inner = Inner::new(cache, max_size, label, tx);
         let handle = rt.spawn(
             label,
@@ -246,10 +257,9 @@ impl<
 
     fn drop_waiting(inner: Arc<Mutex<Inner<RT, Key, Value>>>, key: &Key) {
         let mut inner = inner.lock();
-        if let Some(value) = inner.cache.pop(key)
-            && matches!(value, CacheResult::Ready { .. })
-        {
-            panic!("Dropped a ready result without changing the cache's size!");
+        // Only remove if still Waiting
+        if matches!(inner.cache.peek(key), Some(CacheResult::Waiting { .. })) {
+            inner.cache.pop(key);
         }
     }
 
@@ -379,7 +389,6 @@ impl<
         }
     }
 
-    #[fastrace::trace]
     fn get_sync(
         &self,
         key: &Key,
@@ -428,6 +437,7 @@ impl<
         }
     }
 
+    #[fastrace::trace]
     async fn wait_for_value(
         key: &Key,
         mut receiver: async_broadcast::Receiver<BuildValueResult<Value>>,
@@ -477,324 +487,5 @@ impl<
         })
         .await;
         tracing::warn!("Worker shut down, shutting down scheduler");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::HashMap,
-        sync::Arc,
-    };
-
-    use common::{
-        pause::PauseController,
-        runtime,
-    };
-    use futures::{
-        future::join_all,
-        select,
-        FutureExt,
-    };
-    use parking_lot::Mutex;
-    use runtime::testing::TestRuntime;
-
-    use super::SizedValue;
-    use crate::async_lru::{
-        AsyncLru,
-        PAUSE_DURING_GENERATE_VALUE_LABEL,
-    };
-
-    struct SneakyMutableValue {
-        size: Mutex<u64>,
-    }
-
-    impl SizedValue for SneakyMutableValue {
-        fn size(&self) -> u64 {
-            *self.size.lock()
-        }
-    }
-
-    #[derive(Clone)]
-    struct GenerateSneakyMutableValue;
-    impl GenerateSneakyMutableValue {
-        async fn generate_value(_key: &'static str) -> anyhow::Result<SneakyMutableValue> {
-            Ok(SneakyMutableValue {
-                size: Mutex::new(1),
-            })
-        }
-    }
-
-    #[derive(Clone)]
-    struct GenerateRandomValue;
-    impl GenerateRandomValue {
-        async fn generate_value(_key: &'static str) -> anyhow::Result<u32> {
-            Ok(rand::random::<u32>())
-        }
-    }
-
-    struct SizeTwoValue;
-
-    impl SizedValue for SizeTwoValue {
-        fn size(&self) -> u64 {
-            2
-        }
-    }
-
-    #[derive(Clone)]
-    struct GenerateSizeTwoValue;
-
-    impl GenerateSizeTwoValue {
-        async fn generate_value(_key: &'static str) -> anyhow::Result<SizeTwoValue> {
-            Ok(SizeTwoValue)
-        }
-    }
-
-    #[derive(Clone)]
-    struct FailAlways;
-
-    impl FailAlways {
-        async fn generate_value(_key: &'static str) -> anyhow::Result<u32> {
-            let mut err = anyhow::anyhow!("original error");
-            err = err.context("NO!");
-            Err(err)
-        }
-    }
-
-    impl SizedValue for u32 {
-        fn size(&self) -> u64 {
-            1
-        }
-    }
-
-    #[convex_macro::test_runtime]
-    async fn get_only_generates_once_per_key(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new(rt, 1, 1, "label");
-        let first = cache
-            .get("key", GenerateRandomValue::generate_value("key").boxed())
-            .await?;
-        let second = cache
-            .get("key", GenerateRandomValue::generate_value("key").boxed())
-            .await?;
-        assert_eq!(first, second);
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn can_hold_multiple_values(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new(rt, 3, 1, "label");
-        let keys = ["key1", "key2", "key3"];
-
-        let get_all_values = || async {
-            join_all(
-                keys.into_iter()
-                    .map(|key| cache.get(key, GenerateRandomValue::generate_value(key).boxed())),
-            )
-            .await
-            .into_iter()
-            .collect::<anyhow::Result<Vec<_>>>()
-        };
-
-        let initial_values = get_all_values().await?;
-        let second_values = get_all_values().await?;
-        assert_eq!(initial_values, second_values);
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn test_get_and_prepopulate(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new(rt, 10, 1, "label");
-        let first = cache
-            .get_and_prepopulate(
-                "k1",
-                async move {
-                    let mut hashmap = HashMap::new();
-                    hashmap.insert("k1", Ok(Arc::new(1)));
-                    hashmap.insert("k2", Ok(Arc::new(2)));
-                    hashmap.insert("k3", Err(anyhow::anyhow!("k3 failed")));
-                    hashmap
-                }
-                .boxed(),
-            )
-            .await?;
-        assert_eq!(*first, 1);
-        let k1_again = cache
-            .get("k1", GenerateRandomValue::generate_value("k1").boxed())
-            .await?;
-        assert_eq!(*k1_again, 1);
-        let k2_prepopulated = cache
-            .get("k2", GenerateRandomValue::generate_value("k2").boxed())
-            .await?;
-        assert_eq!(*k2_prepopulated, 2);
-        let k3_prepopulated = cache.get("k3", async move { Ok(3) }.boxed()).await?;
-        assert_eq!(*k3_prepopulated, 3);
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn get_generates_new_value_after_eviction(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new(rt, 1, 1, "label");
-        let first = cache
-            .get("key", GenerateRandomValue::generate_value("key").boxed())
-            .await?;
-        cache
-            .get(
-                "other_key",
-                GenerateRandomValue::generate_value("other_key").boxed(),
-            )
-            .await?;
-        let second = cache
-            .get("key", GenerateRandomValue::generate_value("key").boxed())
-            .await?;
-        assert_ne!(first, second);
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn get_with_failure_propagates_error(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new(rt, 1, 1, "label");
-        let result = cache
-            .get("key", FailAlways::generate_value("key").boxed())
-            .await;
-        assert_is_our_error(result);
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn get_when_canceled_during_calculate_returns_value(
-        rt: TestRuntime,
-        pause: PauseController,
-    ) -> anyhow::Result<()> {
-        let cache = AsyncLru::new_for_tests(rt, 1, "label");
-        let hold_guard = pause.hold(PAUSE_DURING_GENERATE_VALUE_LABEL);
-        let mut first = cache
-            .get("key", GenerateRandomValue::generate_value("key").boxed())
-            .boxed();
-        let mut wait_for_blocked = hold_guard.wait_for_blocked().boxed();
-        loop {
-            select! {
-                _ = first.as_mut().fuse() => {
-                    // This first get should get to the calculating stage,
-                    // then pause, then be canceled, so it should never finish.
-                    anyhow::bail!("get finished first?!");
-                }
-                pause_guard = wait_for_blocked.as_mut().fuse() => {
-                    if let Some(pause_guard) = pause_guard {
-                        // Cancel the first request in the middle of calculating.
-                        drop(first);
-                        // Unblock (not technically required).
-                        pause_guard.unpause();
-                        // Let pause be used again later.
-                        drop(wait_for_blocked);
-                        break
-                    }
-                }
-            }
-        }
-
-        // Make sure that a subsequent get() can succeed.
-        cache
-            .get("key", GenerateRandomValue::generate_value("key").boxed())
-            .await?;
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn size_is_zero_initially(rt: TestRuntime) {
-        let cache: AsyncLru<TestRuntime, &str, u32> = AsyncLru::new_for_tests(rt, 1, "label");
-        assert_eq!(0, cache.size());
-    }
-
-    #[convex_macro::test_runtime]
-    async fn size_increases_on_put(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new_for_tests(rt, 2, "label");
-        cache
-            .get("key1", GenerateRandomValue::generate_value("key1").boxed())
-            .await?;
-        assert_eq!(1, cache.size());
-        cache
-            .get("key2", GenerateRandomValue::generate_value("key2").boxed())
-            .await?;
-        assert_eq!(2, cache.size());
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn size_with_custom_size_increases_on_put(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new_for_tests(rt, 4, "label");
-        cache
-            .get("key1", GenerateSizeTwoValue::generate_value("key1").boxed())
-            .await?;
-        assert_eq!(2, cache.size());
-        cache
-            .get("key2", GenerateSizeTwoValue::generate_value("key2").boxed())
-            .await?;
-        assert_eq!(4, cache.size());
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn size_does_not_increase_on_get(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new_for_tests(rt, 1, "label");
-        cache
-            .get("key", GenerateRandomValue::generate_value("key").boxed())
-            .await?;
-        cache
-            .get("key", GenerateRandomValue::generate_value("key").boxed())
-            .await?;
-        assert_eq!(1, cache.size());
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn size_with_custom_size_does_not_increase_on_get(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new_for_tests(rt, 2, "label");
-        cache
-            .get("key", GenerateSizeTwoValue::generate_value("key").boxed())
-            .await?;
-        cache
-            .get("key", GenerateSizeTwoValue::generate_value("key").boxed())
-            .await?;
-        assert_eq!(2, cache.size());
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn size_when_value_size_changes_is_consistent(rt: TestRuntime) -> anyhow::Result<()> {
-        let cache = AsyncLru::new_for_tests(rt, 1, "label");
-        let value = cache
-            .get(
-                "key",
-                GenerateSneakyMutableValue::generate_value("key").boxed(),
-            )
-            .await?;
-        *value.size.lock() += 10;
-        cache
-            .get(
-                "otherKey",
-                GenerateSneakyMutableValue::generate_value("otherKey").boxed(),
-            )
-            .await?;
-        assert_eq!(1, cache.size());
-        Ok(())
-    }
-
-    fn assert_is_our_error(result: anyhow::Result<Arc<u32>>) {
-        let err = result.unwrap_err();
-        assert!(
-            format!("{:?}", err).contains("NO!"),
-            "Expected our test error, but instead got: {:?}",
-            err,
-        );
-        assert!(
-            format!("{:?}", err).contains("original error"),
-            "Expected our test error, but instead got: {:?}",
-            err,
-        );
-        assert!(
-            format!("{:?}", err).contains("Orig Error"),
-            "Expected our test error, but instead got: {:?}",
-            err,
-        );
     }
 }

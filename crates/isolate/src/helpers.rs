@@ -18,10 +18,14 @@ use humansize::{
     BINARY,
 };
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
+use sync_types::types::SerializedArgs;
 use value::Size;
 
-use crate::strings;
+use crate::{
+    metrics::log_legacy_positional_args,
+    strings,
+};
 
 // The below methods were taken from `deno_core`
 // https://github.com/denoland/deno_core/blob/main/LICENSE.md - MIT License
@@ -46,10 +50,10 @@ use crate::strings;
 // SOFTWARE.
 
 /// Taken from `deno_core::bindings::module_origin`.
-pub fn module_origin<'a>(
-    s: &mut v8::HandleScope<'a>,
-    resource_name: v8::Local<'a, v8::String>,
-) -> v8::ScriptOrigin<'a> {
+pub fn module_origin<'s>(
+    s: &v8::PinScope<'s, '_>,
+    resource_name: v8::Local<'s, v8::String>,
+) -> v8::ScriptOrigin<'s> {
     // TODO: Fill this out more accurately.
     let source_map_url = strings::empty.create(s).unwrap();
     v8::ScriptOrigin::new(
@@ -69,19 +73,19 @@ pub fn module_origin<'a>(
 
 /// Run all queued tasks from this isolate's foreground task runner.
 /// In particular, this runs minor GC tasks that are scheduled.
-pub fn pump_message_loop(isolate: &mut v8::Isolate) {
+pub fn pump_message_loop(isolate: &v8::Isolate) {
     let platform = v8::V8::get_current_platform();
     while v8::Platform::pump_message_loop(&platform, isolate, false /* wait_for_work */) {}
 }
 
 /// Taken from `deno_core::bindings::throw_type_error`.
-pub fn throw_type_error(scope: &mut v8::HandleScope, message: impl AsRef<str>) {
+pub fn throw_type_error(scope: &mut v8::PinScope, message: impl AsRef<str>) {
     let message = v8::String::new(scope, message.as_ref()).unwrap();
     let exception = v8::Exception::type_error(scope, message);
     scope.throw_exception(exception);
 }
 
-pub fn to_rust_string(scope: &mut v8::Isolate, s: &v8::String) -> anyhow::Result<String> {
+pub fn to_rust_string(scope: &v8::Isolate, s: &v8::String) -> anyhow::Result<String> {
     let n = s.utf8_length(scope);
     let mut buf = vec![0; n];
     // Don't set `kReplaceInvalidUtf8` since we want unpaired surrogates to fail
@@ -92,11 +96,11 @@ pub fn to_rust_string(scope: &mut v8::Isolate, s: &v8::String) -> anyhow::Result
     Ok(s)
 }
 
-pub fn get_property<'a>(
-    scope: &mut v8::HandleScope<'a>,
+pub fn get_property<'s>(
+    scope: &v8::PinScope<'s, '_>,
     object: v8::Local<v8::Object>,
     key: &str,
-) -> anyhow::Result<Option<v8::Local<'a, v8::Value>>> {
+) -> anyhow::Result<Option<v8::Local<'s, v8::Value>>> {
     let key = v8::String::new(scope, key)
         .ok_or_else(|| anyhow::anyhow!("Failed to create string for {key}"))?;
     Ok(object.get(scope, key.into()))
@@ -180,11 +184,11 @@ fn deserialize_udf_custom_error_data(
 
 pub fn format_uncaught_error(message: String, name: String) -> String {
     if !name.is_empty() && !message.is_empty() {
-        format!("Uncaught {}: {}", name, message)
+        format!("Uncaught {name}: {message}")
     } else if !name.is_empty() {
-        format!("Uncaught {}", name)
+        format!("Uncaught {name}")
     } else if !message.is_empty() {
-        format!("Uncaught {}", message)
+        format!("Uncaught {message}")
     } else {
         "Uncaught".to_string()
     }
@@ -192,22 +196,22 @@ pub fn format_uncaught_error(message: String, name: String) -> String {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-#[serde(untagged)]
-pub enum UdfArgsJson {
-    /// For legacy positional args array
-    PositionalArgs(Vec<JsonValue>),
-    /// For named args
-    NamedArgs(JsonValue),
-}
+pub struct UdfArgsJson(Box<RawValue>);
 
 impl UdfArgsJson {
     /// Map it into our internal representation of positional args.
     /// Modern apps just have a single positional arg with an object.
-    pub fn into_arg_vec(self) -> Vec<JsonValue> {
-        match self {
-            UdfArgsJson::PositionalArgs(args) => args,
-            UdfArgsJson::NamedArgs(obj) => vec![obj],
+    pub fn into_serialized_args(self) -> anyhow::Result<SerializedArgs> {
+        // For legacy positional args array
+        // RawValue from serde is guaranteed to have no leading whitespace.
+        if self.0.get().starts_with("[") {
+            log_legacy_positional_args();
+            return Ok(SerializedArgs::from_raw(self.0));
         }
+        // For named args - stick it in an array
+        Ok(SerializedArgs::from_raw(serde_json::value::to_raw_value(
+            &[self.0],
+        )?))
     }
 }
 
@@ -223,31 +227,5 @@ pub fn source_map_from_slice(slice: &[u8]) -> Option<sourcemap::SourceMap> {
             report_error_sync(&mut e);
             None
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::assert_matches::assert_matches;
-
-    use serde_json::json;
-
-    use crate::UdfArgsJson;
-
-    #[test]
-    fn test_udf_args_json() -> anyhow::Result<()> {
-        let json1: UdfArgsJson = serde_json::from_str(r#"["a", "b", "c"]"#)?;
-        let json2: UdfArgsJson = serde_json::from_str(r#"{"named": "arg"}"#)?;
-        let json3: UdfArgsJson = serde_json::from_str(r#"[{"named": "arg"}]"#)?;
-        assert_matches!(json1, UdfArgsJson::PositionalArgs(_));
-        assert_matches!(json2, UdfArgsJson::NamedArgs(_));
-        assert_matches!(json3, UdfArgsJson::PositionalArgs(_));
-        assert_eq!(
-            json1.into_arg_vec(),
-            vec![json!("a"), json!("b"), json!("c")]
-        );
-        assert_eq!(json2.into_arg_vec(), vec![json!({"named": "arg"})]);
-        assert_eq!(json3.into_arg_vec(), vec![json!({"named": "arg"})]);
-        Ok(())
     }
 }

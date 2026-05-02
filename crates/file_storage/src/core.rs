@@ -43,8 +43,8 @@ use headers::{
     ContentType,
 };
 use keybroker::{
+    FunctionRunnerKeyBroker,
     Identity,
-    KeyBroker,
 };
 use maplit::btreemap;
 use model::{
@@ -77,7 +77,6 @@ use crate::{
         log_get_file_chunk_size,
         GetFileType,
     },
-    FileRangeStream,
     FileStorage,
     FileStream,
     TransactionalFileStorage,
@@ -97,7 +96,7 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
     pub fn generate_upload_url_with_origin(
         &self,
         origin_override: Option<ConvexOrigin>,
-        key_broker: &KeyBroker,
+        key_broker: &FunctionRunnerKeyBroker,
         issued_ts: UnixTimestamp,
         component: ComponentId,
     ) -> anyhow::Result<String> {
@@ -110,7 +109,7 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
     pub async fn generate_upload_url(
         &self,
         tx: &mut Transaction<RT>,
-        key_broker: &KeyBroker,
+        key_broker: &FunctionRunnerKeyBroker,
         issued_ts: UnixTimestamp,
         component: ComponentId,
     ) -> anyhow::Result<String> {
@@ -164,7 +163,7 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
             .await;
         let component_query = component
             .serialize_to_string()
-            .map(|s| format!("?component={}", s))
+            .map(|s| format!("?component={s}"))
             .unwrap_or_default();
         files
             .into_iter()
@@ -234,7 +233,7 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
     ) -> anyhow::Result<FileStream> {
         let sha256 = file.sha256.clone();
 
-        let result = self
+        let mut result = self
             .file_stream(
                 component_path,
                 file,
@@ -243,13 +242,9 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
                 GetFileType::All,
             )
             .await?;
-
-        Ok(FileStream {
-            sha256,
-            content_length: result.content_length,
-            content_type: result.content_type,
-            stream: result.stream,
-        })
+        result.sha256 = Some(sha256);
+        result.content_range = None;
+        Ok(result)
     }
 
     pub async fn get_file_range_stream(
@@ -258,7 +253,7 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
         file: FileStorageEntry,
         bytes_range: (Bound<u64>, Bound<u64>),
         usage_tracker: impl StorageUsageTracker + Clone + 'static,
-    ) -> anyhow::Result<FileRangeStream> {
+    ) -> anyhow::Result<FileStream> {
         self.file_stream(
             component_path,
             file,
@@ -276,7 +271,7 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
         bytes_range: (Bound<u64>, Bound<u64>),
         usage_tracker: impl StorageUsageTracker + Clone + 'static,
         get_file_type: GetFileType,
-    ) -> anyhow::Result<FileRangeStream> {
+    ) -> anyhow::Result<FileStream> {
         let FileStorageEntry {
             storage_id,
             storage_key,
@@ -308,11 +303,14 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
             )
             .await;
 
-        Ok(FileRangeStream {
+        Ok(FileStream {
+            sha256: None,
             content_length,
             content_range,
             content_type,
-            stream: Self::track_stream_usage(component_path, stream, get_file_type, call_tracker),
+            inner: Self::track_stream_usage(component_path, stream, get_file_type, call_tracker),
+            bytes_read_so_far: 0,
+            on_complete: Vec::new(),
         })
     }
 
@@ -350,7 +348,7 @@ impl<RT: Runtime> TransactionalFileStorage<RT> {
                 let bytes_size = bytes.len() as u64;
                 log_get_file_chunk_size(bytes_size, get_file_type);
                 storage_call_tracker
-                    .track_storage_egress_size(
+                    .track_storage_egress(
                         component_path.clone(),
                         "get_range".to_string(),
                         bytes_size,
@@ -500,7 +498,7 @@ impl<RT: Runtime> FileStorage<RT> {
                 sha256,
             )
             .await
-            .track_storage_ingress_size(component_path, "store".to_string(), size as u64)
+            .track_storage_ingress(component_path, "store".to_string(), size as u64)
             .await;
         Ok(virtual_id)
     }

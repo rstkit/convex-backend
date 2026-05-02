@@ -1,18 +1,10 @@
 use std::sync::LazyLock;
 
 use common::{
-    document::{
-        ParseDocument,
-        ParsedDocument,
-    },
-    query::{
-        Order,
-        Query,
-    },
+    document::ParsedDocument,
     runtime::Runtime,
 };
 use database::{
-    ResolvedQuery,
     SystemMetadataModel,
     Transaction,
 };
@@ -29,7 +21,7 @@ use crate::{
 
 pub mod types;
 
-use types::BackendState;
+use types::OldBackendState;
 
 use self::types::PersistedBackendState;
 
@@ -66,86 +58,37 @@ impl<'a, RT: Runtime> BackendStateModel<'a, RT> {
         SystemMetadataModel::new_global(self.tx)
             .insert(
                 &BACKEND_STATE_TABLE,
-                PersistedBackendState(BackendState::Running).try_into()?,
+                PersistedBackendState::Old(OldBackendState::Running).try_into()?,
             )
             .await?;
         Ok(())
     }
 
-    pub async fn get_backend_state(&mut self) -> anyhow::Result<BackendState> {
-        let backend_state = self.get_backend_state_inner().await?;
-        Ok(backend_state.into_value().0)
-    }
-
-    async fn get_backend_state_inner(
-        &mut self,
-    ) -> anyhow::Result<ParsedDocument<PersistedBackendState>> {
-        let query = Query::full_table_scan(BACKEND_STATE_TABLE.clone(), Order::Asc);
-        let mut query_stream = ResolvedQuery::new(self.tx, TableNamespace::Global, query)?;
-        let doc = query_stream
-            .next(self.tx, None)
+    pub async fn get_backend_state(&mut self) -> anyhow::Result<ParsedDocument<OldBackendState>> {
+        let backend_state = self
+            .tx
+            .query_system(
+                TableNamespace::Global,
+                &SystemIndex::<BackendStateTable>::by_id(),
+            )?
+            .unique()
             .await?
             .ok_or_else(|| anyhow::anyhow!("Backend must have a state."))?;
-        let backend_state: ParsedDocument<PersistedBackendState> = doc.parse()?;
-        anyhow::ensure!(
-            query_stream.next(self.tx, None).await?.is_none(),
-            "Backend must have a single state."
-        );
-        Ok(backend_state)
+        (*backend_state).clone().map(|bs| Ok(bs.to_old_lossy()))
     }
 
-    pub async fn toggle_backend_state(&mut self, new_state: BackendState) -> anyhow::Result<()> {
-        let (id, current_state) = self.get_backend_state_inner().await?.into_id_and_value();
+    pub async fn toggle_backend_state(&mut self, new_state: OldBackendState) -> anyhow::Result<()> {
+        let (id, current_state) = self.get_backend_state().await?.into_id_and_value();
         anyhow::ensure!(
-            current_state.0 != new_state,
+            current_state != new_state,
             ErrorMetadata::bad_request(
                 "DeploymentAlreadyInState",
                 format!("Deployment is already {new_state}")
             )
         );
         SystemMetadataModel::new_global(self.tx)
-            .replace(id, PersistedBackendState(new_state).try_into()?)
+            .replace(id, PersistedBackendState::Old(new_state).try_into()?)
             .await?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use database::test_helpers::DbFixtures;
-    use errors::{
-        ErrorCode,
-        ErrorMetadata,
-    };
-    use runtime::testing::TestRuntime;
-
-    use crate::{
-        backend_state::{
-            types::BackendState,
-            BackendStateModel,
-        },
-        test_helpers::DbFixturesWithModel,
-    };
-
-    #[convex_macro::test_runtime]
-    async fn test_toggle_backend_state(rt: TestRuntime) -> anyhow::Result<()> {
-        let db = DbFixtures::new_with_model(&rt).await?.db;
-        let mut tx = db.begin_system().await?;
-        let mut model = BackendStateModel::new(&mut tx);
-        let starting_state = model.get_backend_state().await?;
-        assert_eq!(starting_state, BackendState::Running);
-        model.toggle_backend_state(BackendState::Paused).await?;
-        let new_state = model.get_backend_state().await?;
-        assert_eq!(new_state, BackendState::Paused);
-
-        // Fail to toggle to the same state
-        let err = model
-            .toggle_backend_state(BackendState::Paused)
-            .await
-            .unwrap_err();
-        let err = err.downcast_ref::<ErrorMetadata>().unwrap();
-        assert_eq!(err.short_msg, "DeploymentAlreadyInState");
-        assert_eq!(err.code, ErrorCode::BadRequest);
         Ok(())
     }
 }

@@ -1,11 +1,12 @@
 ---
 title: "Data Types"
 sidebar_position: 40
+description: "Supported data types in Convex documents"
 ---
 
 import ConvexValues from "@site/docs/\_convexValues.mdx";
 
-All Convex documents are defined as Javascript objects. These objects can have
+All Convex documents are defined as JavaScript objects. These objects can have
 field values of any of the types below.
 
 You can codify the shape of documents within your tables by
@@ -25,13 +26,12 @@ Every document in Convex has two automatically-generated system fields:
 
 ## Limits
 
-Convex values must be less than 1MB in total size. This is an approximate limit
-for now, but if you're running into these limits and would like a more precise
-method to calculate a document's size,
-[reach out to us](https://convex.dev/community). Documents can have nested
-values, either objects or arrays that contain other Convex types. Convex types
-can have at most 16 levels of nesting, and the cumulative size of a nested tree
-of values must be under the 1MB limit.
+Convex values must be less than 1MB in total size. You can calculate the exact
+size of any value using [`getConvexSize`](/api/modules/values#getconvexsize)
+from `convex/values`. Documents can have nested values, either objects or arrays
+that contain other Convex types. Convex types can have at most 16 levels of
+nesting, and the cumulative size of a nested tree of values must be under the
+1MB limit.
 
 Table names may contain alphanumeric characters ("a" to "z", "A" to "Z", and "0"
 to "9") and underscores ("\_"), and they cannot start with an underscore.
@@ -40,6 +40,25 @@ For information on other limits, see [here](/production/state/limits.mdx).
 
 If any of these limits don't work for you,
 [let us know](https://convex.dev/community)!
+
+### Measuring document sizes
+
+Use [`getDocumentSize`](/api/modules/values#getdocumentsize) from
+`"convex/values"` to measure the size of documents, including the default `_id`
+and `_creationTime` fields. Use
+[`getConvexSize`](/api/modules/values#getconvexsize) to measure the byte size of
+arbitrary values.
+
+```ts
+import { getDocumentSize, getConvexSize } from "convex/values";
+
+// Includes the size of the system fields added during `db.insert`.
+const bytes = getDocumentSize(doc);
+await ctx.db.insert("documents", doc);
+
+// Calculates the Convex-encoded size of any valid Convex `Value`
+const arraySize = getConvexSize([true, 1n, null, "string", doc, buffer]);
+```
 
 ## Working with `undefined`
 
@@ -61,7 +80,8 @@ used in Convex function arguments or return values, or in stored documents.
    `.withIndex("by_a", q=>q.eq("a", undefined))` matches document `{}` and
    `{b: 1}`, but not `{a: 1}` or `{a: null, b: 1}`.
    - In Convex's ordering scheme, `undefined < null < all other values`, so you
-     can match documents that _have_ a field via `q.gte("a", null as any)`.
+     can match documents that _have_ a field via `q.gte("a", null as any)` or
+     `q.gt("a", undefined)`.
 4. There is exactly one case where `{a: undefined}` is different from `{}`: when
    passed to `ctx.db.patch`. Passing `{a: undefined}` removes the field "a" from
    the document, while passing `{}` does not change the field "a". See
@@ -80,7 +100,7 @@ used in Convex function arguments or return values, or in stored documents.
      if (args.a === null) {
        args.a = undefined;
      }
-     await ctx.db.patch(id, args);
+     await ctx.db.patch(tableName, id, args);
      ```
 6. Functions that return a plain `undefined`/`void` are treated as if they
    returned `null`.

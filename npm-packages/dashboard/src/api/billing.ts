@@ -40,6 +40,16 @@ export function useCreateSubscription(teamId: number) {
   });
 }
 
+export function useChangeSubscription(teamId: number) {
+  return useBBMutation({
+    path: "/teams/{team_id}/change_subscription_plan",
+    pathParams: { team_id: teamId.toString() },
+    mutateKey: "/teams/{team_id}/get_orb_subscription",
+    mutatePathParams: { team_id: teamId.toString() },
+    successToast: "Subscription changed.",
+  });
+}
+
 export function useCancelSubscription(teamId: number) {
   return useBBMutation({
     path: "/teams/{team_id}/cancel_orb_subscription",
@@ -121,6 +131,24 @@ export function useGetCoupon(
   return { coupon: data, isLoading: !!promoCode && isLoading };
 }
 
+export function useHasFailedPayment(teamId?: number) {
+  const { data, error, isLoading } = useBBQuery({
+    path: "/teams/{team_id}/has_failed_payment",
+    pathParams: {
+      team_id: teamId?.toString() || "",
+    },
+    swrOptions: {
+      refreshInterval: 1000 * 60,
+    },
+  });
+
+  if (error) {
+    return { isLoading, hasFailedPayment: false };
+  }
+
+  return { isLoading, hasFailedPayment: data?.hasFailedPayment ?? false };
+}
+
 export function useListInvoices(teamId?: number) {
   const { data, error, isLoading } = useBBQuery({
     path: "/teams/{team_id}/list_invoices",
@@ -128,7 +156,7 @@ export function useListInvoices(teamId?: number) {
       team_id: teamId?.toString() || "",
     },
     swrOptions: {
-      refreshInterval: 0,
+      refreshInterval: 1000 * 60,
     },
   });
 
@@ -161,7 +189,7 @@ export function useListPlans(teamId?: number) {
   });
 
   if (error) {
-    // eslint-disable-next-line @typescript-eslint/no-throw-literal
+    // eslint-disable-next-line @typescript-eslint/only-throw-error
     throw error;
   }
 

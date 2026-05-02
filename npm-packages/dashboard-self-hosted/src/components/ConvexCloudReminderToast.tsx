@@ -4,11 +4,10 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   Cross2Icon,
-  ExternalLinkIcon,
 } from "@radix-ui/react-icons";
 import { Button } from "@ui/Button";
 import { CopyTextButton } from "@common/elements/CopyTextButton";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { cn } from "@ui/cn";
 
 // Little toast to prompt users who are trying out Convex before creating
@@ -39,7 +38,7 @@ export function ConvexCloudReminderToast() {
           <Button
             variant="unstyled"
             className={cn(
-              "flex w-full cursor-pointer items-center justify-between rounded-lg p-2 text-sm font-medium text-purple-700 hover:bg-background-tertiary focus:outline-none focus:ring-2 focus:ring-purple-700",
+              "flex w-full cursor-pointer items-center justify-between rounded-lg p-2 text-sm font-medium text-purple-700 hover:bg-background-tertiary focus:ring-2 focus:ring-purple-700 focus:outline-hidden",
               isExpanded && "border-b border-purple-500",
             )}
             onClick={() => setIsExpanded(!isExpanded)}
@@ -87,13 +86,8 @@ export function ConvexCloudReminderToast() {
               Run this in your terminal:
               <CopyTextButton text="npx convex login" />
             </p>
-            <Link
-              href="https://docs.convex.dev"
-              className="inline-flex items-center gap-2 text-content-link hover:underline"
-              target="_blank"
-            >
+            <Link href="https://docs.convex.dev" target="_blank" externalIcon>
               Learn more about Convex
-              <ExternalLinkIcon className="h-4 w-4" />
             </Link>
           </div>
         )}

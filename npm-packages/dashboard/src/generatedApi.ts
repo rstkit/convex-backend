@@ -4,483 +4,14 @@
  */
 
 export interface paths {
-    "/authorize": {
+    "/profile_emails/list": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
-        put?: never;
-        /** This endpoint is a placeholder for generating our own access tokens.
-         *     Right now, it is a no-op for the token.
-         *     Version 1 of the token is the Auth0 access token */
-        post: operations["authorize_device"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/authorize_app": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["authorize_app"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/cloud_backups/{cloud_backup_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_cloud_backup"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/cloud_backups/{cloud_backup_id}/cancel": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["cancel_cloud_backup"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/cloud_backups/{cloud_backup_id}/delete": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["delete_cloud_backup"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/create_project": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["create_project_and_provision_deployment"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/delete_access_token": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["delete_access_token"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/delete_account": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["delete_account"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/delete_project/{project_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["dashboard_delete_project"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/delete_projects": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["dashboard_delete_projects"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/deployments/{deployment_id}/configure_periodic_backup": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["configure_periodic_backup"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/deployments/{deployment_id}/disable_periodic_backup": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["disable_periodic_backup"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/deployments/{deployment_id}/get_periodic_backup_config": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_periodic_backup_config"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/deployments/{deployment_id}/request_cloud_backup": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["request_cloud_backup"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/deployments/{deployment_id}/restore_from_cloud_backup": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["restore_from_cloud_backup"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/discord/accounts": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_discord_accounts"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/discord/authorize": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["authorize_discord_account"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/discord/login_url": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_discord_login_url"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/discord/unlink": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["unlink_discord_account"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/instances/{deployment_name}/access_tokens": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_deployment_access_tokens"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/instances/{deployment_name}/auth": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["get_deployment_auth_dashboard"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/instances/{deployment_name}/domains/create": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["create_vanity_domain"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/instances/{deployment_name}/domains/delete": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["delete_vanity_domain"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/instances/{deployment_name}/domains/list": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_vanity_domains_for_instance"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/invites/{code}/accept": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["accept_invitation"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/link_identity": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** @description Link a secondary identity to a user's account */
-        post: operations["link_identity"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/list_identities": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** @description List all identities for a user */
-        get: operations["list_identities"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/member_data": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_member_data"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/optins": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["dashboard_get_opt_ins"];
-        put: operations["dashboard_accept_opt_ins"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/profile": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_profile"];
+        get: operations["list_profile_emails"];
         put?: never;
         post?: never;
         delete?: never;
@@ -521,14 +52,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/profile_emails/list": {
+    "/member_data": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["list_profile_emails"];
+        get: operations["get_member_data"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_profile"];
         put?: never;
         post?: never;
         delete?: never;
@@ -569,6 +116,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/update_profile_name": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["update_profile_name"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/profile_emails/verify/{code}": {
         parameters: {
             query?: never;
@@ -585,6 +148,262 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/delete_account": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["delete_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/optins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["dashboard_get_opt_ins"];
+        put: operations["dashboard_accept_opt_ins"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_teams_for_member"];
+        put?: never;
+        post: operations["create_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_members_for_team"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/remove_member": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["remove_member_from_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/get_entitlements": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_team_entitlements"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["update_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["delete_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/apply_referral_code": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["apply_referral_code"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/validate_referral_code": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["validate_referral_code"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/referral_state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_referral_state_for_team"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_projects_for_team"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/projects/{project_slug}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_project_by_slug"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/usage/team_usage_state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_team_usage_state"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/unpause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["unpause_deployments"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/get_audit_log_events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_audit_log_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/projects/{project_id}": {
         parameters: {
             query?: never;
@@ -594,6 +413,422 @@ export interface paths {
         };
         get: operations["get_project"];
         put: operations["update_project"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/delete_project/{project_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["dashboard_delete_project"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/delete_projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["dashboard_delete_projects"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/create_project": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_project_and_provision_deployment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{project_id}/transfer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["transfer_project"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/instances/{deployment_name}/auth": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["get_deployment_auth_dashboard"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/deployments/{deployment_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_deployment_by_id"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/update_member_role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["update_member_role"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/get_project_roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_project_roles_for_team"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/update_project_roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["update_project_roles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_id}/request_cloud_backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["request_cloud_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_id}/restore_from_cloud_backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["restore_from_cloud_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_id}/list_cloud_backups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_cloud_backups_by_deployment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cloud_backups/{cloud_backup_id}/delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["delete_cloud_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cloud_backups/{cloud_backup_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_cloud_backup"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cloud_backups/{cloud_backup_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_cloud_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_id}/get_periodic_backup_config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_periodic_backup_config"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_id}/configure_periodic_backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["configure_periodic_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_id}/disable_periodic_backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["disable_periodic_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/discord/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_discord_accounts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/discord/login_url": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_discord_login_url"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/discord/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["authorize_discord_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/discord/unlink": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["unlink_discord_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/delete_access_token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["delete_access_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/access_tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_team_access_tokens"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/app_access_tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_team_app_access_tokens"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/instances/{deployment_name}/access_tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_deployment_access_tokens"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -633,166 +868,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/projects/{project_id}/delete_preview_deployment": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["deactivate_preview_deployment"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/projects/{project_id}/environment_variables/list": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_environment_variables"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/projects/{project_id}/environment_variables/update_batch": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["update_environment_variables"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/projects/{project_id}/instances": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_deployments_for_project"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/projects/{project_id}/preview_deployments": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_preview_deployments_for_project"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/projects/{project_id}/provision": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["provision_deployment_dashboard"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/projects/{project_id}/transfer": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["transfer_project"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/rename_token": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["rename_access_token"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/set_jwt_cookie": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["set_jwt_cookie"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_teams_for_member"];
-        put?: never;
-        post: operations["create_team"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/teams/delete_access_token": {
         parameters: {
             query?: never;
@@ -809,7 +884,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}": {
+    "/authorize": {
         parameters: {
             query?: never;
             header?: never;
@@ -818,30 +893,17 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post: operations["update_team"];
+        /** This endpoint is a placeholder for generating our own access tokens.
+         *     Right now, it is a no-op for the token.
+         *     Version 1 of the token is the WorkOS access token */
+        post: operations["authorize_device"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}/access_tokens": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_team_access_tokens"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/apply_referral_code": {
+    "/authorize_app": {
         parameters: {
             query?: never;
             header?: never;
@@ -850,199 +912,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post: operations["apply_referral_code"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/cancel_orb_subscription": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["cancel_orb_subscription"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/create_setup_intent": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["create_setup_intent"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/create_subscription": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["create_subscription"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/delete": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["delete_team"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/deployments/{deployment_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_deployment_by_id"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/get_audit_log_events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_audit_log_events"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/get_current_spend": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_current_spend"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/get_discounted_plan/{plan_id}/{promo_code}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_discounted_plan"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/get_entitlements": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_team_entitlements"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/get_orb_subscription": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_orb_subscription"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/get_project_roles": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_project_roles_for_team"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/get_spending_limits": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_spending_limits"];
-        put?: never;
-        post?: never;
+        post: operations["authorize_app"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1081,14 +951,78 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}/list_active_plans": {
+    "/invites/{code}/accept": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["list_active_plans"];
+        get?: never;
+        put?: never;
+        post: operations["accept_invitation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/cancel_orb_subscription": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_orb_subscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/change_subscription_plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["change_subscription_plan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/create_subscription": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_subscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/get_discounted_plan/{plan_id}/{promo_code}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_discounted_plan"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1097,14 +1031,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}/list_cloud_backups": {
+    "/teams/{team_id}/get_orb_subscription": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["list_cloud_backups"];
+        get: operations["get_orb_subscription"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/list_active_plans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_active_plans"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1129,96 +1079,16 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}/members": {
+    "/teams/{team_id}/has_failed_payment": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["get_members_for_team"];
+        get: operations["has_failed_payment"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/projects": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_projects_for_team"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/referral_state": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_referral_state_for_team"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/remove_member": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["remove_member_from_team"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/set_spending_limit": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["set_spending_limit"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_id}/unpause": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["unpause_deployments"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1273,22 +1143,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}/update_member_role": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["update_member_role"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/teams/{team_id}/update_payment_method": {
         parameters: {
             query?: never;
@@ -1305,7 +1159,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}/update_project_roles": {
+    "/teams/{team_id}/create_setup_intent": {
         parameters: {
             query?: never;
             header?: never;
@@ -1314,23 +1168,87 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post: operations["update_project_roles"];
+        post: operations["create_setup_intent"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}/usage/current_billing_period": {
+    "/teams/{team_id}/set_spending_limit": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["get_team_current_billing_period"];
+        get?: never;
+        put?: never;
+        post: operations["set_spending_limit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/get_current_spend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_current_spend"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/get_spending_limits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_spending_limits"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{project_id}/environment_variables/list": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_environment_variables"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{project_id}/environment_variables/update_batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["update_environment_variables"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1353,14 +1271,14 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_id}/usage/team_usage_state": {
+    "/teams/{team_id}/usage/current_billing_period": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["get_team_usage_state"];
+        get: operations["get_team_current_billing_period"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1385,22 +1303,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/teams/{team_slug}/usage/record_tokens": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["record_tokens"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/unlink_identity": {
         parameters: {
             query?: never;
@@ -1418,15 +1320,16 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/update_profile_name": {
+    "/list_identities": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
-        put: operations["update_profile_name"];
+        /** @description List all identities for a user */
+        get: operations["list_identities"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -1434,16 +1337,496 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/validate_referral_code": {
+    "/identities": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["validate_referral_code"];
+        /** @description List simplified identities grouped by WorkOS user ID */
+        get: operations["identities"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/oauth_apps": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_oauth_apps_for_team"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/oauth_apps/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["check_oauth_app"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/oauth_apps/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["register_oauth_app"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/oauth_apps/{client_id}/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["update_oauth_app"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/oauth_apps/{client_id}/delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["delete_oauth_app"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/oauth_apps/{client_id}/regenerate_secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["regenerate_oauth_client_secret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workos/delete_environment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Delete a WorkOS environment. This removes the environment from both WorkOS and the Convex database. */
+        post: operations["delete_workos_environment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workos/disconnect_workos_team": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Disconnect a WorkOS team from a Convex team. This is a destructive action that will prevent new WorkOS environments from being provisioned, though existing environments will continue to work. */
+        post: operations["disconnect_workos_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workos/available_workos_team_emails": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Get candidate email addresses to be WorkOS admins. */
+        get: operations["get_available_workos_team_emails"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_name}/workos_environment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_deployment_workos_environment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_name}/has_associated_workos_team": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Check if a deployment has an associated WorkOS team */
+        get: operations["get_has_associated_workos_team"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workos/get_or_provision_workos_environment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Get or provision a WorkOS environment for a deployment */
+        post: operations["get_or_provision_workos_environment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/workos_integration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_team_workos_integration"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/deployments/{deployment_name}/workos_environment_health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Check if the WorkOS environment associated with this deployment is still accessible */
+        get: operations["get_workos_environment_health"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/workos_invitation_eligible_emails": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Get emails eligible for WorkOS team invitation (all verified emails except those that are admin of a different WorkOS team) */
+        get: operations["get_workos_invitation_eligible_emails"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/workos_team_health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Check if the WorkOS team associated with this Convex team is still accessible */
+        get: operations["get_workos_team_health"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workos/invite_team_member": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Invite a member to the WorkOS team associated with a Convex team */
+        post: operations["invite_workos_team_member"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workos/provision_associated_workos_team": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Provision a WorkOS team for a Convex team */
+        post: operations["provision_associated_workos_team"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{project_id}/workos_environments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description List all WorkOS environments for a project */
+        get: operations["get_project_workos_environments"];
+        put?: never;
+        /** @description Create a new WorkOS environment for a project */
+        post: operations["provision_project_workos_environment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/projects/{project_id}/workos_environments/{client_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Get a specific WorkOS environment for a project including credentials. This action is audited. */
+        get: operations["get_project_workos_environment"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workos/delete_project_environment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Delete a WorkOS environment from a project */
+        post: operations["delete_project_environment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workos/check_project_environment_health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Check the health of a project WorkOS environment. Returns HTTP error on failure. */
+        post: operations["check_project_environment_health"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/enable_sso": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["enable_sso"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/get_sso": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_sso"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/disable_sso": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["disable_sso"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/update_sso": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["update_sso"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/generate_sso_configuration_link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["generate_sso_configuration_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vercel/potential_teams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_potential_vercel_teams_dashboard"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vercel/potential_teams/{proposed_team_id}/join": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["join_vercel_team_dashboard"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1468,6 +1851,7 @@ export interface components {
         /** @description Encrypted admin key */
         AdminKey: string;
         AppAccessTokenResponse: {
+            appClientId: string;
             appName: components["schemas"]["AppName"];
             /** Format: int64 */
             creationTime: number;
@@ -1480,7 +1864,7 @@ export interface components {
             referralCode: components["schemas"]["ReferralCode"];
         };
         /** @enum {string} */
-        AuditLogAction: "joinTeam" | "createTeam" | "updateTeam" | "deleteTeam" | "createProject" | "transferProject" | "receiveProject" | "updateProject" | "deleteProject" | "createProjectEnvironmentVariable" | "updateProjectEnvironmentVariable" | "deleteProjectEnvironmentVariable" | "createDeployment" | "deleteDeployment" | "inviteMember" | "cancelMemberInvitation" | "removeMember" | "updateMemberRole" | "updateMemberProjectRole" | "updatePaymentMethod" | "updateBillingContact" | "updateBillingAddress" | "createSubscription" | "resumeSubscription" | "cancelSubscription" | "createTeamAccessToken" | "updateTeamAccessToken" | "deleteTeamAccessToken" | "viewTeamAccessToken" | "createCustomDomain" | "deleteCustomDomain" | "startManualCloudBackup" | "restoreFromCloudBackup" | "configurePeriodicBackup" | "disablePeriodicBackup" | "deleteCloudBackup" | "disableTeamExceedingSpendingLimits" | "setSpendingLimit" | "applyReferralCode";
+        AuditLogAction: "joinTeam" | "createTeam" | "updateTeam" | "deleteTeam" | "createProject" | "transferProject" | "receiveProject" | "updateProject" | "deleteProject" | "createProjectEnvironmentVariable" | "updateProjectEnvironmentVariable" | "deleteProjectEnvironmentVariable" | "createDeployment" | "deleteDeployment" | "inviteMember" | "cancelMemberInvitation" | "removeMember" | "updateMemberRole" | "updateMemberProjectRole" | "updatePaymentMethod" | "updateBillingContact" | "updateBillingAddress" | "createSubscription" | "resumeSubscription" | "cancelSubscription" | "changeSubscriptionPlan" | "createTeamAccessToken" | "updateTeamAccessToken" | "deleteTeamAccessToken" | "viewTeamAccessToken" | "createProjectAccessToken" | "updateProjectAccessToken" | "deleteProjectAccessToken" | "viewProjectAccessToken" | "createDeploymentAccessToken" | "updateDeploymentAccessToken" | "deleteDeploymentAccessToken" | "viewDeploymentAccessToken" | "createCustomDomain" | "deleteCustomDomain" | "startManualCloudBackup" | "restoreFromCloudBackup" | "configurePeriodicBackup" | "disablePeriodicBackup" | "deleteCloudBackup" | "disableTeamExceedingSpendingLimits" | "setSpendingLimit" | "applyReferralCode" | "createOAuthApplication" | "updateOAuthApplication" | "deleteOAuthApplication" | "verifyOAuthApplication" | "generateOAuthClientSecret" | "createWorkosTeam" | "createWorkosEnvironment" | "deleteWorkosEnvironment" | "retrieveWorkosEnvironmentCredentials" | "disconnectWorkosTeam" | "inviteWorkosTeamMember" | "createProjectWorkosEnvironment" | "deleteProjectWorkosEnvironment" | "retrieveProjectWorkosEnvironmentCredentials" | "enableSSO" | "disableSSO" | "updateSSO" | "transferDeployment" | "receiveDeployment" | "updateDeployment" | "createCustomRole" | "updateCustomRole" | "deleteCustomRole";
         /** @description Represents the `ValidatedActor` equivalent for audit logs. This identifies
          *     who executed an AuditLogEvent */
         AuditLogActor: "system" | {
@@ -1494,6 +1878,10 @@ export interface components {
         } | {
             team: {
                 team_id: components["schemas"]["TeamId"];
+            };
+        } | {
+            app: {
+                client_id: string;
             };
         };
         AuditLogEventResponse: {
@@ -1511,30 +1899,38 @@ export interface components {
             cursor?: string | null;
             events: components["schemas"]["AuditLogEventResponse"][];
         };
-        AuthIdentity: {
+        AuthIdentityResponse: {
             connection: string;
-            profileData: components["schemas"]["ProfileData"];
+            isPrimary: boolean;
+            parentUserId?: string | null;
             provider: string;
             userId: string;
         };
         AuthorizeAppArgs: {
-            /** @description Authentication token is expected to be the access token from auth0 */
+            /** @description Authentication token is expected to be the access token from WorkOS */
             authnToken: string;
             clientId: string;
             codeChallenge?: string | null;
             mode: components["schemas"]["AuthorizeAppMode"];
-            projectId: components["schemas"]["ProjectId"];
+            projectId?: null | components["schemas"]["ProjectId"];
             redirectUri: string;
+            teamId?: null | components["schemas"]["TeamId"];
         };
         /** @enum {string} */
         AuthorizeAppMode: "AuthorizationCode";
         AuthorizeArgs: {
             anonymousId?: string | null;
-            appName?: null | components["schemas"]["AppName"];
-            /** @description Authentication token is expected to be the access token from auth0 */
+            /** @description Authentication token is expected to be the access token from WorkOS */
             authnToken: string;
             deploymentId?: null | components["schemas"]["DeploymentId"];
             deviceName?: null | components["schemas"]["DeviceName"];
+            /**
+             * Format: int64
+             * @description Timestamp in milliseconds when this token will expire. Must be at
+             *     least 30 minutes in the future.
+             */
+            expiresAt?: number | null;
+            oauthApp?: null | components["schemas"]["OauthAppMetadata"];
             permissions?: string[] | null;
             projectId?: null | components["schemas"]["ProjectId"];
             teamId?: null | components["schemas"]["TeamId"];
@@ -1551,6 +1947,10 @@ export interface components {
             /** @description a serialized access token that the CLI will send back up */
             accessToken: components["schemas"]["SerializedAccessToken"];
         };
+        AvailableWorkOSTeamEmailsResponse: {
+            availableEmails: string[];
+            usedEmails: string[];
+        };
         BillingContactResponse: {
             email: string;
             name: string;
@@ -1558,38 +1958,67 @@ export interface components {
         CancelInvitationArgs: {
             email: string;
         };
+        ChangeSubscriptionPlanArgs: {
+            newPlanId: string;
+        };
+        CheckOauthAppArgs: {
+            clientId: string;
+            redirectUri: string;
+        };
+        CheckProjectEnvironmentHealthRequest: {
+            /** @description WorkOS client ID */
+            clientId: string;
+            /**
+             * Format: int64
+             * @description Project ID
+             */
+            projectId: number;
+        };
         /** Format: int64 */
         CloudBackupId: number;
         CloudBackupResponse: {
             /** Format: int64 */
+            completedTime?: number | null;
+            /** Format: int64 */
             expirationTime: number;
             id: components["schemas"]["CloudBackupId"];
+            includeStorage: boolean;
             /** Format: int64 */
             requestedTime: number;
             snapshotId?: string | null;
             sourceDeploymentId: components["schemas"]["DeploymentId"];
-            sourceDeploymentName: components["schemas"]["InstanceName"];
+            sourceDeploymentName: components["schemas"]["CloudDeploymentName"];
             state: string;
         };
+        /** @description Example instance names:
+         *
+         *     tall-sheep-123
+         *
+         *     test-tall-sheep-123  # Prefix of test for internal testing */
+        CloudDeploymentName: string;
         ConfigurePeriodicBackupArgs: {
             cronspec: string;
             /** Format: int64 */
             expirationDeltaSecs?: number | null;
+            includeStorage?: boolean | null;
         };
         CreateInvitationArgs: {
             email: string;
             role: components["schemas"]["Role"];
         };
         CreateProjectArgs: {
+            deploymentClass?: string | null;
             deploymentType?: null | components["schemas"]["DeploymentType"];
-            partitionId?: null | components["schemas"]["PartitionId"];
             projectName: components["schemas"]["ProjectName"];
+            region?: null | components["schemas"]["RegionName"];
             team: components["schemas"]["TeamSlug"];
         };
         CreateProjectResponse: {
-            adminKey: components["schemas"]["AdminKey"];
-            deploymentName: string;
-            prodUrl: string;
+            adminKey?: null | components["schemas"]["AdminKey"];
+            deploymentName?: string | null;
+            /** Format: int64 */
+            deploymentsRemaining?: number | null;
+            prodUrl?: string | null;
             projectId: components["schemas"]["ProjectId"];
             projectSlug: components["schemas"]["ProjectSlug"];
             /** Format: int64 */
@@ -1611,29 +2040,71 @@ export interface components {
         CreateTeamArgs: {
             name: components["schemas"]["ProposedTeamName"];
         };
-        DeactivatePreviewDeploymentArgs: {
-            identifier: components["schemas"]["PreviewDeploymentIdentifier"];
-        };
         DeleteAccessTokenArgs: {
             name: components["schemas"]["DeviceName"];
+        };
+        DeleteProjectEnvironmentRequest: {
+            /** @description WorkOS client ID of the environment to delete */
+            clientId: string;
+            /**
+             * Format: int64
+             * @description Project ID for the environment to delete
+             */
+            projectId: number;
+        };
+        /** @description Response for deleting a project environment - matches
+         *     DeleteWorkOSEnvironmentResponse */
+        DeleteProjectEnvironmentResponse: {
+            workosEnvironmentId: string;
+            workosEnvironmentName: string;
+            workosTeamId: string;
         };
         DeleteProjectsArgs: {
             projectIds: components["schemas"]["ProjectId"][];
         };
+        DeleteWorkOSEnvironmentRequest: {
+            /** @description Deployment name for the environment to delete */
+            deploymentName: string;
+        };
+        DeleteWorkOSEnvironmentResponse: {
+            workosEnvironmentId: string;
+            workosEnvironmentName: string;
+            workosTeamId: string;
+        };
         /** Format: int64 */
         DeploymentId: number;
+        /** @description An identifier that uniquely identifies this deployment within the project. */
+        DeploymentReference: string;
         DeploymentResponse: {
             /** Format: int64 */
             createTime: number;
-            creator: components["schemas"]["MemberId"];
+            creator?: null | components["schemas"]["MemberId"];
+            dashboardEditConfirmation?: boolean | null;
+            /** @description The deployment class for this deployment. */
+            deploymentClass: string;
             deploymentType: components["schemas"]["DeploymentType"];
-            /** Format: int64 */
-            id: number;
+            /**
+             * Format: int64
+             * @description Timestamp in milliseconds when this deployment will be
+             *     deleted. Preview deployments have this set by default unless
+             *     overridden.
+             */
+            expiresAt?: number | null;
+            id: components["schemas"]["DeploymentId"];
+            isDefault: components["schemas"]["IsDefaultDeployment"];
             /** @enum {string} */
             kind: "cloud";
+            /** Format: int64 */
+            lastDeployTime?: number | null;
             name: string;
             previewIdentifier?: null | components["schemas"]["PreviewDeploymentIdentifier"];
             projectId: components["schemas"]["ProjectId"];
+            reference: components["schemas"]["DeploymentReference"];
+            region: components["schemas"]["RegionName"];
+            /** @description Whether to send function logs to the client. If `null`, the
+             *     deployment-type default is used (true for dev/preview, false for
+             *     prod). */
+            sendLogsToClient?: boolean | null;
         } | {
             /** Format: int64 */
             createTime: number;
@@ -1643,6 +2114,7 @@ export interface components {
             /** Format: int64 */
             id: number;
             isActive: boolean;
+            isDefault: components["schemas"]["IsDefaultDeployment"];
             /** @enum {string} */
             kind: "local";
             /** Format: int64 */
@@ -1654,8 +2126,30 @@ export interface components {
             projectId: components["schemas"]["ProjectId"];
         };
         /** @enum {string} */
-        DeploymentType: "dev" | "prod" | "preview";
+        DeploymentType: "dev" | "prod" | "preview" | "custom";
+        DeploymentWorkOSEnvironmentInfo: {
+            deploymentName: string;
+            isProduction: boolean;
+            workosApiKey: string;
+            workosClientId: string;
+            workosEnvironmentId: string;
+            workosEnvironmentName: string;
+            workosTeamId: string;
+        };
+        DeploymentWorkOSEnvironmentResponse: {
+            environment?: null | components["schemas"]["DeploymentWorkOSEnvironmentInfo"];
+            teamId: components["schemas"]["TeamId"];
+            workosTeam?: null | components["schemas"]["WorkOSAssociatedTeam"];
+        };
         DeviceName: string;
+        DisconnectWorkOSTeamRequest: {
+            /** @description Convex team ID to disconnect from WorkOS */
+            teamId: components["schemas"]["TeamId"];
+        };
+        DisconnectWorkOSTeamResponse: {
+            workosTeamId: string;
+            workosTeamName: string;
+        };
         DiscordAccount: {
             details?: null | components["schemas"]["DiscordAccountDetails"];
             id: string;
@@ -1681,6 +2175,7 @@ export interface components {
             planId: string;
             requiresPaymentMethod: boolean;
         };
+        EnableSSORequest: Record<string, never>;
         EnvVariableConfigJson: {
             deploymentTypes: components["schemas"]["DeploymentType"][];
             name: string;
@@ -1690,12 +2185,37 @@ export interface components {
             name: string;
             value: string;
         };
+        GenerateSSOConfigurationLinkRequest: {
+            intent: components["schemas"]["SSOPortalIntent"];
+        };
+        GenerateSSOConfigurationLinkResponse: {
+            link: string;
+        };
         GetCurrentSpendResponse: {
             /** Format: int64 */
             totalCents: number;
         };
         GetOptInsResponse: {
             optInsToAccept: components["schemas"]["OptInToAccept"][];
+        };
+        GetOrProvisionEnvironmentRequest: {
+            deploymentName: string;
+            environmentName?: string | null;
+            isProduction?: boolean | null;
+        };
+        /** @description Response for getting a project WorkOS environment with credentials - matches
+         *     ProvisionProjectEnvironmentResponse pattern with workos_ prefix */
+        GetProjectEnvironmentResponse: {
+            isProduction: boolean;
+            /** @description The user-provided environment name (e.g., "staging", "development") */
+            userEnvironmentName: string;
+            workosApiKey: string;
+            workosClientId: string;
+            workosEnvironmentId: string;
+            workosEnvironmentName: string;
+        };
+        GetProjectEnvironmentsResponse: {
+            environments: components["schemas"]["ProjectEnvironmentSummary"][];
         };
         GetSpendingLimitsResponse: {
             /** Format: int64 */
@@ -1711,10 +2231,33 @@ export interface components {
             centitokensUsed: number;
             isPaidPlan: boolean;
             isTeamDisabled: boolean;
+            planType: string;
             /** Format: int64 */
             tokensQuota: number;
             /** Format: int64 */
             tokensUsed: number;
+        };
+        HasAssociatedWorkOSTeamResponse: {
+            /** @description Email of Convex team member who created the WorkOS account.
+             *     This field should always be present when has_associated_workos_team is
+             *     true. */
+            adminConvexEmail?: string | null;
+            /** @description Email address used to provision the WorkOS account. This field should
+             *     always be present if has_associated_workos_team is true. */
+            adminEmail?: string | null;
+            /** @description Name of Convex team member who created the WorkOS account.
+             *     This field is optional even when has_associated_workos_team is true. */
+            adminName?: string | null;
+            hasAssociatedWorkosTeam: boolean;
+            teamId: components["schemas"]["TeamId"];
+        };
+        HasFailedPaymentResponse: {
+            hasFailedPayment: boolean;
+        };
+        IdentityResponse: {
+            email?: string | null;
+            id: string;
+            providers: string[];
         };
         InstanceAuthForDashboardInteractionsResponse: {
             adminKey: components["schemas"]["SerializedAccessToken"];
@@ -1727,16 +2270,27 @@ export interface components {
             /** @enum {string} */
             kind: "Local";
         };
-        /** @description Example instance names:
-         *
-         *     tall-sheep-123
-         *
-         *     test-tall-sheep-123  # Prefix of test for internal testing */
-        InstanceName: string;
+        InvitationEligibleEmailsResponse: {
+            /** @description The admin email used to create this team's WorkOS account (always
+             *     eligible for re-invitation) */
+            adminEmail?: string | null;
+            eligibleEmails: string[];
+        };
         InvitationResponse: {
             email: string;
             expired: boolean;
             role: components["schemas"]["Role"];
+        };
+        InviteWorkOSTeamMemberRequest: {
+            /** @description Email address to invite to the WorkOS team,
+             *     must be a verified email address associated with the user's account */
+            email: string;
+            /** @description Convex team ID that has an associated WorkOS team */
+            teamId: components["schemas"]["TeamId"];
+        };
+        InviteWorkOSTeamMemberResponse: {
+            email: string;
+            roleSlug: string;
         };
         InvoiceResponse: {
             amountDue: string;
@@ -1753,20 +2307,20 @@ export interface components {
         InvoicesResponse: {
             invoices: components["schemas"]["InvoiceResponse"][];
         };
-        LinkIdentityRequest: {
-            fromProfile: boolean;
-        };
+        /** @description Indicates whether the deployment is the default prod deployment for the
+         *     project, or the default cloud dev deployment for the member in the project. */
+        IsDefaultDeployment: boolean;
         ListEnvVariableResponse: {
             configs: components["schemas"]["EnvVariableConfigJson"][];
         };
-        ListVanityDomainsResponse: {
-            domains: components["schemas"]["VanityDomainResponse"][];
+        ManagedBy: "vercel" | {
+            oauthApp: string;
         };
         MemberDataResponse: {
-            deployments: components["schemas"]["DeploymentResponse"][];
+            deployments: components["schemas"]["PlatformDeploymentResponse"][];
             optInsToAccept: components["schemas"]["OptInToAccept"][];
             projects: components["schemas"]["ProjectDetails"][];
-            teams: components["schemas"]["Team"][];
+            teams: components["schemas"]["TeamResponse"][];
         };
         /** Format: int64 */
         MemberEmailId: number;
@@ -1785,6 +2339,19 @@ export interface components {
             id: components["schemas"]["MemberId"];
             name?: string | null;
         };
+        OauthAppMetadata: {
+            clientId: string;
+            clientSecret: string;
+        };
+        OauthAppResponse: {
+            appName: components["schemas"]["AppName"];
+            clientId: string;
+            clientSecret?: string | null;
+            /** Format: int64 */
+            createTime: number;
+            redirectUris: string[];
+            verified: boolean;
+        };
         OptIn: {
             tos: string;
         };
@@ -1794,16 +2361,28 @@ export interface components {
         };
         OrbSubscriptionResponse: {
             billingAddress?: null | components["schemas"]["Address"];
-            billingContact: components["schemas"]["BillingContactResponse"];
+            billingContact?: null | components["schemas"]["BillingContactResponse"];
             /** Format: int64 */
             endDate?: number | null;
+            /** @description Whether this subscription includes new billing metrics (e.g. Database
+             *     I/O). */
+            hasNewBilling: boolean;
+            /** @description The first renewal date on or after the new billing cutover (May 6,
+             *     2026). Only set when `has_new_billing` is false. */
+            newBillingStartDate?: string | null;
             nextBillingPeriodStart: string;
             paymentMethod?: null | components["schemas"]["PaymentMethodResponse"];
             plan: components["schemas"]["PlanResponse"];
             status: string;
         };
-        /** Format: int64 */
-        PartitionId: number;
+        PaginatedProjectsResponse: {
+            items: components["schemas"]["ProjectDetails"][];
+            pagination: components["schemas"]["PaginationMetadata"];
+        };
+        PaginationMetadata: {
+            hasMore: boolean;
+            nextCursor?: string | null;
+        };
         PaymentMethodResponse: {
             display: string;
             kind: string;
@@ -1812,6 +2391,7 @@ export interface components {
             cronspec: string;
             /** Format: int64 */
             expirationDeltaSecs: number;
+            includeStorage: boolean;
             /** Format: int64 */
             nextRun: number;
             sourceDeploymentId: components["schemas"]["DeploymentId"];
@@ -1822,29 +2402,131 @@ export interface components {
             name: string;
             planType?: string | null;
             /** Format: double */
-            seatPrice: number;
+            seatPrice?: number | null;
             status: string;
         };
         PlansResponse: {
             plans: components["schemas"]["PlanResponse"][];
         };
-        PreviewDeploymentIdentifier: string;
-        ProfileData: {
-            email?: string | null;
-            name?: string | null;
-            username?: string | null;
+        PlatformDeploymentResponse: {
+            /** @description The deployment class for this deployment. */
+            class: string;
+            /**
+             * Format: int64
+             * @description Timestamp in milliseconds when this deployment was created.
+             */
+            createTime: number;
+            creator?: null | components["schemas"]["MemberId"];
+            /** @description Controls whether the dashboard requires a confirmation before
+             *     allowing edits during a browser session for this deployment.
+             *     If not set, defaults to true for prod deployments and false
+             *     for dev and preview deployments. */
+            dashboardEditConfirmation?: boolean | null;
+            /** @description The type of this deployment. */
+            deploymentType: components["schemas"]["DeploymentType"];
+            /** @description The full backend URL for this deployment (e.g. "https://joyful-capybara-123.convex.cloud" or "https://calm-cow-456.eu-west-1.convex.cloud"). This is always a `.convex.cloud` URL, even when the deployment is using custom domains. To get the canonical URL, use [`/get_canonical_urls`](https://docs.convex.dev/deployment-api/get-canonical-urls). */
+            deploymentUrl: string;
+            /**
+             * Format: int64
+             * @description Timestamp in milliseconds when this deployment will be
+             *     deleted. Preview deployments have this set by default unless
+             *     overridden.
+             */
+            expiresAt?: number | null;
+            id: components["schemas"]["DeploymentId"];
+            /** @description For prod deployments, whether they are the default prod deployment
+             *     of the project. For dev deployments, whether they are the default
+             *     dev deployment for the member that created it.
+             *     For other deployments, set to false. */
+            isDefault: components["schemas"]["IsDefaultDeployment"];
+            /** @enum {string} */
+            kind: "cloud";
+            /**
+             * Format: int64
+             * @description Timestamp in milliseconds of the last deploy to this deployment, if
+             *     any.
+             */
+            lastDeployTime?: number | null;
+            /** @description The readable identifier for this deployment, something like
+             *     playful-otter-123. */
+            name: string;
+            previewIdentifier?: null | components["schemas"]["PreviewDeploymentIdentifier"];
+            /** @description The project this deployment belongs to. */
+            projectId: components["schemas"]["ProjectId"];
+            /** @description An identifier that uniquely identifies this deployment within the
+             *     project. */
+            reference: components["schemas"]["DeploymentReference"];
+            /** @description The region where this deployment is hosted. */
+            region: components["schemas"]["RegionName"];
+            /** @description Whether to send function logs to the client. If `null`, the
+             *     deployment-type default is used (true for dev/preview, false for
+             *     prod). */
+            sendLogsToClient?: boolean | null;
+        } | {
+            /**
+             * Format: int64
+             * @description Timestamp in milliseconds when this deployment was created.
+             */
+            createTime: number;
+            /** @description The member who created this deployment. */
+            creator: components["schemas"]["MemberId"];
+            /** @description Whether this is a "dev" development deployment or "prod" production
+             *     deployment. Note that this will always be "dev" for local
+             *     deployments. */
+            deploymentType: components["schemas"]["DeploymentType"];
+            /** @description The device name where this local deployment is running. */
+            deviceName: components["schemas"]["DeviceName"];
+            /** @description Whether this local deployment is currently active. */
+            isActive: boolean;
+            /** @enum {string} */
+            kind: "local";
+            /** @description The readable identifier for this deployment. */
+            name: string;
+            /**
+             * Format: int32
+             * @description The port where this local deployment is running.
+             */
+            port: number;
+            previewIdentifier?: null | components["schemas"]["PreviewDeploymentIdentifier"];
+            /** @description The project this deployment belongs to. */
+            projectId: components["schemas"]["ProjectId"];
         };
+        PotentialVercelTeam: {
+            planId: string;
+            planName: string;
+            /** @description Human-readable description of billing impact when joining this team.
+             *     `None` for free plans. Clients should show this verbatim so CLI and
+             *     dashboard stay in sync on pricing copy. */
+            pricingNotice?: string | null;
+            teamId: components["schemas"]["TeamId"];
+            teamName: components["schemas"]["TeamName"];
+            teamSlug: components["schemas"]["TeamSlug"];
+        };
+        PreviewDeploymentIdentifier: string;
         ProfileEmailArgs: {
             email: string;
         };
         ProjectDetails: {
             /** Format: int64 */
             createTime: number;
+            devDeploymentName?: string | null;
             id: components["schemas"]["ProjectId"];
             isDemo: boolean;
             name: components["schemas"]["ProjectName"];
+            prodDeploymentName?: string | null;
             slug: components["schemas"]["ProjectSlug"];
             teamId: components["schemas"]["TeamId"];
+        };
+        /** @description Summary of a project WorkOS environment for list responses - slimmer than
+         *     full environment details, uses workos_ prefix for consistency with
+         *     deployment */
+        ProjectEnvironmentSummary: {
+            isProduction: boolean;
+            /** @description The user-provided environment name (e.g., "staging", "development") */
+            userEnvironmentName: string;
+            workosClientId: string;
+            workosEnvironmentId: string;
+            workosEnvironmentName: string;
         };
         /** Format: int64 */
         ProjectId: number;
@@ -1865,41 +2547,83 @@ export interface components {
             role?: null | components["schemas"]["ProjectRole"];
         };
         ProjectSlug: string;
+        ProjectsResponse: components["schemas"]["PaginatedProjectsResponse"] | components["schemas"]["ProjectDetails"][];
         ProposedTeamName: string;
-        ProvisionDeploymentDashboardArgs: {
-            deploymentType: components["schemas"]["DeploymentType"];
+        ProvisionEnvironmentResponse: {
+            apiKey: string;
+            clientId: string;
+            environmentId: string;
+            environmentName: string;
+            newlyProvisioned: boolean;
         };
-        ProvisionDeploymentDashboardResponse: {
-            deploymentName: string;
+        ProvisionProjectEnvironmentRequest: {
+            environmentName: string;
+            isProduction?: boolean | null;
         };
-        RecordTokensArgs: {
-            /** Format: int64 */
-            centitokens: number;
+        /** @description Response for provisioning a project WorkOS environment - matches
+         *     ProvisionEnvironmentResponse pattern with workos_ prefix for consistency */
+        ProvisionProjectEnvironmentResponse: {
+            newlyProvisioned: boolean;
+            /** @description The user-provided environment name (e.g., "staging", "development") */
+            userEnvironmentName: string;
+            workosApiKey: string;
+            workosClientId: string;
+            workosEnvironmentId: string;
+            workosEnvironmentName: string;
+        };
+        ProvisionWorkOSTeamRequest: {
+            /** @description Email address to use for the WorkOS team admin,
+             *     must be a verified email address associated with the user's account */
+            email: string;
+            /** @description Convex team ID, no WorkOS team exists at this point */
+            teamId: components["schemas"]["TeamId"];
+        };
+        ProvisionWorkOSTeamResponse: {
+            adminEmail: string;
+            workosTeamId: string;
+            workosTeamName: string;
         };
         ReferralCode: string;
         ReferralState: {
             referrals: components["schemas"]["TeamName"][];
             referredBy?: null | components["schemas"]["TeamName"];
         };
+        /** @enum {string} */
+        RegionName: "aws-us-east-1" | "aws-eu-west-1";
+        RegisterOauthAppArgs: {
+            appName: components["schemas"]["AppName"];
+            redirectUris: string[];
+        };
         RemoveMemberArgs: {
             memberId: components["schemas"]["MemberId"];
         };
-        RenameAccessTokenArgs: {
-            /** @description Authentication token is expected to be the access token from auth0 */
-            accessToken: string;
-            newName: components["schemas"]["DeviceName"];
+        RequestCloudBackupArgs: {
+            includeStorage: boolean;
         };
-        /** @enum {string} */
-        RequestDestination: "convexCloud" | "convexSite";
         RestoreFromCloudBackupArgs: {
             id: components["schemas"]["CloudBackupId"];
         };
         /** @enum {string} */
         Role: "admin" | "developer";
+        /** @enum {string} */
+        SSODomainState: "verified" | "pending" | "failed" | "legacyVerified";
+        SSOOrganizationDomain: {
+            domain: string;
+            id: string;
+            state: components["schemas"]["SSODomainState"];
+        };
+        SSOOrganizationResponse: {
+            /** Format: int64 */
+            createTime: number;
+            domains: components["schemas"]["SSOOrganizationDomain"][];
+            requireSsoLogin: boolean;
+        };
+        /** @enum {string} */
+        SSOPortalIntent: "sso" | "domainVerification" | "certificateRenewal";
         /** @description ConvexAccessToken is our own internal notion of authorization.
          *     It is versioned.
          *
-         *     V1 - uses an auth0_access_token for authorization.
+         *     V1 - uses an WorkOS access token for authorization.
          *
          *     Serialization is done by SerializedAccessToken::new
          *     The ConvexAccessToken is serialized (json) and base64
@@ -1913,7 +2637,7 @@ export interface components {
          *     left public.
          *
          *     The json is externally tagged. Expect it to look like
-         *     {"v1": "auth0token"} */
+         *     {"v1": "workostoken"} */
         SerializedAccessToken: string;
         SetSpendingLimitArgs: {
             /** Format: int64 */
@@ -1926,21 +2650,13 @@ export interface components {
         };
         /** @enum {string} */
         SpendingLimitsState: "Running" | "Disabled" | "Warning";
-        Team: {
-            creator?: null | components["schemas"]["MemberId"];
-            id: components["schemas"]["TeamId"];
-            managedBy?: string | null;
-            name: components["schemas"]["TeamName"];
-            referralCode: components["schemas"]["ReferralCode"];
-            referredBy?: null | components["schemas"]["TeamId"];
-            slug: components["schemas"]["TeamSlug"];
-            suspended: boolean;
-        };
         TeamAccessTokenResponse: {
             accessToken: string;
             /** Format: int64 */
             creationTime: number;
-            creator: components["schemas"]["MemberId"];
+            creator?: null | components["schemas"]["MemberId"];
+            /** Format: int64 */
+            expiresAt?: number | null;
             /** Format: int64 */
             lastUsedTime?: number | null;
             name: components["schemas"]["DeviceName"];
@@ -1952,20 +2668,25 @@ export interface components {
             start: string;
         };
         TeamEntitlementsResponse: {
-            auditLogsEnabled: boolean;
+            /** Format: int64 */
+            auditLogRetentionDays: number;
             customDomainsEnabled: boolean;
+            customRolesEnabled: boolean;
+            deploymentClassSelectionEnabled: boolean;
             logStreamingEnabled: boolean;
+            managementApiEnabled: boolean;
             /** Format: int64 */
             maxChefTokens: number;
             /** Format: int64 */
             maxCloudBackups: number;
             /** Format: int64 */
-            maxProjects: number;
+            maxDeployments: number;
             /** Format: int64 */
             maxTeamMembers: number;
             periodicBackupsEnabled: boolean;
             /** Format: int64 */
-            projectMaxPreviewDeployments: number;
+            previewDeploymentRetentionDays: number;
+            ssoEnabled: boolean;
             streamingExportEnabled: boolean;
             /** Format: int64 */
             teamMaxActionCompute: number;
@@ -1980,19 +2701,37 @@ export interface components {
             /** Format: int64 */
             teamMaxFunctionCalls: number;
             /** Format: int64 */
+            teamMaxSearchQueries: number;
+            /** Format: int64 */
             teamMaxVectorBandwidth: number;
             /** Format: int64 */
             teamMaxVectorStorage: number;
         };
         /** Format: int64 */
         TeamId: number;
-        TeamMemberResponse: {
+        TeamMember: {
+            /** @description The email of the team member */
             email: string;
             id: components["schemas"]["MemberId"];
+            /** @description The name of the team member */
             name?: string | null;
+            /** @description The role of the team member */
             role: components["schemas"]["Role"];
         };
         TeamName: string;
+        TeamResponse: {
+            creator?: null | components["schemas"]["MemberId"];
+            defaultRegion?: null | components["schemas"]["RegionName"];
+            id: components["schemas"]["TeamId"];
+            managedBy?: null | components["schemas"]["ManagedBy"];
+            managedByUrl?: string | null;
+            name: components["schemas"]["TeamName"];
+            referralCode: components["schemas"]["ReferralCode"];
+            referredBy?: null | components["schemas"]["TeamId"];
+            slug: components["schemas"]["TeamSlug"];
+            ssoLoginId?: string | null;
+            suspended: boolean;
+        };
         TeamSlug: string;
         TeamUsageStateResponse: {
             teamId: components["schemas"]["TeamId"];
@@ -2005,7 +2744,6 @@ export interface components {
             discordId: components["schemas"]["DiscordId"];
         };
         UnlinkIdentityRequest: {
-            provider: string;
             userId: string;
         };
         UpdateBillingAddressArgs: {
@@ -2026,6 +2764,10 @@ export interface components {
             memberId: components["schemas"]["MemberId"];
             role: components["schemas"]["Role"];
         };
+        UpdateOauthAppArgs: {
+            appName?: null | components["schemas"]["AppName"];
+            redirectUris?: string[] | null;
+        };
         UpdatePaymentMethodArgs: {
             paymentMethod: string;
         };
@@ -2039,7 +2781,11 @@ export interface components {
         UpdateProjectRolesArgs: {
             updates: components["schemas"]["ProjectRoleUpdateArg"][];
         };
+        UpdateSSORequest: {
+            requireSsoLogin?: boolean | null;
+        };
         UpdateTeamArgs: {
+            defaultRegion?: null | components["schemas"]["RegionName"];
             name?: null | components["schemas"]["ProposedTeamName"];
             slug?: null | components["schemas"]["TeamSlug"];
         };
@@ -2052,22 +2798,47 @@ export interface components {
             };
         } | "Invalid";
         Value: unknown;
-        VanityDomainRequestArgs: {
-            domain: string;
-            requestDestination: components["schemas"]["RequestDestination"];
+        WorkOSAssociatedTeam: {
+            convexTeamId: components["schemas"]["TeamId"];
+            creatorMemberId: components["schemas"]["MemberId"];
+            workosAdminEmail: string;
+            workosTeamId: string;
+            workosTeamName: string;
         };
-        VanityDomainResponse: {
-            /** Format: int64 */
-            creationTime: number;
-            /** @deprecated */
-            creationTs: string;
-            domain: string;
-            instanceName: components["schemas"]["InstanceName"];
-            requestDestination: components["schemas"]["RequestDestination"];
-            /** Format: int64 */
-            verificationTime?: number | null;
-            /** @deprecated */
-            verificationTs?: string | null;
+        WorkOSEnvironmentHealthResponse: {
+            clientId: string;
+            id: string;
+            name: string;
+        };
+        WorkOSEnvironmentInfo: {
+            deploymentName: string;
+            workosClientId: string;
+            workosEnvironmentId: string;
+            workosEnvironmentName: string;
+        };
+        /** @enum {string} */
+        WorkOSProductionState: "active" | "inactive" | "suspended" | "deleting";
+        WorkOSTeamAssociation: {
+            adminEmail: string;
+            creatorEmail: string;
+            creatorName?: string | null;
+            workosTeamId: string;
+            workosTeamName: string;
+        };
+        WorkOSTeamHealthResponse: {
+            teamInfo?: null | components["schemas"]["WorkOSTeamInfo"];
+            /** @description Whether a WorkOS team has been provisioned for this Convex team */
+            teamProvisioned: boolean;
+        };
+        WorkOSTeamInfo: {
+            id: string;
+            name: string;
+            productionState: components["schemas"]["WorkOSProductionState"];
+        };
+        WorkOSTeamIntegrationResponse: {
+            /** @description List of WorkOS environments for deployments */
+            environments: components["schemas"]["WorkOSEnvironmentInfo"][];
+            teamAssociation?: null | components["schemas"]["WorkOSTeamAssociation"];
         };
     };
     responses: never;
@@ -2086,95 +2857,132 @@ export type AuditLogAction = components['schemas']['AuditLogAction'];
 export type AuditLogActor = components['schemas']['AuditLogActor'];
 export type AuditLogEventResponse = components['schemas']['AuditLogEventResponse'];
 export type AuditLogResponse = components['schemas']['AuditLogResponse'];
-export type AuthIdentity = components['schemas']['AuthIdentity'];
+export type AuthIdentityResponse = components['schemas']['AuthIdentityResponse'];
 export type AuthorizeAppArgs = components['schemas']['AuthorizeAppArgs'];
 export type AuthorizeAppMode = components['schemas']['AuthorizeAppMode'];
 export type AuthorizeArgs = components['schemas']['AuthorizeArgs'];
 export type AuthorizeCodeResponse = components['schemas']['AuthorizeCodeResponse'];
 export type AuthorizeDiscordAccountRequest = components['schemas']['AuthorizeDiscordAccountRequest'];
 export type AuthorizeResponse = components['schemas']['AuthorizeResponse'];
+export type AvailableWorkOsTeamEmailsResponse = components['schemas']['AvailableWorkOSTeamEmailsResponse'];
 export type BillingContactResponse = components['schemas']['BillingContactResponse'];
 export type CancelInvitationArgs = components['schemas']['CancelInvitationArgs'];
+export type ChangeSubscriptionPlanArgs = components['schemas']['ChangeSubscriptionPlanArgs'];
+export type CheckOauthAppArgs = components['schemas']['CheckOauthAppArgs'];
+export type CheckProjectEnvironmentHealthRequest = components['schemas']['CheckProjectEnvironmentHealthRequest'];
 export type CloudBackupId = components['schemas']['CloudBackupId'];
 export type CloudBackupResponse = components['schemas']['CloudBackupResponse'];
+export type CloudDeploymentName = components['schemas']['CloudDeploymentName'];
 export type ConfigurePeriodicBackupArgs = components['schemas']['ConfigurePeriodicBackupArgs'];
 export type CreateInvitationArgs = components['schemas']['CreateInvitationArgs'];
 export type CreateProjectArgs = components['schemas']['CreateProjectArgs'];
 export type CreateProjectResponse = components['schemas']['CreateProjectResponse'];
 export type CreateSubscriptionArgs = components['schemas']['CreateSubscriptionArgs'];
 export type CreateTeamArgs = components['schemas']['CreateTeamArgs'];
-export type DeactivatePreviewDeploymentArgs = components['schemas']['DeactivatePreviewDeploymentArgs'];
 export type DeleteAccessTokenArgs = components['schemas']['DeleteAccessTokenArgs'];
+export type DeleteProjectEnvironmentRequest = components['schemas']['DeleteProjectEnvironmentRequest'];
+export type DeleteProjectEnvironmentResponse = components['schemas']['DeleteProjectEnvironmentResponse'];
 export type DeleteProjectsArgs = components['schemas']['DeleteProjectsArgs'];
+export type DeleteWorkOsEnvironmentRequest = components['schemas']['DeleteWorkOSEnvironmentRequest'];
+export type DeleteWorkOsEnvironmentResponse = components['schemas']['DeleteWorkOSEnvironmentResponse'];
 export type DeploymentId = components['schemas']['DeploymentId'];
+export type DeploymentReference = components['schemas']['DeploymentReference'];
 export type DeploymentResponse = components['schemas']['DeploymentResponse'];
 export type DeploymentType = components['schemas']['DeploymentType'];
+export type DeploymentWorkOsEnvironmentInfo = components['schemas']['DeploymentWorkOSEnvironmentInfo'];
+export type DeploymentWorkOsEnvironmentResponse = components['schemas']['DeploymentWorkOSEnvironmentResponse'];
 export type DeviceName = components['schemas']['DeviceName'];
+export type DisconnectWorkOsTeamRequest = components['schemas']['DisconnectWorkOSTeamRequest'];
+export type DisconnectWorkOsTeamResponse = components['schemas']['DisconnectWorkOSTeamResponse'];
 export type DiscordAccount = components['schemas']['DiscordAccount'];
 export type DiscordAccountDetails = components['schemas']['DiscordAccountDetails'];
 export type DiscordAccountsResponse = components['schemas']['DiscordAccountsResponse'];
 export type DiscordId = components['schemas']['DiscordId'];
 export type DiscordLoginUrlResponse = components['schemas']['DiscordLoginUrlResponse'];
 export type DiscountedPlanResponse = components['schemas']['DiscountedPlanResponse'];
+export type EnableSsoRequest = components['schemas']['EnableSSORequest'];
 export type EnvVariableConfigJson = components['schemas']['EnvVariableConfigJson'];
 export type EnvironmentVariableJson = components['schemas']['EnvironmentVariableJson'];
+export type GenerateSsoConfigurationLinkRequest = components['schemas']['GenerateSSOConfigurationLinkRequest'];
+export type GenerateSsoConfigurationLinkResponse = components['schemas']['GenerateSSOConfigurationLinkResponse'];
 export type GetCurrentSpendResponse = components['schemas']['GetCurrentSpendResponse'];
 export type GetOptInsResponse = components['schemas']['GetOptInsResponse'];
+export type GetOrProvisionEnvironmentRequest = components['schemas']['GetOrProvisionEnvironmentRequest'];
+export type GetProjectEnvironmentResponse = components['schemas']['GetProjectEnvironmentResponse'];
+export type GetProjectEnvironmentsResponse = components['schemas']['GetProjectEnvironmentsResponse'];
 export type GetSpendingLimitsResponse = components['schemas']['GetSpendingLimitsResponse'];
 export type GetTokenInfoResponse = components['schemas']['GetTokenInfoResponse'];
+export type HasAssociatedWorkOsTeamResponse = components['schemas']['HasAssociatedWorkOSTeamResponse'];
+export type HasFailedPaymentResponse = components['schemas']['HasFailedPaymentResponse'];
+export type IdentityResponse = components['schemas']['IdentityResponse'];
 export type InstanceAuthForDashboardInteractionsResponse = components['schemas']['InstanceAuthForDashboardInteractionsResponse'];
-export type InstanceName = components['schemas']['InstanceName'];
+export type InvitationEligibleEmailsResponse = components['schemas']['InvitationEligibleEmailsResponse'];
 export type InvitationResponse = components['schemas']['InvitationResponse'];
+export type InviteWorkOsTeamMemberRequest = components['schemas']['InviteWorkOSTeamMemberRequest'];
+export type InviteWorkOsTeamMemberResponse = components['schemas']['InviteWorkOSTeamMemberResponse'];
 export type InvoiceResponse = components['schemas']['InvoiceResponse'];
 export type InvoicesResponse = components['schemas']['InvoicesResponse'];
-export type LinkIdentityRequest = components['schemas']['LinkIdentityRequest'];
+export type IsDefaultDeployment = components['schemas']['IsDefaultDeployment'];
 export type ListEnvVariableResponse = components['schemas']['ListEnvVariableResponse'];
-export type ListVanityDomainsResponse = components['schemas']['ListVanityDomainsResponse'];
+export type ManagedBy = components['schemas']['ManagedBy'];
 export type MemberDataResponse = components['schemas']['MemberDataResponse'];
 export type MemberEmailId = components['schemas']['MemberEmailId'];
 export type MemberEmailResponse = components['schemas']['MemberEmailResponse'];
 export type MemberId = components['schemas']['MemberId'];
 export type MemberResponse = components['schemas']['MemberResponse'];
+export type OauthAppMetadata = components['schemas']['OauthAppMetadata'];
+export type OauthAppResponse = components['schemas']['OauthAppResponse'];
 export type OptIn = components['schemas']['OptIn'];
 export type OptInToAccept = components['schemas']['OptInToAccept'];
 export type OrbSubscriptionResponse = components['schemas']['OrbSubscriptionResponse'];
-export type PartitionId = components['schemas']['PartitionId'];
+export type PaginatedProjectsResponse = components['schemas']['PaginatedProjectsResponse'];
+export type PaginationMetadata = components['schemas']['PaginationMetadata'];
 export type PaymentMethodResponse = components['schemas']['PaymentMethodResponse'];
 export type PeriodicBackupConfig = components['schemas']['PeriodicBackupConfig'];
 export type PlanResponse = components['schemas']['PlanResponse'];
 export type PlansResponse = components['schemas']['PlansResponse'];
+export type PlatformDeploymentResponse = components['schemas']['PlatformDeploymentResponse'];
+export type PotentialVercelTeam = components['schemas']['PotentialVercelTeam'];
 export type PreviewDeploymentIdentifier = components['schemas']['PreviewDeploymentIdentifier'];
-export type ProfileData = components['schemas']['ProfileData'];
 export type ProfileEmailArgs = components['schemas']['ProfileEmailArgs'];
 export type ProjectDetails = components['schemas']['ProjectDetails'];
+export type ProjectEnvironmentSummary = components['schemas']['ProjectEnvironmentSummary'];
 export type ProjectId = components['schemas']['ProjectId'];
 export type ProjectMemberRoleResponse = components['schemas']['ProjectMemberRoleResponse'];
 export type ProjectName = components['schemas']['ProjectName'];
 export type ProjectRole = components['schemas']['ProjectRole'];
 export type ProjectRoleUpdateArg = components['schemas']['ProjectRoleUpdateArg'];
 export type ProjectSlug = components['schemas']['ProjectSlug'];
+export type ProjectsResponse = components['schemas']['ProjectsResponse'];
 export type ProposedTeamName = components['schemas']['ProposedTeamName'];
-export type ProvisionDeploymentDashboardArgs = components['schemas']['ProvisionDeploymentDashboardArgs'];
-export type ProvisionDeploymentDashboardResponse = components['schemas']['ProvisionDeploymentDashboardResponse'];
-export type RecordTokensArgs = components['schemas']['RecordTokensArgs'];
+export type ProvisionEnvironmentResponse = components['schemas']['ProvisionEnvironmentResponse'];
+export type ProvisionProjectEnvironmentRequest = components['schemas']['ProvisionProjectEnvironmentRequest'];
+export type ProvisionProjectEnvironmentResponse = components['schemas']['ProvisionProjectEnvironmentResponse'];
+export type ProvisionWorkOsTeamRequest = components['schemas']['ProvisionWorkOSTeamRequest'];
+export type ProvisionWorkOsTeamResponse = components['schemas']['ProvisionWorkOSTeamResponse'];
 export type ReferralCode = components['schemas']['ReferralCode'];
 export type ReferralState = components['schemas']['ReferralState'];
+export type RegionName = components['schemas']['RegionName'];
+export type RegisterOauthAppArgs = components['schemas']['RegisterOauthAppArgs'];
 export type RemoveMemberArgs = components['schemas']['RemoveMemberArgs'];
-export type RenameAccessTokenArgs = components['schemas']['RenameAccessTokenArgs'];
-export type RequestDestination = components['schemas']['RequestDestination'];
+export type RequestCloudBackupArgs = components['schemas']['RequestCloudBackupArgs'];
 export type RestoreFromCloudBackupArgs = components['schemas']['RestoreFromCloudBackupArgs'];
 export type Role = components['schemas']['Role'];
+export type SsoDomainState = components['schemas']['SSODomainState'];
+export type SsoOrganizationDomain = components['schemas']['SSOOrganizationDomain'];
+export type SsoOrganizationResponse = components['schemas']['SSOOrganizationResponse'];
+export type SsoPortalIntent = components['schemas']['SSOPortalIntent'];
 export type SerializedAccessToken = components['schemas']['SerializedAccessToken'];
 export type SetSpendingLimitArgs = components['schemas']['SetSpendingLimitArgs'];
 export type SetupIntentResponse = components['schemas']['SetupIntentResponse'];
 export type SpendingLimitsState = components['schemas']['SpendingLimitsState'];
-export type Team = components['schemas']['Team'];
 export type TeamAccessTokenResponse = components['schemas']['TeamAccessTokenResponse'];
 export type TeamCurrentBillingPeriodResponse = components['schemas']['TeamCurrentBillingPeriodResponse'];
 export type TeamEntitlementsResponse = components['schemas']['TeamEntitlementsResponse'];
 export type TeamId = components['schemas']['TeamId'];
-export type TeamMemberResponse = components['schemas']['TeamMemberResponse'];
+export type TeamMember = components['schemas']['TeamMember'];
 export type TeamName = components['schemas']['TeamName'];
+export type TeamResponse = components['schemas']['TeamResponse'];
 export type TeamSlug = components['schemas']['TeamSlug'];
 export type TeamUsageStateResponse = components['schemas']['TeamUsageStateResponse'];
 export type TransferProjectArgs = components['schemas']['TransferProjectArgs'];
@@ -2185,336 +2993,27 @@ export type UpdateBillingContactArgs = components['schemas']['UpdateBillingConta
 export type UpdateEnvironmentVariable = components['schemas']['UpdateEnvironmentVariable'];
 export type UpdateEnvironmentVariables = components['schemas']['UpdateEnvironmentVariables'];
 export type UpdateMemberRoleArgs = components['schemas']['UpdateMemberRoleArgs'];
+export type UpdateOauthAppArgs = components['schemas']['UpdateOauthAppArgs'];
 export type UpdatePaymentMethodArgs = components['schemas']['UpdatePaymentMethodArgs'];
 export type UpdateProfileNameArgs = components['schemas']['UpdateProfileNameArgs'];
 export type UpdateProjectArgs = components['schemas']['UpdateProjectArgs'];
 export type UpdateProjectRolesArgs = components['schemas']['UpdateProjectRolesArgs'];
+export type UpdateSsoRequest = components['schemas']['UpdateSSORequest'];
 export type UpdateTeamArgs = components['schemas']['UpdateTeamArgs'];
 export type UsageState = components['schemas']['UsageState'];
 export type ValidateReferralCodeResult = components['schemas']['ValidateReferralCodeResult'];
 export type Value = components['schemas']['Value'];
-export type VanityDomainRequestArgs = components['schemas']['VanityDomainRequestArgs'];
-export type VanityDomainResponse = components['schemas']['VanityDomainResponse'];
+export type WorkOsAssociatedTeam = components['schemas']['WorkOSAssociatedTeam'];
+export type WorkOsEnvironmentHealthResponse = components['schemas']['WorkOSEnvironmentHealthResponse'];
+export type WorkOsEnvironmentInfo = components['schemas']['WorkOSEnvironmentInfo'];
+export type WorkOsProductionState = components['schemas']['WorkOSProductionState'];
+export type WorkOsTeamAssociation = components['schemas']['WorkOSTeamAssociation'];
+export type WorkOsTeamHealthResponse = components['schemas']['WorkOSTeamHealthResponse'];
+export type WorkOsTeamInfo = components['schemas']['WorkOSTeamInfo'];
+export type WorkOsTeamIntegrationResponse = components['schemas']['WorkOSTeamIntegrationResponse'];
 export type $defs = Record<string, never>;
 export interface operations {
-    authorize_device: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AuthorizeArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AuthorizeResponse"];
-                };
-            };
-        };
-    };
-    authorize_app: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AuthorizeAppArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AuthorizeCodeResponse"];
-                };
-            };
-        };
-    };
-    get_cloud_backup: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                cloud_backup_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CloudBackupResponse"];
-                };
-            };
-        };
-    };
-    cancel_cloud_backup: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                cloud_backup_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    delete_cloud_backup: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                cloud_backup_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    create_project_and_provision_deployment: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateProjectArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CreateProjectResponse"];
-                };
-            };
-        };
-    };
-    delete_access_token: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DeleteAccessTokenArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    delete_account: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    dashboard_delete_project: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    dashboard_delete_projects: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DeleteProjectsArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    configure_periodic_backup: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ConfigurePeriodicBackupArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": null | components["schemas"]["PeriodicBackupConfig"];
-                };
-            };
-        };
-    };
-    disable_periodic_backup: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_periodic_backup_config: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": null | components["schemas"]["PeriodicBackupConfig"];
-                };
-            };
-        };
-    };
-    request_cloud_backup: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CloudBackupResponse"];
-                };
-            };
-        };
-    };
-    restore_from_cloud_backup: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RestoreFromCloudBackupArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_discord_accounts: {
+    list_profile_emails: {
         parameters: {
             query?: never;
             header?: never;
@@ -2528,309 +3027,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DiscordAccountsResponse"];
-                };
-            };
-        };
-    };
-    authorize_discord_account: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AuthorizeDiscordAccountRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_discord_login_url: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DiscordLoginUrlResponse"];
-                };
-            };
-        };
-    };
-    unlink_discord_account: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UnlinkDiscordAccountRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_deployment_access_tokens: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TeamAccessTokenResponse"][];
-                };
-            };
-        };
-    };
-    get_deployment_auth_dashboard: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InstanceAuthForDashboardInteractionsResponse"];
-                };
-            };
-        };
-    };
-    create_vanity_domain: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_name: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["VanityDomainRequestArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    delete_vanity_domain: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_name: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["VanityDomainRequestArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    list_vanity_domains_for_instance: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                deployment_name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListVanityDomainsResponse"];
-                };
-            };
-        };
-    };
-    accept_invitation: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                code: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Team"];
-                };
-            };
-        };
-    };
-    link_identity: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LinkIdentityRequest"];
-            };
-        };
-        responses: never;
-    };
-    list_identities: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AuthIdentity"][];
-                };
-            };
-        };
-    };
-    get_member_data: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MemberDataResponse"];
-                };
-            };
-        };
-    };
-    dashboard_get_opt_ins: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GetOptInsResponse"];
-                };
-            };
-        };
-    };
-    dashboard_accept_opt_ins: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["OptIn"][];
-            };
-        };
-        responses: {
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_profile: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MemberResponse"];
+                    "application/json": components["schemas"]["MemberEmailResponse"][];
                 };
             };
         };
@@ -2877,7 +3074,7 @@ export interface operations {
             };
         };
     };
-    list_profile_emails: {
+    get_member_data: {
         parameters: {
             query?: never;
             header?: never;
@@ -2891,7 +3088,26 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["MemberEmailResponse"][];
+                    "application/json": components["schemas"]["MemberDataResponse"];
+                };
+            };
+        };
+    };
+    get_profile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemberResponse"];
                 };
             };
         };
@@ -2938,6 +3154,27 @@ export interface operations {
             };
         };
     };
+    update_profile_name: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProfileNameArgs"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     verify_profile_email: {
         parameters: {
             query?: never;
@@ -2954,6 +3191,398 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    delete_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dashboard_get_opt_ins: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GetOptInsResponse"];
+                };
+            };
+        };
+    };
+    dashboard_accept_opt_ins: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OptIn"][];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_teams_for_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamResponse"][];
+                };
+            };
+        };
+    };
+    create_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTeamArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamResponse"];
+                };
+            };
+        };
+    };
+    get_members_for_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamMember"][];
+                };
+            };
+        };
+    };
+    remove_member_from_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoveMemberArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_team_entitlements: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamEntitlementsResponse"];
+                };
+            };
+        };
+    };
+    update_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateTeamArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    apply_referral_code: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApplyReferralCodeArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    validate_referral_code: {
+        parameters: {
+            query: {
+                code: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ValidateReferralCodeResult"];
+                };
+            };
+        };
+    };
+    get_referral_state_for_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReferralState"];
+                };
+            };
+        };
+    };
+    get_projects_for_team: {
+        parameters: {
+            query?: {
+                /** @description Cursor for pagination */
+                cursor?: string;
+                /** @description Maximum number of projects to return (defaults to 100) */
+                limit?: number;
+                /** @description Search query to filter projects by name or slug (case-insensitive) */
+                q?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectsResponse"];
+                };
+            };
+        };
+    };
+    get_project_by_slug: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: components["schemas"]["TeamId"];
+                /** @description Project slug */
+                project_slug: components["schemas"]["ProjectSlug"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDetails"];
+                };
+            };
+        };
+    };
+    get_team_usage_state: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamUsageStateResponse"];
+                };
+            };
+        };
+    };
+    unpause_deployments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_audit_log_events: {
+        parameters: {
+            query: {
+                from: number;
+                to: number;
+                memberId?: components["schemas"]["MemberId"];
+                action?: components["schemas"]["AuditLogAction"];
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditLogResponse"];
+                };
             };
         };
     };
@@ -3001,6 +3630,562 @@ export interface operations {
             };
         };
     };
+    dashboard_delete_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dashboard_delete_projects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteProjectsArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_project_and_provision_deployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateProjectResponse"];
+                };
+            };
+        };
+    };
+    transfer_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransferProjectArgs"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_deployment_auth_dashboard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstanceAuthForDashboardInteractionsResponse"];
+                };
+            };
+        };
+    };
+    get_deployment_by_id: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: components["schemas"]["TeamId"];
+                /** @description Can be a deployment's id (integer) or name (string) */
+                deployment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentResponse"];
+                };
+            };
+        };
+    };
+    update_member_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateMemberRoleArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_project_roles_for_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMemberRoleResponse"][];
+                };
+            };
+        };
+    };
+    update_project_roles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProjectRolesArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    request_cloud_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RequestCloudBackupArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CloudBackupResponse"];
+                };
+            };
+        };
+    };
+    restore_from_cloud_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RestoreFromCloudBackupArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_cloud_backups_by_deployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CloudBackupResponse"][];
+                };
+            };
+        };
+    };
+    delete_cloud_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                cloud_backup_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_cloud_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                cloud_backup_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CloudBackupResponse"];
+                };
+            };
+        };
+    };
+    cancel_cloud_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                cloud_backup_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    get_periodic_backup_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": null | components["schemas"]["PeriodicBackupConfig"];
+                };
+            };
+        };
+    };
+    configure_periodic_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfigurePeriodicBackupArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": null | components["schemas"]["PeriodicBackupConfig"];
+                };
+            };
+        };
+    };
+    disable_periodic_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_discord_accounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiscordAccountsResponse"];
+                };
+            };
+        };
+    };
+    get_discord_login_url: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiscordLoginUrlResponse"];
+                };
+            };
+        };
+    };
+    authorize_discord_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthorizeDiscordAccountRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unlink_discord_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnlinkDiscordAccountRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_access_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteAccessTokenArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_team_access_tokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamAccessTokenResponse"][];
+                };
+            };
+        };
+    };
+    get_team_app_access_tokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppAccessTokenResponse"][];
+                };
+            };
+        };
+    };
+    get_deployment_access_tokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamAccessTokenResponse"][];
+                };
+            };
+        };
+    };
     get_project_access_tokens: {
         parameters: {
             query?: never;
@@ -3043,236 +4228,6 @@ export interface operations {
             };
         };
     };
-    deactivate_preview_deployment: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DeactivatePreviewDeploymentArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    list_environment_variables: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ListEnvVariableResponse"];
-                };
-            };
-        };
-    };
-    update_environment_variables: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateEnvironmentVariables"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    list_deployments_for_project: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeploymentResponse"][];
-                };
-            };
-        };
-    };
-    list_preview_deployments_for_project: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeploymentResponse"][];
-                };
-            };
-        };
-    };
-    provision_deployment_dashboard: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProvisionDeploymentDashboardArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ProvisionDeploymentDashboardResponse"];
-                };
-            };
-        };
-    };
-    transfer_project: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                project_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TransferProjectArgs"];
-            };
-        };
-        responses: {
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    rename_access_token: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RenameAccessTokenArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    set_jwt_cookie: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: never;
-    };
-    get_teams_for_member: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Team"][];
-                };
-            };
-        };
-    };
-    create_team: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateTeamArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Team"];
-                };
-            };
-        };
-    };
     delete_team_access_token: {
         parameters: {
             query?: never;
@@ -3294,330 +4249,48 @@ export interface operations {
             };
         };
     };
-    update_team: {
+    authorize_device: {
         parameters: {
             query?: never;
             header?: never;
-            path: {
-                team_id: string;
-            };
+            path?: never;
             cookie?: never;
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["UpdateTeamArgs"];
+                "application/json": components["schemas"]["AuthorizeArgs"];
             };
         };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_team_access_tokens: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
         responses: {
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TeamAccessTokenResponse"][];
+                    "application/json": components["schemas"]["AuthorizeResponse"];
                 };
             };
         };
     };
-    apply_referral_code: {
+    authorize_app: {
         parameters: {
             query?: never;
             header?: never;
-            path: {
-                team_id: string;
-            };
+            path?: never;
             cookie?: never;
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ApplyReferralCodeArgs"];
+                "application/json": components["schemas"]["AuthorizeAppArgs"];
             };
         };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    cancel_orb_subscription: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    create_setup_intent: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
         responses: {
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SetupIntentResponse"];
-                };
-            };
-        };
-    };
-    create_subscription: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateSubscriptionArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    delete_team: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_deployment_by_id: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: components["schemas"]["TeamId"];
-                /** @description Can be a deployment's id (integer) or name (string) */
-                deployment_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeploymentResponse"];
-                };
-            };
-        };
-    };
-    get_audit_log_events: {
-        parameters: {
-            query: {
-                from: number;
-                to: number;
-                memberId?: components["schemas"]["MemberId"];
-                action?: components["schemas"]["AuditLogAction"];
-                limit?: number;
-                cursor?: string;
-            };
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AuditLogResponse"];
-                };
-            };
-        };
-    };
-    get_current_spend: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GetCurrentSpendResponse"];
-                };
-            };
-        };
-    };
-    get_discounted_plan: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-                plan_id: string;
-                promo_code: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DiscountedPlanResponse"];
-                };
-            };
-        };
-    };
-    get_team_entitlements: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TeamEntitlementsResponse"];
-                };
-            };
-        };
-    };
-    get_orb_subscription: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": null | components["schemas"]["OrbSubscriptionResponse"];
-                };
-            };
-        };
-    };
-    get_project_roles_for_team: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ProjectMemberRoleResponse"][];
-                };
-            };
-        };
-    };
-    get_spending_limits: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GetSpendingLimitsResponse"];
+                    "application/json": components["schemas"]["AuthorizeCodeResponse"];
                 };
             };
         };
@@ -3689,6 +4362,136 @@ export interface operations {
             };
         };
     };
+    accept_invitation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamResponse"];
+                };
+            };
+        };
+    };
+    cancel_orb_subscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    change_subscription_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangeSubscriptionPlanArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_subscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateSubscriptionArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_discounted_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+                plan_id: string;
+                promo_code: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiscountedPlanResponse"];
+                };
+            };
+        };
+    };
+    get_orb_subscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": null | components["schemas"]["OrbSubscriptionResponse"];
+                };
+            };
+        };
+    };
     list_active_plans: {
         parameters: {
             query?: never;
@@ -3706,27 +4509,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlansResponse"];
-                };
-            };
-        };
-    };
-    list_cloud_backups: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CloudBackupResponse"][];
                 };
             };
         };
@@ -3752,7 +4534,7 @@ export interface operations {
             };
         };
     };
-    get_members_for_team: {
+    has_failed_payment: {
         parameters: {
             query?: never;
             header?: never;
@@ -3768,115 +4550,8 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TeamMemberResponse"][];
+                    "application/json": components["schemas"]["HasFailedPaymentResponse"];
                 };
-            };
-        };
-    };
-    get_projects_for_team: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ProjectDetails"][];
-                };
-            };
-        };
-    };
-    get_referral_state_for_team: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ReferralState"];
-                };
-            };
-        };
-    };
-    remove_member_from_team: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RemoveMemberArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    set_spending_limit: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SetSpendingLimitArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    unpause_deployments: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
             };
         };
     };
@@ -3945,29 +4620,6 @@ export interface operations {
             };
         };
     };
-    update_member_role: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateMemberRoleArgs"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
     update_payment_method: {
         parameters: {
             query?: never;
@@ -3991,7 +4643,28 @@ export interface operations {
             };
         };
     };
-    update_project_roles: {
+    create_setup_intent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupIntentResponse"];
+                };
+            };
+        };
+    };
+    set_spending_limit: {
         parameters: {
             query?: never;
             header?: never;
@@ -4002,7 +4675,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["UpdateProjectRolesArgs"];
+                "application/json": components["schemas"]["SetSpendingLimitArgs"];
             };
         };
         responses: {
@@ -4011,6 +4684,124 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    get_current_spend: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GetCurrentSpendResponse"];
+                };
+            };
+        };
+    };
+    get_spending_limits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GetSpendingLimitsResponse"];
+                };
+            };
+        };
+    };
+    list_environment_variables: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListEnvVariableResponse"];
+                };
+            };
+        };
+    };
+    update_environment_variables: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateEnvironmentVariables"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    query_usage_databricks: {
+        parameters: {
+            query: {
+                /** @description Uuid of a databricks query */
+                queryId: string;
+                from?: string;
+                to?: string;
+                projectId?: components["schemas"]["ProjectId"];
+                /** @description Required for insights queries; ignored otherwise. */
+                deploymentName?: components["schemas"]["CloudDeploymentName"];
+                componentPath?: string;
+                udfId?: string;
+                tableName?: string;
+            };
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": (string | null)[][];
+                };
             };
         };
     };
@@ -4035,61 +4826,12 @@ export interface operations {
             };
         };
     };
-    query_usage_databricks: {
-        parameters: {
-            query: {
-                /** @description Uuid of a databricks query */
-                queryId: string;
-                from?: string;
-                to?: string;
-                projectId?: components["schemas"]["ProjectId"];
-                deploymentName?: components["schemas"]["InstanceName"];
-                componentPath?: string;
-                udfId?: string;
-                tableName?: string;
-            };
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": string[][];
-                };
-            };
-        };
-    };
-    get_team_usage_state: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TeamUsageStateResponse"];
-                };
-            };
-        };
-    };
     get_token_info: {
         parameters: {
-            query?: never;
+            query?: {
+                from?: string;
+                to?: string;
+            };
             header?: never;
             path: {
                 team_slug: string;
@@ -4097,31 +4839,6 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GetTokenInfoResponse"];
-                };
-            };
-        };
-    };
-    record_tokens: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                team_slug: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RecordTokensArgs"];
-            };
-        };
         responses: {
             200: {
                 headers: {
@@ -4147,32 +4864,9 @@ export interface operations {
         };
         responses: never;
     };
-    update_profile_name: {
+    list_identities: {
         parameters: {
             query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateProfileNameArgs"];
-            };
-        };
-        responses: {
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    validate_referral_code: {
-        parameters: {
-            query: {
-                code: string;
-            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -4184,7 +4878,703 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ValidateReferralCodeResult"];
+                    "application/json": components["schemas"]["AuthIdentityResponse"][];
+                };
+            };
+        };
+    };
+    identities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityResponse"][];
+                };
+            };
+        };
+    };
+    list_oauth_apps_for_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthAppResponse"][];
+                };
+            };
+        };
+    };
+    check_oauth_app: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CheckOauthAppArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthAppResponse"];
+                };
+            };
+        };
+    };
+    register_oauth_app: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterOauthAppArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthAppResponse"];
+                };
+            };
+        };
+    };
+    update_oauth_app: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: components["schemas"]["TeamId"];
+                /** @description The client ID of the OAuth app to update */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateOauthAppArgs"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthAppResponse"];
+                };
+            };
+        };
+    };
+    delete_oauth_app: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: components["schemas"]["TeamId"];
+                /** @description The client ID of the OAuth app to delete */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    regenerate_oauth_client_secret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: components["schemas"]["TeamId"];
+                /** @description The client ID of the OAuth app to regenerate the secret for */
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_workos_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteWorkOSEnvironmentRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteWorkOSEnvironmentResponse"];
+                };
+            };
+        };
+    };
+    disconnect_workos_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DisconnectWorkOSTeamRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DisconnectWorkOSTeamResponse"];
+                };
+            };
+        };
+    };
+    get_available_workos_team_emails: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AvailableWorkOSTeamEmailsResponse"];
+                };
+            };
+        };
+    };
+    get_deployment_workos_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                deployment_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentWorkOSEnvironmentResponse"];
+                };
+            };
+        };
+    };
+    get_has_associated_workos_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Deployment name */
+                deployment_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HasAssociatedWorkOSTeamResponse"];
+                };
+            };
+        };
+    };
+    get_or_provision_workos_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GetOrProvisionEnvironmentRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionEnvironmentResponse"];
+                };
+            };
+        };
+    };
+    get_team_workos_integration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkOSTeamIntegrationResponse"];
+                };
+            };
+        };
+    };
+    get_workos_environment_health: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Deployment name */
+                deployment_name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkOSEnvironmentHealthResponse"];
+                };
+            };
+        };
+    };
+    get_workos_invitation_eligible_emails: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Convex team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InvitationEligibleEmailsResponse"];
+                };
+            };
+        };
+    };
+    get_workos_team_health: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Convex team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkOSTeamHealthResponse"];
+                };
+            };
+        };
+    };
+    invite_workos_team_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InviteWorkOSTeamMemberRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InviteWorkOSTeamMemberResponse"];
+                };
+            };
+        };
+    };
+    provision_associated_workos_team: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProvisionWorkOSTeamRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionWorkOSTeamResponse"];
+                };
+            };
+        };
+    };
+    get_project_workos_environments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GetProjectEnvironmentsResponse"];
+                };
+            };
+        };
+    };
+    provision_project_workos_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProvisionProjectEnvironmentRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionProjectEnvironmentResponse"];
+                };
+            };
+        };
+    };
+    get_project_workos_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: number;
+                client_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GetProjectEnvironmentResponse"];
+                };
+            };
+        };
+    };
+    delete_project_environment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteProjectEnvironmentRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteProjectEnvironmentResponse"];
+                };
+            };
+        };
+    };
+    check_project_environment_health: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CheckProjectEnvironmentHealthRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkOSEnvironmentHealthResponse"];
+                };
+            };
+        };
+    };
+    enable_sso: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EnableSSORequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SSOOrganizationResponse"];
+                };
+            };
+        };
+    };
+    get_sso: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": null | components["schemas"]["SSOOrganizationResponse"];
+                };
+            };
+        };
+    };
+    disable_sso: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_sso: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateSSORequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    generate_sso_configuration_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerateSSOConfigurationLinkRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenerateSSOConfigurationLinkResponse"];
+                };
+            };
+        };
+    };
+    list_potential_vercel_teams_dashboard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PotentialVercelTeam"][];
+                };
+            };
+        };
+    };
+    join_vercel_team_dashboard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The Convex team to join */
+                proposed_team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamResponse"];
                 };
             };
         };

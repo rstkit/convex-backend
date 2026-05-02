@@ -68,14 +68,14 @@ pub async fn start_beacon(
             let mut uuid = globals.id().to_string();
             let mut extra_fields = JsonValue::Null;
 
-            if let Some(fields) = beacon_fields.clone() {
-                if let Ok(parsed_fields) = serde_json::from_value::<BeaconFields>(fields) {
-                    if let Some(override_uuid) = parsed_fields.override_uuid {
-                        uuid = override_uuid;
-                    }
-                    if let Some(f) = parsed_fields.fields {
-                        extra_fields = f;
-                    }
+            if let Some(fields) = beacon_fields.clone()
+                && let Ok(parsed_fields) = serde_json::from_value::<BeaconFields>(fields)
+            {
+                if let Some(override_uuid) = parsed_fields.override_uuid {
+                    uuid = override_uuid;
+                }
+                if let Some(f) = parsed_fields.fields {
+                    extra_fields = f;
                 }
             }
 
@@ -95,7 +95,8 @@ pub async fn start_beacon(
                 tracing::info!(
                     "Beacon request with json {sent_json} sent successfully to {url}. This \
                      anonymized data is used to help Convex understand and improve the product. \
-                     You can disable this telemetry by setting the --disable-beacon flag."
+                     You can disable this telemetry by setting the --disable-beacon flag or the \
+                     DISABLE_BEACON environment variable."
                 );
             } else {
                 tracing::warn!("Beacon request failed with status: {}", response.status());

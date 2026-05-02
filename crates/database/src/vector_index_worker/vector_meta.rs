@@ -1,5 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    ops::RangeToInclusive,
     path::PathBuf,
     sync::Arc,
 };
@@ -8,11 +12,10 @@ use async_trait::async_trait;
 use common::{
     bootstrap_model::index::{
         vector_index::{
-            DeveloperVectorIndexConfig,
             FragmentedVectorSegment,
-            VectorIndexBackfillState,
             VectorIndexSnapshot,
             VectorIndexSnapshotData,
+            VectorIndexSpec,
             VectorIndexState,
         },
         IndexConfig,
@@ -22,17 +25,30 @@ use common::{
         ParsedDocument,
         ResolvedDocument,
     },
+    index::{
+        IndexKey,
+        IndexKeyBytes,
+    },
     persistence::{
         DocumentStream,
         RepeatablePersistence,
+        TimestampRange,
     },
+    query::Order,
     runtime::{
         try_join_buffer_unordered,
+        RateLimiter,
         Runtime,
     },
-    types::IndexId,
+    types::{
+        IndexId,
+        SearchIndexMetricLabels,
+    },
 };
-use futures::TryStreamExt;
+use futures::{
+    StreamExt,
+    TryStreamExt,
+};
 use search::{
     disk_index::upload_vector_segment,
     fragmented_segment::{
@@ -44,36 +60,37 @@ use search::{
 };
 use storage::Storage;
 use sync_types::Timestamp;
+use value::{
+    DeveloperDocumentId,
+    TableNumber,
+    TabletId,
+};
 use vector::{
     qdrant_segments::VectorDiskSegmentValues,
     QdrantSchema,
 };
 
 use crate::{
-    index_workers::{
-        index_meta::{
-            BackfillState,
-            SearchIndex,
-            SearchIndexConfig,
-            SearchOnDiskState,
-            SearchSnapshot,
-            SegmentStatistics,
-            SegmentType,
-            SnapshotData,
-        },
-        search_flusher::MultipartBuildType,
+    search_index_workers::index_meta::{
+        SearchIndex,
+        SearchIndexConfig,
+        SearchOnDiskState,
+        SearchSnapshot,
+        SegmentStatistics,
+        SegmentType,
+        SnapshotData,
     },
+    Database,
     Snapshot,
 };
 
 impl From<VectorIndexState> for SearchOnDiskState<VectorSearchIndex> {
     fn from(value: VectorIndexState) -> Self {
         match value {
-            VectorIndexState::Backfilling(backfill_state) => {
-                SearchOnDiskState::Backfilling(backfill_state.into())
-            },
-            VectorIndexState::Backfilled(snapshot) => {
-                SearchOnDiskState::Backfilled(snapshot.into())
+            VectorIndexState::Backfilling(state) => SearchOnDiskState::Backfilling(state),
+            VectorIndexState::Backfilled { snapshot, staged } => SearchOnDiskState::Backfilled {
+                snapshot: snapshot.into(),
+                staged,
             },
             VectorIndexState::SnapshottedAt(snapshot) => {
                 SearchOnDiskState::SnapshottedAt(snapshot.into())
@@ -82,15 +99,16 @@ impl From<VectorIndexState> for SearchOnDiskState<VectorSearchIndex> {
     }
 }
 
-impl TryFrom<SearchOnDiskState<VectorSearchIndex>> for VectorIndexState {
-    type Error = anyhow::Error;
-
-    fn try_from(value: SearchOnDiskState<VectorSearchIndex>) -> anyhow::Result<Self> {
-        Ok(match value {
-            SearchOnDiskState::Backfilling(state) => Self::Backfilling(state.into()),
-            SearchOnDiskState::Backfilled(snapshot) => Self::Backfilled(snapshot.try_into()?),
-            SearchOnDiskState::SnapshottedAt(snapshot) => Self::SnapshottedAt(snapshot.try_into()?),
-        })
+impl From<SearchOnDiskState<VectorSearchIndex>> for VectorIndexState {
+    fn from(value: SearchOnDiskState<VectorSearchIndex>) -> Self {
+        match value {
+            SearchOnDiskState::Backfilling(state) => Self::Backfilling(state),
+            SearchOnDiskState::Backfilled { snapshot, staged } => Self::Backfilled {
+                snapshot: snapshot.into(),
+                staged,
+            },
+            SearchOnDiskState::SnapshottedAt(snapshot) => Self::SnapshottedAt(snapshot.into()),
+        }
     }
 }
 
@@ -109,7 +127,7 @@ impl SegmentType<VectorSearchIndex> for FragmentedVectorSegment {
 
     fn total_size_bytes(
         &self,
-        config: &<VectorSearchIndex as SearchIndex>::DeveloperConfig,
+        config: &<VectorSearchIndex as SearchIndex>::Spec,
     ) -> anyhow::Result<u64> {
         self.total_size_bytes(config.dimensions)
     }
@@ -134,24 +152,25 @@ pub struct BuildVectorIndexArgs {
 #[async_trait]
 impl SearchIndex for VectorSearchIndex {
     type BuildIndexArgs = BuildVectorIndexArgs;
-    type DeveloperConfig = DeveloperVectorIndexConfig;
+    type DocStream<'a> = DocumentStream<'a>;
     type NewSegment = VectorDiskSegmentValues;
     type PreviousSegments = PreviousVectorSegments;
     type Schema = QdrantSchema;
     type Segment = FragmentedVectorSegment;
+    type Spec = VectorIndexSpec;
     type Statistics = VectorStatistics;
 
-    fn get_config(config: IndexConfig) -> Option<SearchIndexConfig<Self>> {
+    fn get_config(config: &IndexConfig) -> Option<SearchIndexConfig<Self>> {
         let IndexConfig::Vector {
             on_disk_state,
-            developer_config,
+            spec,
         } = config
         else {
             return None;
         };
         Some(SearchIndexConfig {
-            developer_config,
-            on_disk_state: SearchOnDiskState::from(on_disk_state),
+            spec: spec.clone(),
+            on_disk_state: SearchOnDiskState::from(on_disk_state.clone()),
         })
     }
 
@@ -166,7 +185,7 @@ impl SearchIndex for VectorSearchIndex {
         snapshot.data.is_version_current()
     }
 
-    fn new_schema(config: &Self::DeveloperConfig) -> Self::Schema {
+    fn new_schema(config: &Self::Spec) -> Self::Schema {
         QdrantSchema::new(config)
     }
 
@@ -202,17 +221,58 @@ impl SearchIndex for VectorSearchIndex {
         schema.estimate_vector_size() as u64
     }
 
+    fn load_doc_stream<'a, RT: Runtime>(
+        database: &'a Database<RT>,
+        tablet_id: TabletId,
+        range: TimestampRange,
+        order: Order,
+        rate_limiter: &'a RateLimiter<RT>,
+    ) -> DocumentStream<'a> {
+        database.load_documents_in_table(tablet_id, range, order, rate_limiter)
+    }
+
+    fn table_scan_stream_to_doc_stream<'a>(documents: DocumentStream<'a>) -> DocumentStream<'a> {
+        documents
+    }
+
+    fn walk_document_log_for_updates<'a>(
+        scan_doc_stream: DocumentStream<'a>,
+        reader: &'a RepeatablePersistence,
+        tablet_id: TabletId,
+        table_number: TableNumber,
+        range: TimestampRange,
+        filter_id_range: RangeToInclusive<IndexKeyBytes>,
+    ) -> DocumentStream<'a> {
+        let mut documents_seen = BTreeSet::new();
+        let log_stream = reader
+            .load_documents_from_table(tablet_id, range, Order::Desc)
+            .try_filter(move |entry| {
+                let doc_id_index_key = IndexKey::new(
+                    vec![],
+                    DeveloperDocumentId::new(table_number, entry.id.internal_id()),
+                );
+                let in_range = filter_id_range.contains(&doc_id_index_key.to_bytes());
+                let duplicate = documents_seen.contains(&entry.id);
+                if in_range && !duplicate {
+                    documents_seen.insert(entry.id);
+                    futures::future::ready(true)
+                } else {
+                    futures::future::ready(false)
+                }
+            })
+            .boxed();
+        scan_doc_stream.chain(log_stream).boxed()
+    }
+
     async fn build_disk_index(
         schema: &Self::Schema,
         index_path: &PathBuf,
         documents: DocumentStream<'_>,
-        _reader: RepeatablePersistence,
         previous_segments: &mut Self::PreviousSegments,
         _document_log_lower_bound: Option<Timestamp>,
         BuildVectorIndexArgs {
             full_scan_threshold_bytes,
         }: Self::BuildIndexArgs,
-        _multipart_build_type: MultipartBuildType,
     ) -> anyhow::Result<Option<Self::NewSegment>> {
         schema
             .build_disk_index(
@@ -234,29 +294,26 @@ impl SearchIndex for VectorSearchIndex {
 
     fn extract_metadata(
         metadata: ParsedDocument<TabletIndexMetadata>,
-    ) -> anyhow::Result<(Self::DeveloperConfig, SearchOnDiskState<Self>)> {
-        let (on_disk_state, developer_config) = match metadata.into_value().config {
+    ) -> anyhow::Result<(Self::Spec, SearchOnDiskState<Self>)> {
+        let (on_disk_state, spec) = match metadata.into_value().config {
             IndexConfig::Database { .. } | IndexConfig::Text { .. } => {
                 anyhow::bail!("Index type changed!");
             },
             IndexConfig::Vector {
                 on_disk_state,
-                developer_config,
-            } => (on_disk_state, developer_config),
+                spec,
+            } => (on_disk_state, spec),
         };
 
-        Ok((developer_config, SearchOnDiskState::from(on_disk_state)))
+        Ok((spec, SearchOnDiskState::from(on_disk_state)))
     }
 
-    fn new_index_config(
-        developer_config: Self::DeveloperConfig,
-        new_state: SearchOnDiskState<Self>,
-    ) -> anyhow::Result<IndexConfig> {
-        let on_disk_state = VectorIndexState::try_from(new_state)?;
-        Ok(IndexConfig::Vector {
+    fn new_index_config(spec: Self::Spec, new_state: SearchOnDiskState<Self>) -> IndexConfig {
+        let on_disk_state = VectorIndexState::from(new_state);
+        IndexConfig::Vector {
             on_disk_state,
-            developer_config,
-        })
+            spec,
+        }
     }
 
     fn search_type() -> SearchType {
@@ -266,7 +323,7 @@ impl SearchIndex for VectorSearchIndex {
     async fn execute_compaction(
         searcher: Arc<dyn Searcher>,
         search_storage: Arc<dyn Storage>,
-        config: &Self::DeveloperConfig,
+        config: &Self::Spec,
         segments: Vec<Self::Segment>,
     ) -> anyhow::Result<Self::Segment> {
         let protos: Vec<pb::searchlight::FragmentedVectorSegmentPaths> = segments
@@ -274,14 +331,18 @@ impl SearchIndex for VectorSearchIndex {
             .map(|segment| segment.to_paths_proto())
             .collect::<anyhow::Result<Vec<_>>>()?;
         searcher
-            .execute_vector_compaction(search_storage, protos, config.dimensions.into())
+            .execute_vector_compaction(
+                search_storage,
+                protos,
+                config.dimensions.into(),
+                SearchIndexMetricLabels::unknown(),
+            )
             .await
     }
 
     async fn merge_deletes(
         previous_segments: &mut Self::PreviousSegments,
         mut documents: DocumentStream<'_>,
-        _repeatable_persistence: &RepeatablePersistence,
         _build_index_args: Self::BuildIndexArgs,
         _schema: Self::Schema,
         _document_log_lower_bound: Timestamp,
@@ -320,26 +381,6 @@ impl SegmentStatistics for VectorStatistics {
     }
 }
 
-impl From<VectorIndexBackfillState> for BackfillState<VectorSearchIndex> {
-    fn from(value: VectorIndexBackfillState) -> Self {
-        Self {
-            segments: value.segments,
-            cursor: value.cursor,
-            backfill_snapshot_ts: value.backfill_snapshot_ts,
-        }
-    }
-}
-
-impl From<BackfillState<VectorSearchIndex>> for VectorIndexBackfillState {
-    fn from(value: BackfillState<VectorSearchIndex>) -> Self {
-        Self {
-            segments: value.segments,
-            cursor: value.cursor,
-            backfill_snapshot_ts: value.backfill_snapshot_ts,
-        }
-    }
-}
-
 impl From<VectorIndexSnapshot> for SearchSnapshot<VectorSearchIndex> {
     fn from(snapshot: VectorIndexSnapshot) -> Self {
         Self {
@@ -349,15 +390,12 @@ impl From<VectorIndexSnapshot> for SearchSnapshot<VectorSearchIndex> {
     }
 }
 
-// TODO(CX-6589): Make this infallible
-impl TryFrom<SearchSnapshot<VectorSearchIndex>> for VectorIndexSnapshot {
-    type Error = anyhow::Error;
-
-    fn try_from(value: SearchSnapshot<VectorSearchIndex>) -> anyhow::Result<Self> {
-        Ok(VectorIndexSnapshot {
-            data: value.data.try_into()?,
+impl From<SearchSnapshot<VectorSearchIndex>> for VectorIndexSnapshot {
+    fn from(value: SearchSnapshot<VectorSearchIndex>) -> Self {
+        VectorIndexSnapshot {
+            data: value.data.into(),
             ts: value.ts,
-        })
+        }
     }
 }
 
@@ -370,14 +408,11 @@ impl From<VectorIndexSnapshotData> for SnapshotData<FragmentedVectorSegment> {
     }
 }
 
-// TODO(CX-6589): Make this infallible
-impl TryFrom<SnapshotData<FragmentedVectorSegment>> for VectorIndexSnapshotData {
-    type Error = anyhow::Error;
-
-    fn try_from(value: SnapshotData<FragmentedVectorSegment>) -> anyhow::Result<Self> {
-        Ok(match value {
+impl From<SnapshotData<FragmentedVectorSegment>> for VectorIndexSnapshotData {
+    fn from(value: SnapshotData<FragmentedVectorSegment>) -> Self {
+        match value {
             SnapshotData::Unknown(obj) => Self::Unknown(obj),
             SnapshotData::MultiSegment(data) => Self::MultiSegment(data),
-        })
+        }
     }
 }

@@ -15,7 +15,6 @@ use sync_types::Timestamp;
 use value::codegen_convex_serialization;
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 /// The export state machine. A new export starts as `Requested` and the valid
 /// transitions are:
 ///
@@ -47,6 +46,7 @@ pub enum Export {
         /// Expiration timestamp in nanos
         expiration_ts: u64,
         progress_message: Option<String>,
+        resumption_token: Option<serde_json::Map<String, serde_json::Value>>,
     },
     Completed {
         /// Timestamp for the successful (final) attempt at Export.
@@ -61,6 +61,7 @@ pub enum Export {
         format: ExportFormat,
         component: ComponentId,
         requestor: ExportRequestor,
+        size: u64,
     },
     Failed {
         /// Timestamp for the failed (final) attempt at Export.
@@ -99,6 +100,8 @@ pub enum SerializedExport {
         requestor: String,
         expiration_ts: i64,
         progress_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resumption_token: Option<serde_json::Map<String, serde_json::Value>>,
     },
     Completed {
         start_ts: u64,
@@ -108,6 +111,8 @@ pub enum SerializedExport {
         format: SerializedExportFormat,
         component: Option<String>,
         requestor: String,
+        #[serde(default)] // 0-default for backward compatibility
+        size: i64,
     },
     Failed {
         start_ts: u64,
@@ -150,6 +155,7 @@ impl TryFrom<Export> for SerializedExport {
                 expiration_ts,
                 requestor,
                 progress_message,
+                resumption_token,
             } => SerializedExport::InProgress {
                 start_ts: start_ts.into(),
                 format: format.into(),
@@ -157,6 +163,7 @@ impl TryFrom<Export> for SerializedExport {
                 requestor: requestor.to_string(),
                 expiration_ts: expiration_ts as i64,
                 progress_message,
+                resumption_token,
             },
             Export::Completed {
                 start_ts,
@@ -166,6 +173,7 @@ impl TryFrom<Export> for SerializedExport {
                 format,
                 component,
                 requestor,
+                size,
             } => SerializedExport::Completed {
                 start_ts: start_ts.into(),
                 complete_ts: complete_ts.into(),
@@ -174,6 +182,7 @@ impl TryFrom<Export> for SerializedExport {
                 format: format.into(),
                 component: component.serialize_to_string(),
                 requestor: requestor.to_string(),
+                size: size as i64,
             },
             Export::Failed {
                 start_ts,
@@ -228,6 +237,7 @@ impl TryFrom<SerializedExport> for Export {
                 expiration_ts,
                 requestor,
                 progress_message,
+                resumption_token,
             } => Export::InProgress {
                 start_ts: start_ts.try_into()?,
                 format: format.into(),
@@ -235,6 +245,7 @@ impl TryFrom<SerializedExport> for Export {
                 requestor: requestor.parse()?,
                 expiration_ts: expiration_ts as u64,
                 progress_message,
+                resumption_token,
             },
             SerializedExport::Completed {
                 start_ts,
@@ -244,6 +255,7 @@ impl TryFrom<SerializedExport> for Export {
                 format,
                 component,
                 requestor,
+                size,
             } => Export::Completed {
                 start_ts: start_ts.try_into()?,
                 complete_ts: complete_ts.try_into()?,
@@ -252,6 +264,7 @@ impl TryFrom<SerializedExport> for Export {
                 format: format.into(),
                 component: ComponentId::deserialize_from_string(component.as_deref())?,
                 requestor: requestor.parse()?,
+                size: size as u64,
             },
             SerializedExport::Failed {
                 start_ts,
@@ -318,7 +331,6 @@ impl Export {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ExportFormat {
     /// zip file containing a CleanJsonl for each table, and sidecar type info.
     Zip { include_storage: bool },
@@ -350,7 +362,6 @@ codegen_convex_serialization!(ExportFormat, SerializedExportFormat);
 
 #[derive(Copy, Clone, Debug, PartialEq, strum::EnumString, strum::Display)]
 #[strum(serialize_all = "camelCase")]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ExportRequestor {
     /// The snapshot export feature in the CLI/Dashboard
     SnapshotExport,
@@ -396,6 +407,7 @@ impl Export {
                 requestor,
                 expiration_ts,
                 progress_message: None,
+                resumption_token: None,
             }),
             Self::Completed { .. }
             | Self::InProgress { .. }
@@ -406,23 +418,15 @@ impl Export {
         }
     }
 
-    pub fn update_progress(self, msg: String) -> anyhow::Result<Export> {
+    pub fn update_progress(mut self, msg: String) -> anyhow::Result<Export> {
         match self {
             Self::InProgress {
-                format,
-                component,
-                requestor,
-                expiration_ts,
-                start_ts,
-                progress_message: _,
-            } => Ok(Self::InProgress {
-                start_ts,
-                format,
-                component,
-                requestor,
-                expiration_ts,
-                progress_message: Some(msg),
-            }),
+                ref mut progress_message,
+                ..
+            } => {
+                *progress_message = Some(msg);
+                Ok(self)
+            },
             Self::Completed { .. }
             | Self::Requested { .. }
             | Self::Failed { .. }
@@ -432,11 +436,33 @@ impl Export {
         }
     }
 
+    pub fn update_resumption_token(
+        mut self,
+        token: serde_json::Map<String, serde_json::Value>,
+    ) -> anyhow::Result<Export> {
+        match self {
+            Self::InProgress {
+                ref mut resumption_token,
+                ..
+            } => {
+                *resumption_token = Some(token);
+                Ok(self)
+            },
+            Self::Completed { .. }
+            | Self::Requested { .. }
+            | Self::Failed { .. }
+            | Self::Canceled { .. } => Err(anyhow::anyhow!(
+                "Can only set resumption token on an export that is InProgress"
+            )),
+        }
+    }
+
     pub fn completed(
         self,
         snapshot_ts: Timestamp,
         complete_ts: Timestamp,
         zip_object_key: ObjectKey,
+        size: u64,
     ) -> anyhow::Result<Export> {
         match self {
             Self::InProgress {
@@ -446,6 +472,7 @@ impl Export {
                 expiration_ts,
                 start_ts: _, // replace start_ts with the actual database TS
                 progress_message: _,
+                resumption_token: _,
             } => {
                 anyhow::ensure!(snapshot_ts <= complete_ts);
                 Ok(Self::Completed {
@@ -456,6 +483,7 @@ impl Export {
                     format,
                     component,
                     requestor,
+                    size,
                 })
             },
             Self::Requested {
@@ -472,6 +500,7 @@ impl Export {
                 format: _,
                 component: _,
                 requestor: _,
+                size: _,
             }
             | Self::Failed {
                 start_ts: _,
@@ -523,6 +552,7 @@ impl Export {
                 format: _,
                 component: _,
                 requestor: _,
+                size: _,
             }
             | Self::Failed {
                 start_ts: _,

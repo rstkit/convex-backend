@@ -1,29 +1,16 @@
-use std::collections::BTreeMap;
+//! The `_udf_config` table has a single row with the global configuration
+//! for the UDF runtime.
 
 use anyhow::Context;
-#[cfg(any(test, feature = "testing"))]
-use common::runtime::Runtime;
-/// The `_udf_config` table has a single row with the global configuration
-/// for the UDF runtime.
-use common::{
-    obj,
-    runtime::UnixTimestamp,
-};
-#[cfg(any(test, feature = "testing"))]
-use proptest::{
-    arbitrary::Arbitrary,
-    strategy::Strategy,
-};
-#[cfg(any(test, feature = "testing"))]
-use rand::Rng;
+use common::runtime::UnixTimestamp;
 use semver::Version;
-use value::{
-    ConvexObject,
-    ConvexValue,
+use serde::{
+    Deserialize,
+    Serialize,
 };
+use value::codegen_convex_serialization;
 
 #[derive(Debug, Clone)]
-#[cfg_attr(any(test, feature = "testing"), derive(PartialEq))]
 pub struct UdfConfig {
     /// What is the version of `convex` in a developer's
     /// "package.json" when they push their UDFs? We currently allow this to
@@ -35,75 +22,44 @@ pub struct UdfConfig {
     pub import_phase_unix_timestamp: UnixTimestamp,
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for UdfConfig {
-    type Parameters = ();
+impl UdfConfig {
+}
 
-    type Strategy = impl Strategy<Value = UdfConfig>;
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializedUdfConfig {
+    server_version: String,
+    #[serde(with = "serde_bytes")]
+    import_phase_rng_seed: [u8; 32],
+    import_phase_unix_timestamp: i64,
+}
 
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
+impl TryFrom<UdfConfig> for SerializedUdfConfig {
+    type Error = anyhow::Error;
 
-        any::<([u8; 32], UnixTimestamp)>().prop_map(|(rng_seed, unix_ts)| UdfConfig {
-            server_version: Version::parse("0.0.0").unwrap(),
-            import_phase_rng_seed: rng_seed,
-            import_phase_unix_timestamp: unix_ts,
+    fn try_from(config: UdfConfig) -> anyhow::Result<Self> {
+        Ok(SerializedUdfConfig {
+            server_version: config.server_version.to_string(),
+            import_phase_rng_seed: config.import_phase_rng_seed,
+            import_phase_unix_timestamp: config
+                .import_phase_unix_timestamp
+                .as_nanos()
+                .try_into()
+                .context("Unix timestamp past 2262")?,
         })
     }
 }
 
-impl UdfConfig {
-    #[cfg(any(test, feature = "testing"))]
-    pub fn new_for_test<RT: Runtime>(rt: &RT, udf_server_version: Version) -> Self {
-        Self {
-            server_version: udf_server_version,
-            import_phase_rng_seed: rt.rng().random(),
-            import_phase_unix_timestamp: rt.unix_timestamp(),
-        }
-    }
-}
-
-impl TryFrom<UdfConfig> for ConvexObject {
+impl TryFrom<SerializedUdfConfig> for UdfConfig {
     type Error = anyhow::Error;
 
-    fn try_from(config: UdfConfig) -> anyhow::Result<Self> {
-        obj! {
-            "serverVersion" => format!("{}", config.server_version),
-            "importPhaseRngSeed" =>
-                config.import_phase_rng_seed.to_vec(),
-            "importPhaseUnixTimestamp" => ConvexValue::Int64(
-                config.import_phase_unix_timestamp.as_nanos().try_into().context("Unix timestamp past 2262")?
-            ),
-        }
-    }
-}
-
-impl TryFrom<ConvexObject> for UdfConfig {
-    type Error = anyhow::Error;
-
-    fn try_from(value: ConvexObject) -> anyhow::Result<Self> {
-        let mut fields: BTreeMap<_, _> = value.into();
-        let server_version = match fields.remove("serverVersion") {
-            Some(ConvexValue::String(s)) => Version::parse(&s[..])?,
-            v => anyhow::bail!("Invalid serverVersion field for UdfConfig: {v:?}"),
-        };
-        let import_phase_rng_seed = match fields.remove("importPhaseRngSeed") {
-            Some(ConvexValue::Bytes(o)) => {
-                let Ok(rng_seed) = Vec::from(o).try_into() else {
-                    anyhow::bail!(
-                        "Invalid importPhaseRngSeed field for UdfConfig must be 32 bytes"
-                    );
-                };
-                rng_seed
-            },
-            v => anyhow::bail!("Invalid importPhaseRngSeed field for UdfConfig: {:?}", v),
-        };
-        let import_phase_unix_timestamp = match fields.remove("importPhaseUnixTimestamp") {
-            Some(ConvexValue::Int64(nanos)) => {
-                anyhow::ensure!(nanos >= 0, "UnixTimestamp before the unix epoch    ");
-                UnixTimestamp::from_nanos(nanos as u64)
-            },
-            v => anyhow::bail!("Invalid importPhaseTimestamp field for UdfConfig: {:?}", v),
+    fn try_from(value: SerializedUdfConfig) -> anyhow::Result<Self> {
+        let server_version = Version::parse(&value.server_version)?;
+        let import_phase_rng_seed = value.import_phase_rng_seed;
+        let import_phase_unix_timestamp = {
+            let nanos = value.import_phase_unix_timestamp;
+            anyhow::ensure!(nanos >= 0, "UnixTimestamp before the unix epoch");
+            UnixTimestamp::from_nanos(nanos as u64)
         };
         Ok(Self {
             server_version,
@@ -112,3 +68,5 @@ impl TryFrom<ConvexObject> for UdfConfig {
         })
     }
 }
+
+codegen_convex_serialization!(UdfConfig, SerializedUdfConfig);

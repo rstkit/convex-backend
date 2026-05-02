@@ -24,38 +24,38 @@ message ComponentPath {
 }
 
 message ResolvedDocument {
-    ResolvedDocumentId id = 1;
-    optional double creation_time = 2;
-    optional bytes value = 3;
+  ResolvedDocumentId id = 1;
+  optional double creation_time = 2;
+  optional bytes value = 3;
 }
 
 message ResolvedDocumentId {
-    TabletIdAndTableNumber table = 1;
-    optional bytes internal_id = 2;
+  TabletIdAndTableNumber table = 1;
+  optional bytes internal_id = 2;
 }
 
 message DeveloperDocumentId {
-    optional uint32 table_number = 1;
-    optional bytes internal_id = 2;
+  optional uint32 table_number = 1;
+  optional bytes internal_id = 2;
 }
 
 message DocumentUpdate {
-    ResolvedDocumentId id = 3;
-    ResolvedDocument old_document = 1;
-    ResolvedDocument new_document = 2;
+  ResolvedDocumentId id = 3;
+  ResolvedDocument old_document = 1;
+  ResolvedDocument new_document = 2;
 }
 
 message DocumentUpdateWithPrevTs {
-    ResolvedDocumentId id = 3;
-    ResolvedDocument old_document = 1;
-    // `old_ts` should be present iff `old_document` is present
-    optional uint64 old_ts = 4;
-    ResolvedDocument new_document = 2;
+  ResolvedDocumentId id = 3;
+  ResolvedDocument old_document = 1;
+  // `old_ts` should be present iff `old_document` is present
+  optional uint64 old_ts = 4;
+  ResolvedDocument new_document = 2;
 }
 
 message TabletIdAndTableNumber {
-    optional bytes table_id = 1;
-    optional uint32 table_number = 2;
+  optional bytes table_id = 1;
+  optional uint32 table_number = 2;
 }
 
 message FunctionResult {
@@ -72,7 +72,7 @@ message JsError {
 }
 
 message JsFrames {
-    repeated FrameData frames = 1;
+  repeated FrameData frames = 1;
 }
 
 message FrameData {
@@ -93,11 +93,13 @@ message FrameData {
 }
 
 message ExecutionContext {
-    optional string parent_scheduled_job = 1;
-    optional string parent_scheduled_job_component_id = 5;
-    optional string request_id = 2;
-    optional string execution_id = 3;
-    optional bool is_root = 4;
+  optional string parent_scheduled_job = 1;
+  optional string parent_scheduled_job_component_id = 5;
+  optional string request_id = 2;
+  optional string execution_id = 3;
+  optional bool is_root = 4;
+  optional string client_ip = 6;
+  optional string client_user_agent = 7;
 }
 
 enum UdfType {
@@ -149,12 +151,13 @@ message SchedulerFunctionCaller {
 message ActionFunctionCaller {
   common.DeveloperDocumentId parent_scheduled_job = 1;
   optional string component_id = 2;
+  optional string parent_execution_id = 3;
 }
 
 message RedactedJsError {
-    common.JsError error = 1;
-    optional bool block_logging = 2;
-    optional string request_id = 3;
+  common.JsError error = 1;
+  optional bool block_logging = 2;
+  optional string request_id = 3;
 }
 
 message RedactedLogLines {
@@ -171,6 +174,11 @@ message Interval {
     bytes exclusive = 2;
     google.protobuf.Empty after_all = 3;
   }
+}
+
+enum Order {
+  ASC = 0;
+  DESC = 1;
 }
 
 message HttpActionRequestHead {
@@ -194,5 +202,12 @@ message HttpActionResponse {
   oneof message_type {
     HttpActionResponseHead head = 1;
     bytes body = 2;
+  }
+}
+
+message ExecuteQueryTimestamp {
+  oneof ts {
+    google.protobuf.Empty latest = 1;
+    uint64 at = 2;
   }
 }

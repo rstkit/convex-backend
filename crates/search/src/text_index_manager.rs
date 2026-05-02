@@ -20,13 +20,12 @@ use common::{
     knobs::SEARCHLIGHT_CLUSTER_NAME,
     query::{
         InternalSearch,
-        InternalSearchFilterExpression,
         SearchVersion,
     },
     types::{
         IndexId,
         IndexName,
-        PersistenceVersion,
+        SearchIndexMetricLabels,
         Timestamp,
         WriteTimestamp,
     },
@@ -54,6 +53,7 @@ use crate::{
     QueryResults,
     Searcher,
     TantivySearchIndexSchema,
+    TextIndexWriteSize,
 };
 
 #[derive(Clone)]
@@ -88,29 +88,17 @@ pub enum TextIndex {
 impl TextIndex {
     fn memory_index(&self) -> &MemoryTextIndex {
         match self {
-            TextIndex::Backfilling { ref memory_index } => memory_index,
-            TextIndex::Backfilled(SnapshotInfo {
-                ref memory_index, ..
-            }) => memory_index,
-            TextIndex::Ready(SnapshotInfo {
-                ref memory_index, ..
-            }) => memory_index,
+            TextIndex::Backfilling { memory_index } => memory_index,
+            TextIndex::Backfilled(SnapshotInfo { memory_index, .. }) => memory_index,
+            TextIndex::Ready(SnapshotInfo { memory_index, .. }) => memory_index,
         }
     }
 
     pub fn memory_index_mut(&mut self) -> &mut MemoryTextIndex {
         match self {
-            TextIndex::Backfilling {
-                ref mut memory_index,
-            } => memory_index,
-            TextIndex::Backfilled(SnapshotInfo {
-                ref mut memory_index,
-                ..
-            }) => memory_index,
-            TextIndex::Ready(SnapshotInfo {
-                ref mut memory_index,
-                ..
-            }) => memory_index,
+            TextIndex::Backfilling { memory_index } => memory_index,
+            TextIndex::Backfilled(SnapshotInfo { memory_index, .. }) => memory_index,
+            TextIndex::Ready(SnapshotInfo { memory_index, .. }) => memory_index,
         }
     }
 }
@@ -118,7 +106,6 @@ impl TextIndex {
 #[derive(Clone)]
 pub struct TextIndexManager {
     indexes: TextIndexManagerState,
-    persistence_version: PersistenceVersion,
 }
 
 #[derive(Clone)]
@@ -132,17 +119,14 @@ impl TextIndexManager {
         matches!(self.indexes, TextIndexManagerState::Bootstrapping)
     }
 
-    pub fn new(indexes: TextIndexManagerState, persistence_version: PersistenceVersion) -> Self {
-        Self {
-            indexes,
-            persistence_version,
-        }
+    pub fn new(indexes: TextIndexManagerState) -> Self {
+        Self { indexes }
     }
 
     fn require_ready_indexes(&self) -> anyhow::Result<&OrdMap<IndexId, TextIndex>> {
         match self.indexes {
             TextIndexManagerState::Bootstrapping => {
-                anyhow::bail!(ErrorMetadata::overloaded(
+                anyhow::bail!(ErrorMetadata::feature_temporarily_unavailable(
                     "SearchIndexesUnavailable",
                     "Search indexes bootstrapping and not yet available for use"
                 ));
@@ -172,8 +156,7 @@ impl TextIndexManager {
                     // If the search index was written to disk with a different format from
                     // how the current backend constructs search queries, assume the new
                     // search index is backfilling.
-                    snapshot_info.disk_index_version
-                        == TextSnapshotVersion::new(self.persistence_version),
+                    snapshot_info.disk_index_version == TextSnapshotVersion::current(),
                     index_backfilling_error(printable_index_name)
                 );
                 Ok(snapshot_info)
@@ -193,17 +176,6 @@ impl TextIndexManager {
         let tantivy_schema =
             TantivySearchIndexSchema::new_for_index(index, &search.printable_index_name()?)?;
         let (compiled_query, reads) = tantivy_schema.compile(search, version)?;
-        // Ignore empty searches to avoid failures due to transient search issues (e.g.
-        // bootstrapping). Do this after validating the query above.
-        if search.filters.iter().any(|filter| {
-            let InternalSearchFilterExpression::Search(_, query_string) = filter else {
-                return false;
-            };
-            query_string.trim().is_empty()
-        }) {
-            tracing::debug!("Skipping empty search query");
-            return Ok(QueryResults::empty());
-        }
 
         let revisions_with_keys = self
             .run_compiled_query(
@@ -224,7 +196,7 @@ impl TextIndexManager {
         Ok(results)
     }
 
-    pub async fn search_with_compiled_query(
+    pub async fn text_search(
         &self,
         index: &Index,
         printable_index_name: &IndexName,
@@ -260,12 +232,19 @@ impl TextIndexManager {
         searcher: Arc<dyn Searcher>,
         search_storage: Arc<dyn Storage>,
     ) -> anyhow::Result<RevisionWithKeys> {
+        // Ignore empty searches to avoid failures due to transient search
+        // issues (e.g. bootstrapping).
+        if compiled_query.is_empty() {
+            tracing::debug!("Skipping empty search query");
+            return Ok(vec![]);
+        }
         let SnapshotInfo {
             disk_index,
             disk_index_ts,
             memory_index,
             ..
         } = self.get_snapshot_info(index, printable_index_name)?;
+        let metric_labels = SearchIndexMetricLabels::new(Some(index.id()), None::<&str>);
         tantivy_schema
             .search(
                 compiled_query,
@@ -279,6 +258,7 @@ impl TextIndexManager {
                     .collect(),
                 *disk_index_ts,
                 searcher,
+                metric_labels,
             )
             .await
     }
@@ -318,12 +298,13 @@ impl TextIndexManager {
         deletion: Option<&ResolvedDocument>,
         insertion: Option<&ResolvedDocument>,
         ts: WriteTimestamp,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<TextIndexWriteSize> {
+        let mut write_size = TextIndexWriteSize(0);
         let TextIndexManagerState::Ready(ref mut indexes) = self.indexes else {
-            return Ok(());
+            return Ok(write_size);
         };
         let Some(id) = deletion.as_ref().or(insertion.as_ref()).map(|d| d.id()) else {
-            return Ok(());
+            return Ok(write_size);
         };
         let timer = metrics::index_manager_update_timer();
 
@@ -371,13 +352,21 @@ impl TextIndexManager {
                                     ..
                                 },
                                 IndexConfig::Text {
-                                    on_disk_state: TextIndexState::Backfilled(snapshot),
+                                    on_disk_state:
+                                        TextIndexState::Backfilled {
+                                            snapshot,
+                                            staged: _,
+                                        },
                                     ..
                                 },
                             ) => (None, Some(snapshot)),
                             (
                                 IndexConfig::Text {
-                                    on_disk_state: TextIndexState::Backfilled(old_snapshot),
+                                    on_disk_state:
+                                        TextIndexState::Backfilled {
+                                            snapshot: old_snapshot,
+                                            staged: _,
+                                        },
                                     ..
                                 },
                                 IndexConfig::Text {
@@ -387,11 +376,19 @@ impl TextIndexManager {
                             ) => (Some(old_snapshot), Some(new_snapshot)),
                             (
                                 IndexConfig::Text {
-                                    on_disk_state: TextIndexState::Backfilled(old_snapshot),
+                                    on_disk_state:
+                                        TextIndexState::Backfilled {
+                                            snapshot: old_snapshot,
+                                            staged: _,
+                                        },
                                     ..
                                 },
                                 IndexConfig::Text {
-                                    on_disk_state: TextIndexState::Backfilled(new_snapshot),
+                                    on_disk_state:
+                                        TextIndexState::Backfilled {
+                                            snapshot: new_snapshot,
+                                            staged: _,
+                                        },
                                     ..
                                 },
                             ) => (Some(old_snapshot), Some(new_snapshot)),
@@ -405,6 +402,27 @@ impl TextIndexManager {
                                     ..
                                 },
                             ) => (Some(old_snapshot), Some(new_snapshot)),
+                            (
+                                IndexConfig::Text {
+                                    on_disk_state: TextIndexState::SnapshottedAt(old_snapshot),
+                                    ..
+                                },
+                                IndexConfig::Text {
+                                    on_disk_state:
+                                        TextIndexState::Backfilled {
+                                            snapshot: new_snapshot,
+                                            staged,
+                                        },
+                                    ..
+                                },
+                            ) => {
+                                anyhow::ensure!(
+                                    old_snapshot == new_snapshot,
+                                    "Snapshot mismatch when disabling text index"
+                                );
+                                anyhow::ensure!(staged, "Disabled text index must be staged");
+                                (Some(old_snapshot), Some(new_snapshot))
+                            },
                             (IndexConfig::Text { .. }, _) | (_, IndexConfig::Text { .. }) => {
                                 anyhow::bail!(
                                     "Invalid index type transition: {prev_metadata:?} to \
@@ -490,14 +508,10 @@ impl TextIndexManager {
 
         // Handle index updates for our existing search indexes.
         for index in index_registry.text_indexes_by_table(id.tablet_id) {
-            let IndexConfig::Text {
-                ref developer_config,
-                ..
-            } = index.metadata.config
-            else {
+            let IndexConfig::Text { ref spec, .. } = index.metadata.config else {
                 continue;
             };
-            let tantivy_schema = TantivySearchIndexSchema::new(developer_config);
+            let tantivy_schema = TantivySearchIndexSchema::new(spec);
             let Some(index) = indexes.get_mut(&index.id()) else {
                 continue;
             };
@@ -512,10 +526,13 @@ impl TextIndexManager {
             index
                 .memory_index_mut()
                 .update(id.internal_id(), ts, old_value, new_terms)?;
+            if let Some(insertion) = insertion {
+                write_size.0 += tantivy_schema.estimate_size(insertion);
+            }
         }
 
         timer.finish();
-        Ok(())
+        Ok(write_size)
     }
 
     pub fn total_in_memory_size(&self) -> usize {
@@ -540,11 +557,4 @@ impl TextIndexManager {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    pub fn ready_indexes(&self) -> &OrdMap<IndexId, TextIndex> {
-        match self.indexes {
-            TextIndexManagerState::Bootstrapping => panic!("Search indexes not ready"),
-            TextIndexManagerState::Ready(ref indexes) => indexes,
-        }
-    }
 }

@@ -79,7 +79,6 @@ export function usePositions(latencyBuffer: LatencyBuffer, sessionId: string) {
     const now = Date.now();
     for (const pos of positions) {
       const latency = now - pos.clientSentTs;
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const _latency2 = now - pos.serverSentTs;
       latencyBuffer.record(latency, pos.session, localNow);
     }
@@ -102,7 +101,7 @@ export function usePositions(latencyBuffer: LatencyBuffer, sessionId: string) {
   const reportPositionRef = useRef(reportPosition);
   reportPositionRef.current = reportPosition;
 
-  const dbId = useRef<Id | null>(null);
+  const dbId = useRef<Id<"positions"> | null>(null);
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     async function report() {

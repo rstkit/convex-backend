@@ -42,8 +42,6 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 mod value;
-#[cfg(any(test, feature = "testing"))]
-pub use value::export::roundtrip::ExportContext;
 pub use value::{
     ConvexError,
     Value,
@@ -63,9 +61,11 @@ pub use sync::WebSocketState;
 pub mod base_client;
 #[doc(inline)]
 pub use base_client::{
+    AuthTokenFetcher,
     FunctionResult,
     QueryResults,
     SubscriberId,
 };
+pub use convex_sync_types::AuthenticationToken;
 
 mod sync;

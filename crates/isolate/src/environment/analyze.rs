@@ -2,10 +2,12 @@ use std::{
     collections::{
         btree_map::Entry,
         BTreeMap,
+        VecDeque,
     },
     path::Path,
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{
@@ -14,7 +16,7 @@ use anyhow::{
 };
 use common::{
     errors::JsError,
-    json::JsonSerializable as _,
+    json::JsonForm as _,
     knobs::{
         DATABASE_UDF_SYSTEM_TIMEOUT,
         ISOLATE_ANALYZE_USER_TIMEOUT,
@@ -26,7 +28,6 @@ use common::{
     },
     types::{
         HttpActionRoute,
-        ModuleEnvironment,
         RoutableMethod,
         UdfType,
     },
@@ -34,14 +35,14 @@ use common::{
 use deno_core::{
     v8::{
         self,
+        scope,
+        scope_with_context,
         GetPropertyNamesArgs,
-        HandleScope,
     },
     ModuleResolutionError,
 };
 use errors::ErrorMetadata;
 use model::{
-    config::types::ModuleConfig,
     cron_jobs::types::{
         CronIdentifier,
         CronSpec,
@@ -87,7 +88,6 @@ use value::{
 
 use super::ModuleCodeCacheResult;
 use crate::{
-    concurrency_limiter::ConcurrencyPermit,
     environment::{
         helpers::{
             module_loader::{
@@ -122,7 +122,7 @@ use crate::{
 };
 
 pub struct AnalyzeEnvironment {
-    modules: BTreeMap<CanonicalizedModulePath, FullModuleSource>,
+    modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<FullModuleSource>>>,
     // This is used to lazily cache the result of sourcemap::SourceMap::from_slice across
     // modules and functions. There are certain source maps whose source origin we don't
     // need to construct during analysis (i.e. if all of the UDFs it defines have function
@@ -132,14 +132,22 @@ pub struct AnalyzeEnvironment {
     rng: ChaCha12Rng,
     unix_timestamp: UnixTimestamp,
     environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+    // Collect logs during analysis for push failure reporting (max 100 entries)
+    collected_logs: VecDeque<String>,
 }
 
 impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
     fn trace(&mut self, _level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
-        tracing::warn!(
-            "Unexpected Console access at import time: {}",
-            messages.join(" ")
-        );
+        // These logs are only shown to the pusher on error.
+        let log_message = messages.join(" ");
+
+        // Keep only the last 100 log entries
+        if self.collected_logs.len() >= 100 {
+            self.collected_logs.pop_front();
+        }
+        self.collected_logs.push_back(log_message.clone());
+
+        tracing::warn!("Console access at import time: {}", log_message);
         Ok(())
     }
 
@@ -156,6 +164,20 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
 
     fn unix_timestamp(&mut self) -> anyhow::Result<UnixTimestamp> {
         Ok(self.unix_timestamp)
+    }
+
+    fn performance_now(&mut self) -> anyhow::Result<Duration> {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "NoPerformanceDuringImport",
+            "The Performance API is not supported at import time"
+        ))
+    }
+
+    fn performance_time_origin(&mut self) -> anyhow::Result<UnixTimestamp> {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "NoPerformanceDuringImport",
+            "The Performance API is not supported at import time"
+        ))
     }
 
     fn get_environment_variable(
@@ -177,8 +199,7 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AnalyzeEnvironment {
         &mut self,
         path: &str,
         _timeout: &mut Timeout<RT>,
-        _permit: &mut Option<ConcurrencyPermit>,
-    ) -> anyhow::Result<Option<(FullModuleSource, ModuleCodeCacheResult)>> {
+    ) -> anyhow::Result<Option<(Arc<FullModuleSource>, ModuleCodeCacheResult)>> {
         let p = ModulePath::from_str(path)?.canonicalize();
         let result = self.modules.get(&p).cloned();
         Ok(result.map(|m| (m, ModuleCodeCacheResult::noop())))
@@ -246,49 +267,28 @@ impl AnalyzeEnvironment {
         v8_context: v8::Global<v8::Context>,
         isolate_clean: &mut bool,
         udf_config: UdfConfig,
-        modules: BTreeMap<CanonicalizedModulePath, ModuleConfig>,
+        modules: Arc<BTreeMap<CanonicalizedModulePath, Arc<FullModuleSource>>>,
+        to_analyze: CanonicalizedModulePath,
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
-    ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
-        let to_analyze = modules
-            .keys()
-            .filter(|p| !p.is_deps())
-            .cloned()
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            modules
-                .values()
-                .all(|m| m.environment == ModuleEnvironment::Isolate),
-            "Isolate environment can only analyze Isolate modules"
-        );
+    ) -> anyhow::Result<Result<AnalyzedModule, JsError>> {
+        anyhow::ensure!(!to_analyze.is_deps());
         let rng = ChaCha12Rng::from_seed(udf_config.import_phase_rng_seed);
         let unix_timestamp = udf_config.import_phase_unix_timestamp;
         let environment = AnalyzeEnvironment {
-            modules: modules
-                .into_iter()
-                .map(|(path, module)| {
-                    (
-                        path,
-                        FullModuleSource {
-                            source: module.source,
-                            source_map: module.source_map,
-                        },
-                    )
-                })
-                .collect(),
+            modules,
             source_maps_cache: BTreeMap::new(),
             rng,
             unix_timestamp,
             environment_variables,
+            collected_logs: VecDeque::new(),
         };
         let client_id = Arc::new(client_id);
-        let (handle, state) = isolate.start_request(client_id, environment).await?;
-        let mut handle_scope = isolate.handle_scope();
-        let v8_context = v8::Local::new(&mut handle_scope, v8_context);
-        let mut context_scope = v8::ContextScope::new(&mut handle_scope, v8_context);
+        let (handle, state, mut timeout) = isolate.start_request(client_id, environment).await?;
+        scope_with_context!(let context_scope, isolate.isolate(), v8_context);
         let mut isolate_context =
-            RequestScope::new(&mut context_scope, handle.clone(), state, false).await?;
+            RequestScope::new(context_scope, handle.clone(), state, false).await?;
         let handle = isolate_context.handle();
-        let result = Self::run_analyze(&mut isolate_context, to_analyze).await;
+        let result = Self::run_analyze(&mut isolate_context, &mut timeout, to_analyze).await;
 
         // Perform a microtask checkpoint one last time before taking the environment
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
@@ -296,17 +296,34 @@ impl AnalyzeEnvironment {
         isolate_context.checkpoint();
         *isolate_clean = true;
 
+        let error_logs = if let Ok(Err(_)) = result {
+            let state = isolate_context.take_state().expect("Lost RequestState?");
+            state.environment.collected_logs.clone()
+        } else {
+            VecDeque::new()
+        };
+
         // Unlink the request from the isolate.
         // After this point, it's unsafe to run js code in the isolate that
         // expects the current request's environment.
         // If the microtask queue is somehow nonempty after this point but before
         // the next request starts, the isolate may panic.
         drop(isolate_context);
+        drop(timeout);
 
         // Suppress the original error if the isolate was forcibly terminated.
         if let Err(e) = handle.take_termination_error(None, "analyze")? {
             return Ok(Err(e));
         }
+
+        if let Ok(Err(mut js_error)) = result {
+            if !error_logs.is_empty() {
+                let logs_text = error_logs.iter().cloned().collect::<Vec<_>>().join("\n");
+                js_error.message = format!("{}\n\n{}", js_error.message, logs_text);
+            }
+            return Ok(Err(js_error));
+        }
+
         result
     }
 
@@ -333,114 +350,107 @@ impl AnalyzeEnvironment {
     }
 
     async fn run_analyze<RT: Runtime>(
-        isolate: &mut RequestScope<'_, '_, RT, Self>,
-        to_analyze: Vec<CanonicalizedModulePath>,
-    ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
-        let mut v8_scope = isolate.scope();
-        let mut scope = RequestScope::<RT, Self>::enter(&mut v8_scope);
+        isolate: &mut RequestScope<'_, '_, '_, RT, Self>,
+        timeout: &mut Timeout<RT>,
+        path: CanonicalizedModulePath,
+    ) -> anyhow::Result<Result<AnalyzedModule, JsError>> {
+        scope!(let v8_scope, isolate.scope());
+        let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
 
-        // Iterate through modules paths to_analyze
-        let mut result = BTreeMap::new();
-        for path in to_analyze {
-            // module_specifier is the key in the ModuleMap which we use to address the
-            // ModuleId for this module. We then use this ModuleId to fetch the
-            // v8::Module for evaluation.
-            let module_specifier = module_specifier_from_path(&path)?;
-            // Register the module and its dependencies with V8, instantiate the module, and
-            // evaluate the module. After this, we can inspect the module's
-            // in-memory objects to find functions which we can analyze as UDFs.
-            // For more info on registration/instantiation see here: https://choubey.gitbook.io/internals-of-deno/import-and-ops/registration-and-instantiation
-            let module: v8::Local<v8::Module> = match scope.eval_module(&module_specifier).await {
-                Ok(m) => m,
-                Err(e) => {
-                    if let Some(e) = e.downcast_ref::<ModuleNotFoundError>() {
-                        return Ok(Err(JsError::from_message(format!("{e}"))));
-                    }
-                    if let Some(e) = e.downcast_ref::<ModuleResolutionError>() {
-                        return Ok(Err(JsError::from_message(format!("{e}"))));
-                    }
-                    if let Some(e) = e.downcast_ref::<SystemModuleNotFoundError>() {
-                        return Ok(Err(JsError::from_message(format!("{e}"))));
-                    }
-                    match e.downcast::<JsError>() {
-                        Ok(e) => {
-                            return Ok(Err(JsError {
-                                message: format!(
-                                    "Failed to analyze {}: {}",
-                                    path.as_str(),
-                                    e.message
-                                ),
-                                custom_data: None,
-                                frames: e.frames,
-                            }))
-                        },
-                        Err(e) => return Err(e),
-                    }
+        // module_specifier is the key in the ModuleMap which we use to address the
+        // ModuleId for this module. We then use this ModuleId to fetch the
+        // v8::Module for evaluation.
+        let module_specifier = module_specifier_from_path(&path)?;
+        // Register the module and its dependencies with V8, instantiate the module, and
+        // evaluate the module. After this, we can inspect the module's
+        // in-memory objects to find functions which we can analyze as UDFs.
+        // For more info on registration/instantiation see here: https://choubey.gitbook.io/internals-of-deno/import-and-ops/registration-and-instantiation
+        let module: v8::Local<v8::Module> = match scope
+            .eval_module(&module_specifier, timeout)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(e) = e.downcast_ref::<ModuleNotFoundError>() {
+                    return Ok(Err(JsError::from_message(format!("{e}"))));
+                }
+                if let Some(e) = e.downcast_ref::<ModuleResolutionError>() {
+                    return Ok(Err(JsError::from_message(format!("{e}"))));
+                }
+                if let Some(e) = e.downcast_ref::<SystemModuleNotFoundError>() {
+                    return Ok(Err(JsError::from_message(format!("{e}"))));
+                }
+                match e.downcast::<JsError>() {
+                    Ok(e) => {
+                        return Ok(Err(JsError {
+                            message: format!("Failed to analyze {}: {}", path.as_str(), e.message),
+                            custom_data: None,
+                            frames: e.frames,
+                        }))
+                    },
+                    Err(e) => return Err(e),
+                }
+            },
+        };
+
+        // Gather UDFs, HTTP action routes, and crons
+        let functions = match udf_analyze(&mut scope, &module, &path)? {
+            Err(e) => return Ok(Err(e)),
+            Ok(funcs) => WithHeapSize::from(funcs),
+        };
+
+        let mut http_routes = None;
+        if path.is_http() {
+            let routes = match http_analyze(&mut scope, &module, &path)? {
+                Err(err) => {
+                    return Ok(Err(err));
                 },
+                Ok(value) => value,
             };
-
-            // Gather UDFs, HTTP action routes, and crons
-            let functions = match udf_analyze(&mut scope, &module, &path)? {
-                Err(e) => return Ok(Err(e)),
-                Ok(funcs) => WithHeapSize::from(funcs),
-            };
-
-            let mut http_routes = None;
-            if path.is_http() {
-                let routes = match http_analyze(&mut scope, &module, &path)? {
-                    Err(err) => {
-                        return Ok(Err(err));
-                    },
-                    Ok(value) => value,
-                };
-                http_routes = Some(routes);
-            }
-
-            let mut cron_specs = None;
-            if path.is_cron() {
-                let crons = match cron_analyze(&mut scope, &module, &path)? {
-                    Err(err) => {
-                        return Ok(Err(err));
-                    },
-                    Ok(value) => value,
-                };
-                cron_specs = Some(WithHeapSize::from(crons));
-            }
-
-            // Get source_index of current module
-            let source_index = scope
-                .state_mut()?
-                .environment
-                .get_source_map(&path)?
-                .as_ref()
-                .and_then(|source_map| {
-                    for (i, filename) in source_map.sources().enumerate() {
-                        if Path::new(filename).file_stem()
-                            != Path::new(module_specifier.path()).file_stem()
-                        {
-                            continue;
-                        }
-
-                        return source_map.get_source_contents(i as u32).map(|_| i as u32);
-                    }
-                    None
-                });
-
-            let analyzed_module = AnalyzedModule {
-                functions,
-                http_routes,
-                cron_specs,
-                source_index,
-            };
-            result.insert(path, analyzed_module);
+            http_routes = Some(routes);
         }
 
-        Ok(Ok(result))
+        let mut cron_specs = None;
+        if path.is_cron() {
+            let crons = match cron_analyze(&mut scope, &module, &path)? {
+                Err(err) => {
+                    return Ok(Err(err));
+                },
+                Ok(value) => value,
+            };
+            cron_specs = Some(WithHeapSize::from(crons));
+        }
+
+        // Get source_index of current module
+        let source_index = scope
+            .state_mut()?
+            .environment
+            .get_source_map(&path)?
+            .as_ref()
+            .and_then(|source_map| {
+                for (i, filename) in source_map.sources().enumerate() {
+                    if Path::new(filename).file_stem()
+                        != Path::new(module_specifier.path()).file_stem()
+                    {
+                        continue;
+                    }
+
+                    return source_map.get_source_contents(i as u32).map(|_| i as u32);
+                }
+                None
+            });
+
+        Ok(Ok(AnalyzedModule {
+            functions,
+            http_routes,
+            cron_specs,
+            source_index,
+        }))
     }
 }
 
 fn make_str_val<'s>(
-    scope: &mut HandleScope<'s, ()>,
+    scope: &mut v8::PinScope<'s, '_, ()>,
     value: &str,
 ) -> anyhow::Result<v8::Local<'s, v8::Value>> {
     let v8_str_val: v8::Local<v8::Value> = v8::String::new(scope, value)
@@ -663,7 +673,7 @@ fn udf_analyze<RT: Runtime>(
         // Get the appropriate source map to look in
         let (fn_source_map, fn_canon_path) = {
             let resource_name_val = handler
-                .get_script_origin()
+                .get_script_origin(scope)
                 .resource_name()
                 .context("resource_name was None")?;
             let resource_name = resource_name_val.to_rust_string_lossy(scope);
@@ -677,7 +687,7 @@ fn udf_analyze<RT: Runtime>(
 
         let canonicalized_name: FunctionName = property_name
             .parse()
-            .map_err(|e| invalid_function_name_error(&e))?;
+            .map_err(|e| invalid_function_name_error(module_path, &e))?;
         if let Some(Some(token)) = fn_source_map.as_ref().map(|sm| sm.lookup_token(lineno, linecol))
             // This condition is in place so that we don't have to jump to source in source mappings
             // to get back to the original source. This logic gets complicated and is not strictly necessary now
@@ -716,7 +726,7 @@ fn udf_analyze<RT: Runtime>(
                 log_source_map_token_lookup_failed();
             }
 
-            tracing::warn!(
+            tracing::debug!(
                 "Failed to resolve source position of {module_path:?}:{canonicalized_name}"
             );
         }
@@ -837,47 +847,46 @@ fn http_analyze<RT: Runtime>(
 
     for i in 0..len {
         let Some(entry) = routes_arr.get_index(scope, i) else {
-            return routes_error(format!("problem with arr[{}]", i).as_str());
+            return routes_error(format!("problem with arr[{i}]").as_str());
         };
         let Some(entry) = entry.to_object(scope) else {
-            return routes_error(format!("arr[{}] is not an object", i).as_str());
+            return routes_error(format!("arr[{i}] is not an object").as_str());
         };
 
         let Some(path) = entry.get_index(scope, 0) else {
-            return routes_error(format!("problem with arr[{}][0]", i).as_str());
+            return routes_error(format!("problem with arr[{i}][0]").as_str());
         };
         let path: Result<v8::Local<v8::String>, _> = path.try_into();
         let Ok(path) = path else {
-            return routes_error(format!("arr[{}][0] is not a string", i).as_str());
+            return routes_error(format!("arr[{i}][0] is not a string").as_str());
         };
         let path: String = path.to_rust_string_lossy(scope);
 
         let Some(method) = entry.get_index(scope, 1) else {
-            return routes_error(format!("problem with arr[{}][1]", i).as_str());
+            return routes_error(format!("problem with arr[{i}][1]").as_str());
         };
         let method: Result<v8::Local<v8::String>, _> = method.try_into();
         let Ok(method) = method else {
-            return routes_error(format!("arr[{}][1] is not a string", i).as_str());
+            return routes_error(format!("arr[{i}][1] is not a string").as_str());
         };
         let method: String = method.to_rust_string_lossy(scope);
 
         let Ok(method): Result<RoutableMethod, _> = method.parse() else {
             return routes_error(
                 format!(
-                    "'{}' is not not a routable method (one of GET, POST, PUT, DELETE, PATCH, \
-                     OPTIONS)",
-                    method
+                    "'{method}' is not not a routable method (one of GET, POST, PUT, DELETE, \
+                     PATCH, OPTIONS)"
                 )
                 .as_str(),
             );
         };
 
         let Some(function) = entry.get_index(scope, 2) else {
-            return routes_error(format!("problem with third element of {} of array", i).as_str());
+            return routes_error(format!("problem with third element of {i} of array").as_str());
         };
         let function: Result<v8::Local<v8::Object>, _> = function.try_into();
         let Ok(function) = function else {
-            return routes_error(format!("arr[{}][2] not an HttpAction", i).as_str());
+            return routes_error(format!("arr[{i}][2] not an HttpAction").as_str());
         };
 
         let handler_str = strings::_handler.create(scope)?;
@@ -887,13 +896,13 @@ fn http_analyze<RT: Runtime>(
                 handler
             },
             Some(handler_value) if !handler_value.is_undefined() => {
-                let message = format!("arr[{}][2].handler is not a function", i);
+                let message = format!("arr[{i}][2].handler is not a function");
                 return Ok(Err(JsError::from_message(message)));
             },
             _ => match function.try_into() {
                 Ok(f) => f,
                 Err(_) => {
-                    let message = format!("arr[{}][2] is not an HttpAction", i);
+                    let message = format!("arr[{i}][2] is not an HttpAction");
                     return Ok(Err(JsError::from_message(message)));
                 },
             },
@@ -912,7 +921,7 @@ fn http_analyze<RT: Runtime>(
         // Get the appropriate source map to look in
         let (fn_source_map, fn_canon_path) = {
             let resource_name_val = handler
-                .get_script_origin()
+                .get_script_origin(scope)
                 .resource_name()
                 .context("resource_name was None")?;
             let resource_name = resource_name_val.to_rust_string_lossy(scope);
@@ -943,6 +952,7 @@ fn http_analyze<RT: Runtime>(
             route: HttpActionRoute {
                 path: path.clone(),
                 method,
+                matched: true,
             },
             pos: source_pos,
         });

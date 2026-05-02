@@ -11,8 +11,6 @@ use anyhow::Context;
 use cmd_util::env::env_config;
 use errors::ErrorMetadata;
 pub use metrics::SERVER_VERSION_STR;
-#[cfg(any(test, feature = "testing"))]
-use proptest::strategy::Strategy;
 pub use semver::Version;
 use serde::{
     Deserialize,
@@ -46,6 +44,15 @@ pub static DEPRECATION_THRESHOLD: LazyLock<DeprecationThreshold> = LazyLock::new
 pub static MIN_NPM_VERSION_FOR_FUZZY_SEARCH: LazyLock<Version> =
     LazyLock::new(|| env_config("MIN_NPM_VERSION_FOR_FUZZY_SEARCH", Version::new(1, 6, 1000)));
 
+// Enabled in 1.27.5
+pub static MIN_NPM_VERSION_FOR_TRANSITION_CHUNKS: LazyLock<Version> = LazyLock::new(|| {
+    env_config(
+        // Until clients can handle these better use a large number we'll never hit.
+        "MIN_NPM_VERSION_FOR_TRANSITION_CHUNKS",
+        Version::parse("1.28.0").expect("Invalid version"),
+    )
+});
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub enum ClientVersionState {
     Unsupported(String),
@@ -68,7 +75,6 @@ impl ClientVersionState {
 }
 
 #[derive(PartialEq, Eq, Clone, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct ClientVersion {
     client: ClientType,
     version: ClientVersionIdent,
@@ -96,14 +102,7 @@ impl TryFrom<pb::common::ClientVersion> for ClientVersion {
 }
 
 #[derive(PartialEq, Eq, Clone, Ord, PartialOrd, Debug)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ClientVersionIdent {
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "(0..5, 0..100, 0..4).prop_map(|(major, minor, patch)| \
-                             ClientVersionIdent::Semver(format!(\"{major}.{minor}.{patch}\").\
-                             parse().unwrap()))")
-    )]
     Semver(Version),
     Unrecognized(String),
 }
@@ -167,10 +166,11 @@ impl TryFrom<pb::common::ClientVersionIdent> for ClientVersionIdent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ClientType {
     Python,
     CLI,
+    // `npm create convex` CLI tool https://github.com/get-convex/templates/tree/main/create-convex
+    CreateConvex,
     NPM,
     // Actions running in node call into queries/mutations/etc. with this client.
     Actions,
@@ -185,11 +185,6 @@ pub enum ClientType {
     Swift,
     Kotlin,
     // We convert to lower case when we parse, so lets just generate lowercase strings.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "proptest::string::string_regex(\"[a-z]+\").unwrap().\
-                             prop_map(ClientType::Unrecognized)")
-    )]
     Unrecognized(String),
 }
 
@@ -202,6 +197,7 @@ impl FromStr for ClientType {
             "python" => Self::Python,
             "npm-cli" => Self::CLI,
             "npm" => Self::NPM,
+            "create-convex" => Self::CreateConvex,
             "actions" => Self::Actions,
             "rust" => Self::Rust,
             "streaming-import" => Self::StreamingImport,
@@ -222,6 +218,7 @@ impl Display for ClientType {
         match self {
             Self::Python => write!(f, "python"),
             Self::CLI => write!(f, "npm-cli"),
+            Self::CreateConvex => write!(f, "create-convex"),
             Self::NPM => write!(f, "npm"),
             Self::Actions => write!(f, "actions"),
             Self::Rust => write!(f, "rust"),
@@ -244,7 +241,8 @@ impl ClientType {
             Self::NPM | Self::CLI | Self::Actions => Some(npm.upgrade_required.clone()),
             Self::Python => Some(python.upgrade_required.clone()),
             Self::Rust => Some(rust.upgrade_required.clone()),
-            Self::StreamingImport
+            Self::CreateConvex
+            | Self::StreamingImport
             | Self::AirbyteExport
             | Self::FivetranImport
             | Self::FivetranExport
@@ -261,7 +259,8 @@ impl ClientType {
             Self::NPM | Self::CLI | Self::Actions => Some(npm.unsupported.clone()),
             Self::Python => Some(python.unsupported.clone()),
             Self::Rust => Some(rust.unsupported.clone()),
-            Self::StreamingImport
+            Self::CreateConvex
+            | Self::StreamingImport
             | Self::AirbyteExport
             | Self::FivetranImport
             | Self::FivetranExport
@@ -284,7 +283,8 @@ impl ClientType {
                 "Update your Convex rust version with `cargo update -p convex` or by updating \
                  `Cargo.toml`."
             },
-            Self::StreamingImport
+            Self::CreateConvex
+            | Self::StreamingImport
             | Self::AirbyteExport
             | Self::FivetranImport
             | Self::FivetranExport
@@ -400,6 +400,7 @@ impl ClientVersion {
             },
             ClientType::Python => self.version().above_threshold(&Version::new(0, 5, 0)),
             ClientType::Rust
+            | ClientType::CreateConvex
             | ClientType::StreamingImport
             | ClientType::AirbyteExport
             | ClientType::FivetranImport
@@ -427,179 +428,5 @@ impl fmt::Display for ClientVersion {
 impl fmt::Debug for ClientVersion {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{} ({:?})", self, self.current_state())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::assert_matches::assert_matches;
-
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-    use semver::{
-        BuildMetadata,
-        Prerelease,
-        Version,
-    };
-    use sync_types::testing::assert_roundtrips;
-    use value::export::ValueFormat;
-
-    use super::{
-        ClientVersion,
-        ClientVersionState,
-    };
-    use crate::version::{
-        ClientType,
-        ClientVersionIdent,
-        DeprecationThreshold,
-        DEPRECATION_THRESHOLD,
-    };
-
-    #[test]
-    fn test_static_versions() {
-        let DeprecationThreshold { npm, python, rust } = &*DEPRECATION_THRESHOLD;
-        assert!(npm.upgrade_required >= npm.unsupported);
-        assert!(python.upgrade_required >= python.unsupported);
-        assert!(rust.upgrade_required >= rust.unsupported);
-    }
-
-    #[test]
-    fn test_client_version() -> anyhow::Result<()> {
-        assert_matches!(
-            "npm-cli-0.0.0".parse::<ClientVersion>()?.current_state(),
-            ClientVersionState::Unsupported(_)
-        );
-        let upgrade_required_version_plus_one = Version::new(
-            DEPRECATION_THRESHOLD.npm.upgrade_required.major,
-            DEPRECATION_THRESHOLD.npm.upgrade_required.minor,
-            DEPRECATION_THRESHOLD.npm.upgrade_required.patch + 1,
-        );
-        let client_version = ClientVersion {
-            client: ClientType::NPM,
-            version: ClientVersionIdent::Semver(upgrade_required_version_plus_one),
-        };
-        assert_eq!(
-            client_version.current_state(),
-            ClientVersionState::Supported
-        );
-
-        // Unknown version of NPM are unsupported
-        let client_version = ClientVersion {
-            client: ClientType::NPM,
-            version: ClientVersionIdent::Unrecognized("asdfdsasdf".to_string()),
-        };
-        assert_matches!(
-            client_version.current_state(),
-            ClientVersionState::Unsupported(_)
-        );
-
-        // Versions higher than what we know about are also considered latest.
-        assert_eq!(
-            "python-1000.0.0".parse::<ClientVersion>()?.current_state(),
-            ClientVersionState::Supported
-        );
-        assert_eq!(
-            "streaming-import-0.0.10".parse::<ClientVersion>()?,
-            ClientVersion {
-                client: ClientType::StreamingImport,
-                version: ClientVersionIdent::Semver(Version::new(0, 0, 10))
-            }
-        );
-
-        // Not a valid semver
-        assert_matches!(
-            "npm-1.2.3.4".parse::<ClientVersion>()?.current_state(),
-            ClientVersionState::Unsupported(_)
-        );
-
-        assert_eq!(
-            &format!("{}", "npm-0.0.10".parse::<ClientVersion>()?),
-            "npm-0.0.10"
-        );
-        assert_matches!(
-            "npm-0.0.0".parse::<ClientVersion>()?.current_state(),
-            ClientVersionState::Unsupported(_),
-        );
-        assert_eq!(
-            &format!("{}", "custom-swift-0.0.10".parse::<ClientVersion>()?),
-            "custom-swift-0.0.10"
-        );
-        assert_eq!(
-            &format!(
-                "{}",
-                "custom-swift-0.0.10-alpha.0".parse::<ClientVersion>()?
-            ),
-            "custom-swift-0.0.10-alpha.0"
-        );
-        // longest parseable semver spec from the right
-        assert_eq!(
-            "some-custom-thing-1.2.3-4.5.6-alpha.7".parse::<ClientVersion>()?,
-            ClientVersion {
-                client: ClientType::Unrecognized("some-custom-thing".to_string()),
-                version: ClientVersionIdent::Semver(Version {
-                    major: 1,
-                    minor: 2,
-                    patch: 3,
-                    pre: Prerelease::new("4.5.6-alpha.7")?,
-                    build: BuildMetadata::EMPTY
-                })
-            }
-        );
-        assert_eq!(
-            "big_brain-20240412T160958Z-baea64010a12"
-                .parse::<ClientVersion>()?
-                .current_state(),
-            ClientVersionState::Supported
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_should_require_format_param() -> anyhow::Result<()> {
-        let require = [
-            "npm-1.4.1",
-            "npm-1.5.0",
-            "npm-1.6.0",
-            "npm-2.0.0",
-            "actions-1.4.1",
-            "npm-cli-1.4.1",
-            "python-0.5.0",
-            "python-0.6.0",
-            "python-1.6.0",
-            "asdf-0.0.0", // unknown
-        ];
-        for r in require {
-            assert_eq!(
-                r.parse::<ClientVersion>()?.default_format(),
-                ValueFormat::ConvexCleanJSON,
-            );
-        }
-        let not_require = [
-            "npm-1.3.0",
-            "npm-1.2.0",
-            "npm-0.19.0",
-            "actions-1.3.0",
-            "npm-cli-1.3.0",
-            "python-0.4.0",
-            "python-0.3.0",
-        ];
-        for r in not_require {
-            assert_eq!(
-                r.parse::<ClientVersion>()?.default_format(),
-                ValueFormat::ConvexEncodedJSON,
-            );
-        }
-        Ok(())
-    }
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_client_version_roundtrips(u in any::<ClientVersion>()) {
-            assert_roundtrips::<ClientVersion, pb::common::ClientVersion>(u);
-        }
     }
 }

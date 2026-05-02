@@ -23,7 +23,7 @@ use std::{
 
 use atomic_refcell::AtomicRefCell;
 use common::{
-    bootstrap_model::index::vector_index::DeveloperVectorIndexConfig,
+    bootstrap_model::index::vector_index::VectorIndexSpec,
     document::ResolvedDocument,
     knobs::VECTOR_INDEX_THREADS,
     persistence::DocumentStream,
@@ -132,7 +132,7 @@ pub enum QdrantVectorIndexType {
 }
 
 impl QdrantSchema {
-    pub fn new(index_config: &DeveloperVectorIndexConfig) -> Self {
+    pub fn new(index_config: &VectorIndexSpec) -> Self {
         Self {
             dimension: u32::from(index_config.dimensions) as usize,
             vector_field: index_config.vector_field.clone(),
@@ -142,7 +142,7 @@ impl QdrantSchema {
 
     pub fn index(&self, document: &ResolvedDocument) -> Option<QdrantDocument> {
         let object = document.value();
-        let Some(ConvexValue::Array(ref array)) = object.get_path(&self.vector_field) else {
+        let Some(ConvexValue::Array(array)) = object.get_path(&self.vector_field) else {
             return None;
         };
         let mut vector = Vec::with_capacity(self.dimension);
@@ -238,8 +238,8 @@ impl QdrantSchema {
             ErrorMetadata::bad_request(
                 "TooManyElementsInVectorQueryError",
                 format!(
-                    "Vector query against {index_name} has too many conditions. Max: {} Actual: {}",
-                    MAX_FILTER_LENGTH, filter_length
+                    "Vector query against {index_name} has too many conditions. Max: \
+                     {MAX_FILTER_LENGTH} Actual: {filter_length}"
                 )
             )
         );
@@ -312,7 +312,7 @@ impl QdrantSchema {
                 histograms: true,
             };
             tracing::warn!(
-                "Slow qdrant query, duration: {}ms, segment telemetry: {:#?}",
+                "Slow qdrant query, duration: {}ms, segment telemetry: {:?}",
                 duration.as_millis(),
                 segment.get_telemetry_data(detail),
             )
@@ -522,13 +522,6 @@ impl QdrantDocument {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-pub fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
-    let v1 = CosineMetric::preprocess(v1.to_vec());
-    let v2 = CosineMetric::preprocess(v2.to_vec());
-    CosineMetric::similarity(&v1, &v2)
-}
-
 // NB: For cosine similarity, we need to normalize vectors before indexing them.
 #[derive(Clone, Debug)]
 pub struct NormalizedQdrantDocument {
@@ -671,68 +664,5 @@ fn json_path_from_str(s: &str) -> anyhow::Result<JsonPath> {
         Err(()) => {
             anyhow::bail!("Unable to parse to JsonPath: {s}");
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use common::types::Timestamp;
-    use maplit::btreemap;
-    use rand::Rng;
-    use serde_json::json;
-    use value::InternalId;
-
-    use crate::QdrantDocument;
-
-    #[test]
-    fn test_encode_payload() -> anyhow::Result<()> {
-        let mut rng = rand::rng();
-        let d = 1536;
-
-        let document = QdrantDocument {
-            internal_id: InternalId(1u128.to_le_bytes()),
-            vector: (0..d)
-                .map(|_| rng.random())
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-            filter_fields: btreemap!(),
-        };
-        let payload = document.encode_payload(Timestamp::MIN)?;
-        assert_eq!(payload, json!({ "_ts": "AAAAAAAAAAA"}));
-
-        let document = QdrantDocument {
-            internal_id: InternalId(1u128.to_le_bytes()),
-            vector: (0..d)
-                .map(|_| rng.random())
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-            filter_fields: btreemap!(
-                "abc".parse()? => vec![97],
-                "def.ghi".parse()? => vec![98],
-                "def.xyz".parse()? => vec![99],
-            ),
-        };
-        let payload = document.encode_payload(Timestamp::MIN)?;
-        assert_eq!(
-            payload,
-            json!({ "abc": "YQ", "def": { "ghi": "Yg", "xyz": "Yw"}, "_ts": "AAAAAAAAAAA"})
-        );
-
-        let document = QdrantDocument {
-            internal_id: InternalId(1u128.to_le_bytes()),
-            vector: (0..d)
-                .map(|_| rng.random())
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-            filter_fields: btreemap!(
-                "zzz".parse()? => vec![97],
-            ),
-        };
-        let payload = document.encode_payload(Timestamp::MIN)?;
-        assert_eq!(payload, json!({ "zzz": "YQ", "_ts": "AAAAAAAAAAA"}));
-        Ok(())
     }
 }

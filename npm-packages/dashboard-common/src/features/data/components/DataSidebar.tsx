@@ -1,9 +1,8 @@
-import { CodeIcon, MagnifyingGlassIcon, PlusIcon } from "@radix-ui/react-icons";
+import { CubeIcon, MagnifyingGlassIcon, PlusIcon } from "@radix-ui/react-icons";
 import { useMutation } from "convex/react";
 import classNames from "classnames";
 import { useContext, useState } from "react";
 import udfs from "@common/udfs";
-import { cn } from "@ui/cn";
 import { useInvalidateShapes } from "@common/features/data/lib/api";
 import { TextInput } from "@ui/TextInput";
 import {
@@ -24,10 +23,12 @@ export function DataSidebar({
   tableData,
   onSelectTable,
   showSchema,
+  onTableCreated,
 }: {
   tableData: TableMetadata;
   onSelectTable?: () => void;
   showSchema: { hasSaved: boolean; showSchema: () => void } | undefined;
+  onTableCreated?: () => void;
 }) {
   const { name: selectedTable, tables } = tableData;
 
@@ -59,12 +60,12 @@ export function DataSidebar({
             type="search"
             className={classNames(
               "placeholder:text-content-tertiary truncate relative w-full text-left text-xs text-content-primary disabled:bg-background-tertiary disabled:text-content-secondary disabled:cursor-not-allowed",
-              "focus:outline-none bg-background-secondary font-normal",
+              "focus:outline-hidden bg-background-secondary font-normal",
             )}
           />
         </div>
       )}
-      <div className={cn("flex-1 overflow-auto scrollbar px-3 pt-1")}>
+      <div className="scrollbar flex-1 overflow-auto px-3 py-1">
         <div className="flex flex-col gap-0.5">
           {Array.from(tables.keys())
             .filter(
@@ -84,16 +85,16 @@ export function DataSidebar({
               />
             ))}
         </div>
-        <CreateNewTable tableData={tableData} />
+        <CreateNewTable tableData={tableData} onTableCreated={onTableCreated} />
       </div>
-      <div className="mt-2 flex justify-around border-t pt-4">
+      <div className="flex justify-around border-t pt-4">
         {showSchema === undefined ? (
           <Loading className="h-[2.25rem]" fullHeight={false} />
         ) : (
           <Button
             variant="neutral"
             onClick={showSchema.showSchema}
-            icon={<CodeIcon />}
+            icon={<CubeIcon />}
             className="animate-fadeInFromLoading overflow-hidden"
           >
             <span className="truncate">Schema</span>
@@ -104,7 +105,13 @@ export function DataSidebar({
   );
 }
 
-export function CreateNewTable({ tableData }: { tableData: TableMetadata }) {
+export function CreateNewTable({
+  tableData,
+  onTableCreated,
+}: {
+  tableData: TableMetadata;
+  onTableCreated?: () => void;
+}) {
   const { tables, selectTable } = tableData;
   const invalidateShapes = useInvalidateShapes();
 
@@ -116,16 +123,20 @@ export function CreateNewTable({ tableData }: { tableData: TableMetadata }) {
   );
   const { selectedNent } = useNents();
 
-  const { useCurrentDeployment, useHasProjectAdminPermissions } = useContext(
-    DeploymentInfoContext,
-  );
+  const {
+    useCurrentDeployment,
+    useHasProjectAdminPermissions,
+    useIsOperationAllowed,
+  } = useContext(DeploymentInfoContext);
 
   const deployment = useCurrentDeployment();
   const hasAdminPermissions = useHasProjectAdminPermissions(
     deployment?.projectId,
   );
+  const canWriteData = useIsOperationAllowed("WriteData");
   const canCreateTable =
-    deployment?.deploymentType !== "prod" || hasAdminPermissions;
+    (deployment?.deploymentType !== "prod" || hasAdminPermissions) &&
+    canWriteData;
 
   return newTableName !== undefined ? (
     <form
@@ -146,6 +157,7 @@ export function CreateNewTable({ tableData }: { tableData: TableMetadata }) {
           });
           await invalidateShapes();
           selectTable(newTableName);
+          onTableCreated?.();
         } finally {
           setNewTableName(undefined);
         }
@@ -156,7 +168,9 @@ export function CreateNewTable({ tableData }: { tableData: TableMetadata }) {
         className="mt-1"
         labelHidden
         onKeyDown={(e) => {
-          e.key === "Escape" && setNewTableName(undefined);
+          if (e.key === "Escape") {
+            setNewTableName(undefined);
+          }
         }}
         autoFocus
         placeholder="Untitled table"
@@ -207,7 +221,7 @@ export function CreateNewTable({ tableData }: { tableData: TableMetadata }) {
         selectedNent && selectedNent.state !== "active"
           ? "Cannot create tables in an unmounted component."
           : !canCreateTable &&
-            "You do not have permission to create tables in production."
+            "You do not have permission to create tables in this deployment."
       }
     >
       <span className="truncate">Create Table</span>

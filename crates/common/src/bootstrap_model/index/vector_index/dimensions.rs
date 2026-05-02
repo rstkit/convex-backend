@@ -6,12 +6,7 @@ pub const MIN_VECTOR_DIMENSIONS: u32 = 2;
 pub const MAX_VECTOR_DIMENSIONS: u32 = 4096;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct VectorDimensions(
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "MIN_VECTOR_DIMENSIONS..=MAX_VECTOR_DIMENSIONS")
-    )]
     u32,
 );
 
@@ -44,8 +39,8 @@ impl TryFrom<u32> for VectorDimensions {
             ErrorMetadata::bad_request(
                 "InvalidVectorDimensionError",
                 format!(
-                    "Dimensions {} must be between {} and {}.",
-                    value, MIN_VECTOR_DIMENSIONS, MAX_VECTOR_DIMENSIONS
+                    "Dimensions {value} must be between {MIN_VECTOR_DIMENSIONS} and \
+                     {MAX_VECTOR_DIMENSIONS}."
                 )
             )
         );

@@ -1,12 +1,28 @@
-import { StoryObj } from "@storybook/react";
+import { Meta, StoryObj } from "@storybook/nextjs";
 import { useRef, useState } from "react";
 import { ExternalLinkIcon, StarIcon, TrashIcon } from "@radix-ui/react-icons";
 import { ContextMenu } from "@common/features/data/components/ContextMenu";
 import { useContextMenuTrigger } from "@common/features/data/lib/useContextMenuTrigger";
+import { fn } from "storybook/test";
 
-export default { component: ContextMenu };
+const meta = {
+  component: ContextMenu,
+  args: {
+    target: null,
+    onClose: fn(),
+  },
+  argTypes: {
+    target: {
+      control: false,
+    },
+    onClose: {
+      control: false,
+    },
+  },
+} satisfies Meta<typeof ContextMenu>;
 
-type Story = StoryObj<typeof ContextMenu>;
+export default meta;
+type Story = StoryObj<typeof meta>;
 
 function DemoTrigger({
   onOpenContextMenu,
@@ -82,6 +98,9 @@ function ContextMenuDemo() {
           ))}
           <ContextMenu.Submenu label="Another submenu" action={() => {}}>
             <ContextMenu.Item label="Other item" action={() => {}} />
+          </ContextMenu.Submenu>
+          <ContextMenu.Submenu label="Non-clickable submenu">
+            <ContextMenu.Item label="Disabled submenu item" action={() => {}} />
           </ContextMenu.Submenu>
         </ContextMenu.Submenu>
         <hr />

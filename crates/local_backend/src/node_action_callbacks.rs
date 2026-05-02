@@ -5,12 +5,7 @@ use std::{
 
 use anyhow::Context;
 use axum::{
-    debug_handler,
-    extract::{
-        FromRef,
-        FromRequestParts,
-        State,
-    },
+    extract::FromRequestParts,
     response::IntoResponse,
     RequestPartsExt,
 };
@@ -21,15 +16,22 @@ use common::{
         PublicFunctionPath,
     },
     execution_context::{
+        ClientIp,
+        ClientUserAgent,
         ExecutionContext,
         ExecutionId,
+        RequestMetadata,
     },
     fastrace_helpers::{
         initialize_root_from_parent,
         EncodedSpan,
     },
     http::{
-        extract::Json,
+        extract::{
+            FromMtState,
+            Json,
+            MtState,
+        },
         ExtractClientVersion,
         HttpResponseError,
     },
@@ -39,15 +41,13 @@ use common::{
         FunctionCaller,
         UdfIdentifier,
     },
+    RequestContext,
     RequestId,
 };
 use errors::ErrorMetadata;
 use fastrace::future::FutureExt;
 use http::HeaderMap;
-use isolate::{
-    ActionCallbacks,
-    UdfArgsJson,
-};
+use isolate::UdfArgsJson;
 use keybroker::Identity;
 use serde::{
     Deserialize,
@@ -61,6 +61,7 @@ use sync_types::{
     AuthenticationToken,
     CanonicalizedUdfPath,
 };
+use udf::ActionCallbacks;
 use usage_tracking::FunctionUsageTracker;
 use value::{
     export::ValueFormat,
@@ -96,9 +97,8 @@ pub struct NodeCallbackUdfPostRequest {
 /// endpoints, and should only be used to support Convex functions calling into
 /// other Convex functions (i.e. actions calling into mutations)
 #[fastrace::trace]
-#[debug_handler]
 pub async fn internal_query_post(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -120,12 +120,13 @@ pub async fn internal_query_post(
     let udf_return = st
         .application
         .read_only_udf(
-            context.request_id,
+            RequestContext::new(context.request_id, context.request_metadata),
             PublicFunctionPath::Component(path),
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             identity,
             FunctionCaller::Action {
                 parent_scheduled_job: context.parent_scheduled_job,
+                parent_execution_id: Some(context.execution_id),
             },
         )
         .await?;
@@ -135,7 +136,7 @@ pub async fn internal_query_post(
     let value_format = Some(ValueFormat::ConvexEncodedJSON);
     let response = match udf_return.result {
         Ok(value) => UdfResponse::Success {
-            value: export_value(value.unpack(), value_format, client_version)?,
+            value: export_value(value.unpack()?, value_format, client_version)?,
             log_lines: udf_return.log_lines,
         },
         Err(error) => {
@@ -150,9 +151,8 @@ pub async fn internal_query_post(
 /// endpoints, and should only be used to support Convex functions calling into
 /// other Convex functions (i.e. actions calling into mutations)
 #[fastrace::trace]
-#[debug_handler]
 pub async fn internal_mutation_post(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -174,13 +174,14 @@ pub async fn internal_mutation_post(
     let udf_result = st
         .application
         .mutation_udf(
-            context.request_id,
+            RequestContext::new(context.request_id, context.request_metadata),
             PublicFunctionPath::Component(path),
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             identity,
             None,
             FunctionCaller::Action {
                 parent_scheduled_job: context.parent_scheduled_job,
+                parent_execution_id: Some(context.execution_id),
             },
             None,
         )
@@ -191,7 +192,7 @@ pub async fn internal_mutation_post(
     let value_format = Some(ValueFormat::ConvexEncodedJSON);
     let response = match udf_result {
         Ok(write_return) => UdfResponse::Success {
-            value: export_value(write_return.value.unpack(), value_format, client_version)?,
+            value: export_value(write_return.value.unpack()?, value_format, client_version)?,
             log_lines: write_return.log_lines,
         },
         Err(write_error) => UdfResponse::nested_error(
@@ -209,9 +210,8 @@ pub async fn internal_mutation_post(
 /// endpoints, and should only be used to support Convex functions calling into
 /// other Convex functions (i.e. actions calling into actions)
 #[fastrace::trace]
-#[debug_handler]
 pub async fn internal_action_post(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -233,12 +233,13 @@ pub async fn internal_action_post(
     let udf_result = st
         .application
         .action_udf(
-            context.request_id,
+            RequestContext::new(context.request_id, context.request_metadata),
             PublicFunctionPath::Component(path),
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             identity,
             FunctionCaller::Action {
                 parent_scheduled_job: context.parent_scheduled_job,
+                parent_execution_id: Some(context.execution_id),
             },
         )
         .await?;
@@ -248,7 +249,7 @@ pub async fn internal_action_post(
     let value_format = Some(ValueFormat::ConvexEncodedJSON);
     let response = match udf_result {
         Ok(action_return) => UdfResponse::Success {
-            value: export_value(action_return.value.unpack(), value_format, client_version)?,
+            value: export_value(action_return.value.unpack()?, value_format, client_version)?,
             log_lines: action_return.log_lines,
         },
         Err(action_error) => UdfResponse::nested_error(
@@ -277,9 +278,8 @@ pub struct ScheduleJobResponse {
     job_id: String,
 }
 
-#[debug_handler]
 pub async fn schedule_job(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -287,7 +287,9 @@ pub async fn schedule_job(
     ExtractExecutionContext(context): ExtractExecutionContext,
     Json(req): Json<ScheduleJobRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    let scheduled_ts = UnixTimestamp::from_secs_f64(req.scheduled_ts);
+    let scheduled_ts = UnixTimestamp::from_secs_f64(req.scheduled_ts).with_context(|| {
+        ErrorMetadata::bad_request("InvalidTimestamp", "Requested scheduled_ts is invalid")
+    })?;
     // User might have entered an invalid path, so this is a developer error.
     let path = st
         .application
@@ -302,7 +304,7 @@ pub async fn schedule_job(
         .map_err(|e| {
             anyhow::anyhow!(ErrorMetadata::bad_request("InvalidUdfPath", e.to_string()))
         })?;
-    let udf_args = req.udf_args.into_arg_vec();
+    let udf_args = req.udf_args.into_serialized_args()?;
     let job_id = st
         .application
         .runner()
@@ -326,9 +328,8 @@ pub struct CancelDeveloperJobRequest {
     pub id: String,
 }
 
-#[debug_handler]
 pub async fn cancel_developer_job(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id: _,
@@ -359,9 +360,8 @@ pub struct CreateFunctionHandleResponse {
     handle: String,
 }
 
-#[debug_handler]
 pub async fn create_function_handle(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -391,9 +391,8 @@ pub async fn create_function_handle(
     }))
 }
 
-#[debug_handler]
 pub async fn vector_search(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -415,7 +414,7 @@ pub async fn vector_search(
     // This is a workaround. The correct way to track usage is to return in the
     // response, and then Node.js should aggregate it and then send it back to
     // the backend alongside the action result, which is how Funrun actions
-    // work. Since we don't have that pipeline working in Node.js/Typescript, we
+    // work. Since we don't have that pipeline working in Node.js/TypeScript, we
     // report vector usage directly here.
     if let Some(action_name) = action_name {
         let usage = FunctionUsageTracker::new();
@@ -450,9 +449,8 @@ pub async fn vector_search(
     Ok(Json(json!({ "results": results })))
 }
 
-#[debug_handler]
 pub async fn storage_generate_upload_url(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -471,9 +469,8 @@ pub struct GetParams {
     storage_id: String,
 }
 
-#[debug_handler]
 pub async fn storage_get_url(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -489,9 +486,8 @@ pub async fn storage_get_url(
     Ok(Json(json!({ "url": url })))
 }
 
-#[debug_handler]
 pub async fn storage_get_metadata(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -526,9 +522,8 @@ pub async fn storage_get_metadata(
     Ok(Json(file_metadata))
 }
 
-#[debug_handler]
 pub async fn storage_delete(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractActionIdentity {
         identity,
         component_id,
@@ -541,6 +536,23 @@ pub async fn storage_delete(
         .storage_delete(identity, component_id, storage_id)
         .await?;
     Ok(Json(json!(null)))
+}
+
+#[derive(Deserialize)]
+pub struct AuditLogParams {
+    #[allow(dead_code)]
+    body: JsonValue,
+}
+
+pub async fn audit_log(
+    _: ExtractActionIdentity,
+    Json(_): Json<AuditLogParams>,
+) -> Result<Json<JsonValue>, HttpResponseError> {
+    Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+        "AuditLogNotSupportedInAction",
+        "Audit logging is not yet supported in actions",
+    ))
+    .into())
 }
 
 pub static CONVEX_ACTIONS_CALLBACK_TOKEN: &str = "Convex-Action-Callback-Token";
@@ -577,18 +589,13 @@ fn get_encoded_span(headers: &HeaderMap) -> anyhow::Result<EncodedSpan> {
 }
 
 pub async fn action_callbacks_middleware<S>(
+    MtState(st): MtState<LocalAppState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<impl IntoResponse, HttpResponseError>
 where
-    LocalAppState: FromRef<S>,
-    S: Send + Sync + Clone + 'static,
+    LocalAppState: FromMtState<S>,
 {
-    let st = LocalAppState::from_ref(
-        req.extensions()
-            .get::<S>()
-            .context("Missing LocalAppState")?,
-    );
     // Validate we have an valid token in order to call any methods in this
     // actions_callback router.
     check_actions_token(&st, req.headers()).await?;
@@ -609,7 +616,7 @@ pub struct ExtractActionIdentity {
 
 impl<S> FromRequestParts<S> for ExtractActionIdentity
 where
-    LocalAppState: FromRef<S>,
+    LocalAppState: FromMtState<S>,
     S: Send + Sync + Clone + 'static,
 {
     type Rejection = HttpResponseError;
@@ -618,7 +625,7 @@ where
         parts: &mut axum::http::request::Parts,
         st: &S,
     ) -> Result<Self, Self::Rejection> {
-        let st = LocalAppState::from_ref(st);
+        let st = LocalAppState::from_request_parts(parts, st).await?;
         let token: AuthenticationToken =
             parts.extract::<ExtractAuthenticationToken>().await?.into();
 
@@ -710,153 +717,39 @@ impl<T: Sync> FromRequestParts<T> for ExtractExecutionContext {
         )
         .context("Invalid parent scheduled job component id")?;
 
+        let client_ip: Option<ClientIp> = parts
+            .headers
+            .get("Convex-Request-Client-Ip")
+            .map(|v| {
+                ClientIp::try_from(
+                    v.to_str()
+                        .context("Request client IP must be a string")?
+                        .to_owned(),
+                )
+            })
+            .transpose()?;
+
+        let client_user_agent: Option<ClientUserAgent> = parts
+            .headers
+            .get("Convex-Request-Client-User-Agent")
+            .map(|v| {
+                ClientUserAgent::try_from(
+                    v.to_str()
+                        .context("Request User-Agent must be a string")?
+                        .to_owned(),
+                )
+            })
+            .transpose()?;
+
         Ok(Self(ExecutionContext::new_from_parts(
             request_id,
             execution_id,
             parent_job_id.map(|id| (parent_component_id, id)),
             is_root,
+            RequestMetadata {
+                ip: client_ip,
+                user_agent: client_user_agent,
+            },
         )))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use application::test_helpers::ApplicationTestExt;
-    use axum::body::Body;
-    use axum_extra::headers::authorization::Credentials;
-    use common::{
-        components::ComponentId,
-        runtime::Runtime,
-    };
-    use http::Request;
-    use runtime::prod::ProdRuntime;
-    use serde_json::{
-        json,
-        Value as JsonValue,
-    };
-
-    use crate::{
-        node_action_callbacks::ScheduleJobResponse,
-        public_api::UdfResponse,
-        scheduling::CancelJobRequest,
-        test_helpers::setup_backend_for_test,
-    };
-
-    #[convex_macro::prod_rt_test]
-    async fn test_cancel_recursive_scheduled_job(rt: ProdRuntime) -> anyhow::Result<()> {
-        let backend = setup_backend_for_test(rt.clone()).await?;
-        let callback_token = backend
-            .st
-            .application
-            .key_broker()
-            .issue_action_token(ComponentId::test_user());
-        backend
-            .st
-            .application
-            .load_udf_tests_modules_with_node()
-            .await?;
-
-        // Schedule a job
-        let schedule_body = serde_json::to_vec(&json!({
-            "udfPath": "node_actions:sleepAnHour",
-            "udfArgs": [],
-            "scheduledTs": Into::<i64>::into(rt.generate_timestamp()?) / 1_000_000_000,
-        }))?;
-        let req = Request::builder()
-            .uri("/api/actions/schedule_job")
-            .method("POST")
-            .header("Authorization", backend.admin_auth_header.0.encode())
-            .header("Host", "localhost")
-            .header("Content-Type", "application/json")
-            .header("Convex-Action-Callback-Token", callback_token.clone())
-            .body(schedule_body.clone().into())?;
-        let ScheduleJobResponse { job_id } = backend.expect_success(req).await?;
-
-        // Get the system document id
-        let json_body = json!({
-            "path":
-                "_system/frontend/paginatedScheduledJobs.js",
-            "args":json!({"paginationOpts": {"numItems": 10, "cursor": null}}),
-            "format": "json",
-        });
-        let body = Body::from(serde_json::to_vec(&json_body)?);
-        let req = Request::builder()
-            .uri("/api/query")
-            .method("POST")
-            .header("Authorization", backend.admin_auth_header.0.encode())
-            .header("Host", "localhost")
-            .header("Content-Type", "application/json")
-            .body(body)?;
-        let result: JsonValue = backend.expect_success(req).await?;
-        let object = result.as_object().unwrap();
-        assert_eq!(object["status"], "success");
-
-        let jobs = object["value"]["page"].as_array().unwrap().clone();
-        assert_eq!(jobs.len(), 1);
-        let system_job_id = jobs[0]["_id"].as_str().unwrap().to_string();
-
-        // Cancel the scheduled job
-        let body = Body::from(serde_json::to_vec(&CancelJobRequest {
-            id: job_id.clone(),
-            component_id: ComponentId::Root.serialize_to_string(),
-        })?);
-        let req = Request::builder()
-            .uri("/api/actions/cancel_job")
-            .method("POST")
-            .header("Authorization", backend.admin_auth_header.0.encode())
-            .header("Content-Type", "application/json")
-            .header("Convex-Action-Callback-Token", callback_token.clone())
-            .body(body)?;
-        let () = backend.expect_success(req).await?;
-
-        // Try to schedule a job as though we are a the currently running node action
-        // that was just canceled
-        let req = Request::builder()
-            .uri("/api/actions/schedule_job")
-            .method("POST")
-            .header("Authorization", backend.admin_auth_header.0.encode())
-            .header("Host", "localhost")
-            .header("Content-Type", "application/json")
-            .header("Convex-Action-Callback-Token", callback_token.clone())
-            .header("Convex-Parent-Scheduled-Job", system_job_id.clone())
-            .body(schedule_body.into())?;
-        backend.expect_success::<ScheduleJobResponse>(req).await?;
-
-        // Call an action A which calls an action B which schedules, as though A were
-        // canceled.
-        let action_body = serde_json::to_vec(&json!({
-            "path": "node_actions:actionCallsAction",
-            "args": [],
-        }))?;
-        let req = Request::builder()
-            .uri("/api/actions/action")
-            .method("POST")
-            .header("Authorization", backend.admin_auth_header.0.encode())
-            .header("Content-Type", "application/json")
-            .header("Convex-Action-Callback-Token", callback_token)
-            .header("Convex-Parent-Scheduled-Job", system_job_id)
-            .body(action_body.into())?;
-        backend.expect_success::<UdfResponse>(req).await?;
-
-        // Check that there are no more scheduled jobs
-        let json_body = json!({
-            "path":
-                "_system/frontend/paginatedScheduledJobs.js",
-            "args":json!({"paginationOpts": {"numItems": 10, "cursor": null}}),
-            "format": "json",
-        });
-        let body = Body::from(serde_json::to_vec(&json_body)?);
-        let req = Request::builder()
-            .uri("/api/query")
-            .method("POST")
-            .header("Authorization", backend.admin_auth_header.0.encode())
-            .header("Host", "localhost")
-            .header("Content-Type", "application/json")
-            .body(body)?;
-        let result: JsonValue = backend.expect_success(req).await?;
-        let object = result.as_object().unwrap();
-        assert_eq!(object["status"], "success");
-        assert_eq!(object["value"]["page"], JsonValue::Array(vec![]));
-        Ok(())
     }
 }

@@ -1,13 +1,15 @@
-import { DeploymentResponse, Team } from "generatedApi";
+import { TeamResponse } from "generatedApi";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
 import { ArchiveIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
 import { useGetZipExport } from "hooks/deploymentApi";
-import { BackupResponse, useListCloudBackups } from "api/backups";
+import { BackupResponse, useListCloudBackupsIfAvailable } from "api/backups";
 import { Loading } from "@ui/Loading";
 import { EmptySection } from "@common/elements/EmptySection";
 import { useQuery } from "convex/react";
 import udfs from "@common/udfs";
 import { BackupListItem, progressMessageForBackup } from "./BackupListItem";
+import { Callout } from "@ui/Callout";
 import { BackupDeploymentSelector } from "./BackupDeploymentSelector";
 import { useLatestRestore } from "./BackupRestoreStatus";
 
@@ -17,15 +19,15 @@ export function BackupList({
   canPerformActions,
   maxCloudBackups,
 }: {
-  targetDeployment: DeploymentResponse; // = deployment the settings page is open for
-  team: Team;
+  targetDeployment: PlatformDeploymentResponse; // = deployment the settings page is open for
+  team: TeamResponse;
   canPerformActions: boolean;
   maxCloudBackups: number;
 }) {
-  const backups = useListCloudBackups(team?.id); // order: latest to oldest
-
   const [selectedDeployment, setSelectedDeployment] =
     useState(targetDeployment);
+
+  const backups = useListCloudBackupsIfAvailable(selectedDeployment); // order: latest to oldest
 
   const latestRestore = useLatestRestore();
   const requestor = latestRestore?.requestor;
@@ -51,63 +53,67 @@ export function BackupList({
           targetDeployment={targetDeployment}
         />
       </div>
-      <div className="grow overflow-auto scrollbar">
-        {backups === undefined ? (
-          <Loading />
-        ) : (
-          <BackupListForDeployment
-            backups={backups}
-            selectedDeployment={selectedDeployment}
-            targetDeployment={targetDeployment}
-            restoringBackupId={restoringBackupId}
-            team={team}
-            canPerformActions={canPerformActions}
-            maxCloudBackups={maxCloudBackups}
-          />
-        )}
-      </div>
+      {selectedDeployment.kind === "cloud" &&
+      selectedDeployment.class.startsWith("d") ? (
+        <Callout className="m-4 max-w-prose">
+          Backups for {selectedDeployment.class.toUpperCase()} deployments are
+          produced every 24 hours and retained for 7 days. Contact the Convex
+          team to restore from a backup.
+        </Callout>
+      ) : (
+        <div className="scrollbar grow overflow-auto">
+          {!backups ? (
+            <Loading />
+          ) : (
+            <BackupListForDeployment
+              backups={backups}
+              targetDeployment={targetDeployment}
+              restoringBackupId={restoringBackupId}
+              canPerformActions={canPerformActions}
+              maxCloudBackups={maxCloudBackups}
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
 function BackupListForDeployment({
   backups,
-  selectedDeployment,
   targetDeployment,
   restoringBackupId,
-  team,
   canPerformActions,
   maxCloudBackups,
 }: {
   backups: BackupResponse[];
-  selectedDeployment: DeploymentResponse;
-  targetDeployment: DeploymentResponse;
+  targetDeployment: PlatformDeploymentResponse;
   restoringBackupId: bigint | null;
-  team: Team;
   canPerformActions: boolean;
   maxCloudBackups: number;
 }) {
   const existingCloudBackup = useQuery(udfs.latestExport.latestCloudExport);
 
-  const selectedDeploymentBackups = backups.filter(
-    (b) => b.sourceDeploymentId === selectedDeployment.id,
-  );
+  // Backups are already scoped to the selected deployment by the server.
+  // For target deployment stats, use a separate query (SWR deduplicates when
+  // selectedDeployment === targetDeployment, the common case).
+  const targetBackups = useListCloudBackupsIfAvailable(targetDeployment);
 
   const latestBackupInTargetDeployment =
-    backups?.find((s) => s.sourceDeploymentId === targetDeployment.id) ?? null;
+    (targetDeployment.kind === "cloud" && targetBackups?.[0]) || null;
 
-  const someBackupInProgress = backups.some(
-    (backup) =>
-      backup.sourceDeploymentId === targetDeployment.id &&
-      (backup.state === "requested" || backup.state === "inProgress"),
-  );
+  const someBackupInProgress =
+    targetDeployment.kind === "cloud" &&
+    (targetBackups ?? []).some(
+      (backup) => backup.state === "requested" || backup.state === "inProgress",
+    );
 
   const getZipExportUrl = useGetZipExport({
     format: "zip",
     include_storage: true,
   });
 
-  return selectedDeploymentBackups.length === 0 ? (
+  return backups.length === 0 ? (
     <EmptySection
       Icon={ArchiveIcon}
       header="No backups in this deployment."
@@ -120,7 +126,7 @@ function BackupListForDeployment({
     />
   ) : (
     <div className="flex flex-col divide-y px-4 py-2">
-      {selectedDeploymentBackups.map((backup) => (
+      {backups.map((backup) => (
         <BackupListItem
           key={backup.id}
           backup={backup}
@@ -129,7 +135,6 @@ function BackupListForDeployment({
           someRestoreInProgress={restoringBackupId !== null}
           latestBackupInTargetDeployment={latestBackupInTargetDeployment}
           targetDeployment={targetDeployment}
-          team={team}
           getZipExportUrl={getZipExportUrl}
           canPerformActions={canPerformActions}
           maxCloudBackups={maxCloudBackups}

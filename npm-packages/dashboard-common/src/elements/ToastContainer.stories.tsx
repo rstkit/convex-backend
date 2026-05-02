@@ -1,4 +1,4 @@
-import type { Meta, StoryObj } from "@storybook/react";
+import type { Meta, StoryObj } from "@storybook/nextjs";
 import { useState } from "react";
 import { ToastContainer } from "@common/elements/ToastContainer";
 import { toast } from "@common/lib/utils";
@@ -6,14 +6,17 @@ import { Sheet } from "@ui/Sheet";
 import { TextInput } from "@ui/TextInput";
 import { Button } from "@ui/Button";
 
-export default {
+const meta = {
   component: ToastContainer,
-} as Meta<typeof ToastContainer>;
+} satisfies Meta<typeof ToastContainer>;
+
+export default meta;
+type Story = StoryObj<typeof meta>;
 
 function ToastDemo() {
   const [message, setMessage] = useState("Hello world");
 
-  const types = ["success", "error", "info"] as const;
+  const types = ["success", "error", "info", "warning"] as const;
   const [type, setType] = useState<(typeof types)[number]>("success");
   const [permanent, setPermanent] = useState(false);
 
@@ -64,12 +67,10 @@ function ToastDemo() {
           </div>
         </form>
       </Sheet>
-
-      <ToastContainer />
     </>
   );
 }
 
-export const Demo: StoryObj<typeof ToastContainer> = {
+export const Demo: Story = {
   render: () => <ToastDemo />,
 };

@@ -1,10 +1,6 @@
-import chalk from "chalk";
-import {
-  Context,
-  logError,
-  logOutput,
-  logWarning,
-} from "../../bundler/context.js";
+import { chalkStderr } from "chalk";
+import { Context } from "../../bundler/context.js";
+import { logError, logOutput, logWarning } from "../../bundler/log.js";
 import { Base64 } from "../../values/index.js";
 import { Value } from "../../values/value.js";
 import { runSystemPaginatedQuery } from "./run.js";
@@ -15,10 +11,17 @@ export async function dataInDeployment(
     deploymentUrl: string;
     adminKey: string;
     deploymentNotice: string;
-    tableName?: string;
+    tableName?: string | undefined;
     limit: number;
     order: "asc" | "desc";
-    component?: string;
+    component?: string | undefined;
+    format?:
+      | "json"
+      | "jsonArray"
+      | "jsonLines"
+      | "jsonl"
+      | "pretty"
+      | undefined;
   },
 ) {
   if (options.tableName !== undefined) {
@@ -31,6 +34,7 @@ export async function dataInDeployment(
         limit: options.limit,
         order: options.order as "asc" | "desc",
         componentPath: options.component ?? "",
+        format: options.format,
       },
     );
   } else {
@@ -59,12 +63,12 @@ async function listTables(
     args: {},
   })) as { name: string }[];
   if (tables.length === 0) {
-    logError(ctx, `There are no tables in the ${deploymentNotice}database.`);
+    logError(`There are no tables in the ${deploymentNotice}database.`);
     return;
   }
   const tableNames = tables.map((table) => table.name);
   tableNames.sort();
-  logOutput(ctx, tableNames.join("\n"));
+  logOutput(tableNames.join("\n"));
 }
 
 async function listDocuments(
@@ -76,6 +80,13 @@ async function listDocuments(
     limit: number;
     order: "asc" | "desc";
     componentPath: string;
+    format?:
+      | "json"
+      | "jsonArray"
+      | "jsonLines"
+      | "jsonl"
+      | "pretty"
+      | undefined;
   },
 ) {
   const data = (await runSystemPaginatedQuery(ctx, {
@@ -91,35 +102,47 @@ async function listDocuments(
   })) as Record<string, Value>[];
 
   if (data.length === 0) {
-    logError(ctx, "There are no documents in this table.");
+    logError("There are no documents in this table.");
     return;
   }
 
-  logDocumentsTable(
-    ctx,
-    data.slice(0, options.limit).map((document) => {
-      const printed: Record<string, string> = {};
-      for (const key in document) {
-        printed[key] = stringify(document[key]);
-      }
-      return printed;
-    }),
-  );
-  if (data.length > options.limit) {
-    logWarning(
-      ctx,
-      chalk.yellow(
-        `Showing the ${options.limit} ${
-          options.order === "desc" ? "most recently" : "oldest"
-        } created document${
-          options.limit > 1 ? "s" : ""
-        }. Use the --limit option to see more.`,
-      ),
+  if (options.format === "json" || options.format === "jsonArray") {
+    logOutput(
+      "[\n" + data.slice(0, options.limit).map(stringify).join(",\n") + "\n]",
     );
+  } else if (options.format === "jsonLines" || options.format === "jsonl") {
+    logOutput(
+      data
+        .slice(0, options.limit)
+        .map((document) => stringify(document))
+        .join("\n"),
+    );
+  } else {
+    logDocumentsTable(
+      ctx,
+      data.slice(0, options.limit).map((document) => {
+        const printed: Record<string, string> = {};
+        for (const key in document) {
+          printed[key] = stringify(document[key]);
+        }
+        return printed;
+      }),
+    );
+    if (data.length > options.limit) {
+      logWarning(
+        chalkStderr.yellow(
+          `Showing the ${options.limit} ${
+            options.order === "desc" ? "most recently" : "oldest"
+          } created document${
+            options.limit > 1 ? "s" : ""
+          }. Use the --limit option to see more.`,
+        ),
+      );
+    }
   }
 }
 
-function logDocumentsTable(ctx: Context, rows: Record<string, string>[]) {
+function logDocumentsTable(_ctx: Context, rows: Record<string, string>[]) {
   const columnsToWidths: Record<string, number> = {};
   for (const row of rows) {
     for (const column in row) {
@@ -152,14 +175,12 @@ function logDocumentsTable(ctx: Context, rows: Record<string, string>[]) {
   }
 
   logOutput(
-    ctx,
     limitLine(
       fields.map((field, i) => field.padEnd(columnWidths[i])).join(" | "),
       lineLimit,
     ),
   );
   logOutput(
-    ctx,
     limitLine(
       columnWidths.map((width) => "-".repeat(width)).join("-|-"),
       lineLimit,
@@ -167,7 +188,6 @@ function logDocumentsTable(ctx: Context, rows: Record<string, string>[]) {
   );
   for (const row of rows) {
     logOutput(
-      ctx,
       limitLine(
         fields
           .map((field, i) => (row[field] ?? "").padEnd(columnWidths[i]))
@@ -178,8 +198,7 @@ function logDocumentsTable(ctx: Context, rows: Record<string, string>[]) {
   }
   if (didTruncate) {
     logWarning(
-      ctx,
-      chalk.yellow(
+      chalkStderr.yellow(
         "Lines were truncated to fit the terminal width. Pipe the command to see " +
           "the full output, such as:\n  `npx convex data tableName | less -S`",
       ),

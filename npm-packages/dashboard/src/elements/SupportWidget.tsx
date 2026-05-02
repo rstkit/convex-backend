@@ -1,4 +1,3 @@
-import { useUser } from "@auth0/nextjs-auth0/client";
 import {
   ChatBubbleIcon,
   ChevronLeftIcon,
@@ -20,6 +19,7 @@ import { useProfile } from "api/profile";
 import { useAuthHeader } from "hooks/fetching";
 import { createGlobalState } from "react-use";
 import * as Yup from "yup";
+import { useWorkOS } from "hooks/useWorkOS";
 
 export const useSupportFormOpen = createGlobalState<
   { defaultMessage: string; defaultSubject: string } | boolean
@@ -28,16 +28,20 @@ export const useSupportFormOpen = createGlobalState<
 export function SupportWidget() {
   const team = useCurrentTeam();
   const { subscription } = useTeamOrbSubscription(team?.id);
-  const { user } = useUser();
+  const { user } = useWorkOS();
   const [openState, setOpenState] = useSupportFormOpen();
 
+  const canSubmitTicket =
+    subscription &&
+    (subscription.plan.planType === "CONVEX_PROFESSIONAL" ||
+      subscription.plan.planType === "CONVEX_BUSINESS");
   if (openState === false || !user) {
     return null;
   }
 
   return (
     <Sheet
-      className="absolute bottom-0 z-50 w-screen animate-fadeInFromLoading p-4 shadow-2xl transition-all sm:bottom-8 sm:right-8 sm:w-[24rem]"
+      className="absolute bottom-0 z-50 w-screen animate-fadeInFromLoading p-4 shadow-2xl transition-all sm:right-8 sm:bottom-8 sm:w-[24rem]"
       padding={false}
     >
       {openState === true ? (
@@ -78,16 +82,19 @@ export function SupportWidget() {
                 setOpenState({ defaultSubject: "", defaultMessage: "" })
               }
               icon={<ChatBubbleIcon />}
-              tip={!subscription && "Email support is available on paid plans."}
+              tip={
+                !canSubmitTicket &&
+                "Email support is available on the Pro plan."
+              }
               tipSide="left"
-              disabled={!subscription}
-              className={subscription ? "text-content-primary" : ""}
+              disabled={!canSubmitTicket}
+              className={canSubmitTicket ? "text-content-primary" : ""}
             >
               File a support ticket{" "}
-              {!subscription && (
+              {!canSubmitTicket && (
                 <span
-                  className="w-fit rounded bg-util-accent px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-white"
-                  title="Only available in paid plans"
+                  className="w-fit rounded-sm bg-util-accent px-1.5 py-0.5 text-xs font-semibold tracking-wider text-white uppercase"
+                  title="Only available on the Pro plan"
                 >
                   Pro
                 </span>
@@ -154,7 +161,7 @@ function SupportForm() {
         try {
           if (resp.status < 500 || resp.status >= 400) {
             const { error } = await resp.json();
-            captureMessage(error);
+            captureMessage(error, "error");
           }
         } catch (e) {
           captureException(e);
@@ -207,7 +214,7 @@ function SupportForm() {
         <textarea
           id="message"
           name="message"
-          className="h-48 resize-y rounded border bg-background-secondary px-4 py-2 text-content-primary placeholder:text-content-tertiary focus:border-border-selected focus:outline-none"
+          className="h-48 resize-y rounded-sm border bg-background-secondary px-4 py-2 text-content-primary placeholder:text-content-tertiary focus:border-border-selected focus:outline-hidden"
           required
           onChange={formState.handleChange}
           value={formState.values.message}
@@ -232,8 +239,7 @@ function SupportForm() {
       </Button>
       {subscription && profile?.email && (
         <p className="text-xs text-content-secondary">
-          The Convex support team will respond by email to {profile.email}{" "}
-          within 24 business hours.
+          The Convex support team will respond by email to {profile.email}.
         </p>
       )}
     </form>

@@ -21,7 +21,6 @@ pub mod crypto_rng;
 pub mod helpers;
 pub mod schema;
 pub mod udf;
-pub mod warnings;
 
 use common::{
     errors::JsError,
@@ -38,7 +37,6 @@ use value::NamespacedTableMapping;
 
 pub use self::async_op::AsyncOpRequest;
 use crate::{
-    concurrency_limiter::ConcurrencyPermit,
     isolate::IsolateHeapStats,
     timeout::Timeout,
 };
@@ -66,8 +64,7 @@ pub trait IsolateEnvironment<RT: Runtime>: 'static {
         &mut self,
         path: &str,
         timeout: &mut Timeout<RT>,
-        permit: &mut Option<ConcurrencyPermit>,
-    ) -> anyhow::Result<Option<(FullModuleSource, ModuleCodeCacheResult)>>;
+    ) -> anyhow::Result<Option<(Arc<FullModuleSource>, ModuleCodeCacheResult)>>;
 
     fn syscall(&mut self, name: &str, args: JsonValue) -> anyhow::Result<JsonValue>;
     fn start_async_syscall(
@@ -81,6 +78,8 @@ pub trait IsolateEnvironment<RT: Runtime>: 'static {
     fn rng(&mut self) -> anyhow::Result<&mut ChaCha12Rng>;
     fn crypto_rng(&mut self) -> anyhow::Result<CryptoRng>;
     fn unix_timestamp(&mut self) -> anyhow::Result<UnixTimestamp>;
+    fn performance_now(&mut self) -> anyhow::Result<Duration>;
+    fn performance_time_origin(&mut self) -> anyhow::Result<UnixTimestamp>;
 
     fn get_environment_variable(&mut self, name: EnvVarName)
         -> anyhow::Result<Option<EnvVarValue>>;

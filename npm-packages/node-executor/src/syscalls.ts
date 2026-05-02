@@ -1,18 +1,11 @@
 import { z } from "zod";
 
-import { UserIdentity } from "convex/server";
+import { DeploymentMetadata, UserIdentity } from "convex/server";
 import { ExecutionContext, SyscallStats } from "./executor";
 import { ConvexError, JSONValue } from "convex/values";
 import { UdfPath } from "./convex";
-import dns from "node:dns";
 
 const MAX_PENDING_SYSCALLS = 1000;
-
-/**
- * Node defaults to ipv6, and since usher runs locally with ipv4 addresses,
- * set the default result order to ipv4
- */
-dns.setDefaultResultOrder("ipv4first");
 
 const STATUS_CODE_BAD_REQUEST = 400;
 // Special custom 5xx HTTP status code to mean that the UDF returned an error.
@@ -97,6 +90,8 @@ export class SyscallsImpl {
 
   encodedParentTrace: string | null;
 
+  deployment: DeploymentMetadata;
+
   constructor(
     udfPath: UdfPath,
     lambdaExecuteId: string,
@@ -106,6 +101,7 @@ export class SyscallsImpl {
     userIdentity: UserIdentity | null,
     executionContext: ExecutionContext,
     encodedParentTrace: string | null,
+    deployment: DeploymentMetadata,
   ) {
     this.udfPath = udfPath;
     this.lambdaExecuteId = lambdaExecuteId;
@@ -117,6 +113,7 @@ export class SyscallsImpl {
     this.pendingSyscallCount = {};
     this.executionContext = executionContext;
     this.encodedParentTrace = encodedParentTrace;
+    this.deployment = deployment;
   }
 
   async actionCallback<ResponseValidator extends z.ZodType>(args: {
@@ -144,7 +141,7 @@ export class SyscallsImpl {
       const body = await response.json();
       const parsedBody = args.responseValidator.parse(body);
       return parsedBody;
-    } catch (e: any) {
+    } catch {
       // This probably represents an error on our side where we're returning the wrong
       // response type, and should ideally never happen. Throw a generic error when
       // it does happen though.
@@ -168,6 +165,13 @@ export class SyscallsImpl {
         this.executionContext.parentScheduledJobComponentId;
     }
     headers["Convex-Request-Id"] = this.executionContext.requestId;
+    if (this.executionContext.ip !== null) {
+      headers["Convex-Request-Client-Ip"] = this.executionContext.ip;
+    }
+    if (this.executionContext.userAgent !== null) {
+      headers["Convex-Request-Client-User-Agent"] =
+        this.executionContext.userAgent;
+    }
     if (this.executionContext.executionId !== undefined) {
       headers["Convex-Execution-Id"] = this.executionContext.executionId;
     }
@@ -198,7 +202,7 @@ export class SyscallsImpl {
     try {
       const parsedArgs = argValidator.parse(args);
       return parsedArgs;
-    } catch (e) {
+    } catch {
       throw new Error(
         `Invalid ${operationName} request with args ${JSON.stringify(args)}`,
       );
@@ -328,6 +332,23 @@ export class SyscallsImpl {
           return JSON.stringify(
             await this.syscallCreateFunctionHandle(jsonArgs),
           );
+        case "1.0/getFunctionMetadata":
+          return JSON.stringify({
+            name: `${stripExtension(this.udfPath.canonicalizedPath)}:${this.udfPath.function}`,
+            // TODO: plumb componentPath through ExecuteRequest when we
+            // support node actions for components.
+            componentPath: "",
+          });
+        case "1.0/getDeploymentMetadata":
+          return JSON.stringify(this.deployment);
+        case "1.0/getRequestMetadata":
+          return JSON.stringify({
+            ip: this.executionContext.ip,
+            userAgent: this.executionContext.userAgent,
+            requestId: this.executionContext.requestId,
+          });
+        case "1.0/auditLog":
+          return JSON.stringify(await this.syscallAuditLog(jsonArgs));
         default:
           throw new Error(`Unknown operation ${op}`);
       }
@@ -641,6 +662,22 @@ export class SyscallsImpl {
     });
   }
 
+  async syscallAuditLog(rawArgs: string): Promise<JSONValue> {
+    const auditLogSchema = z.object({
+      body: z.record(z.string(), z.any()),
+      version: z.string(),
+    });
+    const operationName = "audit log";
+    const args = this.validateArgs(rawArgs, auditLogSchema, operationName);
+    return this.actionCallback({
+      version: args.version,
+      body: { body: args.body },
+      path: "/api/actions/audit_log",
+      operationName,
+      responseValidator: z.any(),
+    });
+  }
+
   async syscallStoreBlob(args: Record<string, any>): Promise<any> {
     if (
       args["requestId"] === undefined ||
@@ -736,4 +773,8 @@ export class SyscallsImpl {
 function forwardErrorData(errorData: JSONValue, error: ConvexError<string>) {
   (error as ConvexError<any>).data = errorData;
   return error;
+}
+
+function stripExtension(path: string): string {
+  return path.replace(/\.[^/.]+$/, "");
 }

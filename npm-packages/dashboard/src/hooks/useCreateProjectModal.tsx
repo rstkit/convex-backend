@@ -2,20 +2,22 @@ import { Modal } from "@ui/Modal";
 import { TextInput } from "@ui/TextInput";
 import { Button } from "@ui/Button";
 import { Loading } from "@ui/Loading";
+
 import { ReactElement, useState } from "react";
 import { useFormik } from "formik";
 import * as Yup from "yup";
-import { Team, CreateProjectResponse } from "generatedApi";
+import { TeamResponse, CreateProjectResponse } from "generatedApi";
 import { useCurrentTeam } from "api/teams";
 import { useCreateProject } from "api/projects";
 import { cn } from "@ui/cn";
+import { usePostHog } from "hooks/usePostHog";
 
 export function useCreateProjectModal(): [
   ReactElement | null,
-  (team?: Team) => void,
+  (team?: TeamResponse) => void,
 ] {
   const [modalOpen, setModalOpen] = useState(false);
-  const [team, setTeam] = useState<Team | undefined>();
+  const [team, setTeam] = useState<TeamResponse | undefined>();
   const currentTeam = useCurrentTeam();
 
   const selectedTeam = team || currentTeam;
@@ -34,7 +36,7 @@ export function useCreateProjectModal(): [
             onClose={() => setModalOpen(false)}
             team={selectedTeam}
             onSuccess={(project) => {
-              const projectUrl = `/t/${selectedTeam.slug}/${project.projectSlug}/${project.deploymentName}/data`;
+              const projectUrl = `/t/${selectedTeam.slug}/${project.projectSlug}/development`;
               window.location.href = projectUrl;
             }}
           />
@@ -47,7 +49,7 @@ export function useCreateProjectModal(): [
 
   return [
     modal,
-    (t?: Team) => {
+    (t?: TeamResponse) => {
       setModalOpen(true);
       setTeam(t);
     },
@@ -69,11 +71,12 @@ export function CreateProjectForm({
   onSuccess,
 }: {
   onClose(): void;
-  team: Team;
+  team: TeamResponse;
   showLabel?: boolean;
   onSuccess: (project: CreateProjectResponse) => void;
 }) {
   const createProject = useCreateProject(team.id);
+  const { capture } = usePostHog();
   const formState = useFormik({
     initialValues: {
       projectName: "",
@@ -85,8 +88,9 @@ export function CreateProjectForm({
       const project = await createProject({
         ...values,
         team: team.slug,
-        deploymentType: "dev",
+        deploymentType: null,
       });
+      capture("created_project");
       onSuccess(project);
       onClose();
     },

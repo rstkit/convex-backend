@@ -1,4 +1,4 @@
-import { Team } from "generatedApi";
+import type { TeamResponse } from "generatedApi";
 import { useLastViewedTeam } from "hooks/useLastViewed";
 import { useInitialData } from "hooks/useServerSideData";
 import { useRouter } from "next/router";
@@ -6,16 +6,18 @@ import { useBBMutation, useBBQuery } from "./api";
 
 export function useTeams(): {
   selectedTeamSlug?: string;
-  teams?: Team[];
+  teams?: TeamResponse[];
 } {
   const [initialData] = useInitialData();
-  const { data: teams, isValidating } = useBBQuery({
+  const { data, isValidating } = useBBQuery({
     path: "/teams",
     pathParams: undefined,
     swrOptions: {
       revalidateOnMount: !initialData,
     },
   });
+
+  const teams = data ?? (initialData?.["/teams"] as TeamResponse[] | undefined);
   const [lastViewedTeam] = useLastViewedTeam();
   const router = useRouter();
 
@@ -56,7 +58,7 @@ export function useCurrentTeam() {
   return currentTeam;
 }
 
-export function useTeamMembers(teamId?: number) {
+export function useTeamMembers(teamId: number | undefined) {
   const { data: members } = useBBQuery({
     path: "/teams/{team_id}/members",
     pathParams: {
@@ -96,14 +98,14 @@ export function useDeleteTeam(teamId: number) {
   });
 }
 
-export function useUpdateTeam(teamId: number) {
+export function useUpdateTeam(teamId: number, toast: boolean = true) {
   return useBBMutation({
     path: `/teams/{team_id}`,
     pathParams: {
       team_id: teamId.toString(),
     },
     mutateKey: "/teams",
-    successToast: "Team settings updated.",
+    successToast: toast ? "Team settings updated." : undefined,
   });
 }
 
@@ -129,5 +131,83 @@ export function useUnpauseTeam(teamId: number) {
     },
     mutateKey: `/teams/{team_id}/usage/team_usage_state`,
     successToast: "Your team has been restored.",
+  });
+}
+
+export function useGetSSO(teamId: number | undefined) {
+  const { data: ssoOrganization, isLoading } = useBBQuery({
+    path: "/teams/{team_id}/get_sso",
+    pathParams: {
+      team_id: teamId?.toString() || "",
+    },
+  });
+  return { data: ssoOrganization, isLoading };
+}
+
+export function useEnableSSO(teamId: number) {
+  return useBBMutation({
+    path: `/teams/{team_id}/enable_sso`,
+    pathParams: {
+      team_id: teamId.toString(),
+    },
+    mutateKey: "/teams/{team_id}/get_sso",
+    mutatePathParams: {
+      team_id: teamId.toString(),
+    },
+    successToast: "SSO has been enabled for your team.",
+  });
+}
+
+export function useDisableSSO(teamId: number) {
+  return useBBMutation({
+    path: `/teams/{team_id}/disable_sso`,
+    pathParams: {
+      team_id: teamId.toString(),
+    },
+    mutateKey: "/teams/{team_id}/get_sso",
+    mutatePathParams: {
+      team_id: teamId.toString(),
+    },
+    successToast: "SSO has been disabled for your team.",
+  });
+}
+
+export function useGenerateSSOConfigurationLink(teamId: number) {
+  return useBBMutation({
+    path: `/teams/{team_id}/generate_sso_configuration_link`,
+    pathParams: {
+      team_id: teamId.toString(),
+    },
+  });
+}
+
+export function useUpdateSSO(teamId: number) {
+  return useBBMutation({
+    path: `/teams/{team_id}/update_sso`,
+    pathParams: {
+      team_id: teamId.toString(),
+    },
+    mutateKey: "/teams/{team_id}/get_sso",
+    mutatePathParams: {
+      team_id: teamId.toString(),
+    },
+    successToast: "SSO settings updated.",
+  });
+}
+
+export function usePotentialVercelTeams() {
+  const { data, error } = useBBQuery({
+    path: "/vercel/potential_teams",
+    pathParams: undefined,
+  });
+  return { data, error };
+}
+
+export function useJoinVercelTeam(proposedTeamId: number) {
+  return useBBMutation({
+    path: "/vercel/potential_teams/{proposed_team_id}/join",
+    pathParams: { proposed_team_id: proposedTeamId.toString() },
+    mutateKey: "/teams",
+    successToast: "Joined team.",
   });
 }

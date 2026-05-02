@@ -1,4 +1,5 @@
-import { Context, logVerbose } from "../../../bundler/context.js";
+import { Context } from "../../../bundler/context.js";
+import { logVerbose } from "../../../bundler/log.js";
 import {
   bigBrainPause,
   bigBrainRecordActivity,
@@ -7,6 +8,9 @@ import {
 import {
   LocalDeploymentConfig,
   loadDeploymentConfig,
+  loadDeploymentConfigFromDir,
+  loadProjectLocalConfig,
+  legacyDeploymentStateDir,
   rootDeploymentStateDir,
   saveDeploymentConfig,
 } from "./filePaths.js";
@@ -21,7 +25,7 @@ import { OnDeploymentActivityFunc } from "../deployment.js";
 import { promptSearch } from "../utils/prompts.js";
 import { LocalDeploymentError, printLocalDeploymentOnError } from "./errors.js";
 import {
-  choosePorts,
+  chooseLocalBackendPorts,
   printLocalDeploymentWelcomeMessage,
   isOffline,
   LOCAL_BACKEND_INSTANCE_SECRET,
@@ -39,11 +43,13 @@ export async function handleLocalDeployment(
   options: {
     teamSlug: string;
     projectSlug: string;
-    ports?: {
-      cloud: number;
-      site: number;
-    };
-    backendVersion?: string;
+    ports?:
+      | {
+          cloud: number;
+          site: number;
+        }
+      | undefined;
+    backendVersion?: string | undefined;
     forceUpgrade: boolean;
   },
 ): Promise<DeploymentDetails> {
@@ -56,18 +62,15 @@ export async function handleLocalDeployment(
     teamSlug: options.teamSlug,
   });
   if (existingDeploymentForProject === null) {
-    printLocalDeploymentWelcomeMessage(ctx);
+    printLocalDeploymentWelcomeMessage();
   }
   ctx.registerCleanup(async (_exitCode, err) => {
     if (err instanceof LocalDeploymentError) {
-      printLocalDeploymentOnError(ctx);
+      printLocalDeploymentOnError();
     }
   });
   if (existingDeploymentForProject !== null) {
-    logVerbose(
-      ctx,
-      `Found existing deployment for project ${options.projectSlug}`,
-    );
+    logVerbose(`Found existing deployment for project ${options.projectSlug}`);
     // If it's still running for some reason, exit and tell the user to kill it.
     // It's fine if a different backend is running on these ports though since we'll
     // pick new ones.
@@ -86,14 +89,14 @@ export async function handleLocalDeployment(
     options.backendVersion === undefined
       ? {
           kind: "latest",
+          allowedVersion: existingDeploymentForProject?.config.backendVersion,
         }
       : { kind: "version", version: options.backendVersion },
   );
-  const [cloudPort, sitePort] = await choosePorts(ctx, {
-    count: 2,
-    startPort: 3210,
-    requestedPorts: [options.ports?.cloud ?? null, options.ports?.site ?? null],
-  });
+  const { cloudPort, sitePort } = await chooseLocalBackendPorts(
+    ctx,
+    options.ports,
+  );
   const { deploymentName, adminKey } = await bigBrainStart(ctx, {
     port: cloudPort,
     projectSlug: options.projectSlug,
@@ -126,8 +129,28 @@ export async function handleLocalDeployment(
     forceUpgrade: options.forceUpgrade,
   });
 
+  // Periodically report activity to BigBrain every 60 seconds.
+  // Uses self-scheduling setTimeout to avoid overlapping requests.
+  let activityTimeout: ReturnType<typeof setTimeout> | null = null;
+  const scheduleActivityPing = () => {
+    activityTimeout = setTimeout(async () => {
+      try {
+        await bigBrainRecordActivity(ctx, {
+          instanceName: deploymentName,
+        });
+      } catch {
+        // Best-effort: don't crash on failed pings
+      }
+      scheduleActivityPing();
+    }, 60_000);
+  };
+  scheduleActivityPing();
+
   const cleanupFunc = ctx.removeCleanup(cleanupHandle);
   ctx.registerCleanup(async (exitCode, err) => {
+    if (activityTimeout !== null) {
+      clearTimeout(activityTimeout);
+    }
     if (cleanupFunc !== null) {
       await cleanupFunc(exitCode, err);
     }
@@ -158,7 +181,8 @@ export async function loadLocalDeploymentCredentials(
     return ctx.crash({
       exitCode: 1,
       errorType: "fatal",
-      printedMessage: "Failed to load deployment config",
+      printedMessage:
+        "Failed to load deployment config - try running `npx convex dev --configure`",
     });
   }
   return {
@@ -173,7 +197,7 @@ async function handleOffline(
   options: {
     teamSlug: string;
     projectSlug: string;
-    ports?: { cloud: number; site: number };
+    ports?: { cloud: number; site: number } | undefined;
   },
 ): Promise<DeploymentDetails> {
   const { deploymentName, config } =
@@ -182,11 +206,10 @@ async function handleOffline(
     kind: "version",
     version: config.backendVersion,
   });
-  const [cloudPort, sitePort] = await choosePorts(ctx, {
-    count: 2,
-    startPort: 3210,
-    requestedPorts: [options.ports?.cloud ?? null, options.ports?.site ?? null],
-  });
+  const { cloudPort, sitePort } = await chooseLocalBackendPorts(
+    ctx,
+    options.ports,
+  );
   saveDeploymentConfig(ctx, "local", deploymentName, config);
   await runLocalBackend(ctx, {
     binaryPath,
@@ -232,9 +255,24 @@ async function getExistingDeployment(
   },
 ): Promise<{ deploymentName: string; config: LocalDeploymentConfig } | null> {
   const { projectSlug, teamSlug } = options;
+
+  // Check project-local storage first - this is the new default location
+  const projectLocal = loadProjectLocalConfig(ctx);
+  if (projectLocal !== null) {
+    // Verify this deployment is for the expected project (matches the naming pattern)
+    const expectedPrefix = `local-${teamSlug.replace(/-/g, "_")}-${projectSlug.replace(/-/g, "_")}`;
+    if (projectLocal.deploymentName.startsWith(expectedPrefix)) {
+      return projectLocal;
+    }
+    logVerbose(
+      `Project-local deployment ${projectLocal.deploymentName} doesn't match expected prefix ${expectedPrefix}`,
+    );
+  }
+
+  // Fall back to checking legacy home directory
   const prefix = `local-${teamSlug.replace(/-/g, "_")}-${projectSlug.replace(/-/g, "_")}`;
-  const localDeployments = await getLocalDeployments(ctx);
-  const existingDeploymentForProject = localDeployments.find((d) =>
+  const legacyDeployments = await getLegacyLocalDeployments(ctx);
+  const existingDeploymentForProject = legacyDeployments.find((d) =>
     d.deploymentName.startsWith(prefix),
   );
   if (existingDeploymentForProject === undefined) {
@@ -246,7 +284,11 @@ async function getExistingDeployment(
   };
 }
 
-async function getLocalDeployments(ctx: Context): Promise<
+/**
+ * Get local deployments from the legacy home directory location.
+ * This is used for backward compatibility and for listing deployments in offline mode.
+ */
+async function getLegacyLocalDeployments(ctx: Context): Promise<
   Array<{
     deploymentName: string;
     config: LocalDeploymentConfig;
@@ -261,7 +303,8 @@ async function getLocalDeployments(ctx: Context): Promise<
     .map((d) => d.name)
     .filter((d) => d.startsWith("local-"));
   return deploymentNames.flatMap((deploymentName) => {
-    const config = loadDeploymentConfig(ctx, "local", deploymentName);
+    const legacyDir = legacyDeploymentStateDir("local", deploymentName);
+    const config = loadDeploymentConfigFromDir(ctx, legacyDir);
     if (config !== null) {
       return [{ deploymentName, config }];
     }
@@ -269,13 +312,66 @@ async function getLocalDeployments(ctx: Context): Promise<
   });
 }
 
+/**
+ * Get all local deployments from both project-local and legacy locations.
+ */
+async function getLocalDeployments(ctx: Context): Promise<
+  Array<{
+    deploymentName: string;
+    config: LocalDeploymentConfig;
+  }>
+> {
+  const deployments: Array<{
+    deploymentName: string;
+    config: LocalDeploymentConfig;
+  }> = [];
+
+  // Check project-local storage
+  const projectLocal = loadProjectLocalConfig(ctx);
+  if (
+    projectLocal !== null &&
+    projectLocal.deploymentName.startsWith("local-")
+  ) {
+    deployments.push(projectLocal);
+  }
+
+  // Also include legacy deployments (but avoid duplicates)
+  const legacyDeployments = await getLegacyLocalDeployments(ctx);
+  for (const legacy of legacyDeployments) {
+    if (!deployments.some((d) => d.deploymentName === legacy.deploymentName)) {
+      deployments.push(legacy);
+    }
+  }
+
+  return deployments;
+}
+
 async function chooseFromExistingLocalDeployments(ctx: Context): Promise<{
   deploymentName: string;
   config: LocalDeploymentConfig;
 }> {
   const localDeployments = await getLocalDeployments(ctx);
+
+  if (localDeployments.length === 0) {
+    return ctx.crash({
+      exitCode: 1,
+      errorType: "fatal",
+      printedMessage:
+        "No local deployments found. Please run `npx convex dev` while online first.",
+    });
+  }
+
+  // Auto-select if there's only one deployment
+  if (localDeployments.length === 1) {
+    logVerbose(
+      `Auto-selecting the only local deployment: ${localDeployments[0].deploymentName}`,
+    );
+    return localDeployments[0];
+  }
+
+  // Multiple deployments (legacy) - prompt user to choose
   return promptSearch(ctx, {
-    message: "Choose from an existing local deployment?",
+    message: "Choose from an existing local deployment:",
     choices: localDeployments.map((d) => ({
       name: d.deploymentName,
       value: d,

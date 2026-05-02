@@ -1,6 +1,5 @@
 import React, { useContext, useEffect, useState } from "react";
 import { useQuery } from "convex/react";
-import Link from "next/link";
 import { Sheet } from "@ui/Sheet";
 import { Loading } from "@ui/Loading";
 import { Button } from "@ui/Button";
@@ -23,11 +22,17 @@ const PAUSE_EXPLANATION: string[] = [
   "Cron jobs will be skipped.",
 ];
 
-export function PauseDeployment() {
+export function PauseDeployment({
+  onPausedDeployment,
+}: {
+  onPausedDeployment?: () => void;
+}) {
   const deploymentState = useQuery(udfs.deploymentState.deploymentState);
-  const { useCurrentDeployment, useHasProjectAdminPermissions } = useContext(
-    DeploymentInfoContext,
-  );
+  const {
+    useCurrentDeployment,
+    useHasProjectAdminPermissions,
+    useIsOperationAllowed,
+  } = useContext(DeploymentInfoContext);
   const deployment = useCurrentDeployment();
   const deploymentType = deployment?.deploymentType ?? "prod";
   const [paused, setPaused] = useState(false);
@@ -36,8 +41,11 @@ export function PauseDeployment() {
   const hasAdminPermissions = useHasProjectAdminPermissions(
     deployment?.projectId,
   );
+  const canPauseOp = useIsOperationAllowed("PauseDeployment");
+  const canUnpauseOp = useIsOperationAllowed("UnpauseDeployment");
   const canPauseOrResume =
-    deployment?.deploymentType !== "prod" || hasAdminPermissions;
+    (deployment?.deploymentType !== "prod" || hasAdminPermissions) &&
+    (paused ? canUnpauseOp : canPauseOp);
 
   const changeDeploymentState = useChangeDeploymentState();
   useEffect(() => {
@@ -46,7 +54,13 @@ export function PauseDeployment() {
     }
   }, [deploymentState]);
   async function toggle() {
-    await changeDeploymentState(paused ? "running" : "paused");
+    const nextState = paused ? "running" : "paused";
+    await changeDeploymentState(nextState);
+
+    // Only fire the callback when we pause a running deployment.
+    if (!paused && nextState === "paused") {
+      onPausedDeployment?.();
+    }
   }
   function changeVerb(isPaused: boolean) {
     return isPaused ? "Resume" : "Pause";
@@ -81,6 +95,7 @@ export function PauseDeployment() {
               onClose={() => setShowConfirmation(false)}
               onConfirm={() => Promise.resolve(toggle())}
               confirmText={
+                // TODO(ENG-10340) Include the deployment ref here
                 changeVerb(paused) +
                 (deploymentType === "prod" ? " Production" : "")
               }
@@ -88,6 +103,7 @@ export function PauseDeployment() {
               dialogBody={
                 <>
                   Are you sure you want to {changeVerb(paused).toLowerCase()}{" "}
+                  {/* TODO(ENG-10340) Include the deployment ref here */}
                   this{" "}
                   {deploymentType === "prod" ? (
                     <span className="font-semibold">Production</span>
@@ -98,14 +114,8 @@ export function PauseDeployment() {
               variant={paused ? undefined : "danger"}
             />
           )}
-          <div>
-            <h3 className="mb-4">Pause Deployment</h3>
-            <p>
-              This deployment is currently{" "}
-              <b>{paused ? "paused" : "running"}</b>.
-            </p>
-          </div>
-          <div className="flex items-center lg:row-span-2">
+          <h3>Pause Deployment</h3>
+          <div className="flex items-start lg:row-span-2">
             <Button
               className="lg:order-2"
               variant={paused ? "primary" : "danger"}
@@ -113,13 +123,17 @@ export function PauseDeployment() {
               disabled={!canPauseOrResume}
               tip={
                 !canPauseOrResume
-                  ? "You do not have permission to pause or resume production."
+                  ? "You do not have permission to pause or resume this deployment."
                   : ""
               }
             >
               {paused ? "Resume Deployment" : "Pause Deployment"}
             </Button>
           </div>
+          <p>
+            This deployment is currently <b>{paused ? "paused" : "running"}</b>.
+          </p>
+
           <div className="lg:order-1">
             When a deployment is {`${changeVerb(paused).toLowerCase()}d`}:
             <ul className="list-outside list-disc pl-4">
@@ -127,16 +141,6 @@ export function PauseDeployment() {
                 <li key={line}>{line}</li>
               ))}
             </ul>
-            <br />
-            <Link
-              passHref
-              href="https://docs.convex.dev/production/pause-deployment"
-              className="text-content-link hover:underline"
-              target="_blank"
-            >
-              Learn more
-            </Link>
-            .
           </div>
         </Sheet>
       )}

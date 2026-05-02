@@ -12,16 +12,17 @@ import {
   QuestionMarkCircledIcon,
 } from "@radix-ui/react-icons";
 import { Tooltip } from "@ui/Tooltip";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { formatUsd } from "@common/lib/utils";
-import { Team } from "generatedApi";
+import { TeamResponse } from "generatedApi";
+import * as Sentry from "@sentry/nextjs";
 
 export type SpendingLimitsValue = {
   // null = disabled (= checkbox unchecked)
-  // undefined = enabled but no value set
+  // "" = enabled but no value set
 
-  spendingLimitWarningThresholdUsd: null | undefined | number;
-  spendingLimitDisableThresholdUsd: null | undefined | number;
+  spendingLimitWarningThresholdUsd: null | "" | number;
+  spendingLimitDisableThresholdUsd: null | "" | number;
 };
 
 export function spendingLimitsSchema({
@@ -35,12 +36,15 @@ export function spendingLimitsSchema({
     .test(
       "is-spending-value",
       "Please enter a positive number.",
-      (value) => value === null || (typeof value === "number" && value >= 0),
+      (value) =>
+        value === null ||
+        value === "" ||
+        (typeof value === "number" && value >= 0),
     )
     .test(
       "is-integer-or-null",
       "Please enter an integer amount.",
-      (value) => value === null || Number.isInteger(value),
+      (value) => value === null || value === "" || Number.isInteger(value),
     );
 
   const disableSchema = baseSchema.test(
@@ -57,6 +61,7 @@ export function spendingLimitsSchema({
     (value) =>
       currentSpending === undefined ||
       value === null ||
+      value === "" ||
       currentSpending.totalCents <= value * 100,
   );
 
@@ -85,24 +90,47 @@ export function spendingLimitsSchema({
   });
 }
 
-export function useSubmitSpendingLimits(team: Team) {
+export function useSubmitSpendingLimits(team: TeamResponse) {
   const setSpendingLimit = useSetSpendingLimit(team.id);
 
   return useCallback(
     async (v: SpendingLimitsValue) => {
-      await setSpendingLimit({
-        warningThresholdCents:
-          typeof v.spendingLimitWarningThresholdUsd === "number"
-            ? v.spendingLimitWarningThresholdUsd * 100
-            : v.spendingLimitWarningThresholdUsd,
-        disableThresholdCents:
-          typeof v.spendingLimitDisableThresholdUsd === "number"
-            ? v.spendingLimitDisableThresholdUsd * 100
-            : v.spendingLimitDisableThresholdUsd,
-      });
+      await setSpendingLimit(spendingLimitValueToCents(v));
     },
     [setSpendingLimit],
   );
+}
+
+export function spendingLimitValueToCents(value: SpendingLimitsValue) {
+  let { spendingLimitWarningThresholdUsd, spendingLimitDisableThresholdUsd } =
+    value;
+
+  if (spendingLimitWarningThresholdUsd === "") {
+    spendingLimitWarningThresholdUsd = null;
+    Sentry.captureMessage(
+      "Spending limits form submitted with empty warning threshold",
+      "error",
+    );
+  }
+
+  if (spendingLimitDisableThresholdUsd === "") {
+    spendingLimitDisableThresholdUsd = null;
+    Sentry.captureMessage(
+      "Spending limits form submitted with empty disable threshold",
+      "error",
+    );
+  }
+
+  return {
+    warningThresholdCents:
+      typeof spendingLimitWarningThresholdUsd === "number"
+        ? spendingLimitWarningThresholdUsd * 100
+        : spendingLimitWarningThresholdUsd,
+    disableThresholdCents:
+      typeof spendingLimitDisableThresholdUsd === "number"
+        ? spendingLimitDisableThresholdUsd * 100
+        : spendingLimitDisableThresholdUsd,
+  };
 }
 
 export function SpendingLimitsForm({
@@ -135,11 +163,11 @@ export function SpendingLimitsForm({
           : defaultValue
       }
       validationSchema={spendingLimitsSchema({ currentSpending })}
-      onSubmit={async (e) => {
-        await onSubmit(e);
+      onSubmit={async (values) => {
+        await onSubmit(values);
       }}
     >
-      {({ isSubmitting, isValid }) => (
+      {({ isSubmitting }) => (
         <Form className="flex flex-col items-start gap-4">
           {isLoading ? (
             <Loading className="h-[176px] w-full max-w-64" fullHeight={false} />
@@ -148,10 +176,7 @@ export function SpendingLimitsForm({
           )}
 
           <div className="flex gap-2">
-            <Button
-              type="submit"
-              disabled={isLoading || isSubmitting || !isValid}
-            >
+            <Button type="submit" disabled={isLoading || isSubmitting}>
               {isSubmitting
                 ? "Saving Spending Limits…"
                 : "Save Spending Limits"}
@@ -234,10 +259,7 @@ function UsageDefinition() {
       tip={
         <>
           Resources used beyond the{" "}
-          <Link
-            className="text-content-link hover:underline"
-            href="https://www.convex.dev/pricing"
-          >
+          <Link href="https://www.convex.dev/pricing">
             built-in resources of your plan
           </Link>
           . Seat fees are not counted in your spending limits.
@@ -245,10 +267,10 @@ function UsageDefinition() {
       }
       side="right"
     >
-      <div className="flex gap-0.5">
+      <span className="inline-flex items-center gap-0.5">
         <span className="underline decoration-dotted">usage</span>
         <QuestionMarkCircledIcon />
-      </div>
+      </span>
     </Tooltip>
   );
 }
@@ -287,10 +309,23 @@ function SpendLimitInput({
           id={checkboxId}
           checked={value !== null}
           onChange={() => {
-            void formState.setFieldValue(
-              formKey,
-              value === null ? undefined : null,
-            );
+            if (value === null) {
+              let defaultValue = 10;
+              if (formKey === "spendingLimitDisableThresholdUsd") {
+                const warningThreshold =
+                  formState.values.spendingLimitWarningThresholdUsd;
+                if (
+                  typeof warningThreshold === "number" &&
+                  warningThreshold >= 10
+                ) {
+                  defaultValue = warningThreshold * 2;
+                }
+              }
+              void formState.setFieldValue(formKey, defaultValue, false);
+            } else {
+              void formState.setFieldValue(formKey, null, false);
+              void formState.setFieldTouched(formKey, false, false);
+            }
           }}
           disabled={disabled}
         />
@@ -319,7 +354,14 @@ function SpendLimitInput({
           </div>
         }
         rightAddon={
-          <div className="text-sm text-content-secondary">/ month</div>
+          <div
+            className={cn(
+              "text-sm",
+              inputDisabled ? "text-content-primary" : "text-content-secondary",
+            )}
+          >
+            / month
+          </div>
         }
         className="pr-16"
         disabled={inputDisabled}

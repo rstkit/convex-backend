@@ -1,19 +1,18 @@
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    hint::black_box,
+};
 
 use criterion::{
-    black_box,
     criterion_group,
     criterion_main,
     AxisScale,
     BenchmarkId,
     Criterion,
     PlotConfiguration,
-};
-use maplit::{
-    btreemap,
-    btreeset,
 };
 use packed_value::{
     ByteBuffer,
@@ -57,9 +56,8 @@ fn benchmark_values() -> anyhow::Result<Vec<(&'static str, ConvexValue)>> {
          知らず、生れ死ぬる人、いづかたより來りて、いづかたへか去る。又知らず、かりのやどり、\
          誰が爲に心を惱まし、何によりてか目をよろこばしむる。そのあるじとすみかと、\
          無常をあらそひ去るさま、いはゞ朝顏の露にことならず。或は露おちて花のこれり。";
-    let string_512k_pieces: Vec<_> = std::iter::repeat(string_short)
-        .take(524_288 / string_short.len())
-        .collect();
+    let string_512k_pieces: Vec<_> =
+        std::iter::repeat_n(string_short, 524_288 / string_short.len()).collect();
     let string_512k = string_512k_pieces.join(" ");
 
     let bytes_short = vec![
@@ -98,20 +96,6 @@ fn benchmark_values() -> anyhow::Result<Vec<(&'static str, ConvexValue)>> {
         ("bytes-512k", val!(bytes_512k)),
         ("array-4-ints", assert_val!([1, 2, 3, 4])),
         ("array-4-mixed", assert_val!([null, 1, 2., "three"])),
-        (
-            "set",
-            ConvexValue::Set(btreeset!(ConvexValue::from(1), ConvexValue::from(2)).try_into()?),
-        ),
-        (
-            "map",
-            ConvexValue::Map(
-                btreemap!(
-                    ConvexValue::from(1) => ConvexValue::from(2),
-                    ConvexValue::from(3) => ConvexValue::from(4),
-                )
-                .try_into()?,
-            ),
-        ),
         ("object-document", ConvexValue::Object(document)),
         ("object-1024", ConvexValue::Object(large_object.try_into()?)),
     ];
@@ -314,7 +298,11 @@ pub fn benchmark_unpack(c: &mut Criterion) {
     for (name, value) in values {
         let packed = PackedValue::<ByteBuffer>::pack(&value);
         group.bench_with_input(BenchmarkId::new("flexbuffer", name), &packed, |b, v| {
-            b.iter(|| PackedValue::open(black_box(v.clone())).unwrap())
+            b.iter(|| ConvexValue::try_from(v.clone()))
+        });
+        let sort_key = value.sort_key();
+        group.bench_with_input(BenchmarkId::new("sort_key", name), &sort_key, |b, v| {
+            b.iter(|| ConvexValue::read_sort_key(&mut &v[..]))
         });
         let serialized = value.json_serialize().unwrap().into_bytes();
         group.bench_with_input(BenchmarkId::new("json", name), &serialized, |b, v| {

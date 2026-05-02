@@ -36,7 +36,7 @@ export const isUserTableName = (name: string) => !name.startsWith("_");
  *                 Use `false` to never auto-close this toast.
  */
 export function toast(
-  type: "success" | "error" | "info",
+  type: "success" | "error" | "info" | "warning",
   message: ReactNode,
   id?: string,
   duration?: number | false,
@@ -80,15 +80,61 @@ export function getReferencedTableName(
   return tableMapping[tableNumber] ?? null;
 }
 
-export function documentHref(
-  deploymentsURI: string,
-  tableName: string,
-  id: string,
-  componentId?: string,
-): {
+/**
+ * System tables _file_storage and _scheduled_jobs have a different name
+ * in user-facing contexts.
+ */
+export function getVisibleTableName(tableName: string) {
+  if (tableName === "_file_storage") {
+    return "_storage";
+  }
+
+  if (tableName === "_scheduled_jobs") {
+    return "_scheduled_functions";
+  }
+
+  return tableName;
+}
+
+export function documentHref({
+  deploymentsURI,
+  tableName,
+  id,
+  componentId,
+  captureMessage,
+}: {
+  deploymentsURI: string;
+  tableName: string;
+  id: string;
+  componentId: string | null;
+  captureMessage: (message: string, severity: "error") => void;
+}): {
   pathname: string;
   query: { [key: string]: string };
 } {
+  if (tableName === "_scheduled_jobs") {
+    return {
+      pathname: `${deploymentsURI}/schedules/functions`,
+      query: {
+        // FIXME: This could include query parameters one day to link to a specific job
+      },
+    };
+  }
+
+  if (tableName === "_file_storage") {
+    return {
+      pathname: `${deploymentsURI}/files`,
+      query: { id },
+    };
+  }
+
+  if (tableName.startsWith("_")) {
+    captureMessage(
+      `Linking to an unsupported system table: ${tableName}`,
+      "error",
+    );
+  }
+
   const filter: FilterExpression = {
     clauses: [
       {
@@ -99,7 +145,6 @@ export function documentHref(
       },
     ],
   };
-
   return {
     pathname: `${deploymentsURI}/data`,
     query: {

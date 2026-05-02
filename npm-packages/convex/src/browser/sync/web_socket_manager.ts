@@ -4,6 +4,8 @@ import {
   encodeClientMessage,
   parseServerMessage,
   ServerMessage,
+  Transition,
+  TransitionChunk,
 } from "./protocol.js";
 
 const CLOSE_NORMAL = 1000;
@@ -87,11 +89,27 @@ type Socket =
 export type ReconnectMetadata = {
   connectionCount: number;
   lastCloseReason: string | null;
+  clientTs: number;
 };
 
 export type OnMessageResponse = {
   hasSyncedPastLastReconnect: boolean;
 };
+
+let firstTime: number | undefined;
+function monotonicMillis() {
+  if (firstTime === undefined) {
+    firstTime = Date.now();
+  }
+  if (typeof performance === "undefined" || !performance.now) {
+    return Date.now();
+  }
+  return Math.round(firstTime + performance.now());
+}
+
+function prettyNow() {
+  return `t=${Math.round((monotonicMillis() - firstTime!) / 100) / 10}s`;
+}
 
 const serverDisconnectErrors = {
   // A known error, e.g. during a restart or push
@@ -104,10 +122,11 @@ const serverDisconnectErrors = {
   ExecuteFullError: { timeout: 3000 },
   SystemTimeoutError: { timeout: 3000 },
   ExpiredInQueue: { timeout: 3000 },
-  // More ErrorMetadata::overloaded() that typically indicate a deploy just happened
+  // ErrorMetadata::feature_temporarily_unavailable() that typically indicate a deploy just happened
   VectorIndexesUnavailable: { timeout: 1000 },
   SearchIndexesUnavailable: { timeout: 1000 },
-  // More ErrorMeatadata::overloaded()
+  TableSummariesUnavailable: { timeout: 1000 },
+  // More ErrorMetadata::overloaded()
   VectorIndexTooLarge: { timeout: 3000 },
   SearchIndexTooLarge: { timeout: 3000 },
   TooManyWritesInTimePeriod: { timeout: 3000 },
@@ -144,6 +163,13 @@ export class WebSocketManager {
     | (string & {}) // a full serverErrorReason (not just the prefix) or a new one
     | null;
 
+  // State for assembling the split-up Transition currently being received.
+  private transitionChunkBuffer: {
+    chunks: string[];
+    totalParts: number;
+    transitionId: string;
+  } | null = null;
+
   /** Upon HTTPS/WSS failure, the first jittered backoff duration, in ms. */
   private readonly defaultInitialBackoff: number;
 
@@ -161,12 +187,27 @@ export class WebSocketManager {
     typeof setTimeout
   > | null;
 
+  /** Scheduled reconnect state: timeout handle and timing info */
+  private scheduledReconnect: {
+    timeout: ReturnType<typeof setTimeout>;
+    scheduledAt: number;
+    backoffMs: number;
+  } | null = null;
+
+  private networkOnlineHandler: (() => void) | null = null;
+
+  /** Pending event to send after reconnecting due to network recovery */
+  private pendingNetworkRecoveryInfo: { timeSavedMs: number } | null = null;
+
   private readonly uri: string;
   private readonly onOpen: (reconnectMetadata: ReconnectMetadata) => void;
   private readonly onResume: () => void;
   private readonly onMessage: (message: ServerMessage) => OnMessageResponse;
   private readonly webSocketConstructor: typeof WebSocket;
   private readonly logger: Logger;
+  private readonly onServerDisconnectError:
+    | ((message: string) => void)
+    | undefined;
 
   constructor(
     uri: string,
@@ -174,9 +215,12 @@ export class WebSocketManager {
       onOpen: (reconnectMetadata: ReconnectMetadata) => void;
       onResume: () => void;
       onMessage: (message: ServerMessage) => OnMessageResponse;
+      onServerDisconnectError?: ((message: string) => void) | undefined;
     },
     webSocketConstructor: typeof WebSocket,
     logger: Logger,
+    private readonly markConnectionStateDirty: () => void,
+    private readonly debug: boolean,
   ) {
     this.webSocketConstructor = webSocketConstructor;
     this.socket = { state: "disconnected" };
@@ -188,14 +232,22 @@ export class WebSocketManager {
     this.maxBackoff = 16000;
     this.retries = 0;
 
-    this.serverInactivityThreshold = 30000;
+    // Ping messages (sync protocol Pings, not WebSocket protocol Pings) are
+    // sent every 15s in the absence of other messages. But a single large
+    // Transition or other downstream message can hog the line so this
+    // threshold is set higher to prevent clients from giving up.
+    this.serverInactivityThreshold = 60000;
     this.reconnectDueToServerInactivityTimeout = null;
 
     this.uri = uri;
     this.onOpen = callbacks.onOpen;
     this.onResume = callbacks.onResume;
     this.onMessage = callbacks.onMessage;
+    this.onServerDisconnectError = callbacks.onServerDisconnectError;
     this.logger = logger;
+
+    // Set up network online event listener
+    this.setupNetworkListener();
 
     this.connect();
   }
@@ -207,6 +259,91 @@ export class WebSocketManager {
         "paused" in this.socket ? this.socket.paused : undefined
       }`,
     );
+    this.markConnectionStateDirty();
+  }
+
+  private setupNetworkListener() {
+    // Only set up listener if we're in a browser environment with addEventListener
+    // (React Native has window but not addEventListener)
+    if (
+      typeof window === "undefined" ||
+      typeof window.addEventListener !== "function"
+    ) {
+      return;
+    }
+    // Avoid registering duplicate listeners
+    if (this.networkOnlineHandler !== null) {
+      return;
+    }
+
+    this.networkOnlineHandler = () => {
+      this._logVerbose("network online event detected");
+      this.tryReconnectImmediately();
+    };
+
+    window.addEventListener("online", this.networkOnlineHandler);
+    this._logVerbose("network online event listener registered");
+  }
+
+  private cleanupNetworkListener() {
+    if (
+      this.networkOnlineHandler &&
+      typeof window !== "undefined" &&
+      typeof window.removeEventListener === "function"
+    ) {
+      window.removeEventListener("online", this.networkOnlineHandler);
+      this.networkOnlineHandler = null;
+      this._logVerbose("network online event listener removed");
+    }
+  }
+
+  private assembleTransition(chunk: TransitionChunk): Transition | null {
+    if (
+      chunk.partNumber < 0 ||
+      chunk.partNumber >= chunk.totalParts ||
+      chunk.totalParts === 0 ||
+      (this.transitionChunkBuffer &&
+        (this.transitionChunkBuffer.totalParts !== chunk.totalParts ||
+          this.transitionChunkBuffer.transitionId !== chunk.transitionId))
+    ) {
+      // Throwing an error doesn't crash the client, so clear the buffer.
+      this.transitionChunkBuffer = null;
+      throw new Error("Invalid TransitionChunk");
+    }
+
+    if (this.transitionChunkBuffer === null) {
+      this.transitionChunkBuffer = {
+        chunks: [],
+        totalParts: chunk.totalParts,
+        transitionId: chunk.transitionId,
+      };
+    }
+
+    if (chunk.partNumber !== this.transitionChunkBuffer.chunks.length) {
+      // Throwing an error doesn't crash the client, so clear the buffer.
+      const expectedLength = this.transitionChunkBuffer.chunks.length;
+      this.transitionChunkBuffer = null;
+      throw new Error(
+        `TransitionChunk received out of order: expected part ${expectedLength}, got ${chunk.partNumber}`,
+      );
+    }
+
+    this.transitionChunkBuffer.chunks.push(chunk.chunk);
+
+    if (this.transitionChunkBuffer.chunks.length === chunk.totalParts) {
+      const fullJson = this.transitionChunkBuffer.chunks.join("");
+      this.transitionChunkBuffer = null;
+
+      const transition = parseServerMessage(JSON.parse(fullJson));
+      if (transition.type !== "Transition") {
+        throw new Error(
+          `Expected Transition, got ${transition.type} after assembling chunks`,
+        );
+      }
+      return transition;
+    }
+
+    return null;
   }
 
   private connect() {
@@ -252,35 +389,97 @@ export class WebSocketManager {
         this.onOpen({
           connectionCount: this.connectionCount,
           lastCloseReason: this.lastCloseReason,
+          clientTs: monotonicMillis(),
         });
       }
 
       if (this.lastCloseReason !== "InitialConnect") {
-        this.logger.log("WebSocket reconnected");
+        if (this.lastCloseReason) {
+          this.logger.log(
+            "WebSocket reconnected at",
+            prettyNow(),
+            "after disconnect due to",
+            this.lastCloseReason,
+          );
+        } else {
+          this.logger.log("WebSocket reconnected at", prettyNow());
+        }
       }
 
       this.connectionCount += 1;
       this.lastCloseReason = null;
+
+      // Send event for network recovery reconnect if applicable
+      if (this.pendingNetworkRecoveryInfo !== null) {
+        const { timeSavedMs } = this.pendingNetworkRecoveryInfo;
+        this.pendingNetworkRecoveryInfo = null;
+        this.sendMessage({
+          type: "Event",
+          eventType: "NetworkRecoveryReconnect",
+          event: { timeSavedMs },
+        });
+        this.logger.log(
+          `Network recovery reconnect saved ~${Math.round(timeSavedMs / 1000)}s of waiting`,
+        );
+      }
     };
     // NB: The WebSocket API calls `onclose` even if connection fails, so we can route all error paths through `onclose`.
     ws.onerror = (error) => {
+      this.transitionChunkBuffer = null;
       const message = (error as ErrorEvent).message;
-      this.logger.log(`WebSocket error: ${message}`);
+      if (message) {
+        this.logger.log(`WebSocket error message: ${message}`);
+      }
     };
     ws.onmessage = (message) => {
       this.resetServerInactivityTimeout();
-      const serverMessage = parseServerMessage(JSON.parse(message.data));
+      const messageLength = message.data.length;
+      let serverMessage = parseServerMessage(JSON.parse(message.data));
       this._logVerbose(`received ws message with type ${serverMessage.type}`);
+
+      // Ping's only purpose is to reset the server inactivity timer.
+      if (serverMessage.type === "Ping") {
+        return;
+      }
+
+      // TransitionChunks never reach the main client logic.
+      if (serverMessage.type === "TransitionChunk") {
+        const transition = this.assembleTransition(serverMessage);
+        if (!transition) {
+          return;
+        }
+        serverMessage = transition;
+        this._logVerbose(
+          `assembled full ws message of type ${serverMessage.type}`,
+        );
+      }
+
+      if (this.transitionChunkBuffer !== null) {
+        this.transitionChunkBuffer = null;
+        this.logger.log(
+          `Received unexpected ${serverMessage.type} while buffering TransitionChunks`,
+        );
+      }
+
+      if (serverMessage.type === "Transition") {
+        this.reportLargeTransition({
+          messageLength,
+          transition: serverMessage,
+        });
+      }
       const response = this.onMessage(serverMessage);
       if (response.hasSyncedPastLastReconnect) {
         // Reset backoff to 0 once all outstanding requests are complete.
         this.retries = 0;
+        this.markConnectionStateDirty();
       }
     };
     ws.onclose = (event) => {
       this._logVerbose("begin ws.onclose");
+      this.transitionChunkBuffer = null;
       if (this.lastCloseReason === null) {
-        this.lastCloseReason = event.reason ?? "OnCloseInvoked";
+        // event.reason is often an empty string
+        this.lastCloseReason = event.reason || `closed with code ${event.code}`;
       }
       if (
         event.code !== CLOSE_NORMAL &&
@@ -293,6 +492,12 @@ export class WebSocketManager {
           msg += `: ${event.reason}`;
         }
         this.logger.log(msg);
+        if (this.onServerDisconnectError && event.reason) {
+          // This callback is a unstable API, InternalServerErrors in particular may be removed
+          // since they reflect expected temporary downtime. But until a quantitative measure
+          // of uptime is reported this unstable API errs on the inclusive side.
+          this.onServerDisconnectError(msg);
+        }
       }
       const reason = classifyDisconnectError(event.reason);
       this.scheduleReconnect(reason);
@@ -323,17 +528,18 @@ export class WebSocketManager {
     if (this.socket.state === "ready" && this.socket.paused === "no") {
       const encodedMessage = encodeClientMessage(message);
       const request = JSON.stringify(encodedMessage);
+      let sent = false;
       try {
         this.socket.ws.send(request);
+        sent = true;
       } catch (error: any) {
         this.logger.log(
           `Failed to send message on WebSocket, reconnecting: ${error}`,
         );
         this.closeAndReconnect("FailedToSendMessage");
       }
-      // We are not sure if this was sent or not.
       this._logVerbose(
-        `sent message with type ${message.type}: ${JSON.stringify(
+        `${sent ? "sent" : "failed to send"} message with type ${message.type}: ${JSON.stringify(
           messageForLog,
         )}`,
       );
@@ -363,10 +569,31 @@ export class WebSocketManager {
   }
 
   private scheduleReconnect(reason: "client" | ServerDisconnectError) {
+    // Cancel any existing scheduled reconnect to avoid multiple reconnects
+    if (this.scheduledReconnect) {
+      clearTimeout(this.scheduledReconnect.timeout);
+      this.scheduledReconnect = null;
+    }
+
     this.socket = { state: "disconnected" };
     const backoff = this.nextBackoff(reason);
-    this.logger.log(`Attempting reconnect in ${backoff}ms`);
-    setTimeout(() => this.connect(), backoff);
+    this.markConnectionStateDirty();
+    this.logger.log(`Attempting reconnect in ${Math.round(backoff)}ms`);
+
+    const scheduledAt = monotonicMillis();
+    const timeoutId = setTimeout(() => {
+      // Only proceed if this timeout hasn't been cleared
+      if (this.scheduledReconnect?.timeout === timeoutId) {
+        this.scheduledReconnect = null;
+        this.connect();
+      }
+    }, backoff);
+
+    this.scheduledReconnect = {
+      timeout: timeoutId,
+      scheduledAt,
+      backoffMs: backoff,
+    };
   }
 
   /**
@@ -392,7 +619,7 @@ export class WebSocketManager {
       }
       default: {
         // Enforce that the switch-case is exhaustive.
-        const _: never = this.socket;
+        this.socket satisfies never;
       }
     }
   }
@@ -405,6 +632,7 @@ export class WebSocketManager {
    * closed socket is not accessible or used again after this method is called
    */
   private close(): Promise<void> {
+    this.transitionChunkBuffer = null;
     switch (this.socket.state) {
       case "disconnected":
       case "terminated":
@@ -413,6 +641,10 @@ export class WebSocketManager {
         return Promise.resolve();
       case "connecting": {
         const ws = this.socket.ws;
+        // Messages can still be received after close but we're not interested.
+        ws.onmessage = (_message) => {
+          this._logVerbose("Ignoring message received after close");
+        };
         return new Promise((r) => {
           ws.onclose = () => {
             this._logVerbose("Closed after connecting");
@@ -427,6 +659,10 @@ export class WebSocketManager {
       case "ready": {
         this._logVerbose("ws.close called");
         const ws = this.socket.ws;
+        // Messages can still be received after close but we're not interested.
+        ws.onmessage = (_message) => {
+          this._logVerbose("Ignoring message received after close");
+        };
         const result: Promise<void> = new Promise((r) => {
           ws.onclose = () => {
             r();
@@ -437,7 +673,7 @@ export class WebSocketManager {
       }
       default: {
         // Enforce that the switch-case is exhaustive.
-        const _: never = this.socket;
+        this.socket satisfies never;
         return Promise.resolve();
       }
     }
@@ -451,6 +687,11 @@ export class WebSocketManager {
     if (this.reconnectDueToServerInactivityTimeout) {
       clearTimeout(this.reconnectDueToServerInactivityTimeout);
     }
+    if (this.scheduledReconnect) {
+      clearTimeout(this.scheduledReconnect.timeout);
+      this.scheduledReconnect = null;
+    }
+    this.cleanupNetworkListener();
     switch (this.socket.state) {
       case "terminated":
       case "stopped":
@@ -463,7 +704,7 @@ export class WebSocketManager {
       }
       default: {
         // Enforce that the switch-case is exhaustive.
-        const _: never = this.socket;
+        this.socket satisfies never;
         throw new Error(
           `Invalid websocket state: ${(this.socket as any).state}`,
         );
@@ -480,13 +721,14 @@ export class WebSocketManager {
       case "stopped":
       case "disconnected":
       case "ready": {
+        this.cleanupNetworkListener();
         const result = this.close();
         this.socket = { state: "stopped" };
         return result;
       }
       default: {
         // Enforce that the switch-case is exhaustive.
-        const _: never = this.socket;
+        this.socket satisfies never;
         return Promise.resolve();
       }
     }
@@ -508,9 +750,10 @@ export class WebSocketManager {
         return;
       default: {
         // Enforce that the switch-case is exhaustive.
-        const _: never = this.socket;
+        this.socket satisfies never;
       }
     }
+    this.setupNetworkListener();
     this.connect();
   }
 
@@ -528,10 +771,47 @@ export class WebSocketManager {
       }
       default: {
         // Enforce that the switch-case is exhaustive.
-        const _: never = this.socket;
+        this.socket satisfies never;
         return;
       }
     }
+  }
+
+  /**
+   * Try to reconnect immediately, canceling any scheduled reconnect.
+   * This is useful when detecting network recovery.
+   * Only takes action if we're in disconnected state (waiting to reconnect).
+   */
+  tryReconnectImmediately(): void {
+    this._logVerbose("tryReconnectImmediately called");
+
+    // Only reconnect if we're in disconnected state (waiting to reconnect)
+    if (this.socket.state !== "disconnected") {
+      this._logVerbose(
+        `tryReconnectImmediately called but socket state is ${this.socket.state}, no action taken`,
+      );
+      return;
+    }
+
+    // Track how much time we saved by reconnecting immediately
+    let timeSavedMs: number | null = null;
+    if (this.scheduledReconnect) {
+      const elapsed = monotonicMillis() - this.scheduledReconnect.scheduledAt;
+      timeSavedMs = Math.max(0, this.scheduledReconnect.backoffMs - elapsed);
+      this._logVerbose(
+        `would have waited ${Math.round(timeSavedMs)}ms more (backoff was ${Math.round(this.scheduledReconnect.backoffMs)}ms, elapsed ${Math.round(elapsed)}ms)`,
+      );
+      // Cancel the scheduled reconnect
+      clearTimeout(this.scheduledReconnect.timeout);
+      this.scheduledReconnect = null;
+      this._logVerbose("canceled scheduled reconnect");
+    }
+
+    this.logger.log("Network recovery detected, reconnecting immediately");
+    // Store the time saved to send as an event after we connect
+    this.pendingNetworkRecoveryInfo =
+      timeSavedMs !== null ? { timeSavedMs } : null;
+    this.connect();
   }
 
   /**
@@ -545,9 +825,11 @@ export class WebSocketManager {
       case "ready":
         if (this.socket.paused === "uninitialized") {
           this.socket = { ...this.socket, paused: "no" };
+          this._hasEverConnected = true;
           this.onOpen({
             connectionCount: this.connectionCount,
             lastCloseReason: this.lastCloseReason,
+            clientTs: monotonicMillis(),
           });
         } else if (this.socket.paused === "yes") {
           this.socket = { ...this.socket, paused: "no" };
@@ -561,7 +843,7 @@ export class WebSocketManager {
         return;
       default: {
         // Enforce that the switch-case is exhaustive.
-        const _: never = this.socket;
+        this.socket satisfies never;
       }
     }
     this.connect();
@@ -598,5 +880,59 @@ export class WebSocketManager {
     const actualBackoff = Math.min(baseBackoff, this.maxBackoff);
     const jitter = actualBackoff * (Math.random() - 0.5);
     return actualBackoff + jitter;
+  }
+
+  private reportLargeTransition({
+    transition,
+    messageLength,
+  }: {
+    transition: Transition;
+    messageLength: number;
+  }) {
+    if (
+      transition.clientClockSkew === undefined ||
+      transition.serverTs === undefined
+    ) {
+      return;
+    }
+
+    const transitionTransitTime =
+      monotonicMillis() - // client time now
+      // clientClockSkew = (server time + upstream latency) - client time
+      // clientClockSkew is "how many milliseconds behind (slow) is the client clock"
+      // but the latency of the Connect message inflates this, making it appear further behind
+      transition.clientClockSkew -
+      transition.serverTs / 1_000_000; // server time when transition was sent
+    const prettyTransitionTime = `${Math.round(transitionTransitTime)}ms`;
+    const prettyMessageMB = `${Math.round(messageLength / 10_000) / 100}MB`;
+    const bytesPerSecond = messageLength / (transitionTransitTime / 1000);
+    const prettyBytesPerSecond = `${Math.round(bytesPerSecond / 10_000) / 100}MB per second`;
+    this._logVerbose(
+      `received ${prettyMessageMB} transition in ${prettyTransitionTime} at ${prettyBytesPerSecond}`,
+    );
+
+    // Warnings that will show up for *all users*, so don't be too aggressive.
+    // These can be silenced (along with reconnection messages) by setting `logger: false` in client options.
+    if (messageLength > 20_000_000) {
+      // Big enough that the developer should be made aware of this.
+      this.logger.log(
+        `received query results totaling more that 20MB (${prettyMessageMB}) which will take a long time to download on slower connections`,
+      );
+    } else if (transitionTransitTime > 20_000) {
+      // Long enough that a pattern of these should be interesting to a developer, but be aware that
+      // weak connections, putting clients to sleep, backgrounding etc. could all cause this too.
+      this.logger.log(
+        `received query results totaling ${prettyMessageMB} which took more than 20s to arrive (${prettyTransitionTime})`,
+      );
+    }
+
+    if (this.debug) {
+      // debug means "reportDebugInfoToConvex" is set so this can be aggressive.
+      this.sendMessage({
+        type: "Event",
+        eventType: "ClientReceivedTransition",
+        event: { transitionTransitTime, messageLength },
+      });
+    }
   }
 }

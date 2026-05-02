@@ -21,6 +21,11 @@ use common::{
 use database::{
     Database,
     SystemMetadataModel,
+    Token,
+};
+use exports::{
+    interface::ExportProvider,
+    ExportComponents,
 };
 use futures::{
     Future,
@@ -41,21 +46,16 @@ use usage_tracking::{
     StorageCallTracker,
     UsageCounter,
 };
+use value::ResolvedDocumentId;
 
 use crate::{
-    exports::{
-        export_inner,
-        metrics::{
-            export_timer,
-            log_export_failed,
-        },
-    },
+    exports::metrics::log_export_failed,
     metrics::log_worker_starting,
 };
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(900); // 15 minutes
-                                                        //
+
 #[derive(thiserror::Error, Debug)]
 #[error("Export canceled")]
 struct ExportCanceled;
@@ -63,8 +63,9 @@ struct ExportCanceled;
 pub struct ExportWorker<RT: Runtime> {
     pub(super) runtime: RT,
     pub(super) database: Database<RT>,
-    pub(super) storage: Arc<dyn Storage>,
+    pub(super) exports_storage: Arc<dyn Storage>,
     pub(super) file_storage: Arc<dyn Storage>,
+    pub(super) export_provider: Arc<dyn ExportProvider<RT>>,
     pub(super) backoff: Backoff,
     pub(super) usage_tracking: UsageCounter,
     pub(super) instance_name: String,
@@ -75,23 +76,35 @@ impl<RT: Runtime> ExportWorker<RT> {
     pub fn new(
         runtime: RT,
         database: Database<RT>,
-        storage: Arc<dyn Storage>,
+        exports_storage: Arc<dyn Storage>,
         file_storage: Arc<dyn Storage>,
+        export_provider: Arc<dyn ExportProvider<RT>>,
         usage_tracking: UsageCounter,
         instance_name: String,
     ) -> impl Future<Output = ()> + Send {
         let mut worker = Self {
             runtime,
             database,
-            storage,
+            exports_storage,
             file_storage,
+            export_provider,
             backoff: Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF),
             usage_tracking,
             instance_name,
         };
         async move {
             loop {
-                if let Err(e) = worker.run().await {
+                let result: anyhow::Result<()> = async {
+                    if let Some(token) = Box::pin(worker.run()).await? {
+                        worker
+                            .database
+                            .subscribe_and_wait_for_invalidation(token)
+                            .await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(e) = result {
                     report_error(&mut e.context("ExportWorker died")).await;
                     let delay = worker.backoff.fail(&mut worker.runtime.rng());
                     worker.runtime.wait(delay).await;
@@ -102,30 +115,10 @@ impl<RT: Runtime> ExportWorker<RT> {
         }
     }
 
-    #[cfg(test)]
-    pub fn new_test(
-        runtime: RT,
-        database: Database<RT>,
-        storage: Arc<dyn Storage>,
-        file_storage: Arc<dyn Storage>,
-    ) -> Self {
-        use events::usage::NoOpUsageEventLogger;
-
-        Self {
-            runtime,
-            database,
-            storage,
-            file_storage,
-            backoff: Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF),
-            usage_tracking: UsageCounter::new(Arc::new(NoOpUsageEventLogger)),
-            instance_name: "carnitas".to_string(),
-        }
-    }
-
     // Subscribe to the export table. If there is a requested export, start
     // an export and mark as in_progress. If there's an export job that didn't
     // finish (it's in_progress), restart that export.
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> anyhow::Result<Option<Token>> {
         let mut tx = self.database.begin(Identity::system()).await?;
         let mut exports_model = ExportsModel::new(&mut tx);
         let export_requested = exports_model.latest_requested().await?;
@@ -137,7 +130,6 @@ impl<RT: Runtime> ExportWorker<RT> {
             (Some(export), None) => {
                 tracing::info!("Export requested.");
                 let _status = log_worker_starting("ExportWorker");
-                let timer = export_timer(&self.instance_name);
                 let ts = self.database.now_ts_for_reads();
                 let in_progress_export = (*export).clone().in_progress(*ts)?;
                 let in_progress_export_doc = SystemMetadataModel::new_global(&mut tx)
@@ -151,25 +143,19 @@ impl<RT: Runtime> ExportWorker<RT> {
                     .commit_with_write_source(tx, "export_worker_export_requested")
                     .await?;
                 self.export(in_progress_export_doc).await?;
-                timer.finish();
-                return Ok(());
+                return Ok(None);
             },
             (None, Some(export)) => {
                 tracing::info!("In progress export restarting...");
                 let _status = log_worker_starting("ExportWorker");
-                let timer = export_timer(&self.instance_name);
                 self.export(export).await?;
-                timer.finish();
-                return Ok(());
+                return Ok(None);
             },
             (None, None) => {
                 tracing::info!("No exports requested or in progress.");
             },
         }
-        let token = tx.into_token()?;
-        let subscription = self.database.subscribe(token).await?;
-        subscription.wait_for_invalidation().await;
-        Ok(())
+        Ok(Some(tx.into_token()?))
     }
 
     async fn export(&mut self, export: ParsedDocument<Export>) -> anyhow::Result<()> {
@@ -183,7 +169,7 @@ impl<RT: Runtime> ExportWorker<RT> {
                         tracing::info!("Export {} canceled", export.id());
                         return Ok(());
                     }
-                    log_export_failed();
+                    log_export_failed(&e);
                     report_error(&mut e).await;
                     let delay = self.backoff.fail(&mut self.runtime.rng());
                     tracing::error!("Export failed, retrying in {delay:?}");
@@ -198,48 +184,121 @@ impl<RT: Runtime> ExportWorker<RT> {
         export: ParsedDocument<Export>,
     ) -> anyhow::Result<()> {
         let id = export.id();
-        let format = export.format();
-        let requestor = export.requestor();
-        drop(export); // Drop this to prevent accidentally using stale state
+        let Export::InProgress {
+            format,
+            requestor,
+            resumption_token,
+            ..
+        } = export.into_value()
+        else {
+            anyhow::bail!(
+                "export_and_mark_complete should only be called with an InProgress export"
+            );
+        };
+        // Drop the rest of `export` to prevent accidentally using stale state
 
-        tracing::info!("Export {id} beginning...");
-        let (snapshot_ts, object_key, usage) = {
+        let database_snapshot = self.database.latest_database_snapshot()?;
+        let snapshot_ts = *database_snapshot.timestamp();
+        let components = ExportComponents {
+            runtime: self.runtime.clone(),
+            database: database_snapshot,
+            exports_storage: self.exports_storage.clone(),
+            file_storage: self.file_storage.clone(),
+            instance_name: self.instance_name.clone(),
+        };
+        async fn modify_export<RT: Runtime>(
+            database: &Database<RT>,
+            id: ResolvedDocumentId,
+            what: &'static str,
+            f: impl FnOnce(Export) -> anyhow::Result<Export> + Send + Clone,
+        ) -> anyhow::Result<()> {
+            database
+                .execute_with_occ_retries(
+                    Identity::system(),
+                    FunctionUsageTracker::new(),
+                    what,
+                    move |tx| {
+                        let f = f.clone();
+                        async move {
+                            let export: ParsedDocument<Export> =
+                                tx.get(id).await?.context(ExportCanceled)?.parse()?;
+                            let export = export.into_value();
+                            if let Export::Canceled { .. } = export {
+                                anyhow::bail!(ExportCanceled);
+                            }
+                            SystemMetadataModel::new_global(tx)
+                                .replace(id, f(export)?.try_into()?)
+                                .await?;
+                            Ok(())
+                        }
+                        .boxed()
+                        .into()
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        let update_progress = |msg| {
             let database_ = self.database.clone();
-            let export_future = async {
-                let database_ = self.database.clone();
-
-                export_inner(self, format, requestor, |msg| async {
-                    tracing::info!("Export {id} progress: {msg}");
-                    database_
-                        .execute_with_occ_retries(
-                            Identity::system(),
-                            FunctionUsageTracker::new(),
-                            "export_worker_update_progress",
-                            move |tx| {
-                                let msg = msg.clone();
-                                async move {
-                                    let export: ParsedDocument<Export> =
-                                        tx.get(id).await?.context(ExportCanceled)?.parse()?;
-                                    let export = export.into_value();
-                                    if let Export::Canceled { .. } = export {
-                                        anyhow::bail!(ExportCanceled);
-                                    }
-                                    SystemMetadataModel::new_global(tx)
-                                        .replace(id, export.update_progress(msg)?.try_into()?)
-                                        .await?;
-                                    Ok(())
-                                }
-                                .boxed()
-                                .into()
-                            },
-                        )
-                        .await?;
-                    Ok(())
+            async move {
+                tracing::info!("Export {id} progress: {msg}");
+                modify_export(&database_, id, "export_worker_update_progress", |export| {
+                    export.update_progress(msg)
                 })
-                .await
+                .await?;
+                Ok(())
+            }
+            .boxed()
+        };
+        let save_resumption_token = |token| {
+            let database_ = self.database.clone();
+            async move {
+                modify_export(
+                    &database_,
+                    id,
+                    "export_worker_save_resumption_token",
+                    |export| export.update_resumption_token(token),
+                )
+                .await?;
+                Ok(())
+            }
+            .boxed()
+        };
+        let (object_key, usage) = {
+            let export_future = async {
+                if let Some(token) = resumption_token {
+                    tracing::info!(?token, "Export {id} resuming...");
+                    match self
+                        .export_provider
+                        .resume_export(self.instance_name.clone(), token, id, &update_progress)
+                        .await
+                    {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => {},
+                        Err(mut err) => {
+                            report_error(&mut err).await;
+                        },
+                    }
+                    tracing::warn!("Export failed to resume");
+                    // If we couldn't resume, just start a new export. We don't
+                    // bother deleting the resumption token here - just assume
+                    // it'll get rewritten soon.
+                }
+                tracing::info!(%snapshot_ts, "Export {id} beginning...");
+                self.export_provider
+                    .export(
+                        &components,
+                        format,
+                        requestor,
+                        id,
+                        &update_progress,
+                        &save_resumption_token,
+                    )
+                    .await
             };
             tokio::pin!(export_future);
 
+            let database_ = self.database.clone();
             // In parallel, monitor the export document to check for cancellation
             let monitor_export = async move {
                 loop {
@@ -259,8 +318,7 @@ impl<RT: Runtime> ExportWorker<RT> {
                         },
                     }
                     let token = tx.into_token()?;
-                    let subscription = database_.subscribe(token).await?;
-                    subscription.wait_for_invalidation().await;
+                    database_.subscribe_and_wait_for_invalidation(token).await?;
                 }
             };
             tokio::pin!(monitor_export);
@@ -270,6 +328,12 @@ impl<RT: Runtime> ExportWorker<RT> {
                 .factor_first()
                 .0?
         };
+
+        let object_attributes = self
+            .exports_storage
+            .get_object_attributes(&object_key)
+            .await?
+            .context("error getting export object attributes from S3")?;
 
         // Export is done; mark it as such.
         tracing::info!("Export {id} completed");
@@ -293,6 +357,7 @@ impl<RT: Runtime> ExportWorker<RT> {
                             snapshot_ts,
                             *tx.begin_timestamp(),
                             object_key,
+                            object_attributes.size,
                         )?;
                         SystemMetadataModel::new_global(tx)
                             .replace(id, completed_export.try_into()?)
@@ -305,12 +370,6 @@ impl<RT: Runtime> ExportWorker<RT> {
             )
             .await?;
 
-        let object_attributes = self
-            .storage
-            .get_object_attributes(&object_key)
-            .await?
-            .context("error getting export object attributes from S3")?;
-
         let tag = requestor.usage_tag().to_string();
         let call_type = match requestor {
             ExportRequestor::SnapshotExport => CallType::Export,
@@ -318,7 +377,7 @@ impl<RT: Runtime> ExportWorker<RT> {
         };
         // Charge file bandwidth for the upload of the snapshot to exports storage
         usage
-            .track_storage_ingress_size(ComponentPath::root(), tag.clone(), object_attributes.size)
+            .track_storage_ingress(ComponentPath::root(), tag.clone(), object_attributes.size)
             .await;
         // Charge database bandwidth accumulated during the export
         self.usage_tracking

@@ -1,4 +1,6 @@
-import chalk from "chalk";
+import { paths as PlatformDeploymentPaths } from "@convex-dev/platform/deploymentApi";
+import { paths as PlatformManagementPaths } from "@convex-dev/platform/managementApi";
+import { chalkStderr } from "chalk";
 import os from "os";
 import path from "path";
 
@@ -7,27 +9,33 @@ import { ProjectConfig } from "../config.js";
 import { spawn } from "child_process";
 import { InvalidArgumentError } from "commander";
 import fetchRetryFactory, { RequestInitRetryParams } from "fetch-retry";
+import { Context, ErrorType } from "../../../bundler/context.js";
 import {
-  Context,
-  ErrorType,
+  failExistingSpinner,
   logError,
   logMessage,
   logWarning,
-} from "../../../bundler/context.js";
+} from "../../../bundler/log.js";
 import { version } from "../../version.js";
-import { Project } from "../api.js";
+import type { CloudDeploymentType, Project } from "../api.js";
 import { promptOptions, promptSearch, promptYesNo } from "./prompts.js";
 import {
   bigBrainEnableFeatureMetadata,
   projectHasExistingCloudDev,
 } from "../localDeployment/bigBrain.js";
+import type {
+  paths as CliManagementPaths,
+  TeamResponse,
+} from "../../generatedApi.js";
+import createClient from "openapi-fetch";
 
 const retryingFetch = fetchRetryFactory(fetch);
 
 export const productionProvisionHost = "https://api.convex.dev";
 export const provisionHost =
   process.env.CONVEX_PROVISION_HOST || productionProvisionHost;
-const BIG_BRAIN_URL = `${provisionHost}/api/`;
+export const BIG_BRAIN_URL = `${provisionHost}/api/`;
+const PLATFORM_MANAGEMENT_API_URL = `${provisionHost}/v1/`;
 export const ENV_VAR_FILE_PATH = ".env.local";
 export const CONVEX_DEPLOY_KEY_ENV_VAR_NAME = "CONVEX_DEPLOY_KEY";
 export const CONVEX_DEPLOYMENT_ENV_VAR_NAME = "CONVEX_DEPLOYMENT";
@@ -37,6 +45,45 @@ export const CONVEX_SELF_HOSTED_ADMIN_KEY_VAR_NAME =
 const MAX_RETRIES = 6;
 // After 3 retries, log a progress message that we're retrying the request
 const RETRY_LOG_THRESHOLD = 3;
+
+/**
+ * Processes the CONVEX_DEPLOY_KEY value to handle special sentinel values.
+ *
+ * - If the value is `<ignore_deploy_key>`, treats it as if the env var isn't set (returns undefined)
+ * - If the value matches `<missing_deploy_key:$STRING>`, crashes with the message in $STRING
+ * - Otherwise returns the value as-is
+ *
+ * @param ctx Context for crashing if needed
+ * @param deployKey The raw deploy key value from environment or config
+ * @returns The processed deploy key value or undefined
+ */
+export async function processDeployKeyValue(
+  ctx: Context,
+  deployKey: string | undefined,
+): Promise<string | undefined> {
+  if (deployKey === undefined) {
+    return undefined;
+  }
+
+  // Check for <ignore_deploy_key> sentinel
+  if (deployKey === "<ignore_deploy_key>") {
+    return undefined;
+  }
+
+  // Check for <missing_deploy_key:$STRING> sentinel
+  const missingKeyPattern = /^<missing_deploy_key:(.+)>$/;
+  const match = deployKey.match(missingKeyPattern);
+  if (match) {
+    const errorMessage = match[1];
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "fatal",
+      printedMessage: errorMessage,
+    });
+  }
+
+  return deployKey;
+}
 
 export function parsePositiveInteger(value: string) {
   const parsedValue = parseInteger(value);
@@ -123,7 +170,7 @@ export class ThrowingFetchError extends Error {
       exitCode: 1,
       errorType: error_type,
       errForSentry: this,
-      printedMessage: chalk.red(msg.trim()),
+      printedMessage: chalkStderr.red(msg.trim()),
     });
   }
 }
@@ -139,13 +186,6 @@ export async function throwingFetch(
   resource: RequestInfo | URL,
   options: (RequestInit & RequestInitRetryParams<typeof fetch>) | undefined,
 ): Promise<Response> {
-  const Headers = globalThis.Headers;
-  const headers = new Headers((options || {})["headers"]);
-  if (options?.body) {
-    if (!headers.has("Content-Type")) {
-      headers.set("Content-Type", "application/json");
-    }
-  }
   const response = await retryingFetch(resource, options);
   if (!response.ok) {
     // This error must always be handled manually.
@@ -171,10 +211,9 @@ export async function logAndHandleFetchError(
   ctx: Context,
   err: unknown,
 ): Promise<never> {
-  if (ctx.spinner) {
-    // Fail the spinner so the stderr lines appear
-    ctx.spinner.fail();
-  }
+  // Fail the spinner so the stderr lines appear
+  failExistingSpinner();
+
   if (err instanceof ThrowingFetchError) {
     return await err.handle(ctx);
   } else {
@@ -182,7 +221,7 @@ export async function logAndHandleFetchError(
       exitCode: 1,
       errorType: "transient",
       errForSentry: err,
-      printedMessage: chalk.red(err),
+      printedMessage: chalkStderr.red(err),
     });
   }
 }
@@ -192,7 +231,7 @@ function logDeprecationWarning(ctx: Context, deprecationMessage: string) {
     return;
   }
   ctx.deprecationMessagePrinted = true;
-  logWarning(ctx, chalk.yellow(deprecationMessage));
+  logWarning(chalkStderr.yellow(deprecationMessage));
 }
 
 async function checkFetchErrorForDeprecation(ctx: Context, resp: Response) {
@@ -212,7 +251,7 @@ async function checkFetchErrorForDeprecation(ctx: Context, resp: Response) {
         return await ctx.crash({
           exitCode: 1,
           errorType: "fatal",
-          printedMessage: chalk.red(deprecationMessage),
+          printedMessage: chalkStderr.red(deprecationMessage),
         });
       default:
         // The error included a deprecation warning. Print, but handle the
@@ -252,14 +291,8 @@ export function deprecationCheckWarning(ctx: Context, resp: Response) {
   }
 }
 
-type Team = {
-  id: number;
-  name: string;
-  slug: string;
-};
-
 export async function hasTeam(ctx: Context, teamSlug: string) {
-  const teams: Team[] = await bigBrainAPI({ ctx, method: "GET", url: "teams" });
+  const teams = (await typedBigBrainClient(ctx).GET("/teams")).data!;
   return teams.some((team) => team.slug === teamSlug);
 }
 
@@ -267,43 +300,51 @@ export async function validateOrSelectTeam(
   ctx: Context,
   teamSlug: string | undefined,
   promptMessage: string,
-): Promise<{ teamSlug: string; chosen: boolean }> {
-  const teams: Team[] = await bigBrainAPI({ ctx, method: "GET", url: "teams" });
+): Promise<{ team: TeamResponse; chosen: boolean }> {
+  const teams = (await typedBigBrainClient(ctx).GET("/teams")).data!;
   if (teams.length === 0) {
     await ctx.crash({
       exitCode: 1,
       errorType: "fatal",
       errForSentry: "No teams found",
-      printedMessage: chalk.red("Error: No teams found"),
+      printedMessage: chalkStderr.red("Error: No teams found"),
     });
   }
   if (!teamSlug) {
     // Prompt the user to select if they belong to more than one team.
     switch (teams.length) {
       case 1:
-        return { teamSlug: teams[0].slug, chosen: false };
-      default:
-        return {
-          teamSlug: await promptSearch(ctx, {
-            message: promptMessage,
-            choices: teams.map((team: Team) => ({
-              name: `${team.name} (${team.slug})`,
-              value: team.slug,
-            })),
-          }),
-          chosen: true,
-        };
+        return { team: teams[0], chosen: false };
+      default: {
+        const teamSlug = await promptSearch(ctx, {
+          message: promptMessage,
+          choices: teams.map((team) => ({
+            name: `${team.name} (${team.slug})`,
+            value: team.slug,
+          })),
+        });
+        const team = teams.find((team) => team.slug === teamSlug);
+        if (!team) {
+          return await ctx.crash({
+            exitCode: 1,
+            errorType: "fatal",
+            printedMessage: `Error: Failed to select team`,
+          });
+        }
+        return { team, chosen: true };
+      }
     }
   } else {
     // Validate the chosen team.
-    if (!teams.find((team) => team.slug === teamSlug)) {
-      await ctx.crash({
+    const team = teams.find((team) => team.slug === teamSlug);
+    if (!team) {
+      return await ctx.crash({
         exitCode: 1,
         errorType: "fatal",
         printedMessage: `Error: Team ${teamSlug} not found, fix the --team option or remove it`,
       });
     }
-    return { teamSlug, chosen: false };
+    return { team, chosen: false };
   }
 }
 
@@ -379,17 +420,87 @@ export async function selectDevDeploymentType(
   return { devDeployment };
 }
 
+export async function logNoDefaultRegionMessage(teamSlug: string) {
+  const { teamDashboardUrl } = await import("../dashboard.js");
+  const noDefaultRegionMessage = chalkStderr.gray(
+    `Tip: you can configure a default region for your team at ${chalkStderr.underline(`${teamDashboardUrl(teamSlug)}/settings`)}`,
+  );
+  logMessage(noDefaultRegionMessage);
+}
+
+export async function selectRegionOrUseDefault(
+  ctx: Context,
+  selectedTeam: TeamResponse,
+  deploymentType: CloudDeploymentType,
+) {
+  if (!process.stdin.isTTY) {
+    // Use the team default in non-interactive terminals
+    if (!selectedTeam.defaultRegion) {
+      await logNoDefaultRegionMessage(selectedTeam.slug);
+    }
+    return selectedTeam.defaultRegion ?? null;
+  }
+  const selectedRegionName =
+    selectedTeam.defaultRegion ??
+    (await selectRegion(ctx, selectedTeam.id, deploymentType));
+  if (!selectedTeam.defaultRegion) {
+    // Log after the user chooses a region
+    await logNoDefaultRegionMessage(selectedTeam.slug);
+  }
+  return selectedRegionName;
+}
+
+export async function selectRegion(
+  ctx: Context,
+  teamId: number,
+  deploymentType: CloudDeploymentType,
+): Promise<string> {
+  const regionsResponse = (
+    await typedPlatformClient(ctx).GET(
+      "/teams/{team_id}/list_deployment_regions",
+      {
+        params: {
+          path: { team_id: `${teamId}` },
+        },
+      },
+    )
+  ).data!;
+  const choices = regionsResponse.items
+    .filter((item) => Boolean(item.available))
+    .map((item) => ({
+      name: item.displayName,
+      value: item.name,
+    }))
+    .sort((a, b) => {
+      // Show US region first if it exists
+      if (a.value === "aws-us-east-1") return -1;
+      if (b.value === "aws-us-east-1") return 1;
+      return 0;
+    });
+  return await promptOptions(ctx, {
+    message: `Where should this ${deploymentType} deployment run?`,
+    suffix: `\n${chalkStderr.gray(
+      "See https://www.convex.dev/pricing for pricing",
+    )}`,
+    choices,
+  });
+}
+
 export async function hasProject(
   ctx: Context,
   teamSlug: string,
   projectSlug: string,
 ) {
   try {
-    const projects: Project[] = await bigBrainAPIMaybeThrows({
-      ctx,
-      method: "GET",
-      url: `teams/${teamSlug}/projects`,
-    });
+    const projects: Project[] = (
+      await typedBigBrainClient(ctx).GET("/teams/{team_slug}/projects", {
+        params: {
+          path: {
+            team_slug: teamSlug,
+          },
+        },
+      })
+    ).data!;
     return !!projects.find((project) => project.slug === projectSlug);
   } catch {
     return false;
@@ -397,7 +508,7 @@ export async function hasProject(
 }
 
 export async function hasProjects(ctx: Context) {
-  return !!(await bigBrainAPI({ ctx, method: "GET", url: `has_projects` }));
+  return !!(await bigBrainAPI({ ctx, method: "GET", path: `has_projects` }));
 }
 
 export async function validateOrSelectProject(
@@ -407,11 +518,15 @@ export async function validateOrSelectProject(
   singleProjectPrompt: string,
   multiProjectPrompt: string,
 ): Promise<string | null> {
-  const projects: Project[] = await bigBrainAPI({
-    ctx,
-    method: "GET",
-    url: `teams/${teamSlug}/projects`,
-  });
+  const projects: Project[] = (
+    await typedBigBrainClient(ctx).GET("/teams/{team_slug}/projects", {
+      params: {
+        path: {
+          team_slug: teamSlug,
+        },
+      },
+    })
+  ).data!;
   if (projects.length === 0) {
     return await ctx.crash({
       exitCode: 1,
@@ -574,8 +689,13 @@ export function cacheDir() {
   return path.join(os.homedir(), ".cache", name);
 }
 
-export async function bigBrainFetch(ctx: Context): Promise<typeof fetch> {
-  const authHeader = await ctx.bigBrainAuth()?.header;
+/**
+ * Fetch with appropriate headers for the Convex Management API.
+ *
+ * This fetch() also has retries and throws if the response is not ok.
+ */
+export function bigBrainFetch(ctx: Context): typeof fetch {
+  const authHeader = ctx.bigBrainAuth()?.header;
   const bigBrainHeaders: Record<string, string> = authHeader
     ? {
         Authorization: authHeader,
@@ -586,9 +706,13 @@ export async function bigBrainFetch(ctx: Context): Promise<typeof fetch> {
       };
   return (resource: RequestInfo | URL, options: RequestInit | undefined) => {
     const { headers: optionsHeaders, ...rest } = options || {};
+    // Use the options headers if they exist. Otherwise, use the request headers
     const headers = {
       ...bigBrainHeaders,
-      ...(optionsHeaders || {}),
+      ...(optionsHeaders ??
+        (resource instanceof Request
+          ? Object.fromEntries(resource.headers.entries())
+          : {})),
     };
     const opts = {
       retries: MAX_RETRIES,
@@ -597,25 +721,19 @@ export async function bigBrainFetch(ctx: Context): Promise<typeof fetch> {
       ...rest,
     };
 
-    const url =
-      resource instanceof URL
-        ? resource.pathname
-        : typeof resource === "string"
-          ? new URL(resource, BIG_BRAIN_URL)
-          : new URL(resource.url, BIG_BRAIN_URL);
-    return throwingFetch(url, opts);
+    return throwingFetch(resource, opts);
   };
 }
 
 export async function bigBrainAPI<T = any>({
   ctx,
   method,
-  url,
+  path,
   data,
 }: {
   ctx: Context;
-  method: string;
-  url: string;
+  method: "GET" | "POST" | "HEAD";
+  path: string;
   data?: any;
 }): Promise<T> {
   const dataString =
@@ -628,7 +746,7 @@ export async function bigBrainAPI<T = any>({
     return await bigBrainAPIMaybeThrows({
       ctx,
       method,
-      url,
+      path,
       data: dataString,
     });
   } catch (err: unknown) {
@@ -636,31 +754,113 @@ export async function bigBrainAPI<T = any>({
   }
 }
 
+/**
+ * Typed API client with a fetch() implemention that includes retries and crashes on errors.
+ * It is always safe to call `.data!` on the response: any error would throw or crash.
+ *
+ * Pass { throw: true } to throw ThrowingFetchErrors instead of exiting the process.
+ */
+function typedApiClientFactory<T>(
+  baseUrl: string,
+  fetchBuilder: (ctx: Context) => typeof fetch,
+) {
+  return (ctx: Context, options: { throw?: boolean } = {}) => {
+    type Paths = T extends CliManagementPaths
+      ? CliManagementPaths
+      : T extends PlatformManagementPaths
+        ? PlatformManagementPaths
+        : T extends PlatformDeploymentPaths
+          ? PlatformDeploymentPaths
+          : never;
+    const client = createClient<Paths>({
+      baseUrl,
+      fetch: fetchBuilder(ctx),
+    });
+
+    // Wrap the client with error handling - go back to proxy since middleware doesn't catch parsing errors
+    return new Proxy(client, {
+      get(target, prop) {
+        const originalMethod = target[prop as keyof typeof target];
+
+        if (
+          prop === "GET" ||
+          prop === "POST" ||
+          prop === "HEAD" ||
+          prop === "OPTIONS" ||
+          prop === "PUT" ||
+          prop === "DELETE" ||
+          prop === "PATCH" ||
+          prop === "TRACE"
+        ) {
+          return async (...args: any[]) => {
+            try {
+              return await (originalMethod as Function).apply(target, args);
+            } catch (err: unknown) {
+              if (options.throw) {
+                // eslint-disable-next-line no-restricted-syntax
+                throw err;
+              }
+              return await logAndHandleFetchError(ctx, err);
+            }
+          };
+        }
+
+        return originalMethod;
+      },
+    });
+  };
+}
+
+export const typedBigBrainClient = typedApiClientFactory<CliManagementPaths>(
+  BIG_BRAIN_URL,
+  bigBrainFetch,
+);
+export const typedPlatformClient =
+  typedApiClientFactory<PlatformManagementPaths>(
+    PLATFORM_MANAGEMENT_API_URL,
+    bigBrainFetch,
+  );
+
+export function typedDeploymentClient(
+  ctx: Context,
+  args: { deploymentUrl: string; adminKey: string },
+  options: { throw?: boolean } = {},
+) {
+  return typedApiClientFactory<PlatformDeploymentPaths>(
+    `${args.deploymentUrl}/api/v1`,
+    (ctx) =>
+      deploymentFetch(ctx, {
+        deploymentUrl: args.deploymentUrl,
+        adminKey: args.adminKey,
+      }),
+  )(ctx, options);
+}
+
 export async function bigBrainAPIMaybeThrows({
   ctx,
   method,
-  url,
+  path,
   data,
 }: {
   ctx: Context;
-  method: string;
-  url: string;
+  method: "GET" | "POST" | "HEAD";
+  path: string;
   data?: any;
 }): Promise<any> {
-  const fetch = await bigBrainFetch(ctx);
+  const fetch = bigBrainFetch(ctx);
   const dataString =
     data === undefined
-      ? method === "POST" || method === "post"
+      ? method === "POST"
         ? JSON.stringify({})
         : undefined
       : typeof data === "string"
         ? data
         : JSON.stringify(data);
-  const res = await fetch(url, {
+  const res = await fetch(new URL(path, BIG_BRAIN_URL), {
     method,
     ...(dataString ? { body: dataString } : {}),
     headers:
-      method === "POST" || method === "post"
+      method === "POST"
         ? {
             "Content-Type": "application/json",
           }
@@ -713,19 +913,40 @@ export function waitUntilCalled(): [Promise<unknown>, () => void] {
   return [waitPromise, () => onCalled(null)];
 }
 
-// We can eventually switch to something like `filesize` for i18n and
-// more robust formatting, but let's keep our CLI bundle small for now.
+const BYTE_UNITS: [number, string][] = [
+  [1 << 30, "GiB"],
+  [1_000_000_000, "GB"],
+  [1 << 20, "MiB"],
+  [1_000_000, "MB"],
+  [1 << 10, "KiB"],
+  [1_000, "KB"],
+];
+
+/**
+ * Format a byte count into a human-friendly string.
+ *
+ * Picks the unit (binary or decimal) that divides most cleanly.
+ * Shows one decimal place only when it divides exactly (e.g. "4.1 MiB").
+ * Falls back to raw bytes when no unit divides cleanly.
+ */
 export function formatSize(n: number): string {
-  if (n < 1024) {
-    return `${n} B`;
+  if (n === 0) {
+    return "0 bytes";
   }
-  if (n < 1024 * 1024) {
-    return `${(n / 1024).toFixed(1)} KB`;
+  for (const [unitSize, unitName] of BYTE_UNITS) {
+    if (n < unitSize) {
+      continue;
+    }
+    if (n % unitSize === 0) {
+      return `${n / unitSize} ${unitName}`;
+    }
+    if ((n * 10) % unitSize === 0) {
+      const whole = Math.floor(n / unitSize);
+      const frac = Math.floor((n * 10) / unitSize) % 10;
+      return `${whole}.${frac} ${unitName}`;
+    }
   }
-  if (n < 1024 * 1024 * 1024) {
-    return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  }
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  return `${n} bytes`;
 }
 
 export function formatDuration(ms: number): string {
@@ -760,7 +981,7 @@ export function getCurrentTimeString() {
 // but we can provide better errors if we look around.
 export async function findParentConfigs(ctx: Context): Promise<{
   parentPackageJson: string;
-  parentConvexJson?: string;
+  parentConvexJson?: string | undefined;
 }> {
   const parentPackageJson = findUp(ctx, "package.json");
   if (!parentPackageJson) {
@@ -844,7 +1065,7 @@ export function spawnAsync(
   options: { stdio: "inherit"; shell?: boolean },
 ): Promise<void>;
 export function spawnAsync(
-  ctx: Context,
+  _ctx: Context,
   command: string,
   args: ReadonlyArray<string>,
   options?: { stdio: "inherit"; shell?: boolean },
@@ -858,10 +1079,10 @@ export function spawnAsync(
 
     if (pipeOutput) {
       child.stdout.on("data", (text) =>
-        logMessage(ctx, text.toString("utf-8").trimEnd()),
+        logMessage(text.toString("utf-8").trimEnd()),
       );
       child.stderr.on("data", (text) =>
-        logError(ctx, text.toString("utf-8").trimEnd()),
+        logError(text.toString("utf-8").trimEnd()),
       );
     } else {
       child.stdout.on("data", (data) => {
@@ -931,7 +1152,7 @@ function deploymentFetchRetryOn(
   method?: string,
 ) {
   const shouldRetry = function (
-    attempt: number,
+    _attempt: number,
     error: Error | null,
     response: Response | null,
   ): { kind: "retry"; error: any } | { kind: "stop" } {
@@ -1009,7 +1230,7 @@ function deploymentFetchRetryOn(
  * must supply any headers.
  */
 export function bareDeploymentFetch(
-  ctx: Context,
+  _ctx: Context,
   options: {
     deploymentUrl: string;
     onError?: (err: any) => void;
@@ -1020,8 +1241,9 @@ export function bareDeploymentFetch(
     onError?.(err);
     if (attempt >= RETRY_LOG_THRESHOLD) {
       logMessage(
-        ctx,
-        chalk.gray(`Retrying request (attempt ${attempt}/${MAX_RETRIES})...`),
+        chalkStderr.gray(
+          `Retrying request (attempt ${attempt}/${MAX_RETRIES})...`,
+        ),
       );
     }
   };
@@ -1048,20 +1270,21 @@ export function bareDeploymentFetch(
  * the `Convex-Client` header if they are not set in the `fetch`.
  */
 export function deploymentFetch(
-  ctx: Context,
+  _ctx: Context,
   options: {
     deploymentUrl: string;
     adminKey: string;
     onError?: (err: any) => void;
   },
-): typeof throwingFetch {
+): typeof fetch {
   const { deploymentUrl, adminKey, onError } = options;
   const onErrorWithAttempt = (err: any, attempt: number) => {
     onError?.(err);
     if (attempt >= RETRY_LOG_THRESHOLD) {
       logMessage(
-        ctx,
-        chalk.gray(`Retrying request (attempt ${attempt}/${MAX_RETRIES})...`),
+        chalkStderr.gray(
+          `Retrying request (attempt ${attempt}/${MAX_RETRIES})...`,
+        ),
       );
     }
   };
@@ -1095,7 +1318,7 @@ export function deploymentFetch(
 
 /**
  * Whether this is likely to be a WebContainer,
- * WebContainers can't complete the Auth0 login but where that login flow
+ * WebContainers can't complete the WorkOS  login but where that login flow
  * fails has changed with the environment.
  */
 export function isWebContainer(): boolean {
@@ -1114,4 +1337,28 @@ export function isWebContainer(): boolean {
     // eslint-disable-next-line no-empty
   } catch {}
   return blitzInternalEnv !== null && blitzInternalEnv !== undefined;
+}
+
+// For (rare) special behaviors based on package.json details.
+export async function currentPackageHomepage(
+  ctx: Context,
+): Promise<string | null> {
+  const { parentPackageJson: packageJsonPath } = await findParentConfigs(ctx);
+  let packageJson: any;
+  try {
+    const packageJsonString = ctx.fs.readUtf8File(packageJsonPath);
+    packageJson = JSON.parse(packageJsonString);
+  } catch (error: any) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "invalid filesystem data",
+      printedMessage: `Couldn't parse "${packageJsonPath}". Make sure it's a valid JSON. Error: ${error}`,
+    });
+  }
+  const name = packageJson["homepage"];
+  if (typeof name !== "string") {
+    // wrong type or missing
+    return null;
+  }
+  return name;
 }

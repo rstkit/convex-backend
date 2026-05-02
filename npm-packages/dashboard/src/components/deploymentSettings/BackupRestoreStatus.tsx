@@ -7,20 +7,18 @@ import { useQuery } from "convex/react";
 import { useConfirmImport } from "hooks/deploymentApi";
 import { useEffect, useState } from "react";
 import { Doc } from "system-udfs/convex/_generated/dataModel";
-import { DeploymentResponse, Team } from "generatedApi";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
 import udfs from "@common/udfs";
 import { CheckCircledIcon, CrossCircledIcon } from "@radix-ui/react-icons";
 import { ProgressBar } from "@ui/ProgressBar";
-import { useListCloudBackups, BackupResponse } from "api/backups";
+import { useGetCloudBackup, BackupResponse } from "api/backups";
 import { TransferSummary } from "./BackupListItem";
 import { ImportSummary } from "./SnapshotImport";
 
 export function BackupRestoreStatus({
   deployment,
-  team,
 }: {
-  deployment: DeploymentResponse;
-  team: Team;
+  deployment: PlatformDeploymentResponse;
 }) {
   const currentRestore = useLatestRestore();
   const requestor = currentRestore?.requestor;
@@ -29,10 +27,9 @@ export function BackupRestoreStatus({
   }
   const sourceCloudBackupId = requestor?.sourceCloudBackupId;
 
-  const backups = useListCloudBackups(team.id);
-  const backup =
-    currentRestore &&
-    (backups?.find((b) => BigInt(b.id) === sourceCloudBackupId) ?? null);
+  const backup = useGetCloudBackup(
+    sourceCloudBackupId !== undefined ? Number(sourceCloudBackupId) : undefined,
+  );
 
   // Automatically call confirmImport when the current backup is waiting for confirmation.
   // This is necessary because the snapshot import flow has a confirmation step, but for backups
@@ -60,7 +57,6 @@ export function BackupRestoreStatus({
           completedTime={new Date(Number(state.timestamp / BigInt(1000000)))}
           restoredRowsCount={state.num_rows_written}
           deployment={deployment}
-          team={team}
           backup={backup}
           snapshotImportCheckpoints={currentRestore.checkpoints}
         />
@@ -71,12 +67,11 @@ export function BackupRestoreStatus({
           errorMessage={state.error_message}
           restoreStartTime={new Date(currentRestore._creationTime)}
           deployment={deployment}
-          team={team}
           backup={backup}
         />
       );
     default: {
-      const _typeCheck: never = state;
+      state satisfies never;
       return null;
     }
   }
@@ -94,23 +89,21 @@ export function BackupRestoreFail({
   errorMessage,
   restoreStartTime,
   deployment,
-  team,
   backup,
 }: {
   errorMessage: string;
   restoreStartTime: Date;
-  deployment: DeploymentResponse;
-  team: Team;
+  deployment: PlatformDeploymentResponse;
   backup: BackupResponse | null;
 }) {
   const [isModalOpen, setIsModalOpen] = useState(false);
 
   return (
     <>
-      <div className="flex min-h-16 flex-wrap items-center gap-2 rounded border bg-background-secondary px-4 py-2">
+      <div className="flex min-h-16 flex-wrap items-center gap-2 rounded-lg border bg-background-secondary px-4 py-2">
         <div className="flex grow gap-2">
           <CrossCircledIcon className="size-5 shrink-0 text-content-errorSecondary" />
-          <p className="grow text-balance text-sm leading-tight text-content-secondary">
+          <p className="grow text-sm leading-tight text-balance text-content-primary">
             The restore started{" "}
             <TimestampDistance
               date={restoreStartTime}
@@ -142,7 +135,6 @@ export function BackupRestoreFail({
             backup={backup}
             targetDeployment={deployment}
             latestBackupInTargetDeployment={undefined}
-            team={team}
           />
 
           <p className="my-2">Encountered an error while restoring:</p>
@@ -157,7 +149,6 @@ export function BackupRestoreSuccess({
   completedTime,
   restoredRowsCount,
   deployment,
-  team,
   backup,
   snapshotImportCheckpoints,
 }: {
@@ -166,8 +157,7 @@ export function BackupRestoreSuccess({
   // `number` is used from stories because Storybook crashes when using bigint
   restoredRowsCount: bigint | number;
 
-  deployment: DeploymentResponse;
-  team: Team;
+  deployment: PlatformDeploymentResponse;
   backup: BackupResponse | null;
   snapshotImportCheckpoints: Doc<"_snapshot_imports">["checkpoints"] | null;
 }) {
@@ -175,10 +165,10 @@ export function BackupRestoreSuccess({
 
   return (
     <>
-      <div className="flex min-h-16 flex-wrap items-center gap-2 rounded border bg-background-secondary px-4 py-2">
+      <div className="flex min-h-16 flex-wrap items-center gap-2 rounded-lg border bg-background-secondary px-4 py-2">
         <div className="flex grow items-center gap-2">
           <CheckCircledIcon className="shrink-0 text-content-success" />
-          <p className="grow text-balance text-sm leading-tight text-content-secondary">
+          <p className="grow text-sm leading-tight text-balance text-content-primary">
             <strong>{`${formatNumberCompact(restoredRowsCount)} ${restoredRowsCount === BigInt(1) ? "document" : "documents"}`}</strong>{" "}
             {restoredRowsCount === BigInt(1) ? "was" : "were"} restored from a
             backup{" "}
@@ -213,7 +203,6 @@ export function BackupRestoreSuccess({
             backup={backup}
             targetDeployment={deployment}
             latestBackupInTargetDeployment={undefined}
-            team={team}
           />
 
           <ImportSummary
@@ -231,7 +220,7 @@ export function BackupRestoreOngoing({
   progressMessage: string;
 }) {
   return (
-    <div className="flex min-h-16 flex-col flex-wrap justify-center gap-2 rounded border bg-background-secondary px-4 py-2 text-sm">
+    <div className="flex min-h-16 flex-col flex-wrap justify-center gap-2 rounded-lg border bg-background-secondary px-4 py-2 text-sm">
       <div className="flex flex-wrap justify-end gap-4">
         <div className="grow font-semibold">Restoring from a backup</div>
         <div className="min-w-56 text-right text-content-secondary">

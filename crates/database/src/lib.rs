@@ -1,13 +1,10 @@
-#![feature(assert_matches)]
 #![feature(coroutines)]
-#![feature(result_flattening)]
 #![feature(iter_advance_by)]
 #![feature(type_alias_impl_trait)]
-#![feature(let_chains)]
 #![feature(iterator_try_collect)]
 #![feature(never_type)]
 #![feature(try_blocks)]
-#![feature(trait_upcasting)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(cow_is_borrowed)]
 #![feature(try_find)]
@@ -16,9 +13,8 @@
 mod bootstrap_model;
 mod committer;
 mod database;
+mod database_index_workers;
 mod execution_size;
-mod index_worker;
-mod index_workers;
 mod metrics;
 pub mod patch;
 pub mod persistence_helpers;
@@ -27,10 +23,12 @@ pub mod query;
 pub mod reads;
 mod retention;
 mod search_index_bootstrap;
+mod search_index_workers;
 mod snapshot_manager;
 mod stack_traces;
 pub mod streaming_export_selection;
 pub mod subscription;
+pub mod system_query;
 pub mod system_tables;
 mod table_registry;
 pub mod table_summary;
@@ -43,22 +41,26 @@ pub mod vector_index_worker;
 mod virtual_tables;
 mod write_limits;
 mod write_log;
+mod write_throughput_limiter;
 mod writes;
 
 mod component_registry;
 mod schema_registry;
 mod table_iteration;
-#[cfg(any(test, feature = "testing"))]
-pub mod test_helpers;
-#[cfg(test)]
-pub mod tests;
 pub mod text_index_worker;
+pub use committer::table_dependency_sort_key;
 pub use component_registry::ComponentRegistry;
+pub use database_index_workers::{
+    index_writer::{
+        IndexWriter,
+        PERFORM_BACKFILL_LABEL,
+    },
+    IndexWorker,
+};
 pub use execution_size::FunctionExecutionSize;
-pub use index_worker::IndexWorker;
-pub use index_workers::{
-    fast_forward::FastForwardIndexWorker,
-    search_worker::SearchIndexWorkers,
+pub use indexing::backend_in_memory_indexes::{
+    DatabaseIndexSnapshotCache,
+    TimestampedIndexCache,
 };
 pub use patch::PatchValue;
 pub use preloaded::PreloadedIndexRange;
@@ -79,17 +81,18 @@ pub use transaction::{
     Transaction,
 };
 pub use transaction_index::{
+    SearchNotEnabled,
     TextIndexManagerSnapshot,
     TransactionTextSnapshot,
 };
 pub use vector_index_worker::flusher::VectorIndexFlusher;
+pub use virtual_tables::VirtualTable;
 pub use write_limits::BiggestDocumentWrites;
 pub use write_log::{
     LogReader,
     WriteSource,
 };
 pub use writes::{
-    DocumentWrite,
     TransactionWriteSize,
     Writes,
 };
@@ -111,7 +114,12 @@ pub use self::{
         index::{
             IndexModel,
             IndexTable,
-            LegacyIndexDiff,
+        },
+        index_backfills::{
+            types::IndexBackfillMetadata,
+            IndexBackfillTable,
+            INDEX_BACKFILLS_BY_INDEX_ID,
+            INDEX_BACKFILLS_TABLE,
         },
         index_workers::{
             IndexWorkerMetadataTable,
@@ -128,6 +136,13 @@ pub use self::{
             SCHEMAS_STATE_INDEX,
             SCHEMAS_TABLE,
             SCHEMA_STATE_FIELD,
+        },
+        schema_validation_progress::{
+            types::SchemaValidationProgressMetadata,
+            SchemaValidationProgressModel,
+            SchemaValidationProgressTable,
+            SCHEMA_VALIDATION_PROGRESS_BY_SCHEMA_ID,
+            SCHEMA_VALIDATION_PROGRESS_TABLE,
         },
         system_metadata::SystemMetadataModel,
         table::{
@@ -147,13 +162,10 @@ pub use self::{
         DocumentDeltas,
         OccRetryStats,
         SnapshotPage,
-        StreamingExportTableFilter,
+        StreamingExportFilter,
         MAX_OCC_FAILURES,
     },
-    index_worker::{
-        IndexSelector,
-        IndexWriter,
-    },
+    database_index_workers::index_writer::IndexSelector,
     query::{
         soft_data_limit,
         DeveloperQuery,
@@ -163,13 +175,24 @@ pub use self::{
         latest_retention_min_snapshot_ts,
         FollowerRetentionManager,
         LeaderRetentionManager,
+        LeaderRetentionWorkers,
         RetentionType,
+    },
+    search_index_workers::{
+        fast_forward::{
+            load_metadata_fast_forward_ts,
+            FastForwardIndexWorker,
+        },
+        search_worker::SearchIndexWorkers,
     },
     snapshot_manager::{
         Snapshot,
         TableSummaries,
     },
-    subscription::Subscription,
+    subscription::{
+        InvalidationEvent,
+        Subscription,
+    },
     table_iteration::{
         MultiTableIterator,
         TableIterator,
@@ -186,6 +209,4 @@ pub use self::{
     transaction_id_generator::TransactionIdGenerator,
     transaction_index::TransactionIndex,
 };
-#[cfg(any(test, feature = "testing"))]
-pub use crate::bootstrap_model::test_facing::TestFacingModel;
 pub use crate::metrics::shutdown_error;

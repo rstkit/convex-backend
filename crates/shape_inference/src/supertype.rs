@@ -14,13 +14,11 @@ use value::{
 
 use crate::{
     array::ArrayShape,
-    map::MapShape,
     object::{
         ObjectField,
         ObjectShape,
         RecordShape,
     },
-    set::SetShape,
     string::StringLiteralShape,
     union::UnionBuilder,
     CountedShape,
@@ -47,21 +45,13 @@ pub fn supertype_candidates<C: ShapeConfig>(
             if let Some(candidate) = array_candidate(types) {
                 yield candidate;
             }
-            if let Some(candidate) = set_candidate(types) {
-                yield candidate;
-            }
-            if let Some(candidate) = map_candidate(types) {
-                yield candidate;
-            }
             // Include a record type in Phase 1 if we already have a record. Otherwise, we'd
             // be widening an object type to a record, which can happen below.
             let any_record = types
                 .iter()
                 .any(|t| matches!(&*t.variant, ShapeEnum::Record(..)));
-            if any_record {
-                if let Some(candidate) = record_candidate(types) {
-                    yield candidate;
-                }
+            if any_record && let Some(candidate) = record_candidate(types) {
+                yield candidate;
             }
             // Phase 2: String supertypes. Propose `id` types, `field_name`, and eventually
             // `string`.
@@ -86,10 +76,8 @@ pub fn supertype_candidates<C: ShapeConfig>(
             if let Some(candidate) = object_candidate(types) {
                 yield candidate;
             }
-            if !any_record {
-                if let Some(candidate) = record_candidate(types) {
-                    yield candidate;
-                }
+            if !any_record && let Some(candidate) = record_candidate(types) {
+                yield candidate;
             }
             // Phase 5: Finally, just emit the `unknown` type.
             let unknown_type =
@@ -132,15 +120,15 @@ fn id_candidates<C: ShapeConfig>(
         move || {
             let mut candidates = BTreeMap::new();
             for (i, t) in types.iter().enumerate() {
-                if let ShapeEnum::StringLiteral(ref s) = &*t.variant {
-                    if let Ok(id) = DeveloperDocumentId::decode(s) {
-                        candidates
-                            .entry(id.table())
-                            .or_insert_with(Vec::new)
-                            .push(i);
-                    }
+                if let ShapeEnum::StringLiteral(s) = &*t.variant
+                    && let Ok(id) = DeveloperDocumentId::decode(s)
+                {
+                    candidates
+                        .entry(id.table())
+                        .or_insert_with(Vec::new)
+                        .push(i);
                 }
-                if let ShapeEnum::Id(ref table) = &*t.variant {
+                if let ShapeEnum::Id(table) = &*t.variant {
                     candidates.entry(*table).or_insert_with(Vec::new).push(i);
                 }
             }
@@ -163,7 +151,7 @@ fn field_name_candidate<C: ShapeConfig>(
     let mut indexes = Vec::new();
     for (i, t) in types.iter().enumerate() {
         let subtype = match &*t.variant {
-            ShapeEnum::StringLiteral(ref s) => s.parse::<FieldName>().is_ok(),
+            ShapeEnum::StringLiteral(s) => s.parse::<FieldName>().is_ok(),
             ShapeEnum::Id(..) | ShapeEnum::FieldName => true,
             _ => false,
         };
@@ -212,7 +200,7 @@ fn array_candidate<C: ShapeConfig>(
     let mut element = UnionBuilder::new();
     let mut indexes = vec![];
     for (i, t) in types.iter().enumerate() {
-        if let ShapeEnum::Array(ref array) = &*t.variant {
+        if let ShapeEnum::Array(array) = &*t.variant {
             element = element.push(array.element().clone());
             indexes.push(i);
         }
@@ -222,50 +210,6 @@ fn array_candidate<C: ShapeConfig>(
     }
     let new_type = CountedShape::new(
         ShapeEnum::Array(ArrayShape::new(element.build())),
-        indexes.iter().map(|&i| types[i].num_values).sum(),
-    );
-    Some((new_type, indexes))
-}
-
-fn set_candidate<C: ShapeConfig>(
-    types: &[CountedShape<C>],
-) -> Option<(CountedShape<C>, Vec<usize>)> {
-    let mut element = UnionBuilder::new();
-    let mut indexes = vec![];
-    for (i, t) in types.iter().enumerate() {
-        if let ShapeEnum::Set(ref set) = &*t.variant {
-            element = element.push(set.element().clone());
-            indexes.push(i);
-        }
-    }
-    if indexes.len() < 2 {
-        return None;
-    }
-    let new_type = CountedShape::new(
-        ShapeEnum::Set(SetShape::new(element.build())),
-        indexes.iter().map(|&i| types[i].num_values).sum(),
-    );
-    Some((new_type, indexes))
-}
-
-fn map_candidate<C: ShapeConfig>(
-    types: &[CountedShape<C>],
-) -> Option<(CountedShape<C>, Vec<usize>)> {
-    let mut key = UnionBuilder::new();
-    let mut value = UnionBuilder::new();
-    let mut indexes = vec![];
-    for (i, t) in types.iter().enumerate() {
-        if let ShapeEnum::Map(ref map) = &*t.variant {
-            key = key.push(map.key().clone());
-            value = value.push(map.value().clone());
-            indexes.push(i);
-        }
-    }
-    if indexes.len() < 2 {
-        return None;
-    }
-    let new_type = CountedShape::new(
-        ShapeEnum::Map(MapShape::new(key.build(), value.build())),
         indexes.iter().map(|&i| types[i].num_values).sum(),
     );
     Some((new_type, indexes))
@@ -290,7 +234,7 @@ fn object_candidate<C: ShapeConfig>(
     let mut num_values = 0;
     let mut optional_fields: BTreeSet<IdentifierFieldName> = BTreeSet::new();
     for &j in &indexes {
-        let ShapeEnum::Object(ref object_type) = &*types[j].variant else {
+        let ShapeEnum::Object(object_type) = &*types[j].variant else {
             panic!("Tried to merge two non-objects");
         };
         for (field_name, field_type) in object_type.fields() {
@@ -318,9 +262,6 @@ fn object_candidate<C: ShapeConfig>(
             optional_fields.insert(field_name.clone());
         }
         num_values += types[j].num_values;
-    }
-    if !optional_fields.is_empty() && !C::allow_optional_object_fields() {
-        return None;
     }
     if field_builders.len() > C::MAX_OBJECT_FIELDS {
         return None;
@@ -351,12 +292,12 @@ fn record_candidate<C: ShapeConfig>(
     let mut value_union = UnionBuilder::new();
     let mut indexes = vec![];
     for (i, t) in types.iter().enumerate() {
-        if let ShapeEnum::Record(ref record) = &*t.variant {
+        if let ShapeEnum::Record(record) = &*t.variant {
             field_union = field_union.push(record.field().clone());
             value_union = value_union.push(record.value().clone());
             indexes.push(i);
         }
-        if let ShapeEnum::Object(ref object) = &*t.variant {
+        if let ShapeEnum::Object(object) = &*t.variant {
             for (field_name, field) in object.iter() {
                 let field_name_type = CountedShape::new(
                     StringLiteralShape::shape_of(&field_name[..]),

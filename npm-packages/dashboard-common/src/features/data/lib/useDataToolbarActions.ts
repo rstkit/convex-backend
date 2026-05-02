@@ -1,4 +1,5 @@
 import { Cursor, GenericDocument } from "convex/server";
+import { useRouter } from "next/router";
 import { ConvexError } from "convex/values";
 import { useMutation } from "convex/react";
 import udfs from "@common/udfs";
@@ -11,17 +12,20 @@ import { useNents } from "@common/lib/useNents";
 import { toast } from "@common/lib/utils";
 import { useContext } from "react";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
+import { shallowNavigate } from "@common/lib/useTableMetadata";
 
 export function useDataToolbarActions({
   handleAddDocuments,
   clearSelectedRows,
   loadMore,
   tableName,
+  onDocumentsAdded,
 }: {
   handleAddDocuments(): void;
   clearSelectedRows(): void;
   loadMore(): void;
   tableName: string;
+  onDocumentsAdded?: (count: number) => void;
 }): {
   addDocuments: (
     tableName: string,
@@ -58,6 +62,7 @@ export function useDataToolbarActions({
     }
     handleAddDocuments();
     await invalidateShapes();
+    onDocumentsAdded?.(documents.length);
   };
 
   const deleteDocuments = useMutation(udfs.deleteDocuments.default);
@@ -92,9 +97,15 @@ export function useDataToolbarActions({
   ): Promise<{ continueCursor: Cursor; deleted: number; hasMore: boolean }> =>
     tableClear({ tableName, cursor, componentId: selectedNent?.id ?? null });
 
+  const router = useRouter();
   const tableDelete = useDeleteTables();
   const deleteTable = async () => {
     try {
+      void shallowNavigate(router, {
+        ...router.query,
+        table: undefined,
+        filters: undefined,
+      });
       const resp = await tableDelete([tableName], selectedNent?.id ?? null);
       if (!resp?.success) {
         toast("error", resp.error);

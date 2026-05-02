@@ -3,7 +3,7 @@ import { runSystemQuery } from "../../run.js";
 import { ConvexTool } from "./index.js";
 import { PaginationResult } from "../../../../server/pagination.js";
 import { loadSelectedDeploymentCredentials } from "../../api.js";
-import { getDeploymentSelection } from "../../deploymentSelection.js";
+import { getMcpDeploymentSelection } from "../requestContext.js";
 
 const inputSchema = z.object({
   deploymentSelector: z
@@ -40,15 +40,16 @@ export const DataTool: ConvexTool<typeof inputSchema, typeof outputSchema> = {
   inputSchema,
   outputSchema,
   handler: async (ctx, args) => {
-    const { projectDir, deployment } = await ctx.decodeDeploymentSelector(
-      args.deploymentSelector,
-    );
+    const { projectDir, deployment } =
+      await ctx.decodeDeploymentSelectorReadOnly(args.deploymentSelector);
     process.chdir(projectDir);
-    const deploymentSelection = await getDeploymentSelection(ctx, ctx.options);
+    const deploymentSelection = await getMcpDeploymentSelection(
+      ctx,
+      deployment,
+    );
     const credentials = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      deployment,
     );
     const paginationResult = (await runSystemQuery(ctx, {
       deploymentUrl: credentials.url,

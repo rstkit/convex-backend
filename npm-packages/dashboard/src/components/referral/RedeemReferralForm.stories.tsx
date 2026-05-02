@@ -1,8 +1,9 @@
-import type { Meta, StoryObj } from "@storybook/react";
-import { Team } from "generatedApi";
+import { fn } from "storybook/test";
+import type { Meta, StoryObj } from "@storybook/nextjs";
+import { TeamResponse } from "generatedApi";
 import { RedeemReferralForm } from "./RedeemReferralForm";
 
-const mockTeams: Team[] = [
+const mockTeams: TeamResponse[] = [
   {
     id: 1,
     name: "Team 1",
@@ -43,10 +44,10 @@ const meta = {
     },
     teams: mockTeams,
     selectedTeam: mockTeams[0],
-    onTeamSelect: () => {},
-    onSubmit: async () => {},
+    onTeamSelect: fn(),
+    onSubmit: fn(),
     teamEligibility: { eligible: true },
-    onShowTeamSelector: () => {},
+    onShowTeamSelector: fn(),
     isTeamSelectorShown: false,
     isChef: false,
   },

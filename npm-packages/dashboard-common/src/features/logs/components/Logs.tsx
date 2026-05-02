@@ -11,6 +11,7 @@ import isEqual from "lodash/isEqual";
 import { dismissToast, toast } from "@common/lib/utils";
 import { LogList } from "@common/features/logs/components/LogList";
 import { LogToolbar } from "@common/features/logs/components/LogToolbar";
+import { SearchLogsInput } from "@common/features/logs/components/SearchLogsInput";
 import { filterLogs } from "@common/features/logs/lib/filterLogs";
 import { NENT_APP_PLACEHOLDER, Nent } from "@common/lib/useNents";
 import {
@@ -20,7 +21,6 @@ import {
 import { functionIdentifierValue } from "@common/lib/functions/generateFileTree";
 import { MAX_LOGS, UdfLog, useLogs } from "@common/lib/useLogs";
 import { useDeploymentAuditLogs } from "@common/lib/useDeploymentAuditLog";
-import { TextInput } from "@ui/TextInput";
 import { Button } from "@ui/Button";
 import { useGlobalLocalStorage } from "@common/lib/useGlobalLocalStorage";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
@@ -74,16 +74,15 @@ export function Logs({
       defaultSelectedNent,
     );
 
-  // When the selected nent changes from props, update the storage if not already set
+  // Seed the nent filter once when navigating to logs with a pre-selected component.
+  // Use a ref so users can still deselect the component after the initial seed.
+  const hasSeededNentRef = useRef<string | null>(null);
   useEffect(() => {
-    if (
-      selectedNent &&
-      selectedNents !== "all" &&
-      !selectedNents.includes(selectedNent.path)
-    ) {
+    if (selectedNent && selectedNent.path !== hasSeededNentRef.current) {
+      hasSeededNentRef.current = selectedNent.path;
       setSelectedNents([selectedNent.path]);
     }
-  }, [selectedNent, selectedNents, setSelectedNents]);
+  }, [selectedNent, setSelectedNents]);
 
   const moduleFunctions = useModuleFunctions();
   const functions = useMemo(
@@ -104,6 +103,8 @@ export function Logs({
 
   const [logs, setLogs] = useState<UdfLog[]>([]);
   const [filteredLogs, setFilteredLogs] = useState<UdfLog[]>([]);
+  const [pausedLogs, setPausedLogs] = useState<UdfLog[]>([]);
+  const [pausedFilteredLogs, setPausedFilteredLogs] = useState<UdfLog[]>([]);
 
   const filters = useMemo(
     () => ({
@@ -123,19 +124,27 @@ export function Logs({
   const deploymentAuditLogs = useDeploymentAuditLogs(fromTimestamp);
 
   const receiveLogs = useCallback(
-    (entries: UdfLog[]) => {
-      setLogs((prev) =>
-        [...prev, ...entries].slice(
-          Math.max(prev.length + entries.length - MAX_LOGS, 0),
-          prev.length + entries.length,
-        ),
-      );
-      setFilteredLogs((prev) =>
-        [...prev, ...(filterLogs(filters, entries) || [])].slice(
-          Math.max(prev.length + entries.length - MAX_LOGS, 0),
-          prev.length + entries.length,
-        ),
-      );
+    (entries: UdfLog[], isPaused: boolean) => {
+      if (isPaused) {
+        // When paused, store new logs separately (except logs for existing requests)
+        setPausedLogs((prev) => [...prev, ...entries]);
+        const filteredEntries = filterLogs(filters, entries) || [];
+        setPausedFilteredLogs((prev) => [...prev, ...filteredEntries]);
+      } else {
+        setLogs((prev) =>
+          [...prev, ...entries].slice(
+            Math.max(prev.length + entries.length - MAX_LOGS, 0),
+            prev.length + entries.length,
+          ),
+        );
+        setFilteredLogs((prev) => {
+          const filteredEntries = filterLogs(filters, entries) || [];
+          return [...prev, ...filteredEntries].slice(
+            Math.max(prev.length + filteredEntries.length - MAX_LOGS, 0),
+            prev.length + filteredEntries.length,
+          );
+        });
+      }
     },
     [filters],
   );
@@ -145,11 +154,31 @@ export function Logs({
   const onPause = (p: boolean) => {
     const now = new Date().getTime();
     setPaused(p ? now : 0);
+
+    // When unpausing, merge pausedLogs into logs
+    if (!p && pausedLogs.length > 0) {
+      setLogs((prev) => {
+        const combined = [...prev, ...pausedLogs];
+        return combined.slice(
+          Math.max(combined.length - MAX_LOGS, 0),
+          combined.length,
+        );
+      });
+      setFilteredLogs((prev) => {
+        const combined = [...prev, ...pausedFilteredLogs];
+        return combined.slice(
+          Math.max(combined.length - MAX_LOGS, 0),
+          combined.length,
+        );
+      });
+      setPausedLogs([]);
+      setPausedFilteredLogs([]);
+    }
   };
   useLogs(
     logsConnectivityCallbacks.current,
-    receiveLogs,
-    paused > 0 || manuallyPaused,
+    (entries) => receiveLogs(entries, paused > 0 || manuallyPaused),
+    false, // Never skip the stream, always stay connected
   );
 
   useEffect(() => {
@@ -167,6 +196,15 @@ export function Logs({
     },
     200,
     [innerFilter],
+  );
+
+  // Function to set filter that also updates the text input
+  const setFilterAndInput = useCallback(
+    (newFilter: string) => {
+      setFilter(newFilter);
+      setInnerFilter(newFilter);
+    },
+    [setFilter],
   );
 
   // Note: fromTimestamp used to be a `useMemo` result, but it was causing a bug
@@ -187,8 +225,8 @@ export function Logs({
       : latestAuditLog?._creationTime;
 
   return (
-    <div className="flex h-full w-full min-w-[48rem] flex-col gap-2 p-6 py-4">
-      <div className="flex flex-col gap-4">
+    <div className="flex h-full w-full min-w-[48rem] flex-col overflow-hidden p-6 py-4">
+      <div className="flex shrink-0 flex-col gap-4">
         <LogToolbar
           firstItem={<LogsHeader />}
           selectedLevels={levels}
@@ -205,12 +243,10 @@ export function Logs({
           setSelectedNents={setSelectedNents}
         />
         <div className="mb-2 flex w-full gap-2">
-          <TextInput
-            id="Search logs"
-            placeholder="Filter logs..."
+          <SearchLogsInput
             value={innerFilter}
             onChange={(e) => setInnerFilter(e.target.value)}
-            type="search"
+            logs={logs}
           />
           <Button
             size="sm"
@@ -236,21 +272,23 @@ export function Logs({
           </Button>
         </div>
       </div>
-      <LogList
-        nents={nents}
-        logs={logs}
-        filteredLogs={filteredLogs}
-        deploymentAuditLogs={deploymentAuditLogs}
-        filter={filter}
-        clearedLogs={clearedLogs}
-        setClearedLogs={setClearedLogs}
-        paused={paused > 0 || manuallyPaused}
-        setPaused={onPause}
-        setManuallyPaused={(p) => {
-          onPause(p);
-          setManuallyPaused(p);
-        }}
-      />
+      <div className="flex-1 overflow-hidden">
+        <LogList
+          logs={logs}
+          pausedLogs={pausedLogs}
+          filteredLogs={filteredLogs}
+          deploymentAuditLogs={deploymentAuditLogs}
+          setFilter={setFilterAndInput}
+          clearedLogs={clearedLogs}
+          setClearedLogs={setClearedLogs}
+          paused={paused > 0 || manuallyPaused}
+          setPaused={onPause}
+          setManuallyPaused={(p) => {
+            onPause(p);
+            setManuallyPaused(p);
+          }}
+        />
+      </div>
     </div>
   );
 }

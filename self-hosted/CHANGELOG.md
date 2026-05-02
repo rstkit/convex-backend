@@ -10,6 +10,46 @@ Different versions are not guaranteed to be compatible with one another.
 Follow the instructions in the [README](README.md#software-upgrades) to upgrade
 your self-hosted backend and dashboard.
 
+## 2025-09-17
+
+As of ~2025-09-17, we're releasing more frequently, so we're not going to update
+this changelog as frequently. Check `git log` for a detailed listing of changes.
+
+## 2025-09-12 `4d3b0a5de955a258e70e3813bbff486051d88820`
+
+- Schema Validation progress on dashboard.
+- Improved error messages
+- Misc improvements.
+
+## 2025-09-03 `00bd92723422f3bff968230c94ccdeb8c1719832`
+
+- Fix command line / env var configuration flag issue.
+- Support AWS credential handling from multiple sources, including IAM. (thanks
+  HeathHopkins)
+- Support disabling AWS S3 SSE/Checksums for better compatibility with AWS
+  compatible services (thanks jovermier)
+
+## 2025-08-27 `08139ef318b1898dad7731910f49ba631631c902`
+
+- Support index backfill progress and staged indexes
+- Fix full text search bug where some filters were ignored
+- Build database indexes in parallel
+
+## 2025-08-05 `33cef775a8a6228cbacee4a09ac2c4073d62ed13`
+
+- Add support for `AWS_S3_FORCE_PATH_STYLE` (thanks Squipward00 and cayter),
+  allowing support for MinIO and DigitalOcean S3-compatible storage.
+- Variety of bug fixes and performance improvements to backend
+
+## 2025-07-01 `6efab6f2b6c182b90255774d747328cfc7b80dd9`
+
+- Add support for integrations (axiom/datadog/sentry/fivetran/airbyte) to
+  self-hosted
+- Fix node actions bug affecting multiple concurrent requests with local node
+  executor
+- Variety of performance improvements to backend (caching, memory usage, CPU
+  usage)
+
 ## 2025-05-29 `c1a7ac393888d743e704de56cf569a154b4526d4`
 
 - Fix bug that prevented folks with crons from upgrading existing older

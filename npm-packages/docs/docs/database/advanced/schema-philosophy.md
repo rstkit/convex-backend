@@ -1,6 +1,7 @@
 ---
 title: Schema Philosophy
 sidebar_position: 450
+description: "Convex schema design philosophy and best practices"
 ---
 
 With Convex there is no need to write any `CREATE TABLE` statements, or think
@@ -16,7 +17,7 @@ what data is in your system.
 
 The good news is Convex is always typed. It's just implicitly typed! When you
 submit a document to Convex, tracks all the types of all the fields in your
-document. You can go to your [dashboard](/dashboard.md) and view the inferred
+document. You can go to your [dashboard](/dashboard.mdx) and view the inferred
 schema of any table to understand what you've ended up with.
 
 "What about that field I changed from a string to a number?" Convex can handle

@@ -8,6 +8,7 @@ use common::{
     components::{
         CanonicalizedComponentFunctionPath,
         ComponentId,
+        ComponentPath,
         Reference,
         Resource,
     },
@@ -20,7 +21,10 @@ use common::{
         UnixTimestamp,
     },
     sync::spsc,
-    types::ConvexOrigin,
+    types::{
+        ConvexOrigin,
+        DeploymentMetadata,
+    },
 };
 use errors::ErrorMetadata;
 use fastrace::future::FutureExt as _;
@@ -32,13 +36,17 @@ use futures::{
     StreamExt,
 };
 use keybroker::{
+    FunctionRunnerKeyBroker,
     Identity,
-    KeyBroker,
 };
 use parking_lot::Mutex;
 use serde_json::Value as JsonValue;
+use sync_types::CanonicalizedUdfPath;
 use tokio::sync::mpsc;
-use udf::SyscallTrace;
+use udf::{
+    ActionCallbacks,
+    SyscallTrace,
+};
 use usage_tracking::FunctionUsageTracker;
 
 use crate::{
@@ -57,7 +65,6 @@ use crate::{
     },
     metrics::log_http_action_with_unknown_identity,
     module_cache::ModuleCache,
-    ActionCallbacks,
 };
 
 /// TaskExecutor is able to execute async syscalls and ops for actions.
@@ -72,14 +79,17 @@ pub struct TaskExecutor<RT: Runtime> {
     pub action_callbacks: Arc<dyn ActionCallbacks>,
     pub fetch_client: Arc<dyn FetchClient>,
     pub _module_loader: Arc<dyn ModuleCache<RT>>,
-    pub key_broker: KeyBroker,
+    pub key_broker: FunctionRunnerKeyBroker,
     pub task_order: TaskOrder,
     pub task_retval_sender: mpsc::UnboundedSender<TaskResponse>,
     pub usage_tracker: FunctionUsageTracker,
     pub context: ExecutionContext,
     pub resources: Arc<Mutex<BTreeMap<Reference, Resource>>>,
     pub component_id: ComponentId,
+    pub udf_path: CanonicalizedUdfPath,
+    pub component_path: ComponentPath,
     pub convex_origin_override: Arc<Mutex<Option<ConvexOrigin>>>,
+    pub deployment: DeploymentMetadata,
 }
 
 impl<RT: Runtime> TaskExecutor<RT> {

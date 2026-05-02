@@ -18,7 +18,7 @@ import { Button } from "@ui/Button";
 import { ObjectEditor } from "@common/elements/ObjectEditor/ObjectEditor";
 import { Checkbox } from "@ui/Checkbox";
 import { Tooltip } from "@ui/Tooltip";
-import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/patchDocumentsFields";
+import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/lib/values";
 import { cn } from "@ui/cn";
 
 export const operatorOptions: Readonly<
@@ -95,7 +95,9 @@ export function FilterEditor({
 
   function filterStateReducer(s: FilterState, action: Partial<FilterState>) {
     const newState = { ...s, ...action } as FilterState;
-    !isEqual(s, newState) && onChange(newState);
+    if (!isEqual(s, newState)) {
+      onChange(newState);
+    }
     return newState;
   }
 
@@ -114,7 +116,7 @@ export function FilterEditor({
     <div className="flex min-w-0 grow">
       <Tooltip
         tip={state.enabled ? "Disable Filter" : "Enable Filter"}
-        className="w-fit"
+        className="flex w-fit items-center"
       >
         <Checkbox
           checked={state.enabled !== false}
@@ -235,6 +237,7 @@ function ValueEditor({
         />
       ) : isDatepicker ? (
         <DateTimePicker
+          aria-label="Creation time"
           date={
             // Convert to date from Unix timestamp, defaulting to now.
             typeof state.value === "number" ? new Date(state.value) : new Date()
@@ -249,7 +252,7 @@ function ValueEditor({
         <>
           {innerText === "" && state.value === UNDEFINED_PLACEHOLDER && (
             <div
-              className="pointer-events-none absolute z-50 font-mono text-xs italic text-content-secondary"
+              className="pointer-events-none absolute z-50 font-mono text-xs text-content-secondary italic"
               data-testid="undefined-placeholder"
               style={{
                 marginTop: "5px",
@@ -265,7 +268,7 @@ function ValueEditor({
               "min-w-4 rounded-none border focus-within:border focus-within:border-border-selected",
               state.enabled !== false && "border-x-transparent",
             )}
-            editorClassname="px-2 py-1 mt-0 rounded bg-background-secondary rounded-l-none rounded-r-none"
+            editorClassname="px-2 py-1 mt-0 rounded-sm bg-background-secondary rounded-l-none rounded-r-none"
             allowTopLevelUndefined
             disabled={state.enabled === false}
             onChangeInnerText={setInnerText}

@@ -44,22 +44,30 @@ export const throwNotImplementedError = (
 };
 
 export const throwUncatchableDeveloperError = (message: string): never => {
-  // Make an error object so we can grab its stack trace and pass it through to
-  // the syscall
-  const error = new Error();
-  // This calls `prepareStackTrace` that populates `__frameData`
-  error.stack;
-  const frameData = JSON.parse((error as any).__frameData ?? []);
-  performOp("throwUncatchableDeveloperError", message, frameData);
-  // This is not actually reachable because the syscall above will throw
-  return null as never;
+  return performOp("throwUncatchableDeveloperError", message) as never;
 };
 
-export function requiredArguments(length, required, prefix) {
+export function requiredArguments(
+  length: number,
+  required: number,
+  prefix: string,
+): void {
   if (length < required) {
     const errMsg = `${prefix ? prefix + ": " : ""}${required} argument${
       required === 1 ? "" : "s"
     } required, but only ${length} present.`;
     throw new TypeError(errMsg);
   }
+}
+
+export function copyBuffer(input: ArrayBufferView | ArrayBuffer): Uint8Array {
+  if (ArrayBuffer.isView(input)) {
+    return new Uint8Array(
+      input.buffer,
+      input.byteOffset,
+      input.byteLength,
+    ).slice();
+  }
+  // ArrayBuffer
+  return new Uint8Array(input, 0, input.byteLength).slice();
 }

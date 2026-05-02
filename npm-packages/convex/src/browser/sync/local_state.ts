@@ -1,3 +1,15 @@
+/**
+ * The local state of the client:
+ * - which queries are subscribed to
+ * - the "Query Set Version," used to produce QuerySetModification messages
+ * - the current auth token and "Identity Version"
+ *
+ * Local state does not include:
+ * - query results (see RemoteQuerySet)
+ * - locally made "optimistic update" modifications to query results (see OptimisticQueryResults)
+ * - any query results at all
+ **/
+
 import { convexToJson, Value } from "../../values/index.js";
 import {
   AddQuery,
@@ -23,9 +35,20 @@ type LocalQuery = {
   canonicalizedUdfPath: string;
   args: Record<string, Value>;
   numSubscribers: number;
-  journal?: QueryJournal;
-  componentPath?: string;
+  journal?: QueryJournal | undefined;
+  componentPath?: string | undefined;
 };
+
+export type AuthState =
+  | {
+      tokenType: "User";
+      value: string;
+    }
+  | {
+      tokenType: "Admin";
+      value: string;
+      impersonating?: UserIdentityAttributes | undefined;
+    };
 
 export class LocalSyncState {
   private nextQueryId: QueryId;
@@ -33,11 +56,7 @@ export class LocalSyncState {
   private readonly querySet: Map<QueryToken, LocalQuery>;
   private readonly queryIdToToken: Map<QueryId, QueryToken>;
   private identityVersion: IdentityVersion;
-  private auth?: {
-    tokenType: "Admin" | "User";
-    value: string;
-    impersonating?: UserIdentityAttributes;
-  };
+  private auth: AuthState | undefined;
   private readonly outstandingQueriesOlderThanRestart: Set<QueryId>;
   private outstandingAuthOlderThanRestart: boolean;
   private paused: boolean;
@@ -69,8 +88,8 @@ export class LocalSyncState {
   subscribe(
     udfPath: string,
     args: Record<string, Value>,
-    journal?: QueryJournal,
-    componentPath?: string,
+    journal?: QueryJournal | undefined,
+    componentPath?: string | undefined,
   ): {
     queryToken: QueryToken;
     modification: QuerySetModification | null;
@@ -157,7 +176,7 @@ export class LocalSyncState {
         }
         default: {
           // Enforce that the switch-case is exhaustive.
-          const _: never = modification;
+          modification satisfies never;
           throw new Error(`Invalid modification ${(modification as any).type}`);
         }
       }
@@ -178,9 +197,13 @@ export class LocalSyncState {
     return version >= this.identityVersion;
   }
 
+  getAuth(): AuthState | undefined {
+    return this.auth;
+  }
+
   setAuth(value: string): Authenticate {
     this.auth = {
-      tokenType: "User",
+      tokenType: "User" as const,
       value: value,
     };
     const baseVersion = this.identityVersion;
@@ -255,7 +278,7 @@ export class LocalSyncState {
     return null;
   }
 
-  queryToken(queryId: QueryId): string | null {
+  queryToken(queryId: QueryId): QueryToken | null {
     return this.queryIdToToken.get(queryId) ?? null;
   }
 
@@ -263,9 +286,7 @@ export class LocalSyncState {
     return this.querySet.get(queryToken)?.journal;
   }
 
-  restart(
-    oldRemoteQueryResults: Set<QueryId>,
-  ): [QuerySetModification, Authenticate?] {
+  restart(): [QuerySetModification, (Authenticate | undefined)?] {
     // Restart works whether we are paused or unpaused.
     // The `this.pendingQuerySetModifications` is not used
     // when restarting as the AddQuery and RemoveQuery are computed
@@ -285,9 +306,10 @@ export class LocalSyncState {
       };
       modifications.push(add);
 
-      if (!oldRemoteQueryResults.has(localQuery.id)) {
-        this.outstandingQueriesOlderThanRestart.add(localQuery.id);
-      }
+      // Track all re-sent queries as outstanding so the backoff retry
+      // counter doesn't reset until the server has re-confirmed results
+      // for every active query.
+      this.outstandingQueriesOlderThanRestart.add(localQuery.id);
     }
     this.querySetVersion = 1;
     const querySet: QuerySetModification = {
@@ -315,7 +337,7 @@ export class LocalSyncState {
     this.paused = true;
   }
 
-  resume(): [QuerySetModification?, Authenticate?] {
+  resume(): [QuerySetModification | undefined, Authenticate | undefined] {
     const querySet: QuerySetModification | undefined =
       this.pendingQuerySetModifications.size > 0
         ? {

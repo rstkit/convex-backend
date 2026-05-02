@@ -10,12 +10,12 @@ import { UserIdentityAttributes } from "convex/browser";
 import { ConvexReactClient } from "convex/react";
 import { ValidatorJSON, Value } from "convex/values";
 import isEqual from "lodash/isEqual";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { useCallback, useContext, useState } from "react";
 import { useDebounce } from "react-use";
 import { ZodError, z } from "zod";
 import { generateErrorMessage } from "zod-error";
-import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/patchDocumentsFields";
+import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/lib/values";
 import {
   itemIdentifier,
   useModuleFunctions,
@@ -88,11 +88,15 @@ export function GlobalFunctionTester({
   setIsVertical,
   isExpanded,
   setIsExpanded,
+  onRanCustomQuery,
+  onCopiedQueryResult,
 }: {
   isVertical: boolean;
   setIsVertical: (v: boolean) => void;
   isExpanded: boolean;
   setIsExpanded: (v: boolean) => void;
+  onRanCustomQuery?: () => void;
+  onCopiedQueryResult?: () => void;
 }) {
   const isShowing = useIsGlobalRunnerShown();
   const hideGlobalRunner = useHideGlobalRunner();
@@ -149,6 +153,7 @@ export function GlobalFunctionTester({
     argsValidator,
     runHistoryItem,
     setRunHistoryItem,
+    onCopiedQueryResult,
   });
   const { queryEditor, customQueryResult, runCustomQueryButton } =
     useFunctionEditor(
@@ -156,6 +161,7 @@ export function GlobalFunctionTester({
       selectedItem?.componentId ?? null,
       runHistoryItem,
       setRunHistoryItem,
+      onRanCustomQuery,
     );
 
   const { useLogDeploymentEvent } = useContext(DeploymentInfoContext);
@@ -174,7 +180,7 @@ export function GlobalFunctionTester({
     <aside
       key={isVertical.toString() + isExpanded.toString()}
       className={classNames(
-        "bg-background-secondary shadow",
+        "bg-background-secondary shadow-sm",
         "gap-6 z-30 relative overflow-auto",
         isExpanded
           ? "h-full w-full border-l"
@@ -197,7 +203,7 @@ export function GlobalFunctionTester({
             setIsExpanded(!isExpanded);
           }}
           inline
-          className="bg-background-primary"
+          className="bg-background-primary/50 backdrop-blur-[2px]"
           variant="neutral"
           icon={isExpanded ? <ExitFullScreenIcon /> : <EnterFullScreenIcon />}
           tip={isExpanded ? "Collapse" : "Expand"}
@@ -210,7 +216,7 @@ export function GlobalFunctionTester({
           size="xs"
           onClick={() => setIsVertical(!isVertical)}
           inline
-          className="bg-background-primary"
+          className="bg-background-primary/50 backdrop-blur-[2px]"
           variant="neutral"
           icon={isVertical ? <ViewHorizontalIcon /> : <ViewVerticalIcon />}
         />
@@ -218,11 +224,11 @@ export function GlobalFunctionTester({
           key={`close-${isVertical.toString()}`}
           side={isVertical ? "bottom" : "top"}
           tip="Close panel"
-          wrapsButton
+          asChild
         >
           <ClosePanelButton
             onClose={() => hideGlobalRunner("click")}
-            className="bg-background-primary"
+            className="bg-background-primary/50 backdrop-blur-[2px]"
           />
         </Tooltip>
       </div>
@@ -241,7 +247,7 @@ export function GlobalFunctionTester({
             )}
           >
             <div className="sticky top-0 z-10 flex w-full items-center gap-4 border-y bg-background-primary px-4 py-2">
-              <h4 className="whitespace-nowrap text-xs text-content-secondary">
+              <h4 className="text-xs whitespace-nowrap text-content-secondary">
                 Function Input
               </h4>
             </div>
@@ -385,12 +391,12 @@ export function GlobalFunctionTester({
           {isVertical && (
             <>
               {selectedItem?.fn.type === "customQuery" ? (
-                <div className="flex h-full w-full flex-col gap-4 px-4 pb-6 pt-4">
+                <div className="flex h-full w-full flex-col gap-4 px-4 pt-4 pb-6">
                   {queryEditor}
                   {runCustomQueryButton}
                 </div>
               ) : selectedItem !== null ? (
-                <div className="flex h-fit w-full flex-col gap-2 pb-6 pt-4">
+                <div className="flex h-fit w-full flex-col gap-2 pt-4 pb-6">
                   {args}
                   {button}
                 </div>
@@ -423,6 +429,7 @@ export function useFunctionTester({
   impersonation = true,
   runHistoryItem,
   setRunHistoryItem,
+  onCopiedQueryResult,
 }: {
   moduleFunction: ModuleFunction | null;
   initialArgs?: Record<string, Value>;
@@ -430,6 +437,7 @@ export function useFunctionTester({
   impersonation?: boolean;
   runHistoryItem?: RunHistoryItem;
   setRunHistoryItem?: (item?: RunHistoryItem) => void;
+  onCopiedQueryResult?: () => void;
 }) {
   const [parameters, setParameters] = useState<Record<string, Value>>(
     initialArgs || {},
@@ -475,7 +483,14 @@ export function useFunctionTester({
           return;
         }
         const user = impersonatedUserSchema.parse(v);
-        setImpersonatedUser(user);
+
+        const { customClaims, ...rootClaims } = user;
+        const flattenedUser = {
+          ...rootClaims,
+          ...(customClaims || {}),
+        };
+
+        setImpersonatedUser(flattenedUser);
         setImpersonatedUserError(undefined);
       } catch (e: any) {
         if (e instanceof ZodError) {
@@ -550,32 +565,61 @@ export function useFunctionTester({
     };
   }, [client, moduleFunction, parameters]);
 
+  const isInComponent = !!moduleFunction?.componentPath;
   const { button, result: functionResult } = useFunctionResult({
     onSubmit,
     disabled,
     udfType: moduleFunction?.udfType,
+    visibility: moduleFunction?.visibility,
+    isInComponent,
     functionIdentifier: moduleFunction?.identifier,
     componentId: moduleFunction?.componentId || null,
     args: parameters,
     runHistoryItem,
+    onCopiedQueryResult,
   });
+
+  const { useLogDeploymentEvent, useIsOperationAllowed } = useContext(
+    DeploymentInfoContext,
+  );
+  const canRunInternalQueries = useIsOperationAllowed("RunInternalQueries");
+  const canViewData = useIsOperationAllowed("ViewData");
+  const canActAsUser = useIsOperationAllowed("ActAsUser");
+
+  const canRunQuery = (() => {
+    if (!moduleFunction || moduleFunction.udfType !== "Query") return true;
+    if (moduleFunction.visibility?.kind === "internal")
+      return canRunInternalQueries;
+    if (moduleFunction.componentPath) return canViewData;
+    return true;
+  })();
 
   const queryResult = moduleFunction &&
     reactClient &&
-    moduleFunction.udfType === "Query" && (
+    moduleFunction.udfType === "Query" &&
+    canRunQuery && (
       <QueryResult
         paused={disabled}
         module={moduleFunction}
         parameters={parameters}
         reactClient={reactClient}
+        onCopiedQueryResult={onCopiedQueryResult}
       />
     );
 
-  const { useLogDeploymentEvent } = useContext(DeploymentInfoContext);
+  const queryPermissionDenied = moduleFunction &&
+    moduleFunction.udfType === "Query" &&
+    !canRunQuery && (
+      <div className="flex h-full items-center justify-center p-4">
+        <p className="text-sm text-content-secondary">
+          You do not have permission to run this function in this deployment.
+        </p>
+      </div>
+    );
   const log = useLogDeploymentEvent();
 
   const args = (
-    <div className="flex h-full flex-col gap-2 overflow-y-auto scrollbar">
+    <div className="scrollbar grid h-full gap-2 overflow-y-auto">
       <div className="px-4">
         <div className="flex max-w-[48rem] items-end justify-between">
           <h5 className="text-xs text-content-secondary">Arguments</h5>
@@ -584,15 +628,16 @@ export function useFunctionTester({
               functionIdentifier={moduleFunction?.identifier || ""}
               componentId={moduleFunction?.componentId ?? null}
               selectItem={(item) => {
-                (!item.type || item.type === "arguments") &&
+                if (!item.type || item.type === "arguments") {
                   onChange(item.arguments);
+                }
                 setRunHistoryItem(item);
               }}
             />
           )}
         </div>
       </div>
-      <div className="relative min-h-32 grow overflow-y-auto px-4">
+      <div className="relative min-h-28 grow overflow-y-auto px-4">
         <ObjectEditor
           className="max-w-[48rem] animate-fadeInFromLoading"
           key={
@@ -613,51 +658,66 @@ export function useFunctionTester({
       </div>
       {impersonation && (
         <div className="flex items-start gap-4 px-4">
-          <label
-            htmlFor="actAsUser"
-            className="flex h-9 items-center gap-2 whitespace-nowrap pt-0.5 text-xs accent-util-accent"
+          <Tooltip
+            tip={
+              !canActAsUser
+                ? "You do not have permission to act as a user in this deployment."
+                : undefined
+            }
           >
-            <input
-              data-testid="actAsUser"
-              id="actAsUser"
-              type="checkbox"
-              checked={isImpersonating}
-              className="hover:cursor-pointer"
-              onChange={() => {
-                setIsImpersonating(!isImpersonating);
-                setRunHistoryItem && setRunHistoryItem(undefined);
-                log("toggle act as user", {
-                  actAsUser: isImpersonating,
-                  function: moduleFunction && {
-                    udfType: moduleFunction.udfType,
-                    visibility: moduleFunction.visibility,
-                    identifier: moduleFunction.identifier,
-                  },
-                });
-              }}
-            />
-            <span className="flex select-none gap-1">
-              Act as a user{" "}
-              <Tooltip
-                tip={
-                  <>
-                    Run authenticated functions by acting as a user.{" "}
-                    <Link
-                      href="https://docs.convex.dev/dashboard/deployments/functions#assuming-a-user-identity"
-                      passHref
-                      className="underline"
-                      target="_blank"
-                    >
-                      Learn more
-                    </Link>
-                    .
-                  </>
-                }
-              >
-                <QuestionMarkCircledIcon />
-              </Tooltip>
-            </span>
-          </label>
+            <label
+              htmlFor="actAsUser"
+              className={classNames(
+                "flex h-9 items-center gap-2 pt-0.5 text-xs whitespace-nowrap accent-util-accent",
+                !canActAsUser && "opacity-50 cursor-not-allowed",
+              )}
+            >
+              <input
+                data-testid="actAsUser"
+                id="actAsUser"
+                type="checkbox"
+                checked={isImpersonating && canActAsUser}
+                disabled={!canActAsUser}
+                className={classNames(
+                  "hover:cursor-pointer",
+                  !canActAsUser && "cursor-not-allowed",
+                )}
+                onChange={() => {
+                  if (!canActAsUser) return;
+                  setIsImpersonating(!isImpersonating);
+                  setRunHistoryItem?.(undefined);
+                  log("toggle act as user", {
+                    actAsUser: isImpersonating,
+                    function: moduleFunction && {
+                      udfType: moduleFunction.udfType,
+                      visibility: moduleFunction.visibility,
+                      identifier: moduleFunction.identifier,
+                    },
+                  });
+                }}
+              />
+              <span className="flex gap-1 select-none">
+                Act as a user{" "}
+                <Tooltip
+                  tip={
+                    <>
+                      Run authenticated functions by acting as a user.{" "}
+                      <Link
+                        href="https://docs.convex.dev/dashboard/deployments/functions#assuming-a-user-identity"
+                        passHref
+                        target="_blank"
+                      >
+                        Learn more
+                      </Link>
+                      .
+                    </>
+                  }
+                >
+                  <QuestionMarkCircledIcon />
+                </Tooltip>
+              </span>
+            </label>
+          </Tooltip>
           <div className="flex max-h-[8rem] w-full flex-col gap-1">
             {isImpersonating && (
               <ObjectEditor
@@ -677,7 +737,7 @@ export function useFunctionTester({
             )}
             {impersonatedUserError && (
               <p
-                className="mt-1 h-4 break-words text-xs text-content-errorSecondary"
+                className="mt-1 h-4 text-xs break-words text-content-errorSecondary"
                 role="alert"
               >
                 {impersonatedUserError}
@@ -691,7 +751,7 @@ export function useFunctionTester({
 
   return {
     args,
-    result: functionResult || queryResult,
+    result: functionResult || queryResult || queryPermissionDenied,
     button,
   };
 }

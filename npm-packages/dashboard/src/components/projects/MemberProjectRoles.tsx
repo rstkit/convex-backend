@@ -9,8 +9,8 @@ import {
   useUpdateProjectRoles,
   useCurrentProjectRoles,
 } from "api/roles";
-import { TeamMemberResponse } from "generatedApi";
-import Link from "next/link";
+import { TeamMember } from "generatedApi";
+import { Link } from "@ui/Link";
 import { useState } from "react";
 import sortBy from "lodash/sortBy";
 import { ProjectAdminFormModal } from "./ProjectAdminsFormModal";
@@ -31,7 +31,7 @@ export function MemberProjectRoles() {
       };
     })
     .filter(
-      (member): member is TeamMemberResponse & { isProjectAdmin: boolean } =>
+      (member): member is TeamMember & { isProjectAdmin: boolean } =>
         member.isProjectAdmin || member.role === "admin",
     );
 
@@ -64,7 +64,6 @@ export function MemberProjectRoles() {
         <Link
           href="https://docs.convex.dev/dashboard/teams#roles-and-permissions"
           target="_blank"
-          className="text-content-link hover:underline"
         >
           Learn more
         </Link>{" "}
@@ -107,11 +106,7 @@ export function MemberProjectRoles() {
                           </p>{" "}
                           <p>
                             You may view and manage team admins on the{" "}
-                            <Link
-                              className="underline"
-                              href={`/t/${team?.slug}/settings/members`}
-                              passHref
-                            >
+                            <Link href={`/t/${team?.slug}/settings/members`}>
                               member settings
                             </Link>{" "}
                             page.
@@ -119,14 +114,14 @@ export function MemberProjectRoles() {
                         </div>
                       }
                     >
-                      <div className="rounded border p-1 text-xs">
+                      <div className="rounded-sm border p-1 text-xs">
                         Team Admin
                       </div>
                     </Tooltip>
                   )}
                   {member.isProjectAdmin && (
                     <Tooltip tip="This member can manage this project because they are a project admin.">
-                      <div className="rounded border p-1 text-xs">
+                      <div className="rounded-sm border p-1 text-xs">
                         Project Admin
                       </div>
                     </Tooltip>

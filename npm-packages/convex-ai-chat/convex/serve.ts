@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { map } from "modern-async";
+import { asyncMap } from "modern-async";
 import OpenAI from "openai";
 import {
   internalAction,
@@ -8,7 +8,6 @@ import {
 } from "./_generated/server";
 import { embedTexts } from "./ingest/embed";
 import { internal } from "./_generated/api";
-import { Id } from "./_generated/dataModel";
 
 export const answer = internalAction({
   args: {
@@ -27,7 +26,7 @@ export const answer = internalAction({
       limit: 8,
     });
 
-    const relevantDocuments = await map(
+    const relevantDocuments = await asyncMap(
       searchResults,
       async ({ _id: embeddingId }) =>
         await ctx.runQuery(internal.serve.getChunk, { embeddingId }),
@@ -82,39 +81,49 @@ export const answer = internalAction({
   },
 });
 
-export const getMessages = internalQuery(
-  async (ctx, { sessionId }: { sessionId: string }) => {
+export const getMessages = internalQuery({
+  args: {
+    sessionId: v.string(),
+  },
+  handler: async (ctx, { sessionId }) => {
     return await ctx.db
       .query("messages")
       .withIndex("bySessionId", (q) => q.eq("sessionId", sessionId))
       .collect();
   },
-);
+});
 
-export const getChunk = internalQuery(
-  async (ctx, { embeddingId }: { embeddingId: Id<"embeddings"> }) => {
+export const getChunk = internalQuery({
+  args: {
+    embeddingId: v.id("embeddings"),
+  },
+  handler: async (ctx, { embeddingId }) => {
     return (await ctx.db
       .query("chunks")
       .withIndex("byEmbeddingId", (q) => q.eq("embeddingId", embeddingId))
       .unique())!;
   },
-);
+});
 
-export const addBotMessage = internalMutation(
-  async (ctx, { sessionId }: { sessionId: string }) => {
+export const addBotMessage = internalMutation({
+  args: {
+    sessionId: v.string(),
+  },
+  handler: async (ctx, { sessionId }) => {
     return await ctx.db.insert("messages", {
       isViewer: false,
       text: "",
       sessionId,
     });
   },
-);
+});
 
-export const updateBotMessage = internalMutation(
-  async (
-    ctx,
-    { messageId, text }: { messageId: Id<"messages">; text: string },
-  ) => {
+export const updateBotMessage = internalMutation({
+  args: {
+    messageId: v.id("messages"),
+    text: v.string(),
+  },
+  handler: async (ctx, { messageId, text }) => {
     await ctx.db.patch(messageId, { text });
   },
-);
+});

@@ -22,11 +22,15 @@ export function FunctionRunnerWrapper({
   setIsVertical,
   isExpanded,
   setIsExpanded,
+  onRanCustomQuery,
+  onCopiedQueryResult,
 }: {
   isVertical: boolean;
   setIsVertical: (isVertical: boolean) => void;
   isExpanded: boolean;
   setIsExpanded: (isExpanded: boolean) => void;
+  onRanCustomQuery?: () => void;
+  onCopiedQueryResult?: () => void;
 }) {
   const deploymentState = useQuery(udfs.deploymentState.deploymentState);
   const router = useRouter();
@@ -74,9 +78,11 @@ export function FunctionRunnerWrapper({
       );
       return;
     }
-    isGlobalRunnerShown
-      ? hideGlobalRunner("keyboard")
-      : showGlobalRunner(null, "keyboard");
+    if (isGlobalRunnerShown) {
+      hideGlobalRunner("keyboard");
+    } else {
+      showGlobalRunner(null, "keyboard");
+    }
   });
 
   const { useLogDeploymentEvent } = useContext(DeploymentInfoContext);
@@ -99,6 +105,8 @@ export function FunctionRunnerWrapper({
         setIsVertical={setIsGlobalRunnerVerticalAndLog}
         isExpanded={isExpanded}
         setIsExpanded={setIsExpanded}
+        onRanCustomQuery={onRanCustomQuery}
+        onCopiedQueryResult={onCopiedQueryResult}
       />
       {!isGlobalRunnerShown && deploymentState?.state !== "paused" && (
         <Button
@@ -117,7 +125,7 @@ export function FunctionRunnerWrapper({
             <FunctionIcon className="h-8 w-8" />
           </div>
 
-          <div className="ml-1 select-none flex-col items-center gap-1 whitespace-nowrap  transition-all">
+          <div className="ml-1 flex-col items-center gap-1 whitespace-nowrap transition-all select-none">
             Run functions
             <div className="flex w-full items-center gap-0.5 text-xs">
               Shortcut:

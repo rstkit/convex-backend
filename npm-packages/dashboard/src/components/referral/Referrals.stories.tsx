@@ -1,17 +1,18 @@
-import type { Meta, StoryObj } from "@storybook/react";
+import type { Meta, StoryObj } from "@storybook/nextjs";
 import { ReferralState } from "generatedApi";
 import { ReferralsInner } from "./Referrals";
 
-const meta: Meta<typeof ReferralsInner> = {
+const meta = {
   component: ReferralsInner,
   tags: ["autodocs"],
   args: {
     referralCode: "CONVEX123",
   },
-};
+  parameters: { a11y: { test: "todo" } },
+} satisfies Meta<typeof ReferralsInner>;
 
 export default meta;
-type Story = StoryObj<typeof ReferralsInner>;
+type Story = StoryObj<typeof meta>;
 
 const mockReferralState: ReferralState = {
   referrals: ["Team A", "Team B"],

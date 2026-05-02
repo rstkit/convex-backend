@@ -18,7 +18,6 @@ use value::{
 };
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct SnapshotImport {
     pub state: ImportState,
     pub format: ImportFormat,
@@ -99,7 +98,6 @@ impl TryFrom<SerializedSnapshotImport> for SnapshotImport {
 codegen_convex_serialization!(SnapshotImport, SerializedSnapshotImport);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ImportFormat {
     Csv(TableName),
     JsonLines(TableName),
@@ -194,7 +192,6 @@ Import│Worker imports       │
 └────────────┘      └─────────┘
  */
 #[derive(Debug, Clone, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ImportState {
     Uploaded,
     WaitingForConfirmation {
@@ -311,7 +308,6 @@ mod import_state_serde {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct ImportTableCheckpoint {
     pub component_path: ComponentPath,
     pub display_table_name: TableName,
@@ -383,7 +379,6 @@ impl TryFrom<SerializedImportTableCheckpoint> for ImportTableCheckpoint {
 #[derive(
     Debug, Default, Deserialize, Clone, Copy, Eq, PartialEq, strum::EnumString, strum::Display,
 )]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub enum ImportMode {
     Append,
@@ -394,10 +389,10 @@ pub enum ImportMode {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ImportRequestor {
     SnapshotImport,
     CloudRestore { source_cloud_backup_id: u64 },
+    StreamingImport,
 }
 
 impl ImportRequestor {
@@ -405,6 +400,7 @@ impl ImportRequestor {
         match self {
             ImportRequestor::SnapshotImport => "snapshot_import",
             ImportRequestor::CloudRestore { .. } => "cloud_restore",
+            ImportRequestor::StreamingImport => "streaming_import",
         }
     }
 }
@@ -416,6 +412,8 @@ pub enum SerializedImportRequestor {
     SnapshotImport,
     #[serde(rename_all = "camelCase")]
     CloudRestore { source_cloud_backup_id: i64 },
+    #[serde(rename_all = "camelCase")]
+    StreamingImport,
 }
 
 impl From<ImportRequestor> for SerializedImportRequestor {
@@ -427,6 +425,7 @@ impl From<ImportRequestor> for SerializedImportRequestor {
             } => SerializedImportRequestor::CloudRestore {
                 source_cloud_backup_id: source_cloud_backup_id as i64,
             },
+            ImportRequestor::StreamingImport => SerializedImportRequestor::StreamingImport,
         }
     }
 }
@@ -439,6 +438,7 @@ impl From<SerializedImportRequestor> for ImportRequestor {
             } => ImportRequestor::CloudRestore {
                 source_cloud_backup_id: source_cloud_backup_id as u64,
             },
+            SerializedImportRequestor::StreamingImport => ImportRequestor::StreamingImport,
         }
     }
 }

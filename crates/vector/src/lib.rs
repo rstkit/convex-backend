@@ -1,10 +1,10 @@
-#![feature(let_chains)]
 #![feature(iterator_try_collect)]
 #![feature(int_roundings)]
 #![feature(type_alias_impl_trait)]
 #![feature(coroutines)]
 #![feature(coroutine_trait)]
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(impl_trait_in_assoc_type)]
 
 use std::ops::Deref;
@@ -26,11 +26,10 @@ pub mod metrics;
 mod qdrant_index;
 pub mod qdrant_segments;
 mod query;
+pub mod result_merger;
 mod searcher;
 mod vector_index_manager;
 
-#[cfg(any(test, feature = "testing"))]
-pub use self::qdrant_index::cosine_similarity;
 pub use self::{
     memory_index::MemoryVectorIndex,
     metrics::{
@@ -121,17 +120,5 @@ fn incorrect_vector_filter_field_error(
     )
 }
 
-/// Present if a document is in a table with one or more vector indexes and has
-/// an actual vector in at least one of those indexes.
-///
-/// Should be Absent if the table has no vector indexes or if this particular
-/// document does not have a vector in any of the vector indexes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(Debug, proptest_derive::Arbitrary)
-)]
-pub enum DocInVectorIndex {
-    Present,
-    Absent,
-}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VectorIndexWriteSize(pub u64);

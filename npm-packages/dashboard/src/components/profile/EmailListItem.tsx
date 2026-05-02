@@ -3,6 +3,7 @@ import { ConfirmationDialog } from "@ui/ConfirmationDialog";
 import { Menu, MenuItem } from "@ui/Menu";
 import {
   useDeleteProfileEmail,
+  useIdentities,
   useResendProfileEmailVerification,
   useUpdatePrimaryProfileEmail,
 } from "api/profile";
@@ -10,6 +11,10 @@ import { useState } from "react";
 import { MemberEmailResponse } from "generatedApi";
 
 export function EmailListItem({ email }: { email: MemberEmailResponse }) {
+  const identities = useIdentities();
+  const emailIsAnIdentity = identities?.some(
+    (identity) => identity.email === email.email,
+  );
   const deleteEmail = useDeleteProfileEmail();
   const updatePrimaryEmail = useUpdatePrimaryProfileEmail();
   const resentEmailVerification = useResendProfileEmailVerification();
@@ -19,12 +24,12 @@ export function EmailListItem({ email }: { email: MemberEmailResponse }) {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-4 border-b py-2 last:border-b-0">
-      <div className="flex items-center gap-2">
-        {email.email}
+      <div className="flex grow items-center gap-2">
+        <div className="grow">{email.email}</div>
         {email.isPrimary && (
-          <div className="rounded border p-1 text-xs">Primary</div>
+          <div className="rounded-sm border p-1 text-xs">Primary</div>
         )}
-        <div className="rounded border p-1 text-xs">
+        <div className="rounded-sm border p-1 text-xs">
           {email.isVerified ? "Verified" : "Unverified"}
         </div>
       </div>
@@ -60,12 +65,14 @@ export function EmailListItem({ email }: { email: MemberEmailResponse }) {
         ) : null}
         <MenuItem
           action={() => setShowDeleteConfirmation(true)}
-          disabled={email.isPrimary}
+          disabled={email.isPrimary || emailIsAnIdentity}
           variant="danger"
           tip={
             email.isPrimary
               ? "You cannot delete your primary email."
-              : undefined
+              : emailIsAnIdentity
+                ? "You cannot delete this email because it is associated with an identity on your account. Delete the identity first to remove this email from your account."
+                : undefined
           }
           tipSide="right"
         >
@@ -90,7 +97,16 @@ export function EmailListItem({ email }: { email: MemberEmailResponse }) {
           confirmText="Delete"
           variant="danger"
           dialogTitle="Delete Email"
-          dialogBody="Deleting this email will remove it from your account."
+          dialogBody={
+            <div className="flex flex-col gap-1">
+              <p>Deleting this email will remove it from your account.</p>
+              <p>
+                Note: If you login again later with a connected identity
+                associated with this email, this email will be re-added to your
+                account.
+              </p>
+            </div>
+          }
           error={error}
           validationText={email.email}
         />

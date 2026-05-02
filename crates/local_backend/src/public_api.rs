@@ -6,7 +6,12 @@ use application::{
     },
 };
 use axum::{
-    extract::State,
+    debug_handler,
+    extract::{
+        DefaultBodyLimit,
+        FromRef,
+        State,
+    },
     response::IntoResponse,
 };
 use common::{
@@ -22,11 +27,14 @@ use common::{
         },
         ExtractClientVersion,
         ExtractRequestId,
+        ExtractRequestMetadata,
         ExtractResolvedHostname,
         HttpResponseError,
     },
+    knobs::MAX_BACKEND_PUBLIC_API_REQUEST_SIZE,
     types::FunctionCaller,
     version::ClientVersion,
+    RequestContext,
 };
 use errors::ErrorMetadata;
 use isolate::UdfArgsJson;
@@ -36,6 +44,8 @@ use serde::{
 };
 use serde_json::Value as JsonValue;
 use sync_types::Timestamp;
+use utoipa::ToSchema;
+use utoipa_axum::router::OpenApiRouter;
 use value::{
     export::ValueFormat,
     ConvexValue,
@@ -51,32 +61,34 @@ use crate::{
     RouterState,
 };
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UdfPostRequest {
     pub path: String,
+    #[schema(value_type = Object)]
     pub args: UdfArgsJson,
 
     pub format: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Ts {
     pub ts: SerializedTs,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UdfPostWithTsRequest {
     pub path: String,
+    #[schema(value_type = Object)]
     pub args: UdfArgsJson,
     pub ts: SerializedTs,
 
     pub format: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct SerializedTs(String);
 
 impl From<Timestamp> for SerializedTs {
@@ -107,7 +119,7 @@ pub struct UdfArgsQuery {
     pub format: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 #[serde(tag = "status")]
 #[serde(rename_all = "camelCase")]
 pub enum UdfResponse {
@@ -116,6 +128,7 @@ pub enum UdfResponse {
         value: JsonValue,
 
         #[serde(skip_serializing_if = "RedactedLogLines::is_empty")]
+        #[schema(value_type = Vec<String>)]
         log_lines: RedactedLogLines,
     },
     #[serde(rename_all = "camelCase")]
@@ -127,6 +140,7 @@ pub enum UdfResponse {
 
         #[serde(skip_serializing_if = "RedactedLogLines::is_empty")]
         #[serde(default = "RedactedLogLines::empty")]
+        #[schema(value_type = Vec<String>)]
         log_lines: RedactedLogLines,
     },
 }
@@ -180,22 +194,33 @@ impl UdfResponse {
     }
 }
 
-/// Executes an arbitrary query/mutation/action from its name.
+/// Execute any function
+///
+/// Execute a query, mutation, or action function by name.
+#[utoipa::path(
+    post,
+    path = "/function",
+    request_body = UdfPostRequestWithComponent,
+    responses((status = 200, body = UdfResponse)),
+)]
+#[debug_handler]
 pub async fn public_function_post(
     State(st): State<RouterState>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req): Json<UdfPostRequestWithComponent>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    let request_context = RequestContext::new(request_id, request_metadata);
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
     // Round trip latency between Usher and Backend is much smaller than between
     // client and Usher.
     let identity = st
         .api
-        .authenticate(&host, request_id.clone(), auth_token)
+        .authenticate(&host, request_context.clone(), auth_token)
         .await?;
 
     let component = req.component_path(&identity)?;
@@ -208,17 +233,17 @@ pub async fn public_function_post(
         .api
         .execute_any_function(
             &host,
-            request_id,
+            request_context,
             identity,
             component_function_path,
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
         )
         .await?;
     let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
     let response = match udf_result {
         Ok(write_return) => UdfResponse::Success {
-            value: export_value(write_return.value.unpack(), value_format, client_version)?,
+            value: export_value(write_return.value.unpack()?, value_format, client_version)?,
             log_lines: write_return.log_lines,
         },
         Err(write_error) => UdfResponse::error(
@@ -231,31 +256,44 @@ pub async fn public_function_post(
     Ok(Json(response))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct UdfPostRequestArgsOnly {
+    #[schema(value_type = Object)]
     pub args: UdfArgsJson,
     pub format: Option<String>,
 }
 
-/// Executes an arbitrary query/mutation/action from its name. This is different
-/// from `public_function_post` because it takes the udf path in the API
-/// request and doesn't require admin auth.
+/// Execute function by URL path
+///
+/// Execute a query, mutation, or action function by path in URL.
+#[utoipa::path(
+    post,
+    path = "/run/{*functionIdentifier}",
+    params(
+        ("functionIdentifier" = String, Path, description = "Function path like messages/list")
+    ),
+    request_body = UdfPostRequestArgsOnly,
+    responses((status = 200, body = UdfResponse)),
+)]
+#[debug_handler]
 pub async fn public_function_post_with_path(
     State(st): State<RouterState>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     Path(path): Path<String>,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req): Json<UdfPostRequestArgsOnly>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    let request_context = RequestContext::new(request_id, request_metadata);
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
     // Round trip latency between Usher and Backend is much smaller than between
     // client and Usher.
     let identity = st
         .api
-        .authenticate(&host, request_id.clone(), auth_token)
+        .authenticate(&host, request_context.clone(), auth_token)
         .await?;
 
     let bad_request_error = || {
@@ -264,6 +302,7 @@ pub async fn public_function_post_with_path(
             "Path or function name not provided in path, e.g. /api/run/messages/list",
         ))
     };
+    println!("{path:?}");
 
     // messages/list -> ["messages", "list"]
     let mut path_parts = path
@@ -271,6 +310,7 @@ pub async fn public_function_post_with_path(
         .split('/')
         .map(|p| urlencoding::decode(p).map_err(|_e| bad_request_error()))
         .try_collect::<Vec<_>>()?;
+    println!("{path_parts:?}");
     if path_parts.len() < 2 {
         return Err(bad_request_error().into());
     }
@@ -281,14 +321,14 @@ pub async fn public_function_post_with_path(
         .api
         .execute_any_function(
             &host,
-            request_id,
+            request_context,
             identity,
             CanonicalizedComponentFunctionPath {
                 // Only functions exported at the root can be called through this endpoint
                 component: ComponentPath::root(),
                 udf_path,
             },
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
         )
         .await?;
@@ -299,7 +339,7 @@ pub async fn public_function_post_with_path(
     };
     let response = match udf_result {
         Ok(write_return) => UdfResponse::Success {
-            value: export_value(write_return.value.unpack(), value_format, client_version)?,
+            value: export_value(write_return.value.unpack()?, value_format, client_version)?,
             log_lines: write_return.log_lines,
         },
         Err(write_error) => UdfResponse::error(
@@ -325,34 +365,49 @@ pub fn export_value(
     Ok(value.export(format))
 }
 
+/// Execute query (GET)
+///
+/// Execute a query function via GET request.
+#[utoipa::path(
+    get,
+    path = "/query",
+    params(
+        ("path" = String, Query, description = "Function path"),
+        ("args" = String, Query, description = "Function arguments as JSON string"),
+        ("format" = Option<String>, Query, description = "Response format")
+    ),
+    responses((status = 200, body = UdfResponse)),
+)]
+#[debug_handler]
 #[fastrace::trace(properties = { "udf_type": "query"})]
 pub async fn public_query_get(
     State(st): State<RouterState>,
     Query(req): Query<UdfArgsQuery>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let export_path = parse_export_path(&req.path)?;
-    let args = req.args.into_arg_vec();
     let journal = None;
+    let request_context = RequestContext::new(request_id, request_metadata);
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
     // Round trip latency between Usher and Backend is much smaller than between
     // client and Usher.
     let identity = st
         .api
-        .authenticate(&host, request_id.clone(), auth_token)
+        .authenticate(&host, request_context.clone(), auth_token)
         .await?;
     let query_result = st
         .api
         .execute_public_query(
             &host,
-            request_id,
+            request_context,
             identity,
             export_path,
-            args,
+            req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::Latest,
             journal,
@@ -362,7 +417,7 @@ pub async fn public_query_get(
     let log_lines = query_result.log_lines;
     let response = match query_result.result {
         Ok(value) => UdfResponse::Success {
-            value: export_value(value.unpack(), value_format, client_version)?,
+            value: export_value(value.unpack()?, value_format, client_version)?,
             log_lines,
         },
         Err(error) => UdfResponse::error(error, log_lines, value_format, client_version)?,
@@ -370,33 +425,45 @@ pub async fn public_query_get(
     Ok(Json(response))
 }
 
+/// Execute query (POST)
+///
+/// Execute a query function via POST request.
+#[utoipa::path(
+    post,
+    path = "/query",
+    request_body = UdfPostRequest,
+    responses((status = 200, body = UdfResponse)),
+)]
+#[debug_handler]
 #[fastrace::trace(properties = { "udf_type": "query"})]
 pub async fn public_query_post(
     State(st): State<RouterState>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req): Json<UdfPostRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let udf_path = parse_export_path(&req.path)?;
     let journal = None;
+    let request_context = RequestContext::new(request_id, request_metadata);
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
     // Round trip latency between Usher and Backend is much smaller than between
     // client and Usher.
     let identity = st
         .api
-        .authenticate(&host, request_id.clone(), auth_token)
+        .authenticate(&host, request_context.clone(), auth_token)
         .await?;
     let query_return = st
         .api
         .execute_public_query(
             &host,
-            request_id,
+            request_context,
             identity,
             udf_path,
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::Latest,
             journal,
@@ -405,7 +472,7 @@ pub async fn public_query_post(
     let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
     let response = match query_return.result {
         Ok(value) => UdfResponse::Success {
-            value: export_value(value.unpack(), value_format, client_version)?,
+            value: export_value(value.unpack()?, value_format, client_version)?,
             log_lines: query_return.log_lines,
         },
         Err(error) => {
@@ -415,6 +482,15 @@ pub async fn public_query_post(
     Ok(Json(response))
 }
 
+/// Get latest timestamp
+///
+/// Get the latest timestamp for queries.
+#[utoipa::path(
+    post,
+    path = "/query_ts",
+    responses((status = 200, body = Ts)),
+)]
+#[debug_handler]
 pub async fn public_get_query_ts(
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestId(request_id): ExtractRequestId,
@@ -424,34 +500,46 @@ pub async fn public_get_query_ts(
     Ok(Json(Ts { ts: ts.into() }))
 }
 
+/// Execute query at timestamp
+///
+/// Execute a query function at a specific timestamp.
+#[utoipa::path(
+    post,
+    path = "/query_at_ts",
+    request_body = UdfPostWithTsRequest,
+    responses((status = 200, body = UdfResponse)),
+)]
+#[debug_handler]
 #[fastrace::trace(properties = { "udf_type": "query"})]
 pub async fn public_query_at_ts_post(
     State(st): State<RouterState>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req): Json<UdfPostWithTsRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let export_path = parse_export_path(&req.path)?;
     let journal = None;
+    let request_context = RequestContext::new(request_id, request_metadata);
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
     // Round trip latency between Usher and Backend is much smaller than between
     // client and Usher.
     let identity = st
         .api
-        .authenticate(&host, request_id.clone(), auth_token)
+        .authenticate(&host, request_context.clone(), auth_token)
         .await?;
     let ts = Timestamp::try_from(req.ts)?;
     let query_return = st
         .api
         .execute_public_query(
             &host,
-            request_id,
+            request_context,
             identity,
             export_path,
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             ExecuteQueryTimestamp::At(ts),
             journal,
@@ -460,7 +548,7 @@ pub async fn public_query_at_ts_post(
     let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
     let response = match query_return.result {
         Ok(value) => UdfResponse::Success {
-            value: export_value(value.unpack(), value_format, client_version)?,
+            value: export_value(value.unpack()?, value_format, client_version)?,
             log_lines: query_return.log_lines,
         },
         Err(error) => {
@@ -470,30 +558,42 @@ pub async fn public_query_at_ts_post(
     Ok(Json(response))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct QueryBatchArgs {
     queries: Vec<UdfPostRequest>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct QueryBatchResponse {
     results: Vec<UdfResponse>,
 }
 
+/// Execute query batch
+///
+/// Execute multiple query functions in a batch.
+#[utoipa::path(
+    post,
+    path = "/query_batch",
+    request_body = QueryBatchArgs,
+    responses((status = 200, body = QueryBatchResponse)),
+)]
+#[debug_handler]
 pub async fn public_query_batch_post(
     State(st): State<RouterState>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req_batch): Json<QueryBatchArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let mut results = vec![];
+    let request_context = RequestContext::new(request_id.clone(), request_metadata);
     // All queries execute at the same timestamp.
-    let ts = st.api.latest_timestamp(&host, request_id.clone()).await?;
+    let ts = st.api.latest_timestamp(&host, request_id).await?;
     let identity = st
         .api
-        .authenticate(&host, request_id.clone(), auth_token)
+        .authenticate(&host, request_context.clone(), auth_token)
         .await?;
     for req in req_batch.queries {
         let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
@@ -502,10 +602,10 @@ pub async fn public_query_batch_post(
             .api
             .execute_public_query(
                 &host,
-                request_id.clone(),
+                request_context.clone(),
                 identity.clone(),
                 export_path,
-                req.args.into_arg_vec(),
+                req.args.into_serialized_args()?,
                 FunctionCaller::HttpApi(client_version.clone()),
                 ExecuteQueryTimestamp::At(*ts),
                 None,
@@ -513,7 +613,7 @@ pub async fn public_query_batch_post(
             .await?;
         let response = match udf_return.result {
             Ok(value) => UdfResponse::Success {
-                value: export_value(value.unpack(), value_format, client_version.clone())?,
+                value: export_value(value.unpack()?, value_format, client_version.clone())?,
                 log_lines: udf_return.log_lines,
             },
             Err(error) => UdfResponse::error(
@@ -528,32 +628,44 @@ pub async fn public_query_batch_post(
     Ok(Json(QueryBatchResponse { results }))
 }
 
+/// Execute mutation
+///
+/// Execute a mutation function.
+#[utoipa::path(
+    post,
+    path = "/mutation",
+    request_body = UdfPostRequest,
+    responses((status = 200, body = UdfResponse)),
+)]
+#[debug_handler]
 #[fastrace::trace(properties = { "udf_type": "mutation"})]
 pub async fn public_mutation_post(
     State(st): State<RouterState>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req): Json<UdfPostRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let export_path = parse_export_path(&req.path)?;
+    let request_context = RequestContext::new(request_id, request_metadata);
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
     // Round trip latency between Usher and Backend is much smaller than between
     // client and Usher.
     let identity = st
         .api
-        .authenticate(&host, request_id.clone(), auth_token)
+        .authenticate(&host, request_context.clone(), auth_token)
         .await?;
     let udf_result = st
         .api
         .execute_public_mutation(
             &host,
-            request_id,
+            request_context,
             identity,
             export_path,
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
             None,
             None,
@@ -562,7 +674,7 @@ pub async fn public_mutation_post(
     let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
     let response = match udf_result {
         Ok(write_return) => UdfResponse::Success {
-            value: export_value(write_return.value.unpack(), value_format, client_version)?,
+            value: export_value(write_return.value.unpack()?, value_format, client_version)?,
             log_lines: write_return.log_lines,
         },
         Err(write_error) => UdfResponse::error(
@@ -575,16 +687,28 @@ pub async fn public_mutation_post(
     Ok(Json(response))
 }
 
+/// Execute action
+///
+/// Execute an action function.
+#[utoipa::path(
+    post,
+    path = "/action",
+    request_body = UdfPostRequest,
+    responses((status = 200, body = UdfResponse)),
+)]
+#[debug_handler]
 #[fastrace::trace(properties = { "udf_type": "action"})]
 pub async fn public_action_post(
     State(st): State<RouterState>,
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractAuthenticationToken(auth_token): ExtractAuthenticationToken,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req): Json<UdfPostRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let export_path = parse_export_path(&req.path)?;
+    let request_context = RequestContext::new(request_id, request_metadata);
 
     // NOTE: We could coalesce authenticating and executing the query into one
     // rpc but we keep things simple by reusing the same method as the sync worker.
@@ -592,23 +716,23 @@ pub async fn public_action_post(
     // client and Usher.
     let identity = st
         .api
-        .authenticate(&host, request_id.clone(), auth_token)
+        .authenticate(&host, request_context.clone(), auth_token)
         .await?;
     let action_result = st
         .api
         .execute_public_action(
             &host,
-            request_id,
+            request_context,
             identity,
             export_path,
-            req.args.into_arg_vec(),
+            req.args.into_serialized_args()?,
             FunctionCaller::HttpApi(client_version.clone()),
         )
         .await?;
     let value_format = req.format.as_ref().map(|f| f.parse()).transpose()?;
     let response = match action_result {
         Ok(action_return) => UdfResponse::Success {
-            value: export_value(action_return.value.unpack(), value_format, client_version)?,
+            value: export_value(action_return.value.unpack()?, value_format, client_version)?,
             log_lines: action_return.log_lines,
         },
         Err(action_error) => UdfResponse::error(
@@ -621,170 +745,21 @@ pub async fn public_action_post(
     Ok(Json(response))
 }
 
-#[cfg(test)]
-mod tests {
-    use application::test_helpers::ApplicationTestExt;
-    use axum::body::Body;
-    use http::{
-        Request,
-        StatusCode,
-    };
-    use runtime::prod::ProdRuntime;
-    use serde_json::{
-        json,
-        Value as JsonValue,
-    };
-
-    use crate::test_helpers::setup_backend_for_test;
-
-    async fn http_format_tester(
-        rt: ProdRuntime,
-        uri: &'static str,
-        udf: &'static str,
-        args: JsonValue,
-        format: Option<&'static str>,
-        expected: Result<JsonValue, &'static str>,
-    ) -> anyhow::Result<()> {
-        let backend = setup_backend_for_test(rt).await?;
-        backend.st.application.load_udf_tests_modules().await?;
-        let mut json_body = json!({
-            "path": udf,
-            "args": args,
-        });
-        if let Some(format) = format {
-            json_body["format"] = format.into();
-        }
-        let body = Body::from(serde_json::to_vec(&json_body)?);
-        let req = Request::builder()
-            .uri(uri)
-            .method("POST")
-            .header("Content-Type", "application/json")
-            .header("Host", "localhost")
-            .body(body)?;
-        match expected {
-            Ok(expected) => {
-                let result: JsonValue = backend.expect_success(req).await?;
-                assert_eq!(
-                    result,
-                    json!({
-                        "status": "success",
-                        "value": expected,
-                    })
-                );
-            },
-            Err(expected) => {
-                backend
-                    .expect_error(req, StatusCode::BAD_REQUEST, expected)
-                    .await?;
-            },
-        };
-        Ok(())
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_http_query_default(rt: ProdRuntime) -> anyhow::Result<()> {
-        // The default format is clean JSON
-        http_format_tester(
-            rt,
-            "/api/query",
-            "values:intQuery",
-            json!({}),
-            None,
-            Ok(json!("1")),
-        )
-        .await
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_http_query_clean_json(rt: ProdRuntime) -> anyhow::Result<()> {
-        http_format_tester(
-            rt,
-            "/api/query",
-            "values:intQuery",
-            json!({}),
-            Some("json"),
-            Ok(json!("1")),
-        )
-        .await
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_http_mutation_default(rt: ProdRuntime) -> anyhow::Result<()> {
-        // The default format is clean JSON
-        http_format_tester(
-            rt,
-            "/api/mutation",
-            "values:intMutation",
-            json!({}),
-            None,
-            Ok(json!("1")),
-        )
-        .await
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_http_mutation_clean_json(rt: ProdRuntime) -> anyhow::Result<()> {
-        http_format_tester(
-            rt,
-            "/api/mutation",
-            "values:intMutation",
-            json!({}),
-            Some("json"),
-            Ok(json!("1")),
-        )
-        .await
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_http_action_default(rt: ProdRuntime) -> anyhow::Result<()> {
-        // The default format is clean JSON
-        http_format_tester(
-            rt,
-            "/api/action",
-            "values:intAction",
-            json!({}),
-            None,
-            Ok(json!("1")),
-        )
-        .await
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_http_action_clean_json(rt: ProdRuntime) -> anyhow::Result<()> {
-        http_format_tester(
-            rt,
-            "/api/action",
-            "values:intAction",
-            json!({}),
-            Some("json"),
-            Ok(json!("1")),
-        )
-        .await
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_http_query_with_arg(rt: ProdRuntime) -> anyhow::Result<()> {
-        http_format_tester(
-            rt,
-            "/api/query",
-            "args_validation:stringArg",
-            json!({"arg": "val"}),
-            Some("json"),
-            Ok(json!("val")),
-        )
-        .await
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_http_query_legacy_list_args(rt: ProdRuntime) -> anyhow::Result<()> {
-        http_format_tester(
-            rt,
-            "/api/query",
-            "args_validation:stringArg",
-            json!([{"arg": "val"}]),
-            Some("json"),
-            Ok(json!("val")),
-        )
-        .await
-    }
+// The public (stable, no auth required) API of a deployment.
+pub fn public_api_router<S>() -> OpenApiRouter<S>
+where
+    RouterState: FromRef<S>,
+    S: Clone + Send + Sync + 'static,
+{
+    OpenApiRouter::new()
+        .routes(utoipa_axum::routes!(public_query_get))
+        .routes(utoipa_axum::routes!(public_query_post))
+        .routes(utoipa_axum::routes!(public_get_query_ts))
+        .routes(utoipa_axum::routes!(public_query_at_ts_post))
+        .routes(utoipa_axum::routes!(public_query_batch_post))
+        .routes(utoipa_axum::routes!(public_mutation_post))
+        .routes(utoipa_axum::routes!(public_action_post))
+        .routes(utoipa_axum::routes!(public_function_post))
+        .routes(utoipa_axum::routes!(public_function_post_with_path))
+        .layer(DefaultBodyLimit::max(*MAX_BACKEND_PUBLIC_API_REQUEST_SIZE))
 }

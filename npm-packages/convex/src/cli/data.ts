@@ -1,9 +1,6 @@
-import chalk from "chalk";
+import { chalkStderr } from "chalk";
 import { oneoffContext } from "../bundler/context.js";
-import {
-  deploymentSelectionWithinProjectFromOptions,
-  loadSelectedDeploymentCredentials,
-} from "./lib/api.js";
+import { loadSelectedDeploymentCredentials } from "./lib/api.js";
 import { Command } from "@commander-js/extra-typings";
 import { actionDescription } from "./lib/command.js";
 import { dataInDeployment } from "./lib/data.js";
@@ -23,18 +20,15 @@ export const data = new Command("data")
   .showHelpAfterError()
   .action(async (tableName, options) => {
     const ctx = await oneoffContext(options);
-    const selectionWithinProject =
-      await deploymentSelectionWithinProjectFromOptions(ctx, options);
 
     const deploymentSelection = await getDeploymentSelection(ctx, options);
     const deployment = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      selectionWithinProject,
     );
 
     const deploymentNotice = deployment.deploymentFields?.deploymentName
-      ? `${chalk.bold(deployment.deploymentFields.deploymentName)} deployment's `
+      ? `${chalkStderr.bold(deployment.deploymentFields.deploymentName)} deployment's `
       : "";
 
     await dataInDeployment(ctx, {

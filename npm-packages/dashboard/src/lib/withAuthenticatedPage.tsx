@@ -1,7 +1,5 @@
 import { useRouter } from "next/router";
-import type { UserProfile } from "@auth0/nextjs-auth0/client";
 import { useHasOptedIn } from "api/optins";
-import { withPageAuthRequired } from "@auth0/nextjs-auth0/client";
 import type { InferGetServerSidePropsType, NextPage } from "next";
 
 import { getServerSideProps } from "lib/ssr";
@@ -10,13 +8,71 @@ import { useAccessToken, useInitialData } from "hooks/useServerSideData";
 import { Button } from "@ui/Button";
 import { Callout } from "@ui/Callout";
 import { LoadingLogo } from "@ui/Loading";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { UIProvider } from "@ui/UIContext";
+import { useWorkOS } from "hooks/useWorkOS";
+import { User } from "@workos-inc/node";
 
 interface UserProps {
   // eslint-disable-next-line react/no-unused-prop-types
-  user: UserProfile;
+  user: User;
 }
+
+// WorkOS version of withPageAuthRequired
+const withPageAuthRequired = (
+  Component: React.ComponentType<any>,
+  options: any = {},
+) =>
+  function WithPageAuthRequired(props: any): JSX.Element {
+    const {
+      returnTo,
+      onRedirecting = defaultOnRedirecting,
+      onError = defaultOnError,
+    } = options;
+    const { user, error, isLoading } = useWorkOS();
+
+    useEffect(() => {
+      if ((user && !error) || isLoading) return;
+      let returnToPath: string;
+
+      if (!returnTo) {
+        const currentLocation = window.location.toString();
+        returnToPath =
+          currentLocation.replace(new URL(currentLocation).origin, "") || "/";
+      } else {
+        returnToPath = returnTo;
+      }
+
+      window.location.assign(
+        `/api/auth/login?returnTo=${encodeURIComponent(returnToPath)}`,
+      );
+    }, [user, error, isLoading, returnTo]);
+
+    if (error) return onError(error);
+    if (user) return <Component user={user} {...(props as any)} />;
+
+    return onRedirecting();
+  };
+
+// Default loading component
+const defaultOnRedirecting = () => (
+  <div className="flex h-full w-full items-center justify-center">
+    <LoadingLogo />
+  </div>
+);
+
+// Default error component
+const defaultOnError = (error: Error) => (
+  <div className="flex h-full flex-col items-center justify-center">
+    <div className="mx-8 flex w-fit flex-col gap-4">
+      <Callout variant="error">
+        <div className="flex max-w-prose flex-col gap-2">
+          Authentication error: {error.message}
+        </div>
+      </Callout>
+    </div>
+  </div>
+);
 
 export const withAuthenticatedPage = (Page: NextPage) =>
   withPageAuthRequired(withSWRFallback(Page));
@@ -30,10 +86,14 @@ function withSWRFallback(Page: NextPage) {
     const [globalAccessToken, setAccessToken] = useAccessToken();
     const [globalInitialData, setInitialData] = useInitialData();
     useEffect(() => {
-      accessToken && setAccessToken(accessToken);
+      if (accessToken) {
+        setAccessToken(accessToken);
+      }
     }, [accessToken, setAccessToken]);
     useEffect(() => {
-      !globalInitialData && setInitialData(initialData);
+      if (!globalInitialData) {
+        setInitialData(initialData);
+      }
     }, [initialData, setInitialData, globalInitialData]);
     const { pathname } = useRouter();
 
@@ -50,7 +110,7 @@ function withSWRFallback(Page: NextPage) {
             <Link
               href="mailto:support@convex.dev"
               passHref
-              className="items-center text-content-link"
+              className="items-center"
             >
               support@convex.dev
             </Link>{" "}
@@ -66,7 +126,7 @@ function withSWRFallback(Page: NextPage) {
             <Link
               href="mailto:support@convex.dev"
               passHref
-              className="items-center text-content-link"
+              className="items-center"
             >
               support@convex.dev
             </Link>
@@ -85,7 +145,7 @@ function withSWRFallback(Page: NextPage) {
               </Callout>
               <UIProvider>
                 <Button
-                  href="/api/auth/logout"
+                  href="/api/auth/logout?returnTo=/api/auth/login"
                   variant="neutral"
                   className="ml-auto w-fit"
                 >
@@ -123,7 +183,7 @@ function OptinRedirect({ children }: { children: JSX.Element }) {
   }
 
   return isLoading || (!hasOptedIn && router.pathname !== "/accept") ? (
-    <div className=" flex h-full w-full items-center justify-center">
+    <div className="flex h-full w-full items-center justify-center">
       <LoadingLogo />
     </div>
   ) : (

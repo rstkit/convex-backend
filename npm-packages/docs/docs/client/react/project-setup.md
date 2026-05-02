@@ -25,7 +25,7 @@ _development_ deployment's URL will be saved in `.env.local` or `.env` file,
 depending on the frontend framework or bundler you're using.
 
 You can find the URLs of all deployments in a project by visiting the
-[deployment settings](/dashboard/deployments/settings.md) on your Convex
+[deployment settings](/dashboard/deployments/settings.mdx) on your Convex
 [dashboard](https://dashboard.convex.dev).
 
 ### Configure the client
@@ -33,7 +33,7 @@ You can find the URLs of all deployments in a project by visiting the
 Construct a Convex React client by passing in the URL of the Convex deployment.
 There should generally be a single Convex client in a frontend application.
 
-```jsx title="src/index.js"
+```jsx title="src/index.ts"
 import { ConvexProvider, ConvexReactClient } from "convex/react";
 
 const deploymentURL = import.meta.env.VITE_CONVEX_URL;

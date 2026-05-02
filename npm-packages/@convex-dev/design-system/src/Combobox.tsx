@@ -1,14 +1,26 @@
-import { useState, useEffect } from "react";
-import { Combobox as HeadlessCombobox } from "@headlessui/react";
+import { omit, isEqual } from "lodash-es";
+import { useState, useEffect, useRef } from "react";
+import {
+  Combobox as HeadlessCombobox,
+  ComboboxButton as HeadlessComboboxButton,
+  ComboboxInput as HeadlessComboboxInput,
+  ComboboxOption as HeadlessComboboxOption,
+  ComboboxOptions as HeadlessComboboxOptions,
+  Label,
+} from "@headlessui/react";
 import { ChevronDownIcon, MagnifyingGlassIcon } from "@radix-ui/react-icons";
 import { cn } from "@ui/cn";
-import { isEqual } from "lodash-es";
 import fuzzy from "fuzzy";
 import { Button, ButtonProps } from "@ui/Button";
 import { createPortal } from "react-dom";
 import { usePopper } from "react-popper";
+import { Tooltip } from "./Tooltip";
+import { Spinner } from "./Spinner";
 
 const { test } = fuzzy;
+
+// Raising this value above 100 may break pagination in the Convex dashboard.
+export const MAX_DISPLAYED_OPTIONS = 100;
 
 export type Option<T> = { label: string; value: T; disabled?: boolean };
 
@@ -31,14 +43,18 @@ export function Combobox<T>({
   unknownLabel = () => "Unknown option",
   labelHidden = true,
   processFilterOption = (option: string) => option,
+  onFilterChange,
   placeholder = "Select an option",
   size = "md",
   icon,
+  isLoadingOptions = false,
 }: {
   label: React.ReactNode;
   labelHidden?: boolean;
+  isLoadingOptions?: boolean;
   className?: string;
   optionsHeader?: React.ReactNode;
+  onFilterChange?: (filter: string) => void;
   options: Readonly<Option<T>[]>;
   placeholder?: string;
   searchPlaceholder?: string;
@@ -72,7 +88,9 @@ export function Combobox<T>({
     null,
   );
 
-  // Force tabindex to 0
+  // Force tabindex to 0 - HeadlessUI sets tabIndex={-1} on the button when
+  // a ComboboxInput exists, but our input is inside the portal and only
+  // rendered when open.
   useEffect(() => {
     if (referenceElement?.children[0]) {
       (referenceElement.children[0] as HTMLElement).tabIndex = 0;
@@ -80,6 +98,16 @@ export function Combobox<T>({
   }, [referenceElement]);
 
   const [isOpen, setIsOpen] = useState(false);
+  const wasOpen = useRef(false);
+
+  // Restore focus to the button when the dropdown closes
+  useEffect(() => {
+    if (wasOpen.current && !isOpen) {
+      const button = referenceElement?.querySelector("button");
+      button?.focus();
+    }
+    wasOpen.current = isOpen;
+  }, [isOpen, referenceElement]);
 
   const { styles, attributes, update } = usePopper(
     referenceElement,
@@ -110,12 +138,18 @@ export function Combobox<T>({
     return undefined; // auto width for "fit"
   };
 
+  // If onFilterChange is defined, it indicates the creator of the Combobox will handle filtering options.
   const filtered =
-    query === ""
+    query === "" || onFilterChange !== undefined
       ? options
       : options.filter((option) =>
           test(query, processFilterOption(option.label)),
         );
+
+  const hasMoreThanMaxOptions = filtered.length > MAX_DISPLAYED_OPTIONS;
+  const displayedOptions = hasMoreThanMaxOptions
+    ? filtered.slice(0, MAX_DISPLAYED_OPTIONS)
+    : filtered;
 
   const selectedOptionData = options.find((o) =>
     isEqual(selectedOption, o.value),
@@ -123,10 +157,11 @@ export function Combobox<T>({
 
   // Update popper position when dropdown opens
   useEffect(() => {
-    if (isOpen && update) {
-      void update();
+    if (isOpen) {
+      void update?.();
+      void onFilterChange?.("");
     }
-  }, [isOpen, update]);
+  }, [isOpen, update, onFilterChange]);
 
   return (
     <HeadlessCombobox
@@ -149,65 +184,84 @@ export function Combobox<T>({
 
         return (
           <>
-            <HeadlessCombobox.Label
+            <Label
               hidden={labelHidden}
               className="text-left text-sm text-content-primary"
             >
               {label}
-            </HeadlessCombobox.Label>
+            </Label>
             <div className={cn("relative", className)}>
               <div
                 ref={setReferenceElement}
-                className={cn("relative flex items-center w-60", buttonClasses)}
+                className={cn("relative flex w-60 items-center", buttonClasses)}
               >
-                <HeadlessCombobox.Button
-                  as={Button}
-                  variant="unstyled"
-                  data-testid={`combobox-button-${label}`}
-                  className={cn(
-                    "flex gap-1 w-full items-center group",
-                    "truncate relative text-left text-content-primary rounded-md disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-background-secondary",
-                    "border focus-visible:z-10 focus-visible:border-border-selected focus-visible:outline-none bg-background-secondary text-sm",
-                    "hover:bg-background-tertiary",
-                    "cursor-pointer",
-                    open && "border-border-selected z-10",
-                    size === "sm" && "py-1 px-1.5 text-xs",
-                    size === "md" && "p-1.5",
-                    innerButtonClasses,
-                  )}
-                  {...buttonProps}
+                <Tooltip
+                  tip={buttonProps?.tip}
+                  side={buttonProps?.tipSide}
+                  disableHoverableContent={
+                    buttonProps?.tipDisableHoverableContent
+                  }
+                  asChild
                 >
-                  {icon}
-                  <div className="truncate">
-                    {!!Option && !!selectedOptionData ? (
-                      <Option
-                        inButton
-                        label={selectedOptionData.label}
-                        value={selectedOptionData.value}
-                        disabled={selectedOptionData.disabled}
-                      />
-                    ) : (
-                      selectedOptionData?.label || (
-                        <span className="text-content-tertiary">
-                          {selectedOption && unknownLabel(selectedOption)}
-                        </span>
+                  <HeadlessComboboxButton
+                    as={Button}
+                    variant="unstyled"
+                    data-testid={`combobox-button-${label}`}
+                    className={cn(
+                      "group flex w-full items-center gap-1",
+                      "relative truncate rounded-md text-left text-content-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-background-secondary",
+                      "border bg-background-secondary text-sm focus-visible:z-10 focus-visible:border-border-selected focus-visible:outline-hidden",
+                      "hover:bg-background-tertiary",
+                      "cursor-pointer",
+                      open && "z-10 border-border-selected",
+                      size === "sm" && "px-1.5 py-1 text-xs",
+                      size === "md" && "p-1.5",
+                      innerButtonClasses,
+                    )}
+                    {
+                      // <HeadlessComboboxButton as={Button} tip="…" /> causes a state update loop since Headless UI 2.0
+                      // (presumably because Headless UI and the tooltip both want to update the ref).
+                      // To circumvent this issue, we place the <Tooltip /> component as a parent of <HeadlessComboboxButton />
+                      ...omit(
+                        buttonProps,
+                        "tip",
+                        "tipSide",
+                        "tipDisableHoverableContent",
                       )
-                    )}
-                    {!selectedOptionData && (
-                      <span className="text-content-tertiary">
-                        {placeholder}
-                      </span>
-                    )}
-                  </div>
-                  {size === "md" && (
-                    <ChevronDownIcon
-                      className={cn(
-                        "text-content-primary ml-auto size-4 transition-all",
-                        open && "rotate-180",
+                    }
+                  >
+                    {icon}
+                    <div className="truncate">
+                      {!!Option && !!selectedOptionData ? (
+                        <Option
+                          inButton
+                          label={selectedOptionData.label}
+                          value={selectedOptionData.value}
+                          disabled={selectedOptionData.disabled}
+                        />
+                      ) : (
+                        selectedOptionData?.label || (
+                          <span className="text-content-tertiary">
+                            {selectedOption && unknownLabel(selectedOption)}
+                          </span>
+                        )
                       )}
-                    />
-                  )}
-                </HeadlessCombobox.Button>
+                      {!selectedOptionData && (
+                        <span className="text-content-tertiary">
+                          {placeholder}
+                        </span>
+                      )}
+                    </div>
+                    {size === "md" && (
+                      <ChevronDownIcon
+                        className={cn(
+                          "ml-auto size-4 text-content-primary transition-all",
+                          open && "rotate-180",
+                        )}
+                      />
+                    )}
+                  </HeadlessComboboxButton>
+                </Tooltip>
               </div>
               {open &&
                 createPortal(
@@ -220,43 +274,63 @@ export function Combobox<T>({
                     {...attributes.popper}
                     className="z-50"
                   >
-                    <HeadlessCombobox.Options
+                    <HeadlessComboboxOptions
+                      modal={false}
                       static
                       className={cn(
-                        "mt-1 max-h-[14.75rem] overflow-auto rounded-md bg-background-secondary pb-1 text-xs shadow scrollbar border",
+                        "mt-1 scrollbar max-h-[14.75rem] overflow-auto rounded-md border bg-background-secondary pb-1 text-xs shadow-sm",
                       )}
                       ref={(el) => {
-                        el && "scrollTo" in el && el.scrollTo(0, 0);
+                        el?.scrollTo?.(0, 0);
                       }}
                     >
                       {optionsHeader && (
                         <div className="border-b p-1 pb-2">{optionsHeader}</div>
                       )}
                       <div className="min-w-fit">
-                        {!disableSearch && (
+                        {disableSearch ? (
+                          // Hidden input to enable keyboard navigation
+                          // (arrow keys, Enter, Escape) via HeadlessUI
+                          <HeadlessComboboxInput
+                            onChange={() => {}}
+                            value=""
+                            autoFocus
+                            className="sr-only"
+                            aria-hidden
+                          />
+                        ) : (
                           <div className="sticky top-0 z-10 flex w-full items-center gap-2 border-b bg-background-secondary px-3 pt-1">
-                            <MagnifyingGlassIcon className="text-content-secondary" />
-                            <HeadlessCombobox.Input
-                              onChange={(event) => setQuery(event.target.value)}
+                            {isLoadingOptions ? (
+                              <div className="animate-fadeInFromLoading">
+                                <Spinner className="size-3" />
+                              </div>
+                            ) : (
+                              <MagnifyingGlassIcon className="animate-fadeInFromLoading text-content-secondary" />
+                            )}
+                            <HeadlessComboboxInput
+                              onChange={(event) => {
+                                setQuery(event.target.value);
+                                onFilterChange?.(event.target.value);
+                              }}
                               value={query}
                               autoFocus
                               className={cn(
-                                "placeholder:text-content-tertiary truncate relative w-full py-1.5 text-left text-xs text-content-primary disabled:bg-background-tertiary disabled:text-content-secondary disabled:cursor-not-allowed",
-                                "focus:outline-none bg-background-secondary",
+                                "relative w-full truncate py-1.5 text-left text-xs text-content-primary placeholder:text-content-tertiary disabled:cursor-not-allowed disabled:bg-background-tertiary disabled:text-content-secondary",
+                                "bg-background-secondary focus:outline-hidden",
                               )}
                               placeholder={searchPlaceholder}
                             />
                           </div>
                         )}
-                        {filtered.map((option, idx) => (
-                          <HeadlessCombobox.Option
+                        {displayedOptions.map((option, idx) => (
+                          <HeadlessComboboxOption
                             key={idx}
                             value={option.value}
                             disabled={option.disabled}
-                            className={({ active }) =>
+                            className={({ focus }) =>
                               cn(
-                                "w-fit min-w-full relative cursor-pointer select-none py-1.5 px-3 text-content-primary",
-                                active && "bg-background-tertiary",
+                                "relative w-fit min-w-full cursor-pointer px-3 py-1.5 text-content-primary select-none",
+                                focus && "bg-background-tertiary",
                                 option.disabled &&
                                   "cursor-not-allowed text-content-secondary opacity-75",
                               )
@@ -280,32 +354,47 @@ export function Combobox<T>({
                                 )}
                               </span>
                             )}
-                          </HeadlessCombobox.Option>
+                          </HeadlessComboboxOption>
                         ))}
+
+                        {hasMoreThanMaxOptions && (
+                          <div className="relative w-fit min-w-full cursor-default px-3 py-1.5 text-content-tertiary select-none">
+                            Too many options to display, use the search bar to
+                            refine this list.
+                          </div>
+                        )}
 
                         {/* Allow users to type a custom value */}
                         {allowCustomValue &&
+                          !isLoadingOptions &&
                           query.length > 0 &&
-                          !filtered.some((x) => x.value === query) && (
-                            <HeadlessCombobox.Option
+                          !filtered.some(
+                            (x) => x.value === query || x.label === query,
+                          ) && (
+                            <HeadlessComboboxOption
                               value={query}
-                              className={({ active }) =>
+                              className={({ focus }) =>
                                 `text-content-primary relative cursor-pointer w-60 select-none py-1 px-3 text-xs ${
-                                  active ? "bg-background-tertiary" : ""
+                                  focus ? "bg-background-tertiary" : ""
                                 }`
                               }
                             >
                               Unknown option: "{query}"
-                            </HeadlessCombobox.Option>
+                            </HeadlessComboboxOption>
                           )}
 
                         {filtered.length === 0 && !allowCustomValue && (
-                          <div className="overflow-hidden text-ellipsis py-1 pl-4 text-content-primary">
+                          <div className="overflow-hidden py-1 pl-4 text-ellipsis text-content-primary">
                             No options matching "{query}".
                           </div>
                         )}
+                        {filtered.length === 0 && isLoadingOptions && (
+                          <div className="m-4 overflow-hidden text-content-primary">
+                            Loading options...
+                          </div>
+                        )}
                       </div>
-                    </HeadlessCombobox.Options>
+                    </HeadlessComboboxOptions>
                   </div>,
                   document.body,
                 )}

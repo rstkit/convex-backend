@@ -1,20 +1,31 @@
 import React, { useContext } from "react";
 import { ArrowsUpDownIcon, FingerPrintIcon } from "@heroicons/react/24/outline";
-import { InfoCircledIcon } from "@radix-ui/react-icons";
-import { GenericDocument } from "convex/server";
-import { ValidatorJSON } from "convex/values";
 import {
+  ClockIcon,
+  IdCardIcon,
+  MagnifyingGlassIcon,
+} from "@radix-ui/react-icons";
+import { GenericDocument } from "convex/server";
+import { convexToJson, ValidatorJSON } from "convex/values";
+import {
+  DatabaseIndexFilter,
+  DatabaseIndexFilterClause,
   FilterByIndexRange,
   FilterExpression,
+  SearchIndexFilter,
+  SearchIndexFilterClause,
 } from "system-udfs/convex/_system/frontend/lib/filters";
 import { Button } from "@ui/Button";
 import { Combobox } from "@ui/Combobox";
 import { Tooltip } from "@ui/Tooltip";
-import { Popover } from "@ui/Popover";
+import { HelpTooltip } from "@ui/HelpTooltip";
 import { SchemaJson } from "@common/lib/format";
-import Link from "next/link";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
-import { IndexFilterEditor, IndexFilterState } from "./IndexFilterEditor";
+import { Index } from "@common/features/data/lib/api";
+import { cn } from "@ui/cn";
+import { DatabaseIndexFilterEditor } from "./DatabaseIndexFilterEditor";
+import { SearchValueEditor } from "./SearchValueEditor";
+import { SearchIndexFilterEditor } from "./SearchIndexFilterEditor";
 
 export function getDefaultIndex(): {
   name: string;
@@ -43,33 +54,56 @@ type SimpleIndex = {
 };
 
 // Define a type for our index option value
-type IndexOptionValue = {
-  name: string;
-  fields: string[];
-};
+type IndexOptionValue =
+  | {
+      name: string;
+      fields: string[];
+      type: "default" | "database";
+    }
+  | {
+      name: string;
+      searchField: string;
+      fields: string[];
+      type: "search";
+    };
 
 // Create constants for the default index
 const DEFAULT_INDEX_NAME = "by_creation_time";
 const DEFAULT_INDEX_FIELD = "_creationTime";
-const DEFAULT_INDEX_LABEL = DEFAULT_INDEX_FIELD;
+const DEFAULT_INDEX_LABEL = "By creation time";
+
+const BY_ID_INDEX_NAME = "by_id";
+const BY_ID_INDEX_FIELD = "_id";
+const BY_ID_INDEX_LABEL = "By ID";
 
 // Define the default index object to reuse throughout the component
-const DEFAULT_INDEX = {
+const DEFAULT_INDEX: IndexOptionValue = {
   name: DEFAULT_INDEX_NAME,
   fields: [DEFAULT_INDEX_FIELD],
+  type: "default",
+};
+
+const BY_ID_INDEX: IndexOptionValue = {
+  name: BY_ID_INDEX_NAME,
+  fields: [BY_ID_INDEX_FIELD],
+  type: "default",
 };
 
 type IndexFiltersProps = {
   shownFilters: FilterExpression;
   defaultDocument: GenericDocument;
-  indexes: any[] | undefined;
+  indexes: Index[] | undefined;
   tableName: string;
   activeSchema: SchemaJson | null;
   getValidatorForField: (fieldName?: string) => ValidatorJSON | undefined;
-  onChangeFilters: (next: FilterExpression) => void;
+  onFiltersChange: (next: FilterExpression) => void;
+  applyFiltersWithHistory: (next: FilterExpression) => Promise<void>;
   setDraftFilters: (next: FilterExpression) => void;
   onChangeOrder: (newOrder: "asc" | "desc") => void;
-  onChangeIndexFilter: (filter: IndexFilterState, idx: number) => void;
+  onChangeIndexFilter: (
+    filter: DatabaseIndexFilterClause | SearchIndexFilterClause,
+    idx: number,
+  ) => void;
   onError: (idx: number, errors: string[]) => void;
   hasInvalidFilters: boolean;
   invalidFilters: Record<string, string>;
@@ -83,7 +117,8 @@ export function IndexFilters({
   tableName,
   activeSchema,
   getValidatorForField,
-  onChangeFilters,
+  onFiltersChange,
+  applyFiltersWithHistory,
   setDraftFilters,
   onChangeOrder,
   onChangeIndexFilter,
@@ -93,251 +128,365 @@ export function IndexFilters({
   const { useLogDeploymentEvent } = useContext(DeploymentInfoContext);
   const log = useLogDeploymentEvent();
 
-  // Restructure indexOptions to use the Option<IndexOptionValue> type
-  const indexOptions = indexes
+  const indexOptions: { value: IndexOptionValue; label: string }[] = indexes
     ? [
-        // Add the default option
+        // Add the by_id system index
         {
-          value: {
-            name: DEFAULT_INDEX.name,
-            fields: DEFAULT_INDEX.fields,
-          },
+          value: DEFAULT_INDEX,
           label: DEFAULT_INDEX_LABEL,
         },
-        // Add other indexes with array fields
+        // Add the default by_creation_time index
+        {
+          value: BY_ID_INDEX,
+          label: BY_ID_INDEX_LABEL,
+        },
+        // Add user database and search indexes
         ...indexes
-          .filter((index) => {
-            const simpleIndex = index as unknown as SimpleIndex;
-            return Array.isArray(simpleIndex.fields);
-          })
+          .filter(
+            (index) =>
+              !index.staged &&
+              (Array.isArray(index.fields) || "searchField" in index.fields),
+          )
           .map((index) => {
-            const simpleIndex = index as unknown as SimpleIndex;
+            if ("vectorField" in index.fields) {
+              // Unreachable: vector indexes are filtered out above
+              throw new Error("Unexpected vector index");
+            }
+
+            const value: IndexOptionValue =
+              "searchField" in index.fields
+                ? {
+                    name: index.name,
+                    searchField: index.fields.searchField,
+                    fields: index.fields.filterFields,
+                    type: "search",
+                  }
+                : {
+                    name: index.name,
+                    fields: index.fields,
+                    type: "database",
+                  };
+
             return {
-              value: {
-                name: simpleIndex.name,
-                fields: simpleIndex.fields,
-              },
-              label: simpleIndex.name,
+              value,
+              label: index.name,
             };
           }),
       ]
     : [];
 
-  const hasUsableIndexes = indexOptions.length > 1; // More than just the default _creationTime index
-
   const selectedTableIndex = indexes?.find(
     (index) => index.name === shownFilters.index?.name,
   );
+  const searchIndex =
+    shownFilters.index && "search" in shownFilters.index
+      ? shownFilters.index
+      : null;
+  const searchFilterField =
+    searchIndex &&
+    selectedTableIndex &&
+    "searchField" in selectedTableIndex.fields
+      ? selectedTableIndex.fields.searchField
+      : null;
 
   return (
     <>
       <div className="mb-1 flex items-center gap-1.5">
-        {hasUsableIndexes ? (
-          <Combobox
-            size="sm"
-            label="Sort by Index"
-            options={indexOptions}
-            buttonClasses="w-fit"
-            buttonProps={{
-              tip: "Use an index to sort your data and improve filter performance.",
-              tipSide: "right",
-            }}
-            innerButtonClasses="text-xs w-fit pl-1"
-            selectedOption={
-              indexOptions.find(
-                (o) => o.value.name === shownFilters.index?.name,
-              )?.value || {
-                name: DEFAULT_INDEX.name,
-                fields: DEFAULT_INDEX.fields,
-              }
-            }
-            setSelectedOption={(option: IndexOptionValue | null) => {
-              if (!option) {
-                return;
-              }
-
-              log("sort by index combobox opened", {
-                selectedOption: option.name,
-              });
-
-              // Clear all errors for the existing index filters
-              shownFilters.index?.clauses.forEach((_, idx) => {
-                onError(idx, []);
-              });
-
-              const newFilters = {
-                ...shownFilters,
-                index: {
-                  name: option.name,
-                  clauses: option.fields.map((field: string) => ({
-                    type: "indexEq",
-                    enabled: false,
-                    value:
-                      field === "_creationTime"
-                        ? new Date().getTime()
-                        : defaultDocument[field],
-                  })),
-                },
-              } as FilterExpression;
-              setDraftFilters(newFilters);
-              onChangeFilters(newFilters);
-            }}
-            Option={({ inButton, label, value }) => (
-              <div className="flex items-center gap-1 text-xs">
-                {inButton && (
-                  <>
-                    <FingerPrintIcon className="size-4" />
-                    Index:
-                  </>
-                )}
-                <span>{label}</span>
-                {!inButton && (
-                  <span className="text-xs text-content-secondary">
-                    ({value.fields.join(", ")})
-                  </span>
-                )}
-              </div>
-            )}
-          />
-        ) : (
-          <Popover
-            button={
-              <Button
-                size="xs"
-                variant="neutral"
-                className="w-fit text-xs"
-                icon={<FingerPrintIcon className="size-4" />}
-                onClick={() => log("viewed sort by index empty state")}
-              >
-                Index: {DEFAULT_INDEX_LABEL}
-              </Button>
-            }
-            openButtonClassName="*:bg-background-tertiary"
-            className="max-w-md"
-            placement="bottom-start"
-          >
-            <div className="flex flex-col gap-3">
-              <h5 className="font-semibold">No Indexes!</h5>
-              <p className="max-w-prose text-xs">
-                This table does not have any standard indexes beyond the default{" "}
-                index on _creationTime.
-              </p>
-              <p className="max-w-prose text-xs">
-                Indexes allow you to sort and filter your data efficiently.
-                They're especially helpful for tables with a lot of documents.
-              </p>
-              <p className="max-w-prose text-xs">
-                Once you create an index, you'll be able to use it to sort and
-                filter your data on this page.
-              </p>
-              <Link
-                href="https://docs.convex.dev/database/reading-data/indexes/"
-                className="text-xs text-content-link hover:underline"
-                target="_blank"
-              >
-                Learn more about indexes.
-              </Link>
-            </div>
-          </Popover>
-        )}
-        <Button
-          variant="neutral"
-          size="xs"
-          onClick={() =>
-            onChangeOrder(shownFilters.order === "asc" ? "desc" : "asc")
+        <Combobox
+          size="sm"
+          label="Sort by Index"
+          options={indexOptions}
+          buttonClasses="w-fit"
+          buttonProps={{
+            tip: "Use an index to sort your data and improve filter performance.",
+            tipSide: "right",
+          }}
+          optionsWidth="fit"
+          innerButtonClasses="text-xs w-fit pl-1"
+          selectedOption={
+            indexOptions.find((o) => o.value.name === shownFilters.index?.name)
+              ?.value ?? DEFAULT_INDEX
           }
-          type="button"
-          tip="Change sort order"
-          className="w-fit text-xs"
-          icon={<ArrowsUpDownIcon className="size-4" />}
-        >
-          {shownFilters.order === "asc" ? "Ascending" : "Descending"}
-        </Button>
+          setSelectedOption={(option: IndexOptionValue | null) => {
+            if (!option) {
+              return;
+            }
+
+            log("sort by index combobox opened", {
+              selectedOption: option.name,
+            });
+
+            // Clear all errors for the existing index filters
+            shownFilters.index?.clauses.forEach((_, idx) => {
+              onError(idx, []);
+            });
+
+            const newFilters: FilterExpression =
+              option.type === "search"
+                ? {
+                    // TODO(ENG-9733) Support arbitrary filters in search queries
+                    clauses: [],
+                    order: "asc",
+                    index: {
+                      name: option.name,
+                      search: searchIndex ? searchIndex.search : "",
+                      clauses: option.fields.map((field: string) => ({
+                        field,
+                        enabled: false,
+                        value:
+                          defaultDocument[field] === undefined
+                            ? undefined
+                            : convexToJson(defaultDocument[field]),
+                      })),
+                    } satisfies SearchIndexFilter,
+                  }
+                : {
+                    clauses: shownFilters.clauses,
+                    order:
+                      // When going from a search index to a database index,
+                      // reset `order` to the default value
+                      searchIndex ? undefined : shownFilters.order,
+                    index: {
+                      name: option.name,
+                      clauses: option.fields.map((field: string) => ({
+                        type: "indexEq",
+                        enabled: false,
+                        value:
+                          field === "_creationTime"
+                            ? new Date().getTime()
+                            : field === "_id"
+                              ? ""
+                              : defaultDocument[field],
+                      })),
+                    } satisfies DatabaseIndexFilter,
+                  };
+            setDraftFilters(newFilters);
+            onFiltersChange(newFilters);
+          }}
+          Option={IndexOption}
+        />
+        {!searchIndex && (
+          // Search indexes only support a single order, so we don’t display the order button for them
+          <Button
+            variant="neutral"
+            size="xs"
+            onClick={() =>
+              onChangeOrder(shownFilters.order === "asc" ? "desc" : "asc")
+            }
+            type="button"
+            tip="Change sort order"
+            className="w-fit text-xs"
+            icon={<ArrowsUpDownIcon className="size-4" />}
+          >
+            {shownFilters.order === "asc" ? "Ascending" : "Descending"}
+          </Button>
+        )}
       </div>
       <div className="flex flex-col gap-2">
         <div className="flex items-center gap-1">
           <hr className="w-2" />{" "}
           <p className="flex items-center gap-1 text-xs text-content-secondary">
             Indexed Filters{" "}
-            <Tooltip
-              tip="Indexed filters are automatically generated based on the index selected above."
-              side="right"
-            >
-              <InfoCircledIcon />
-            </Tooltip>
+            <HelpTooltip tipSide="right">
+              Indexed filters are automatically generated based on the index
+              selected above.
+            </HelpTooltip>
           </p>{" "}
           <hr className="grow" />
         </div>
-        {shownFilters.index?.clauses.map((clause, idx) => {
-          // Get the index definition
-          const tableIndexes =
-            activeSchema?.tables.find(
-              (t: { tableName: string }) => t.tableName === tableName,
-            )?.indexes || [];
+        {/* Regular index filters */}
+        {shownFilters.index &&
+          !searchIndex &&
+          shownFilters.index.clauses.map((clause, idx) => {
+            if ("field" in clause) {
+              throw new Error(
+                "Unexpected search index clause in a regular index filter",
+              );
+            }
 
-          const indexName = shownFilters.index?.name;
+            // Get the index definition
+            const tableIndexes =
+              activeSchema?.tables.find(
+                (t: { tableName: string }) => t.tableName === tableName,
+              )?.indexes || [];
 
-          // Get the field name from the index definition
-          let fieldName =
-            selectedTableIndex && Array.isArray(selectedTableIndex.fields)
-              ? selectedTableIndex.fields[idx]
-              : "_creationTime";
+            const indexName = shownFilters.index?.name;
 
-          // Special case for _creationTime index
-          if (indexName === "_creationTime") {
-            fieldName = "_creationTime";
-          } else {
-            const indexDef = tableIndexes.find((i: any) => {
-              const simpleIndex = i as unknown as SimpleIndex;
-              return simpleIndex.name === indexName;
-            });
+            // Get the field name from the index definition
+            let fieldName =
+              selectedTableIndex && Array.isArray(selectedTableIndex.fields)
+                ? selectedTableIndex.fields[idx]
+                : "_creationTime";
 
-            if (indexDef) {
-              const simpleIndex = indexDef as unknown as SimpleIndex;
-              if (Array.isArray(simpleIndex.fields)) {
-                fieldName = simpleIndex.fields[idx] || fieldName;
+            // Special case for system indexes
+            if (indexName === "by_creation_time") {
+              fieldName = "_creationTime";
+            } else if (indexName === "by_id") {
+              fieldName = "_id";
+            } else {
+              const indexDef = tableIndexes.find((i: any) => {
+                const simpleIndex = i as unknown as SimpleIndex;
+                return simpleIndex.name === indexName;
+              });
+
+              if (indexDef) {
+                const simpleIndex = indexDef as unknown as SimpleIndex;
+                if (Array.isArray(simpleIndex.fields)) {
+                  fieldName = simpleIndex.fields[idx] || fieldName;
+                }
               }
             }
-          }
 
-          // Calculate if all previous filters are enabled
-          const previousFiltersEnabled =
-            shownFilters.index?.clauses.slice(0, idx).map((c) => c.enabled) ||
-            [];
+            // Calculate if all previous filters are enabled
+            const previousFiltersEnabled =
+              shownFilters.index?.clauses.slice(0, idx).map((c) => c.enabled) ||
+              [];
 
-          // Calculate if any subsequent filters are enabled
-          const nextFiltersEnabled =
-            shownFilters.index?.clauses.slice(idx + 1).map((c) => c.enabled) ||
-            [];
+            // Calculate if any subsequent filters are enabled
+            const nextFiltersEnabled =
+              shownFilters.index?.clauses
+                .slice(idx + 1)
+                .map((c) => c.enabled) || [];
 
-          return (
-            <IndexFilterEditor
-              key={idx}
-              idx={idx}
-              field={fieldName}
-              error={
-                clause.enabled ? invalidFilters[`index/${idx}`] : undefined
-              }
-              onChange={onChangeIndexFilter}
-              onApplyFilters={() => {
+            return (
+              <DatabaseIndexFilterEditor
+                key={idx}
+                idx={idx}
+                field={fieldName}
+                error={
+                  clause.enabled ? invalidFilters[`index/${idx}`] : undefined
+                }
+                onChange={onChangeIndexFilter}
+                onApplyFilters={async () => {
+                  if (hasInvalidFilters) {
+                    return;
+                  }
+                  await applyFiltersWithHistory(shownFilters);
+                }}
+                onError={onError}
+                filter={clause}
+                autoFocusValueEditor={
+                  idx === (shownFilters.index?.clauses.length || 0) - 1
+                }
+                documentValidator={getValidatorForField(fieldName)}
+                shouldSurfaceValidatorErrors={activeSchema?.schemaValidation}
+                previousFiltersEnabled={previousFiltersEnabled}
+                nextFiltersEnabled={nextFiltersEnabled}
+              />
+            );
+          })}
+
+        {searchIndex && (
+          <>
+            <SearchValueEditor
+              field={searchFilterField ?? "unknown"}
+              value={searchIndex.search}
+              onChange={(newValue: string) => {
+                const newFilters: FilterExpression = {
+                  ...shownFilters,
+                  index: {
+                    ...searchIndex,
+                    search: newValue,
+                  },
+                };
+                setDraftFilters(newFilters);
+              }}
+              onApplyFilters={async () => {
                 if (hasInvalidFilters) {
                   return;
                 }
-                onChangeFilters(shownFilters);
+                await applyFiltersWithHistory(shownFilters);
               }}
-              onError={onError}
-              filter={clause}
-              autoFocusValueEditor={
-                idx === (shownFilters.index?.clauses.length || 0) - 1
-              }
-              documentValidator={getValidatorForField(fieldName)}
-              shouldSurfaceValidatorErrors={activeSchema?.schemaValidation}
-              previousFiltersEnabled={previousFiltersEnabled}
-              nextFiltersEnabled={nextFiltersEnabled}
+              indented={searchIndex.clauses.length > 0}
             />
-          );
-        })}
+
+            {searchIndex.clauses.map((clause, idx) => (
+              <SearchIndexFilterEditor
+                key={clause.field}
+                idx={idx}
+                field={clause.field}
+                error={
+                  clause.enabled ? invalidFilters[`index/${idx}`] : undefined
+                }
+                onChange={onChangeIndexFilter}
+                onApplyFilters={async () => {
+                  if (hasInvalidFilters) {
+                    return;
+                  }
+                  await applyFiltersWithHistory(shownFilters);
+                }}
+                onError={onError}
+                filter={clause}
+                autoFocusValueEditor={
+                  idx === (shownFilters.index?.clauses.length || 0) - 1
+                }
+                documentValidator={getValidatorForField(clause.field)}
+                shouldSurfaceValidatorErrors={activeSchema?.schemaValidation}
+              />
+            ))}
+          </>
+        )}
       </div>
     </>
+  );
+}
+
+export function IndexOption({
+  label,
+  value,
+  inButton,
+}: {
+  label: string;
+  value: IndexOptionValue;
+  inButton: boolean;
+}) {
+  return (
+    <div className="flex items-center gap-2 text-xs">
+      <div className="text-content-tertiary">
+        {inButton ? (
+          <FingerPrintIcon className="size-4 text-content-primary" />
+        ) : value.type === "database" ? (
+          <Tooltip side="left" tip="Index" aria-label="Index">
+            <FingerPrintIcon className="size-4" />
+          </Tooltip>
+        ) : value.type === "search" ? (
+          <Tooltip
+            side="left"
+            tip="Search index"
+            aria-label="Search index"
+            className="inline-flex size-4 justify-center"
+          >
+            <MagnifyingGlassIcon />
+          </Tooltip>
+        ) : value.name === DEFAULT_INDEX_NAME ? (
+          <ClockIcon />
+        ) : (
+          <IdCardIcon />
+        )}
+      </div>
+
+      <div>
+        <div>
+          {value.type !== "default" && inButton && (
+            <>
+              <span>{value.type === "search" ? "Search index" : "Index"}:</span>{" "}
+            </>
+          )}
+          <span className={cn(value.type !== "default" && "font-mono")}>
+            {label}
+          </span>
+        </div>
+
+        {!inButton && (
+          <div className="text-xs text-content-secondary">
+            (
+            {("searchField" in value ? [value.searchField] : value.fields).join(
+              ", ",
+            )}
+            )
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

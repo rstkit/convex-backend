@@ -1,19 +1,12 @@
 use std::sync::LazyLock;
 
 use common::{
-    document::{
-        ParseDocument,
-        ParsedDocument,
-    },
-    query::{
-        Order,
-        Query,
-    },
+    self,
+    document::ParsedDocument,
     runtime::Runtime,
 };
 use database::{
     patch_value,
-    ResolvedQuery,
     SystemMetadataModel,
     Transaction,
 };
@@ -99,15 +92,29 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
     }
 
     pub async fn get_all(&mut self) -> anyhow::Result<Vec<ParsedDocument<LogSinksRow>>> {
-        let mut result: Vec<_> = vec![];
+        let result = self
+            .tx
+            .query_system(
+                TableNamespace::Global,
+                &SystemIndex::<LogSinksTable>::by_id(),
+            )?
+            .all()
+            .await?
+            .into_iter()
+            .map(|arc_row| (*arc_row).clone())
+            .collect();
+        Ok(result)
+    }
 
-        let value_query = Query::full_table_scan(LOG_SINKS_TABLE.clone(), Order::Asc);
-        let mut query_stream = ResolvedQuery::new(self.tx, TableNamespace::Global, value_query)?;
-        while let Some(doc) = query_stream.next(self.tx, None).await? {
-            let row: ParsedDocument<LogSinksRow> = doc.parse()?;
-            result.push(row);
-        }
-
+    pub async fn get_all_non_tombstoned(
+        &mut self,
+    ) -> anyhow::Result<Vec<ParsedDocument<LogSinksRow>>> {
+        let result = self
+            .get_all()
+            .await?
+            .into_iter()
+            .filter(|row| row.status != SinkState::Tombstoned)
+            .collect();
         Ok(result)
     }
 
@@ -125,12 +132,29 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
         Ok(())
     }
 
+    pub async fn patch_config(
+        &mut self,
+        id: ResolvedDocumentId,
+        config: SinkConfig,
+    ) -> anyhow::Result<()> {
+        SystemMetadataModel::new_global(self.tx)
+            .patch(
+                id,
+                patch_value!("config" => Some(ConvexValue::Object(config.try_into()?)))?,
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn mark_for_removal(&mut self, id: ResolvedDocumentId) -> anyhow::Result<()> {
         self.patch_status(id, SinkState::Tombstoned).await?;
         Ok(())
     }
 
-    pub async fn add_or_update(&mut self, config: SinkConfig) -> anyhow::Result<()> {
+    pub async fn add_or_update(
+        &mut self,
+        config: SinkConfig,
+    ) -> anyhow::Result<ResolvedDocumentId> {
         let sink_type = config.sink_type();
         let row = LogSinksRow {
             status: SinkState::Pending,
@@ -156,10 +180,10 @@ impl<'a, RT: Runtime> LogSinksModel<'a, RT> {
             self.mark_for_removal(row.id()).await?;
         }
 
-        SystemMetadataModel::new_global(self.tx)
+        let id = SystemMetadataModel::new_global(self.tx)
             .insert(&LOG_SINKS_TABLE, row.try_into()?)
             .await?;
-        Ok(())
+        Ok(id)
     }
 
     // It's generally not safe to delete an existing sink without marking it

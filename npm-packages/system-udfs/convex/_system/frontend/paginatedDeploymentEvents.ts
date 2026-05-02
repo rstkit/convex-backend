@@ -2,11 +2,12 @@ import { paginationOptsValidator } from "convex/server";
 import { queryPrivateSystem } from "../secretSystemTables";
 import { v } from "convex/values";
 import { maximumBytesRead, maximumRowsRead } from "../paginationLimits";
+import { DatabaseReader } from "../../_generated/server";
 
 /**
  * Paginated query for the deployment events from most recent to least recent
  */
-export default queryPrivateSystem({
+export default queryPrivateSystem("ViewAuditLog")({
   args: {
     paginationOpts: paginationOptsValidator,
     filters: v.object({
@@ -17,6 +18,8 @@ export default queryPrivateSystem({
     }),
   },
   handler: async function ({ db }, { paginationOpts, filters }) {
+    filters.minDate = await clampForAuditLogRetention(db, filters.minDate);
+
     const paginatedResults = await db
       .query("_deployment_audit_log")
       .withIndex("by_creation_time", (q) => {
@@ -27,7 +30,10 @@ export default queryPrivateSystem({
           : partial;
       })
       .order("desc")
+      // eslint-disable-next-line @convex-dev/no-filter-in-query -- we allow filtering by multiple member IDs/actions
       .filter((q) => {
+        // FIXME: Note that here, we could use an index for the case where we filter for a single member ID and/or a single action
+
         const queryFilters = [];
         if (filters.authorMemberIds !== undefined) {
           queryFilters.push(
@@ -38,7 +44,7 @@ export default queryPrivateSystem({
             ),
           );
         }
-        if (filters.actions != undefined) {
+        if (filters.actions !== undefined) {
           queryFilters.push(
             q.or(
               ...filters.actions.map((action) =>
@@ -58,3 +64,21 @@ export default queryPrivateSystem({
     return paginatedResults;
   },
 });
+
+export async function clampForAuditLogRetention(
+  db: DatabaseReader,
+  minDate: number,
+) {
+  const backendInfo = await db.query("_backend_info").first();
+  const auditLogRetentionDays = Number(backendInfo?.auditLogRetentionDays || 0);
+  // no limit if auditLogRetentionDays is -1
+  if (auditLogRetentionDays === -1) {
+    return minDate;
+  }
+  const minAllowable =
+    Date.now() - (auditLogRetentionDays + 1) * 24 * 60 * 60 * 1000;
+  if (minDate < minAllowable) {
+    return minAllowable;
+  }
+  return minDate;
+}

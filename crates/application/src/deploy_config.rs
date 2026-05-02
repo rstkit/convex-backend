@@ -38,6 +38,7 @@ use common::{
         EnvVarValue,
         ModuleEnvironment,
         NodeDependency,
+        Timestamp,
     },
     version::Version,
 };
@@ -49,11 +50,15 @@ use database::{
     WriteSource,
     SCHEMAS_TABLE,
 };
-use errors::ErrorMetadata;
+use errors::{
+    ErrorMetadata,
+    ErrorMetadataAnyhowExt,
+};
 use fastrace::{
     future::FutureExt as _,
     Span,
 };
+use futures::FutureExt;
 use keybroker::Identity;
 use maplit::btreeset;
 use model::{
@@ -87,10 +92,12 @@ use model::{
         ConfigFile,
         ConfigMetadata,
         ModuleConfig,
+        ModuleHashConfig,
     },
     deployment_audit_log::types::{
         DeploymentAuditLogEvent,
         PushComponentDiffs,
+        PushMessage,
     },
     environment_variables::EnvironmentVariablesModel,
     external_packages::types::ExternalDepsPackageId,
@@ -100,7 +107,10 @@ use model::{
         SourceMap,
     },
     source_packages::{
-        types::SourcePackage,
+        types::{
+            NodeVersion,
+            SourcePackage,
+        },
         upload_download::download_package,
     },
     udf_config::types::UdfConfig,
@@ -121,6 +131,7 @@ use udf::{
 use usage_tracking::FunctionUsageTracker;
 use value::{
     identifier::Identifier,
+    sha256::Sha256Digest,
     DeveloperDocumentId,
     ResolvedDocumentId,
     TableNamespace,
@@ -147,15 +158,70 @@ pub struct PushMetrics {
     pub occ_stats: OccRetryStats,
 }
 
+struct EvaluatedPushContents {
+    app: CheckedComponent,
+    auth_info: Vec<AuthInfo>,
+    component_definition_packages: BTreeMap<ComponentDefinitionPath, SourcePackage>,
+    evaluated_components: BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+    external_deps_id: Option<ExternalDepsPackageId>,
+    user_environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
+    app_functions: Vec<ModuleConfig>,
+}
+
 impl<RT: Runtime> Application<RT> {
     #[fastrace::trace]
-    pub async fn start_push(
+    pub async fn start_push(&self, config: &ProjectConfig) -> anyhow::Result<StartPushResult> {
+        let EvaluatedPushContents {
+            app,
+            auth_info,
+            component_definition_packages,
+            mut evaluated_components,
+            external_deps_id,
+            user_environment_variables,
+            app_functions,
+        } = self.evaluate_push_contents(config).await?;
+
+        let schema_change = self
+            .handle_schema_change_in_start_push(&app, &evaluated_components)
+            .await?;
+        self.database
+            .load_indexes_into_memory(btreeset! { SCHEMAS_TABLE.clone() })
+            .await?;
+
+        // TODO(ENG-7533): Clean up exports from the start push response when we've
+        // updated clients to use `functions` directly.
+        for (path, definition) in evaluated_components.iter_mut() {
+            // We don't need to include exports for the root since we don't use codegen
+            // for the app's `api` object.
+            if path.is_root() {
+                continue;
+            }
+            anyhow::ensure!(definition.definition.exports.is_empty());
+            definition.definition.exports = file_based_exports(&definition.functions)?;
+        }
+
+        let resp = StartPushResponse {
+            environment_variables: user_environment_variables,
+            external_deps_id,
+            component_definition_packages,
+            app_auth: auth_info,
+            analysis: evaluated_components,
+            app,
+            schema_change,
+        };
+        Ok(StartPushResult {
+            response: resp,
+            app_functions,
+        })
+    }
+
+    #[fastrace::trace]
+    async fn evaluate_push_contents(
         &self,
         config: &ProjectConfig,
-        dry_run: bool,
-    ) -> anyhow::Result<StartPushResponse> {
+    ) -> anyhow::Result<EvaluatedPushContents> {
         let unix_timestamp = self.runtime.unix_timestamp();
-        let (external_deps_id, component_definition_packages) =
+        let (external_deps_id, component_definition_packages, app_functions) =
             self.upload_packages(config).await?;
 
         let app_udf_config = UdfConfig {
@@ -177,7 +243,7 @@ impl<RT: Runtime> Application<RT> {
         let (auth_module, app_analysis) = self
             .analyze_modules_with_auth_config(
                 app_udf_config.clone(),
-                config.app_definition.functions.clone(),
+                app_functions.clone(),
                 app_pkg.clone(),
                 user_environment_variables.clone(),
                 system_env_var_overrides.clone(),
@@ -207,7 +273,7 @@ impl<RT: Runtime> Application<RT> {
         )
         .await?;
 
-        let mut evaluated_components = self
+        let evaluated_components = self
             .evaluate_components(
                 config,
                 &component_definition_packages,
@@ -232,56 +298,30 @@ impl<RT: Runtime> Application<RT> {
         let ctx = TypecheckContext::new(&evaluated_components, &initializer_evaluator);
         let app = ctx.instantiate_root().await?;
 
-        let schema_change = self
-            ._handle_schema_change_in_start_push(&app, &evaluated_components, dry_run)
-            .await?;
-        self.database
-            .load_indexes_into_memory(btreeset! { SCHEMAS_TABLE.clone() })
-            .await?;
-
-        // TODO(ENG-7533): Clean up exports from the start push response when we've
-        // updated clients to use `functions` directly.
-        for (path, definition) in evaluated_components.iter_mut() {
-            // We don't need to include exports for the root since we don't use codegen
-            // for the app's `api` object.
-            if path.is_root() {
-                continue;
-            }
-            anyhow::ensure!(definition.definition.exports.is_empty());
-            definition.definition.exports = file_based_exports(&definition.functions)?;
-        }
-
-        let resp = StartPushResponse {
-            environment_variables: user_environment_variables,
-            external_deps_id,
-            component_definition_packages,
-            app_auth: auth_info,
-            analysis: evaluated_components,
+        Ok(EvaluatedPushContents {
             app,
-            schema_change,
-        };
-        Ok(resp)
+            auth_info,
+            component_definition_packages,
+            evaluated_components,
+            external_deps_id,
+            user_environment_variables,
+            app_functions,
+        })
     }
 
-    async fn _handle_schema_change_in_start_push(
+    #[fastrace::trace]
+    async fn handle_schema_change_in_start_push(
         &self,
         app: &CheckedComponent,
         evaluated_components: &BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
-        dry_run: bool,
     ) -> anyhow::Result<SchemaChange> {
-        if dry_run {
-            let mut tx = self.begin(Identity::system()).await?;
-            let schema_change = ComponentConfigModel::new(&mut tx)
-                .start_component_schema_changes(app, evaluated_components)
-                .await?;
-            return Ok(schema_change);
-        }
-
+        // Even in dry run mode, we need to commit the schema changes so that
+        // wait_for_schema can validate the schema against existing data.
         let (_ts, schema_change) = self
             .execute_with_occ_retries(
                 Identity::system(),
                 FunctionUsageTracker::new(),
-                WriteSource::new("start_push"),
+                WriteSource::system("start_push"),
                 |tx| {
                     async move {
                         let schema_change = ComponentConfigModel::new(tx)
@@ -293,6 +333,20 @@ impl<RT: Runtime> Application<RT> {
                 },
             )
             .await?;
+        Ok(schema_change)
+    }
+
+    #[fastrace::trace]
+    async fn handle_schema_change_in_evaluate_push(
+        &self,
+        app: &CheckedComponent,
+        evaluated_components: &BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+    ) -> anyhow::Result<SchemaChange> {
+        let mut tx = self.begin(Identity::system()).await?;
+        let schema_change = ComponentConfigModel::new(&mut tx)
+            .start_component_schema_changes(app, evaluated_components)
+            .await?;
+        drop(tx);
         Ok(schema_change)
     }
 
@@ -439,7 +493,7 @@ impl<RT: Runtime> Application<RT> {
     }
 
     #[fastrace::trace]
-    pub async fn evaluate_app_definitions(
+    async fn evaluate_app_definitions(
         &self,
         app_definition: ModuleConfig,
         component_definitions: BTreeMap<ComponentDefinitionPath, ModuleConfig>,
@@ -459,6 +513,24 @@ impl<RT: Runtime> Application<RT> {
     }
 
     #[fastrace::trace]
+    pub async fn evaluate_push(
+        &self,
+        config: &ProjectConfig,
+    ) -> anyhow::Result<EvaluatePushResponse> {
+        let EvaluatedPushContents {
+            app,
+            evaluated_components,
+            ..
+        } = self.evaluate_push_contents(config).await?;
+
+        let schema_change = self
+            .handle_schema_change_in_evaluate_push(&app, &evaluated_components)
+            .await?;
+
+        Ok(EvaluatePushResponse { schema_change })
+    }
+
+    #[fastrace::trace]
     pub async fn wait_for_schema(
         &self,
         identity: Identity,
@@ -475,9 +547,9 @@ impl<RT: Runtime> Application<RT> {
             if !in_progress || now > deadline {
                 return Ok(status);
             }
-            let subscription = self.subscribe(token).await?;
+            let subscription_fut = self.subscribe_and_wait_for_invalidation(token);
             tokio::select! {
-                _ = subscription.wait_for_invalidation() => {},
+                _ = subscription_fut.fuse() => {},
                 _ = self.runtime.wait(deadline - now)
                     .in_span(fastrace::Span::enter_with_local_parent("wait_for_deadline"))
                  => {},
@@ -486,7 +558,7 @@ impl<RT: Runtime> Application<RT> {
     }
 
     #[fastrace::trace]
-    async fn load_component_schema_status(
+    pub(crate) async fn load_component_schema_status(
         &self,
         identity: &Identity,
         schema_change: &SchemaChange,
@@ -543,6 +615,10 @@ impl<RT: Runtime> Application<RT> {
                 .get_application_indexes(namespace)
                 .await?
             {
+                // Skip counting indexes that are staged
+                if index.config.is_staged() {
+                    continue;
+                }
                 if !index.config.is_backfilling() {
                     indexes_complete += 1;
                 }
@@ -573,7 +649,8 @@ impl<RT: Runtime> Application<RT> {
         &self,
         identity: Identity,
         mut start_push: StartPushResponse,
-    ) -> anyhow::Result<FinishPushDiff> {
+        message: Option<PushMessage>,
+    ) -> anyhow::Result<(FinishPushDiff, Timestamp)> {
         // Download all source packages. We can remove this once we don't store source
         // in the database.
         let mut downloaded_source_packages = BTreeMap::new();
@@ -594,65 +671,89 @@ impl<RT: Runtime> Application<RT> {
             definition.definition.exports = BTreeMap::new();
         }
 
-        let diff = self
-            .execute_with_audit_log_events_and_occ_retries(identity.clone(), "finish_push", |tx| {
-                let start_push = &start_push;
-                let downloaded_source_packages = &downloaded_source_packages;
-                async move {
-                    // Validate that environment variables haven't changed since `start_push`.
-                    let environment_variables =
-                        EnvironmentVariablesModel::new(tx).get_all().await?;
-                    if environment_variables != start_push.environment_variables {
-                        anyhow::bail!(ErrorMetadata::bad_request(
-                            "RaceDetected",
-                            "Environment variables have changed during push"
-                        ));
-                    }
+        let finish_push_write_source = "finish_push";
 
-                    // Update app state: auth info and UDF server version.
-                    let auth_diff = AuthInfoModel::new(tx)
-                        .put(start_push.app_auth.clone())
-                        .await?;
+        let (diff, ts) = self
+            .execute_with_audit_log_events_and_occ_retries_with_timestamp(
+                identity.clone(),
+                finish_push_write_source,
+                |tx| {
+                    let start_push = &start_push;
+                    let downloaded_source_packages = &downloaded_source_packages;
+                    let message = &message;
+                    async move {
+                        // Validate that environment variables haven't changed since `start_push`.
+                        let environment_variables =
+                            EnvironmentVariablesModel::new(tx).get_all().await?;
+                        if environment_variables != start_push.environment_variables {
+                            anyhow::bail!(ErrorMetadata::bad_request(
+                                "RaceDetected",
+                                "Environment variables have changed during push"
+                            ));
+                        }
 
-                    // Diff the component definitions.
-                    let (definition_diffs, modules_by_definition, udf_config_by_definition) =
-                        ComponentDefinitionConfigModel::new(tx)
-                            .apply_component_definitions_diff(
-                                &start_push.analysis,
-                                &start_push.component_definition_packages,
-                                downloaded_source_packages,
+                        // Update app state: auth info and UDF server version.
+                        let auth_diff = AuthInfoModel::new(tx)
+                            .put(start_push.app_auth.clone())
+                            .await?;
+
+                        // Diff the component definitions.
+                        let (definition_diffs, modules_by_definition, udf_config_by_definition) =
+                            ComponentDefinitionConfigModel::new(tx)
+                                .apply_component_definitions_diff(
+                                    &start_push.analysis,
+                                    &start_push.component_definition_packages,
+                                    downloaded_source_packages,
+                                )
+                                .await?;
+
+                        // Diff component tree.
+                        let component_diffs = ComponentConfigModel::new(tx)
+                            .apply_component_tree_diff(
+                                &start_push.app,
+                                udf_config_by_definition,
+                                &start_push.schema_change,
+                                modules_by_definition,
                             )
                             .await?;
 
-                    // Diff component tree.
-                    let component_diffs = ComponentConfigModel::new(tx)
-                        .apply_component_tree_diff(
-                            &start_push.app,
-                            udf_config_by_definition,
-                            &start_push.schema_change,
-                            modules_by_definition,
-                        )
-                        .await?;
-
-                    let diffs = PushComponentDiffs {
-                        auth_diff: auth_diff.clone(),
-                        component_diffs: component_diffs.clone(),
-                    };
-                    let audit_log_events =
-                        vec![DeploymentAuditLogEvent::PushConfigWithComponents { diffs }];
-                    let diff = FinishPushDiff {
-                        auth_diff,
-                        definition_diffs,
-                        component_diffs,
-                    };
-                    Ok((diff, audit_log_events))
+                        let diffs = PushComponentDiffs {
+                            auth_diff: auth_diff.clone(),
+                            component_diffs: component_diffs.clone(),
+                            message: message.clone(),
+                        };
+                        let audit_log_events =
+                            vec![DeploymentAuditLogEvent::PushConfigWithComponents { diffs }];
+                        let diff = FinishPushDiff {
+                            auth_diff,
+                            definition_diffs,
+                            component_diffs,
+                        };
+                        Ok((diff, audit_log_events))
+                    }
+                    .in_span(Span::enter_with_local_parent("finish_push_tx"))
+                    .into()
+                },
+            )
+            .await
+            .map_err(|e| {
+                if let Some(occ_error_info) = e.occ_info()
+                    && let Some(write_source) = occ_error_info.write_source
+                    && write_source == finish_push_write_source
+                {
+                    e.context(ErrorMetadata::bad_request(
+                        "ConcurrentPush",
+                        format!(
+                            "Are you running multiple `npx convex dev` processes in the same \
+                             directory?"
+                        ),
+                    ))
+                } else {
+                    e
                 }
-                .in_span(Span::enter_with_local_parent("finish_push_tx"))
-                .into()
-            })
-            .await?;
+            })?;
 
-        Ok(diff)
+        Ok((diff, ts))
     }
 
     /// N.B.: does not check auth
@@ -664,6 +765,7 @@ impl<RT: Runtime> Application<RT> {
         udf_server_version: Version,
         schema_id: Option<String>,
         node_dependencies: Option<Vec<NodeDependencyJson>>,
+        node_version: Option<NodeVersion>,
     ) -> anyhow::Result<(PushAnalytics, PushMetrics)> {
         let begin_build_external_deps = Instant::now();
         // Upload external node dependencies separately
@@ -682,7 +784,7 @@ impl<RT: Runtime> Application<RT> {
             .unwrap_or_default();
 
         let source_package = self
-            .upload_package(&modules, external_deps_id_and_pkg)
+            .upload_package(&modules, external_deps_id_and_pkg, node_version)
             .await?;
         let end_upload_source_package = Instant::now();
         // Verify that we have not exceeded the max zipped or unzipped file size
@@ -811,7 +913,6 @@ impl<RT: Runtime> InitializerEvaluator for ApplicationInitializerEvaluator<'_, R
 #[serde(rename_all = "camelCase")]
 pub struct StartPushRequest {
     pub admin_key: String,
-    pub dry_run: bool,
 
     pub functions: String,
 
@@ -819,10 +920,24 @@ pub struct StartPushRequest {
     pub component_definitions: Vec<ComponentDefinitionConfigJson>,
 
     pub node_dependencies: Vec<NodeDependencyJson>,
+
+    pub node_version: Option<String>,
 }
 
 impl StartPushRequest {
     pub fn into_project_config(self) -> anyhow::Result<ProjectConfig> {
+        let proposed_node_version: Option<NodeVersion> =
+            self.node_version.map(|v| v.parse()).transpose()?;
+        let node_version = match proposed_node_version {
+            Some(NodeVersion::V18x) => {
+                anyhow::bail!(ErrorMetadata::bad_request(
+                    "NodeVersionNotSupported",
+                    "Node 18 is no longer supported. Upgrade to a newer Node version (https://docs.convex.dev/production/project-configuration#configuring-the-nodejs-version)."
+                ))
+            },
+            version => version,
+        };
+
         Ok(ProjectConfig {
             config: ConfigMetadata {
                 functions: self.functions,
@@ -839,6 +954,7 @@ impl StartPushRequest {
                 .into_iter()
                 .map(NodeDependency::from)
                 .collect(),
+            node_version,
         })
     }
 }
@@ -860,6 +976,18 @@ pub struct StartPushResponse {
     pub schema_change: SchemaChange,
 }
 
+#[derive(Debug)]
+pub struct StartPushResult {
+    pub response: StartPushResponse,
+    /// All runtime function modules in the app component
+    pub app_functions: Vec<ModuleConfig>,
+}
+
+#[derive(Debug)]
+pub struct EvaluatePushResponse {
+    pub schema_change: SchemaChange,
+}
+
 impl From<NodeDependencyJson> for NodeDependency {
     fn from(value: NodeDependencyJson) -> Self {
         Self {
@@ -875,7 +1003,11 @@ pub struct AppDefinitionConfigJson {
     pub definition: Option<ModuleJson>,
     pub dependencies: Vec<String>,
     pub schema: Option<ModuleJson>,
-    pub functions: Vec<ModuleJson>,
+    // CLI versions <= 1.31.5 used functions and did not upload unchanged_module_hashes
+    #[serde(alias = "functions")]
+    pub changed_modules: Vec<ModuleJson>,
+    #[serde(default)]
+    pub unchanged_module_hashes: Vec<ModuleHashJson>,
     pub udf_server_version: String,
 }
 
@@ -891,12 +1023,17 @@ impl TryFrom<AppDefinitionConfigJson> for AppDefinitionConfig {
                 .map(|s| s.parse())
                 .collect::<anyhow::Result<_>>()?,
             schema: value.schema.map(TryInto::try_into).transpose()?,
-            functions: value
-                .functions
+            changed_runtime_modules: value
+                .changed_modules
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<anyhow::Result<_>>()?,
             udf_server_version: value.udf_server_version.parse()?,
+            unchanged_runtime_module_hashes: value
+                .unchanged_module_hashes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<anyhow::Result<_>>()?,
         })
     }
 }
@@ -956,9 +1093,19 @@ impl TryFrom<ComponentDefinitionConfigJson> for ComponentDefinitionConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ModuleJson {
     pub path: String,
-    pub source: ModuleSource,
+    pub source: String,
     pub source_map: Option<SourceMap>,
     pub environment: Option<String>,
+}
+
+/// API level structure for representing module hashes as Json (for unchanged
+/// modules)
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleHashJson {
+    pub path: String,
+    pub environment: Option<String>,
+    pub sha256: String,
 }
 
 impl From<ModuleConfig> for ModuleJson {
@@ -972,7 +1119,7 @@ impl From<ModuleConfig> for ModuleJson {
     ) -> ModuleJson {
         ModuleJson {
             path: path.into(),
-            source,
+            source: source.to_string(),
             source_map,
             environment: Some(environment.to_string()),
         }
@@ -990,18 +1137,47 @@ impl TryFrom<ModuleJson> for ModuleConfig {
             environment,
         }: ModuleJson,
     ) -> anyhow::Result<ModuleConfig> {
-        let environment = match environment {
-            Some(s) => s.parse()?,
-            // Default to using the path for backwards compatibility
-            None => deprecated_extract_environment_from_path(path.clone())?,
-        };
         Ok(ModuleConfig {
             path: parse_module_path(&path)?,
-            source,
+            source: ModuleSource::new(&source),
             source_map,
-            environment,
+            environment: parse_module_environment(&environment, &path)?,
         })
     }
+}
+
+impl TryFrom<ModuleHashJson> for ModuleHashConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(
+        ModuleHashJson {
+            path,
+            environment,
+            sha256,
+        }: ModuleHashJson,
+    ) -> anyhow::Result<ModuleHashConfig> {
+        let sha256_bytes = hex::decode(&sha256).context("Invalid hex in sha256")?;
+        let sha256_array: [u8; 32] = sha256_bytes
+            .try_into()
+            .ok()
+            .context("sha256 not 32 bytes")?;
+        Ok(ModuleHashConfig {
+            path: parse_module_path(&path)?,
+            environment: parse_module_environment(&environment, &path)?,
+            sha256: Sha256Digest::from(sha256_array),
+        })
+    }
+}
+
+pub fn parse_module_environment(
+    environment: &Option<String>,
+    path: &String,
+) -> anyhow::Result<ModuleEnvironment> {
+    Ok(match environment {
+        Some(s) => s.parse()?,
+        // Default to using the path for backwards compatibility
+        None => deprecated_extract_environment_from_path(path.clone())?,
+    })
 }
 
 pub fn parse_module_path(path: &str) -> anyhow::Result<ModulePath> {

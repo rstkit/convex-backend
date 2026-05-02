@@ -2,7 +2,7 @@ import React, { useContext } from "react";
 import { LockClosedIcon } from "@radix-ui/react-icons";
 import { useRouter } from "next/router";
 import { cn } from "@ui/cn";
-import { Disclosure } from "@headlessui/react";
+import { DisclosureButton } from "@headlessui/react";
 import { ModuleFunction } from "@common/lib/functions/types";
 import { useCurrentOpenFunction } from "@common/lib/functions/FunctionsProvider";
 import { useCurrentGloballyOpenFunction } from "@common/features/functionRunner/lib/functionRunner";
@@ -90,12 +90,12 @@ export function DirectoryItem({
       font: "mono",
       small: true,
     }),
-    "px-0 py-0 w-full min-w-full max-w-full truncate h-[30px] pr-2",
+    "h-[30px] w-full max-w-full min-w-full truncate px-0 py-0 pr-2",
     "rounded-none",
     isActive &&
-      "outline outline-util-accent/40 bg-util-accent/30 hover:bg-util-accent/30 font-normal",
+      "bg-util-accent/30 font-normal outline outline-util-accent/40 hover:bg-util-accent/30",
     !isActive && "hover:bg-util-accent/20",
-    "focus-visible:outline-none focus-visible:ring-0 focus-visible:bg-util-accent/20",
+    "focus-visible:bg-util-accent/20 focus-visible:ring-0 focus-visible:outline-hidden",
   );
 
   const buttonChildren = (
@@ -120,13 +120,13 @@ export function DirectoryItem({
 
   if (disclosure) {
     if (href) {
-      captureMessage("DirectoryItem with href and disclosure");
+      captureMessage("DirectoryItem with href and disclosure", "error");
     }
 
     return (
-      <Disclosure.Button className={className} onClick={onClick}>
+      <DisclosureButton className={className} onClick={onClick}>
         {buttonChildren}
-      </Disclosure.Button>
+      </DisclosureButton>
     );
   }
 

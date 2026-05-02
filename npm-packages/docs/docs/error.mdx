@@ -1,3 +1,9 @@
+---
+description: "Understand specific errors thrown by Convex"
+---
+
+import { ComponentCardList } from "@site/src/components/ComponentCard";
+
 # Errors and Warnings
 
 This page explains specific errors thrown by Convex.
@@ -20,8 +26,8 @@ A mutation `updateCounter` always updates the same document:
 export const updateCounter = mutation({
   args: {},
   handler: async (ctx) => {
-    const doc = await ctx.db.get(process.env.COUNTER_ID);
-    await ctx.db.patch(doc._id, { value: doc.value + 1 });
+    const doc = await ctx.db.get("counts", process.env.COUNTER_ID);
+    await ctx.db.patch("counts", doc._id, { value: doc.value + 1 });
   },
 });
 ```
@@ -52,7 +58,7 @@ export const writeCount = mutation({
   },
   handler: async (ctx, args) => {
     const tasks = await ctx.db.query("tasks").collect();
-    await ctx.db.patch(args.target, { value: tasks });
+    await ctx.db.patch("tasks", args.target, { value: tasks });
   },
 });
 
@@ -94,3 +100,104 @@ To fix this issue:
 - Learn more about [optimistic concurrency control](/database/advanced/occ.md).
 - See this [Stack post](https://stack.convex.dev/waitlist) for an example of
   designing an app to avoid mutation conflicts.
+
+### Related Components
+
+<ComponentCardList
+  items={[
+    {
+      title: "Workpool",
+      description:
+        "Workpool give critical tasks priority by organizing async operations into separate, customizable queues.",
+      href: "https://www.convex.dev/components/workpool",
+    },
+    {
+      title: "Sharded Counter",
+      description:
+        "High-throughput counter enables denormalized counts without write conflicts by spreading writes over multiple documents.",
+      href: "https://www.convex.dev/components/sharded-counter",
+    },
+    {
+      title: "Action Cache",
+      description:
+        "Cache frequently run actions. By leveraging the `force` parameter to keep the cache populated, you can ensure that the cache is always up to date and avoid data races.",
+      href: "https://www.convex.dev/components/action-cache",
+    },
+  ]}
+/>
+
+## Undefined validator \{#undefined-validator}
+
+This error occurs when a validator passed to a Convex function definition or
+schema is `undefined`. This most commonly happens due to circular imports (also
+known as import cycles) in TypeScript.
+
+### Example
+
+You have two files that import from each other:
+
+```ts title="convex/validators.ts"
+import { v } from "convex/values";
+import { someUtility } from "./functions";
+
+export const myValidator = v.object({
+  name: v.string(),
+});
+
+// Uses someUtility somewhere...
+```
+
+```ts title="convex/functions.ts"
+import { mutation } from "./_generated/server";
+// Both functions.ts and validators.ts import from each other.
+import { myValidator } from "./validators";
+
+export function someUtility() {
+  // ...
+}
+
+export const myMutation = mutation({
+  args: {
+    data: myValidator, // <-- May be undefined due to import cycle
+  },
+  handler: async (ctx, args) => {
+    // ...
+  },
+});
+```
+
+When `functions.ts` is loaded, it imports from `validators.ts`, which in turn
+tries to import from `functions.ts`. Since `functions.ts` hasn't finished the
+`import` statement yet, `myValidator` is still `undefined`, causing the
+`mutation` builder to throw an error.
+
+Note: the value may be defined at runtime if you try to log it. This is only a
+quirk of TypeScript’s import time behavior.
+
+### Cycles involving `schema.ts`
+
+A common way to accidentally introduce this kind of cycle is through your
+`schema.ts` file. Larger apps often define validators or whole tables in other
+files and import them into `schema.ts`.
+
+If these files import from `schema.ts` or depend on files that do, you have a
+cycle.
+
+```text
+schema.ts → validators.ts → someFile.ts → schema.ts
+```
+
+To break the cycle, define validators in "pure" files that have minimal
+dependencies, and import them into the places they are needed.
+
+### Investigate circular imports
+
+If you suspect a circular import but aren't sure where it is, tools like
+[madge](https://github.com/pahen/madge) can help you visualize your import graph
+and list cycles:
+
+```sh
+npx madge convex/ --extensions ts --exclude api.d.ts --circular
+```
+
+We exclude `api.d.ts` here because type-only imports are generally safe.

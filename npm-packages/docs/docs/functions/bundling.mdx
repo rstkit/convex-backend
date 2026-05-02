@@ -1,6 +1,7 @@
 ---
 title: "Bundling"
 sidebar_position: 90
+description: "How Convex bundles and optimizes your function code"
 ---
 
 Bundling is the process of gathering, optimizing and transpiling the JS/TS
@@ -24,7 +25,7 @@ Thanks to bundling you can write your code using both modern ECMAScript Modules
 
 <Details summary="ESM vs. CJS">
     ESM
-    - Is the standard for browser Javascript
+    - Is the standard for browser JavaScript
     - Uses static imports via the `import` and `export` **keywords** (not functions)
     at the global scope
     - Also supports dynamic imports via the asynchronous `import` function
@@ -63,7 +64,7 @@ You can follow these steps to debug bundle size:
     ```
   </Step>
   <Step title="Generate the bundle">
-   Note that this will not push code, and just generated a bundle for debugging purposes.
+   Note that this will not push code, just generate a bundle for debugging purposes.
 
     ```sh
     npx convex dev --once --debug-bundle-path /tmp/myBundle
@@ -148,8 +149,9 @@ in the same directory as your `package.json` if it does not exist already. Set
 the `node.externalPackages` field to `["*"]` to mark all dependencies used
 within your Node actions as external:
 
-```json
+```json title="convex.json"
 {
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
   "node": {
     "externalPackages": ["*"]
   }
@@ -158,8 +160,9 @@ within your Node actions as external:
 
 Alternatively, you can explicitly specify which packages to mark as external:
 
-```json
+```json title="convex.json"
 {
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
   "node": {
     "externalPackages": ["aws-sdk", "sharp"]
   }

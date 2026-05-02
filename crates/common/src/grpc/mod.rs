@@ -1,7 +1,6 @@
 use std::{
     self,
     convert::Infallible,
-    net::SocketAddr,
     sync::Arc,
 };
 
@@ -10,7 +9,6 @@ use futures::Future;
 use pb::error_metadata::ErrorMetadataStatusExt;
 use pb_extras::ReflectionService;
 use sentry::integrations::tower as sentry_tower;
-use tokio::net::TcpSocket;
 use tonic::{
     server::NamedService,
     service::Routes,
@@ -27,7 +25,10 @@ use tonic_health::{
 use tonic_middleware::MiddlewareLayer;
 use tower::ServiceBuilder;
 
-use crate::knobs::HTTP_SERVER_TCP_BACKLOG;
+use crate::{
+    http::MakeSocket,
+    knobs::HTTP_SERVER_TCP_BACKLOG,
+};
 
 mod middleware;
 
@@ -77,7 +78,7 @@ impl ConvexGrpcService {
         self
     }
 
-    pub async fn serve<F>(self, addr: SocketAddr, shutdown: F) -> anyhow::Result<()>
+    pub async fn serve<F>(self, addr: impl MakeSocket, shutdown: F) -> anyhow::Result<()>
     where
         F: Future<Output = ()>,
     {
@@ -89,10 +90,12 @@ impl ConvexGrpcService {
             .layer(crate::fastrace_helpers::layer::TraceparentReceivingLayer)
             .layer_fn(|s| middleware::TokioInstrumentationService::new(known_methods.clone(), s))
             .layer(sentry_tower::NewSentryLayer::new_from_top())
-            .layer(sentry_tower::SentryHttpLayer::with_transaction());
+            .layer(sentry_tower::SentryHttpLayer::new());
 
+        let socket = addr.make_socket()?;
+        let local_addr = socket.local_addr()?;
         tracing::info!(
-            "gRPC services {} listening on ipv4://{addr}",
+            "gRPC services {} listening on ipv4://{local_addr}",
             self.service_names.join(",")
         );
         for service_name in self.service_names {
@@ -100,16 +103,17 @@ impl ConvexGrpcService {
                 .set_service_status(service_name, ServingStatus::Serving)
                 .await;
         }
-        // Set SO_REUSEADDR and a bounded TCP accept backlog for our server's listening
-        // socket.
-        let socket = TcpSocket::new_v4()?;
-        socket.set_reuseaddr(true)?;
-        socket.set_nodelay(true)?;
-        socket.bind(addr)?;
-
         let listener = socket.listen(*HTTP_SERVER_TCP_BACKLOG)?;
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         tonic::transport::Server::builder()
+            // Internal Convex gRPC clients can validly cancel many streams on
+            // long-lived connections; don't let h2's external-peer abuse
+            // heuristic close those trusted connections.
+            // TODO: Apply the same policy to internal gRPC clients once tonic
+            // exposes h2's client-side max_local_error_reset_streams setting.
+            // The Sentry "too_many_internal_resets" issues are likely from
+            // client-side channels, so this server setting alone is incomplete.
+            .http2_max_local_error_reset_streams(None)
             .layer(convex_layers)
             .add_routes(self.routes)
             .serve_with_incoming_shutdown(incoming, shutdown)

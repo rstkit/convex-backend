@@ -8,6 +8,7 @@ use std::{
     slice,
 };
 
+use anyhow::Context as _;
 use axum::{
     debug_handler,
     http::HeaderMap,
@@ -17,9 +18,12 @@ use serde::Deserialize;
 use tikv_jemalloc_sys::malloc_stats_print;
 use tikv_jemallocator::Jemalloc;
 
-use crate::performance::{
-    JemallocStats,
-    JEMALLOC_STATS_REPORTER,
+use crate::{
+    metrics::log_process_level_stats,
+    performance::{
+        JemallocStats,
+        JEMALLOC_STATS_REPORTER,
+    },
 };
 
 // Configure jemalloc as Rust's global allocator. Based on:
@@ -29,7 +33,7 @@ use crate::performance::{
 static ALLOC: Jemalloc = Jemalloc;
 
 #[allow(non_upper_case_globals)]
-#[export_name = "malloc_conf"]
+#[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] =
     b"prof:true,prof_active:true,lg_prof_sample:19,background_thread:true\0";
 
@@ -46,16 +50,18 @@ struct JemallocReport {
 }
 
 unsafe extern "C" fn stats_write_cb(ctx: *mut c_void, buf: *const c_char) {
-    let slice = slice::from_raw_parts_mut(ctx as *mut u8, MAX_STATS_SIZE);
-    let message = CStr::from_ptr(buf);
+    unsafe {
+        let slice = slice::from_raw_parts_mut(ctx as *mut u8, MAX_STATS_SIZE);
+        let message = CStr::from_ptr(buf);
 
-    // Copy over the message buffer, ensuring there's a null terminator.
-    let message_len = message.to_bytes().len();
-    slice[..message_len].copy_from_slice(message.to_bytes());
-    slice[MAX_STATS_SIZE - 1] = 0;
+        // Copy over the message buffer, ensuring there's a null terminator.
+        let message_len = message.to_bytes().len();
+        slice[..message_len].copy_from_slice(message.to_bytes());
+        slice[MAX_STATS_SIZE - 1] = 0;
+    }
 }
 
-fn load_jemalloc_stats() -> anyhow::Result<JemallocStats> {
+pub fn load_jemalloc_stats() -> anyhow::Result<JemallocStats> {
     let mut buf = vec![0u8; MAX_STATS_SIZE];
     // Just get the bare minimum stats from jemalloc:
     // https://github.com/tikv/jemallocator/blob/main/jemalloc-sys/src/lib.rs#L526
@@ -107,4 +113,11 @@ pub async fn heap_profile(
         },
     }
     Ok(collect_profile().await?)
+}
+
+pub fn log_process_memory_stats() -> anyhow::Result<()> {
+    let jemalloc_stats = load_jemalloc_stats()?;
+    let process_stats = memory_stats::memory_stats().context("failed to get memory stats")?;
+    log_process_level_stats(process_stats.physical_mem, &jemalloc_stats);
+    Ok(())
 }

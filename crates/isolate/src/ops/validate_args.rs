@@ -1,5 +1,4 @@
-use anyhow::Context;
-use common::json::JsonSerializable as _;
+use common::json::JsonForm as _;
 use model::{
     modules::function_validators::ArgsValidator,
     virtual_system_mapping,
@@ -8,7 +7,10 @@ use serde_json::{
     json,
     Value as JsonValue,
 };
-use value::ConvexArray;
+use value::{
+    serialized_args_ext::SerializedArgsExt,
+    ConvexArray,
+};
 
 use super::OpProvider;
 use crate::helpers::UdfArgsJson;
@@ -16,14 +18,10 @@ use crate::helpers::UdfArgsJson;
 #[convex_macro::v8_op]
 pub fn op_validate_args<'b, P: OpProvider<'b>>(
     provider: &mut P,
-    validator: JsonValue,
-    args: UdfArgsJson,
+    validator: String,
+    args: String,
 ) -> anyhow::Result<JsonValue> {
-    let JsonValue::String(validator_string) = validator.clone() else {
-        return Err(anyhow::anyhow!("export_args result not a string"));
-    };
-
-    let args_validator = match ArgsValidator::json_deserialize(&validator_string) {
+    let args_validator = match ArgsValidator::json_deserialize(&validator) {
         Ok(v) => v,
         Err(json_error) => {
             let message = format!("Unable to parse JSON returned from `exportArgs`: {json_error}");
@@ -31,8 +29,10 @@ pub fn op_validate_args<'b, P: OpProvider<'b>>(
         },
     };
 
+    let args: UdfArgsJson = serde_json::from_str(&args)?;
     let args_array = args
-        .into_arg_vec()
+        .into_serialized_args()?
+        .into_args()?
         .into_iter()
         .map(|arg| arg.try_into())
         .collect::<anyhow::Result<Vec<_>>>()

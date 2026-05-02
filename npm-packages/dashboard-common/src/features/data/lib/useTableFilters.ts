@@ -72,14 +72,14 @@ const useInitializeFilters = (
     try {
       f = JSON.parse(decodedFilters);
       FilterExpressionSchema.parse(f);
-    } catch (e) {
+    } catch {
       // The filters decoded from b64, but failed to parse.
       deleteQueryFilters();
       return;
     }
 
     // No clauses in the filters, lets clear out the query param.
-    if (f.clauses.length === 0 && (!f.index || f.index.clauses.length === 0)) {
+    if (isFilterDiscardable(f)) {
       deleteQueryFilters();
       return;
     }
@@ -112,7 +112,7 @@ export const useTableFilters = (
   return {
     filters: filterMap[tableName],
     // Make sure a new object is created so the hook is re-rendered
-    changeFilters: async (newFilters?: FilterExpression) => {
+    applyFiltersWithHistory: async (newFilters?: FilterExpression) => {
       if (newFilters) {
         const newFilterMap = { ...filterMap, [tableName]: newFilters };
         if (
@@ -141,12 +141,29 @@ export const useTableFilters = (
 };
 
 function hasValidEnabledFilters(filters?: FilterExpression) {
-  return (
-    !!filters &&
-    (filters.clauses.filter(isValidFilter).filter((f) => f.enabled !== false)
-      .length > 0 ||
-      (filters.index?.clauses.filter((f) => f.enabled).length ?? 0) > 0)
-  );
+  if (!filters) return false;
+
+  // Arbitrary clause
+  if (
+    filters.clauses.filter(isValidFilter).filter((f) => f.enabled !== false)
+      .length > 0
+  )
+    return true;
+
+  if (!filters.index) return false;
+
+  // Index clauses
+  if ((filters.index.clauses.filter((f) => f.enabled).length ?? 0) > 0) {
+    return true;
+  }
+
+  // Search index filters: we always return true (even if the search is empty)
+  // to allow users to quickly remove the filter and see all documents
+  if ("search" in filters.index) {
+    return true;
+  }
+
+  return false;
 }
 
 export function areAllFiltersValid(filters?: FilterExpression) {
@@ -172,8 +189,10 @@ export function useFilterHistory(
     appendFilterHistory: (value) => {
       setFilterHistory((prev: FilterExpression[]) => {
         if (
+          // Don’t add a history entry if the new value is the same as the most recent one
           (prev.length > 0 && isEqual(prev[0], value)) ||
-          value.clauses.length === 0
+          // Don’t add filters with no clauses to the history
+          isFilterDiscardable(value)
         ) {
           return prev;
         }
@@ -185,4 +204,25 @@ export function useFilterHistory(
       });
     },
   };
+}
+
+/**
+ * Determines whether the filter expression is empty,
+ * hence it has no meaningful value to the user
+ * and can safely be discarded from the history.
+ */
+function isFilterDiscardable(f?: FilterExpression) {
+  if (f === undefined) return true;
+
+  if (f.clauses.length > 0) return false;
+
+  if (!f.index) {
+    return true;
+  }
+
+  if ("search" in f.index && f.index.search !== "") {
+    return false;
+  }
+
+  return f.index.clauses.length === 0;
 }

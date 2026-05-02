@@ -7,11 +7,16 @@ import {
   DeploymentSelectionOptions,
 } from "../api.js";
 import { z } from "zod";
+import {
+  DeploymentSelection,
+  getDeploymentSelection,
+} from "../deploymentSelection.js";
 
 export interface McpOptions extends DeploymentSelectionOptions {
   projectDir?: string;
   disableTools?: string;
-  disableProductionDeployments?: boolean;
+  dangerouslyEnableProductionDeployments?: boolean;
+  cautiouslyAllowProductionPii?: boolean;
 }
 
 export class RequestContext implements Context {
@@ -70,20 +75,50 @@ export class RequestContext implements Context {
     const { projectDir, deployment } = decodeDeploymentSelector(encoded);
     if (
       deployment.kind === "prod" &&
-      this.options.disableProductionDeployments
+      !this.options.dangerouslyEnableProductionDeployments
     ) {
       return await this.crash({
         exitCode: 1,
         errorType: "fatal",
         printedMessage:
-          "Production deployments are disabled due to the --disable-production-deployments flag.",
+          "This tool cannot be used with production deployments. Use a read-only tool like `insights` instead, or enable production access with --dangerously-enable-production-deployments.",
+      });
+    }
+    return { projectDir, deployment };
+  }
+
+  /** Decode a deployment selector without checking the production guard. Use for read-only tools that don't expose PII (e.g. insights). */
+  decodeDeploymentSelectorUnchecked(encoded: string) {
+    return decodeDeploymentSelector(encoded);
+  }
+
+  /** Decode a deployment selector for read-only tools that may expose PII (e.g. data, logs, queries). Requires --cautiously-allow-production-pii. */
+  async decodeDeploymentSelectorReadOnly(encoded: string) {
+    const { projectDir, deployment } = decodeDeploymentSelector(encoded);
+    if (
+      deployment.kind === "prod" &&
+      !this.options.dangerouslyEnableProductionDeployments &&
+      !this.options.cautiouslyAllowProductionPii
+    ) {
+      return await this.crash({
+        exitCode: 1,
+        errorType: "fatal",
+        printedMessage:
+          "This read-only tool may expose PII from production. Enable with --cautiously-allow-production-pii, or use --dangerously-enable-production-deployments for full access.",
       });
     }
     return { projectDir, deployment };
   }
 
   get productionDeploymentsDisabled() {
-    return !!this.options.disableProductionDeployments;
+    return !this.options.dangerouslyEnableProductionDeployments;
+  }
+
+  get productionPiiAllowed() {
+    return (
+      this.options.dangerouslyEnableProductionDeployments ||
+      this.options.cautiouslyAllowProductionPii
+    );
   }
 }
 
@@ -95,6 +130,10 @@ export class RequestCrash {
     printedMessage: string | null,
   ) {
     this.printedMessage = printedMessage ?? "Unknown error";
+  }
+
+  toString(): string {
+    return this.printedMessage;
   }
 }
 
@@ -121,4 +160,24 @@ const payloadSchema = z.object({
 function decodeDeploymentSelector(encoded: string) {
   const [_, serializedPayload] = encoded.split(":");
   return payloadSchema.parse(JSON.parse(atob(serializedPayload)));
+}
+
+/**
+ * Get the deployment selection for MCP tools. The agent can pass different
+ * values of `selectionWithinProject` into a tool, so we overwrite the
+ * `selectionWithinProject` of the `DeploymentSelection` if it exists.
+ */
+export async function getMcpDeploymentSelection(
+  ctx: RequestContext,
+  decodedDeploymentSelector: DeploymentSelectionWithinProject,
+): Promise<DeploymentSelection> {
+  const initialSelection = await getDeploymentSelection(ctx, ctx.options);
+  const hasSelectionWithinProject =
+    initialSelection.kind !== "existingDeployment";
+  return {
+    ...initialSelection,
+    ...(hasSelectionWithinProject && {
+      selectionWithinProject: decodedDeploymentSelector,
+    }),
+  };
 }

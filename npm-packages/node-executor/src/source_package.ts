@@ -6,10 +6,10 @@ import path from "node:path";
 import AdmZip from "adm-zip";
 import concat from "concat-stream";
 
-import fetch from "node-fetch";
 import { createHash } from "node:crypto";
 import { logDebug, logDurationMs } from "./log";
 import { performance } from "node:perf_hooks";
+import { fileURLToPath } from "node:url";
 
 export type SourcePackage = {
   // Deprecated fields
@@ -35,18 +35,17 @@ type MetadataJson = {
   externalDepsStorageKey?: string;
 };
 
-async function download(
-  uri: string,
-): Promise<fs.ReadStream | NodeJS.ReadableStream> {
+async function download(uri: string): Promise<stream.Readable> {
   const url = new URL(uri);
   if (url.protocol === "file:") {
-    return fs.createReadStream(url.pathname);
+    return fs.createReadStream(fileURLToPath(uri));
   } else {
     const response = await fetch(uri);
     if (!response.ok) {
       throw new Error(`Failed to fetch ${uri}: ${response.statusText}`);
     }
-    return response.body;
+    // incompatible ReadableStream definitions
+    return stream.Readable.fromWeb(response.body! as any);
   }
 }
 
@@ -216,7 +215,7 @@ async function createFreshDir(dir: string) {
 }
 
 async function streamToBuffer(
-  readableStream: fs.ReadStream | NodeJS.ReadableStream,
+  readableStream: stream.Readable,
 ): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     // Use concat-stream to collect the stream data into a single buffer
@@ -231,7 +230,7 @@ async function streamToBuffer(
 
 async function processPackageStream(
   sha256Digest: string,
-  packageStream: fs.ReadStream | NodeJS.ReadableStream,
+  packageStream: stream.Readable,
 ): Promise<Buffer> {
   // Create hashing stream
   const hash = createHash("sha256");
@@ -281,7 +280,7 @@ async function unzipFile(
 async function processExternalPackageStream(
   dir: string,
   externalPackage: Package,
-  externalStream: fs.ReadStream | NodeJS.ReadableStream,
+  externalStream: stream.Readable,
 ): Promise<void> {
   const entryValidator = (entry: AdmZip.IZipEntry) => {
     if (!entry.entryName.startsWith("node_modules/")) {
@@ -303,6 +302,10 @@ async function processExternalPackageStream(
 
 type LocalSourcePackage = {
   dir: string;
+  /**
+   * The modules included in the package and that could contain Convex functions.
+   * This doesn’t include bundler chunks (files in /_deps/).
+   */
   modules: Set<CanonicalizedModulePath>;
   dynamicallyDownloaded: boolean;
 };
@@ -315,7 +318,7 @@ type ExternalDepsPackage = {
 async function processSourcePackageStream(
   dir: string,
   sourcePackage: Package,
-  sourceStream: fs.ReadStream | NodeJS.ReadableStream,
+  sourceStream: stream.Readable,
 ): Promise<LocalSourcePackage> {
   const startUnzip = performance.now();
   const zipBuffer = await processPackageStream(
@@ -328,7 +331,16 @@ async function processSourcePackageStream(
   const startWrites = performance.now();
   const entries = await unzipFile(zipBuffer, dir, null);
   const actualModulePaths = entries
-    .filter((entry) => entry !== "metadata.json")
+    .filter(
+      (entry) =>
+        entry !== "metadata.json" &&
+        // Some ZIP implementations store entries for directories themselves
+        // (https://unix.stackexchange.com/a/743512/485280)
+        // The Rust implementation we use in production doesn’t do it, but some
+        // implementations (including the `archiver` npm package used in
+        // node-executor integration tests) do so, so we are filtering them out.
+        !entry.endsWith("/"),
+    )
     .map((entry) => entry.substring("modules/".length));
   await fs.promises.chmod(`${dir}/metadata.json`, "444");
   const metadataJson = parseMetadataFile(
@@ -430,7 +442,10 @@ function modulesFromMetadataJson(
 ): Set<CanonicalizedModulePath> {
   const modules: Set<string> = new Set();
   for (const path of metadataJson.modulePaths) {
-    if (path.endsWith(".js")) {
+    if (path.startsWith("_deps/")) {
+      // Ignore bundler chunks since they don’t contain Convex function definitions.
+      continue;
+    } else if (path.endsWith(".js")) {
       // Only load node files.
       const environment = metadataJson.moduleEnvironments.get(path);
       if (!environment) {

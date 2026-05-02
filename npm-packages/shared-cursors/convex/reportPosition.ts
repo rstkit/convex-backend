@@ -1,18 +1,19 @@
 import { Id } from "./_generated/dataModel";
 import { mutation } from "./_generated/server";
+import { v } from "convex/values";
 
-export const reportContentiously = mutation(
-  async (
-    { db },
-    {
-      x,
-      y,
-      ts,
-      session,
-    }: { x: number; y: number; ts: number; session: string },
-  ): Promise<Id> => {
+export const reportContentiously = mutation({
+  args: {
+    x: v.number(),
+    y: v.number(),
+    ts: v.number(),
+    session: v.string(),
+    id: v.optional(v.any()),
+  },
+  handler: async ({ db }, { x, y, ts, session }): Promise<Id<"positions">> => {
     let pos = await db
       .query("positions")
+      // eslint-disable-next-line @convex-dev/no-filter-in-query -- intentionally writing a query that causes contention
       .filter((q) => q.eq(q.field("session"), session))
       .first();
     if (pos === null) {
@@ -23,25 +24,20 @@ export const reportContentiously = mutation(
       return pos._id;
     }
   },
-);
+});
 
-export const report = mutation(
-  async (
+export const report = mutation({
+  args: {
+    x: v.number(),
+    y: v.number(),
+    ts: v.number(),
+    session: v.string(),
+    id: v.union(v.id("positions"), v.null()),
+  },
+  handler: async (
     { db },
-    {
-      x,
-      y,
-      ts,
-      session,
-      id,
-    }: {
-      x: number;
-      y: number;
-      ts: number;
-      session: string;
-      id: Id | null;
-    },
-  ): Promise<Id> => {
+    { x, y, ts, session, id },
+  ): Promise<Id<"positions">> => {
     let pos = null;
     if (id !== null) {
       pos = await db.get(id);
@@ -54,4 +50,4 @@ export const report = mutation(
       return pos._id;
     }
   },
-);
+});

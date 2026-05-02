@@ -1,22 +1,24 @@
-import { Meta, StoryObj } from "@storybook/react";
+import { fn } from "storybook/test";
+import { Meta, StoryObj } from "@storybook/nextjs";
 import { Sheet } from "@ui/Sheet";
 import { SpendingLimitsSection } from "./SubscriptionOverview";
 
-const meta: Meta<typeof SpendingLimitsSection> = {
+const meta = {
   component: SpendingLimitsSection,
   args: {
     hasAdminPermissions: true,
-    onSubmit: async () => {},
+    onSubmit: fn(),
   },
   render: (args) => (
     <Sheet>
       <SpendingLimitsSection {...args} />
     </Sheet>
   ),
-};
+  parameters: { a11y: { test: "todo" } },
+} satisfies Meta<typeof SpendingLimitsSection>;
 
 export default meta;
-type Story = StoryObj<typeof SpendingLimitsSection>;
+type Story = StoryObj<typeof meta>;
 
 export const NoSpendingLimits: Story = {
   args: {

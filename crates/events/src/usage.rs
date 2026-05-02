@@ -5,7 +5,6 @@ use serde::{
 };
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum UdfType {
     Action,
     Query,
@@ -13,7 +12,6 @@ pub enum UdfType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct FunctionCallUsageFields {
     /// The ExecutionId of a particular UDF
     pub id: String,
@@ -36,6 +34,10 @@ pub struct FunctionCallUsageFields {
     /// The duration in milliseconds of the UDF, or 0 if we don't track
     /// execution time for this tag type.
     pub duration_millis: u64,
+    /// The duration in milliseconds of user execution time in the isolate.
+    /// Excludes syscalls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_execution_millis: Option<u64>,
     /// Whether this was run in V8 or Node, or "unknown".
     pub environment: String,
     /// True if we think it's a call we should track in usage. Right now
@@ -61,7 +63,6 @@ pub struct FunctionCallUsageFields {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct InsightReadLimitCall {
     pub table_name: String,
     pub bytes_read: u64,
@@ -71,7 +72,6 @@ pub struct InsightReadLimitCall {
 // TODO(CX-5845): Use proper serializable types for constants rather than
 // Strings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum UsageEvent {
     FunctionCall {
         #[serde(flatten)]
@@ -121,8 +121,24 @@ pub enum UsageEvent {
         udf_id: String,
         table_name: String,
         ingress: u64,
+        // Includes ingress for tables that have virtual tables
+        ingress_v2: u64,
         egress: u64,
         egress_rows: u64,
+        // Includes egress for tables that have virtual tables
+        egress_v2: u64,
+        #[serde(default)]
+        virtual_table_ingress: u64,
+        #[serde(default)]
+        virtual_table_egress: u64,
+    },
+    NetworkBandwidth {
+        id: String,
+        request_id: String,
+        component_path: Option<String>,
+        udf_id: String,
+        url: String,
+        egress: u64,
     },
     InsightReadLimit {
         id: String,
@@ -139,6 +155,33 @@ pub enum UsageEvent {
         table_name: String,
         ingress: u64,
         egress: u64,
+        ingress_v2: u64,
+    },
+    TextWrites {
+        id: String,
+        component_path: Option<String>,
+        udf_id: String,
+        table_name: String,
+        size: u64,
+    },
+    TextQuery {
+        id: String,
+        component_path: Option<String>,
+        udf_id: String,
+        table_name: String,
+        index_name: String,
+        num_searches: u64,
+        bytes_searched: u64,
+    },
+    VectorQuery {
+        id: String,
+        component_path: Option<String>,
+        udf_id: String,
+        table_name: String,
+        index_name: String,
+        num_searches: u64,
+        bytes_searched: u64,
+        dimensions: u64,
     },
 
     // Current* events record the current storage state as of a time, they're not incremental
@@ -147,9 +190,14 @@ pub enum UsageEvent {
     CurrentVectorStorage {
         tables: Vec<TableVectorStorage>,
     },
+    CurrentTextStorage {
+        tables: Vec<TableTextStorage>,
+    },
     CurrentDatabaseStorage {
-        tables: Vec<TableDatabaseStorage>,
+        #[serde(rename = "tables")]
+        user_tables: Vec<TableDatabaseStorage>,
         system_tables: Vec<TableDatabaseStorage>,
+        virtual_tables: Vec<TableDatabaseStorage>,
     },
     CurrentFileStorage {
         // TODO(Rebecca): tag and total_size can be cleaned up after we start using the other
@@ -167,7 +215,6 @@ pub enum UsageEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct TableDocumentCount {
     pub component_path: Option<String>,
     pub table_name: String,
@@ -175,17 +222,23 @@ pub struct TableDocumentCount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct TableDatabaseStorage {
     pub component_path: Option<String>,
     pub table_name: String,
     pub total_document_size: u64,
     pub total_index_size: u64,
+    pub total_system_index_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct TableVectorStorage {
+    pub component_path: Option<String>,
+    pub table_name: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableTextStorage {
     pub component_path: Option<String>,
     pub table_name: String,
     pub size: u64,
@@ -210,132 +263,5 @@ impl UsageEventLogger for NoOpUsageEventLogger {
 
     async fn shutdown(&self) -> anyhow::Result<()> {
         Ok(())
-    }
-}
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn test_function_call_serialization() {
-        let event = UsageEvent::FunctionCall {
-            fields: FunctionCallUsageFields {
-                id: "123".to_string(),
-                request_id: "request_id".to_string(),
-                status: "success".to_string(),
-                component_path: Some("component/path".to_string()),
-                udf_id: "udf_id".to_string(),
-                udf_id_type: "http".to_string(),
-                tag: "tag".to_string(),
-                memory_megabytes: 100,
-                duration_millis: 200,
-                environment: "Node".to_string(),
-                is_tracked: true,
-                response_sha256: Some("sha256".to_string()),
-                is_occ: false,
-                occ_table_name: None,
-                occ_document_id: None,
-                occ_write_source: None,
-                occ_retry_count: None,
-            },
-        };
-
-        let output = serde_json::to_string(&event).unwrap();
-        let expected_output = json!({"FunctionCall": {
-            "id": "123",
-            "request_id": "request_id",
-            "status": "success",
-            "component_path": "component/path",
-            "udf_id": "udf_id",
-            "udf_id_type": "http",
-            "tag": "tag",
-            "memory_megabytes": 100,
-            "duration_millis": 200,
-            "environment": "Node",
-            "is_tracked": true,
-            "response_sha256": "sha256",
-            "is_occ": false,
-            "occ_table_name": null,
-            "occ_document_id": null,
-            "occ_write_source": null,
-            "occ_retry_count": null,
-        }})
-        .to_string();
-
-        assert_eq!(output, expected_output);
-    }
-
-    #[test]
-    fn test_function_call_serialization_with_occ() {
-        let event = UsageEvent::FunctionCall {
-            fields: FunctionCallUsageFields {
-                id: "123".to_string(),
-                request_id: "request_id".to_string(),
-                status: "success".to_string(),
-                component_path: Some("component/path".to_string()),
-                udf_id: "udf_id".to_string(),
-                udf_id_type: "http".to_string(),
-                tag: "tag".to_string(),
-                memory_megabytes: 100,
-                duration_millis: 200,
-                environment: "Node".to_string(),
-                is_tracked: true,
-                response_sha256: Some("sha256".to_string()),
-                is_occ: true,
-                occ_table_name: Some("table_name".to_string()),
-                occ_document_id: Some("document_id".to_string()),
-                occ_write_source: None,
-                occ_retry_count: Some(1),
-            },
-        };
-
-        let output = serde_json::to_string(&event).unwrap();
-        let expected_output = json!({"FunctionCall": {
-            "id": "123",
-            "request_id": "request_id",
-            "status": "success",
-            "component_path": "component/path",
-            "udf_id": "udf_id",
-            "udf_id_type": "http",
-            "tag": "tag",
-            "memory_megabytes": 100,
-            "duration_millis": 200,
-            "environment": "Node",
-            "is_tracked": true,
-            "response_sha256": "sha256",
-            "is_occ": true,
-            "occ_table_name": "table_name",
-            "occ_document_id": "document_id",
-            "occ_write_source": null,
-            "occ_retry_count": 1,
-        }})
-        .to_string();
-
-        assert_eq!(output, expected_output);
-    }
-
-    #[test]
-    fn test_function_storage_calls_serialization() {
-        let event = UsageEvent::FunctionStorageCalls {
-            id: "456".to_string(),
-            component_path: Some("component/path".to_string()),
-            udf_id: "udf_id".to_string(),
-            call: "call".to_string(),
-            count: 10,
-        };
-
-        let output = serde_json::to_string(&event).unwrap();
-        let expected_output = json!({"FunctionStorageCalls": {
-            "id": "456",
-            "component_path": "component/path",
-            "udf_id": "udf_id",
-            "call": "call",
-            "count": 10,
-        }})
-        .to_string();
-
-        assert_eq!(output, expected_output);
     }
 }

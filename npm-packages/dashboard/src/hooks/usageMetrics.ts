@@ -1,33 +1,67 @@
 import { captureMessage } from "@sentry/nextjs";
-import { DatabricksQueryId, DateRange, useUsageQuery } from "api/usage";
+import { useBBQuery } from "api/api";
+import {
+  DatabricksQueryId,
+  DateRange,
+  USAGE_REFRESH_INTERVAL_MS,
+  useUsageQuery,
+} from "api/usage";
 
 const DATABRICKS_QUERY_IDS: {
-  teamActionCompute: DatabricksQueryId;
-  teamDatabaseBandwidth: DatabricksQueryId;
-  teamDocumentCount: DatabricksQueryId;
-  teamDatabaseStorage: DatabricksQueryId;
-  teamFileBandwidth: DatabricksQueryId;
-  teamFileStorage: DatabricksQueryId;
   teamFunctionBreakdown: DatabricksQueryId;
-  teamFunctionCalls: DatabricksQueryId;
-  teamStorageCalls: DatabricksQueryId;
-  teamSummary: DatabricksQueryId;
-  teamVectorBandwidth: DatabricksQueryId;
-  teamVectorStorage: DatabricksQueryId;
+  teamSummaryByRegion: DatabricksQueryId;
+  teamDeploymentCountByType: DatabricksQueryId;
 } = {
-  teamActionCompute: "544ac7ed-a3bc-43b6-9ee1-a8ef6ae283a9",
-  teamDatabaseBandwidth: "20db8d1c-d08c-41da-93c6-5cecb6b97118",
-  teamDocumentCount: "da7e013a-3042-48a4-ad85-cc3f035a035e",
-  teamDatabaseStorage: "051e19e8-d9bf-4a80-81d1-f10c92b94ee6",
-  teamFileBandwidth: "c9d757fb-7372-4d6a-9a8a-66ee7436ed47",
-  teamFileStorage: "d0b4f882-48f5-4ad7-99e7-0b18f16355eb",
   teamFunctionBreakdown: "8e6592dd-12a0-4ddf-bc79-7498e07352d4",
-  teamFunctionCalls: "46aa42bb-1f90-4fb5-8466-10bc52fcb43f",
-  teamStorageCalls: "fe187e75-8670-4c16-a5c4-2cf7b0c5406f",
-  teamSummary: "15fbb132-6641-4f17-9156-b05e9ee966d9",
-  teamVectorBandwidth: "e24b4660-5dc4-4e41-a895-a91a66dede80",
-  teamVectorStorage: "6cf7ee95-c39e-419e-ac3e-cb0acfcc2a0b",
+  teamSummaryByRegion: "36fc7cf3-a675-49f2-b1ce-23be09a712a2",
+  teamDeploymentCountByType: "34801c2e-06a8-4cc5-8ecc-dd412b908763",
 };
+
+const DATABRICKS_BY_PROJECT_QUERY_IDS: {
+  teamActionComputeByProject: DatabricksQueryId;
+  teamDatabaseBandwidthByProject: DatabricksQueryId;
+  teamDocumentCountByProject: DatabricksQueryId;
+  teamDatabaseStorageByProject: DatabricksQueryId;
+  teamFileBandwidthByProject: DatabricksQueryId;
+  teamFileStorageByProject: DatabricksQueryId;
+  teamFunctionCallsByProject: DatabricksQueryId;
+  teamStorageCallsByProject: DatabricksQueryId;
+  teamVectorBandwidthByProject: DatabricksQueryId;
+  teamVectorStorageByProject: DatabricksQueryId;
+  teamDeploymentCountByProject: DatabricksQueryId;
+} = {
+  teamActionComputeByProject: "56e7167c-ae79-417a-8876-100a6e5db902",
+  teamDatabaseBandwidthByProject: "27330248-82cd-42dd-bc23-a7edc667e1ba",
+  teamDocumentCountByProject: "2a5120a1-b334-4d99-b378-1028487c2202",
+  teamDatabaseStorageByProject: "25ee9158-a11c-45f9-8fd7-c9262c81e99f",
+  teamFileBandwidthByProject: "bc8ac376-b0fd-4745-a1b3-ed7bf73f7825",
+  teamFileStorageByProject: "e4cb8bdc-f54e-497d-947e-b373d51fe86a",
+  teamFunctionCallsByProject: "2cc73be2-3eb0-4069-ad44-749c619b0aa4",
+  teamStorageCallsByProject: "11d0124f-32c9-446f-b65c-cde3971d2017",
+  teamVectorBandwidthByProject: "256e0060-8d24-4d30-968c-d6f531168328",
+  teamVectorStorageByProject: "6f3c9a52-f3c2-46c2-89b2-6cb95fc7cdf5",
+  teamDeploymentCountByProject: "0b6c9ab3-c17c-4ad5-bfca-8f0300e494f6",
+};
+
+const DATABRICKS_BY_TABLE_QUERY_IDS: {
+  teamDatabaseStorageByTable: DatabricksQueryId;
+  teamDocumentCountByTable: DatabricksQueryId;
+} = {
+  teamDatabaseStorageByTable: "9cb8c431-6fa7-40cc-8f00-8aad358b4043",
+  teamDocumentCountByTable: "1e265821-c0b9-4c66-9a1f-a5eef70e4d6f",
+};
+
+export function useTokenUsage(teamSlug: string, period: DateRange | null) {
+  return useBBQuery({
+    path: "/teams/{team_slug}/usage/get_token_info",
+    pathParams: { team_slug: teamSlug },
+    queryParams: period ? { from: period.from, to: period.to } : undefined,
+    swrOptions: {
+      keepPreviousData: false,
+      refreshInterval: USAGE_REFRESH_INTERVAL_MS,
+    },
+  });
+}
 
 export function useUsageTeamSummary(
   teamId: number,
@@ -35,50 +69,61 @@ export function useUsageTeamSummary(
   projectId: number | null,
   componentPrefix: string | null,
 ) {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamSummary,
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_QUERY_IDS.teamSummaryByRegion,
     teamId,
     projectId,
     period,
     componentPrefix,
   });
 
+  if (error) {
+    return { data: undefined, error };
+  }
+
   if (!data) {
-    return undefined;
+    return { data: undefined, error: undefined };
   }
 
   // Report to sentry if this query returns the incorrect number of rows
-  if (data.length !== 1) {
+  if (data.length < 1) {
     captureMessage(
       `Unexpected number of rows in usage summary query: ${data.length}`,
+      "error",
     );
   }
 
-  return data?.map(
-    ([
-      _teamId,
-      databaseStorage,
-      databaseBandwidth,
-      functionCalls,
-      actionCompute,
-      fileStorage,
-      fileBandwidth,
-      vectorStorage,
-      vectorBandwidth,
-    ]) => ({
-      databaseStorage: Number(databaseStorage),
-      databaseBandwidth: Number(databaseBandwidth),
-      fileStorage: Number(fileStorage),
-      fileBandwidth: Number(fileBandwidth),
-      functionCalls: Number(functionCalls),
-      actionCompute: Number(actionCompute) / 60 / 60, // Converts from GB-S to GB-H
-      vectorStorage: Number(vectorStorage),
-      vectorBandwidth: Number(vectorBandwidth),
-    }),
-  )[0];
+  return {
+    data: data?.map(
+      ([
+        _teamId,
+        region,
+        databaseStorage,
+        databaseBandwidth,
+        functionCalls,
+        actionCompute,
+        fileStorage,
+        fileBandwidth,
+        vectorStorage,
+        vectorBandwidth,
+      ]) => ({
+        region,
+        databaseStorage: Number(databaseStorage),
+        databaseBandwidth: Number(databaseBandwidth),
+        fileStorage: Number(fileStorage),
+        fileBandwidth: Number(fileBandwidth),
+        functionCalls: Number(functionCalls),
+        actionCompute: Number(actionCompute) / 60 / 60, // Converts from GB-S to GB-H
+        vectorStorage: Number(vectorStorage),
+        vectorBandwidth: Number(vectorBandwidth),
+      }),
+    ),
+    error: undefined,
+  };
 }
 
 export type UsageSummary = {
+  region: string;
   databaseStorage: number;
   databaseBandwidth: number;
   fileStorage: number;
@@ -93,142 +138,6 @@ export type DailyMetric = {
   ds: string;
   value: number;
 };
-
-export function useUsageTeamDocumentsPerDay(
-  teamId: number,
-  projectId: number | null,
-  period: DateRange | null,
-  componentPrefix: string | null,
-): DailyMetric[] | undefined {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamDocumentCount,
-    teamId,
-    projectId,
-    period,
-    componentPrefix,
-  });
-
-  return data?.map(([_teamId, ds, count]) => ({
-    ds,
-    value: Number(count),
-  }));
-}
-
-export function useUsageTeamDatabaseBandwidthPerDay(
-  teamId: number,
-  projectId: number | null,
-  period: DateRange | null,
-  componentPrefix: string | null,
-) {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamDatabaseBandwidth,
-    teamId,
-    projectId,
-    period,
-    componentPrefix,
-  });
-  return data?.map(([_teamId, ds, ingressSize, egressSize]) => ({
-    ds,
-    metrics: [
-      { tag: "ingress", value: Number(ingressSize) },
-      {
-        tag: "egress",
-        value: Number(egressSize),
-      },
-    ],
-  }));
-}
-
-export function useUsageTeamVectorStoragePerDay(
-  teamId: number,
-  projectId: number | null,
-  period: DateRange | null,
-  componentPrefix: string | null,
-): DailyMetric[] | undefined {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamVectorStorage,
-    teamId,
-    projectId,
-    period,
-    componentPrefix,
-  });
-  return data?.map(([_teamId, ds, vectorStorage]) => ({
-    ds,
-    value: Number(vectorStorage),
-  }));
-}
-
-export function useUsageTeamVectorBandwidthPerDay(
-  teamId: number,
-  projectId: number | null,
-  period: DateRange | null,
-  componentPrefix: string | null,
-) {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamVectorBandwidth,
-    teamId,
-    projectId,
-    period,
-    componentPrefix,
-  });
-  return data?.map(([_teamId, ds, ingressSize, egressSize]) => ({
-    ds,
-    metrics: [
-      { tag: "ingress", value: Number(ingressSize) },
-      {
-        tag: "egress",
-        value: Number(egressSize),
-      },
-    ],
-  }));
-}
-
-export function useUsageTeamDatabaseStoragePerDay(
-  teamId: number,
-  projectId: number | null,
-  period: DateRange | null,
-  componentPrefix: string | null,
-): DailyPerTagMetrics[] | undefined {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamDatabaseStorage,
-    teamId,
-    projectId,
-    period,
-    componentPrefix,
-  });
-  return data?.map(([_teamId, ds, documentStorage, indexStorage]) => ({
-    ds,
-    metrics: [
-      { tag: "document", value: Number(documentStorage) },
-      {
-        tag: "index",
-        value: Number(indexStorage),
-      },
-    ],
-  }));
-}
-
-export function useUsageTeamActionComputeDaily(
-  teamId: number,
-  projectId: number | null,
-  period: DateRange | null,
-  componentPrefix: string | null,
-): DailyMetric[] | undefined {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamActionCompute,
-    teamId,
-    projectId,
-    period,
-    componentPrefix,
-  });
-  return data?.map(([_teamId, ds, valueGbS]) => {
-    const valueGbHour = Number(valueGbS) / 60 / 60;
-    return {
-      ds,
-      value: valueGbHour,
-    };
-  });
-}
 
 export interface AggregatedFunctionMetrics {
   function: string;
@@ -249,8 +158,8 @@ export function useUsageTeamMetricsByFunction(
   period: DateRange | null,
   projectId: number | null,
   componentPrefix: string | null,
-): AggregatedFunctionMetrics[] | undefined {
-  const { data } = useUsageQuery({
+): { data: AggregatedFunctionMetrics[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
     queryId: DATABRICKS_QUERY_IDS.teamFunctionBreakdown,
     teamId,
     projectId,
@@ -258,64 +167,284 @@ export function useUsageTeamMetricsByFunction(
     componentPrefix,
   });
 
-  return data?.map(
-    ([
-      _teamId,
-      functionName,
-      projectIdField,
-      callCount,
-      databaseIngressSize,
-      databaseEgressSize,
-      vectorIngressSize,
-      vectorEgressSize,
-      actionComputeTime,
-      deploymentName,
-      componentPath,
-    ]) => ({
-      function: functionName,
-      projectId: Number(projectIdField),
-      callCount: Number(callCount),
-      databaseIngressSize: Number(databaseIngressSize),
-      databaseEgressSize: Number(databaseEgressSize),
-      vectorIngressSize: Number(vectorIngressSize),
-      vectorEgressSize: Number(vectorEgressSize),
-      actionComputeTime: Number(actionComputeTime) / 60 / 60, // Converts from GB-S to GB-H
-      deploymentName,
-      componentPath,
-    }),
-  );
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(
+      ([
+        _teamId,
+        functionName,
+        projectIdField,
+        callCount,
+        databaseIngressSize,
+        databaseEgressSize,
+        vectorIngressSize,
+        vectorEgressSize,
+        actionComputeTime,
+        deploymentName,
+        componentPath,
+      ]) => ({
+        function: functionName,
+        projectId: Number(projectIdField),
+        callCount: Number(callCount),
+        databaseIngressSize: Number(databaseIngressSize),
+        databaseEgressSize: Number(databaseEgressSize),
+        vectorIngressSize: Number(vectorIngressSize),
+        vectorEgressSize: Number(vectorEgressSize),
+        actionComputeTime: Number(actionComputeTime) / 60 / 60, // Converts from GB-S to GB-H
+        deploymentName,
+        componentPath,
+      }),
+    ),
+    error: undefined,
+  };
 }
 
 export interface DailyPerTagMetrics {
   ds: string;
   metrics: { tag: string; value: number }[];
 }
-export function useUsageTeamDailyCallsByTag(
+
+// By-project query hooks
+export interface DailyMetricByProject extends DailyMetric {
+  projectId: number | "_rest";
+}
+
+export interface DailyPerTagMetricsByProject extends DailyPerTagMetrics {
+  projectId: number | "_rest";
+}
+
+export type DailyMetricByTable = {
+  ds: string;
+  projectId: number | "_rest";
+  tableName: string;
+  value: number;
+};
+
+function parseProjectId(projectId: string | number): number | "_rest" {
+  if (projectId === "_rest") {
+    return "_rest";
+  }
+  return Number(projectId);
+}
+
+export function useUsageTeamDocumentsPerDayByProject(
   teamId: number,
-  projectId: number | null,
   period: DateRange | null,
   componentPrefix: string | null,
-) {
-  const { data: functionData } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamFunctionCalls,
+): { data: DailyMetricByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamDocumentCountByProject,
     teamId,
-    projectId,
+    projectId: null,
     period,
     componentPrefix,
   });
 
-  const { data: storageData } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamStorageCalls,
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(([_teamId, projectId, ds, count]) => ({
+      ds,
+      projectId: parseProjectId(projectId),
+      value: Number(count),
+    })),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamDatabaseBandwidthPerDayByProject(
+  teamId: number,
+  period: DateRange | null,
+  componentPrefix: string | null,
+): { data: DailyPerTagMetricsByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamDatabaseBandwidthByProject,
     teamId,
-    projectId,
+    projectId: null,
     period,
     componentPrefix,
   });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(([_teamId, projectId, ds, ingressSize, egressSize]) => ({
+      ds,
+      projectId: parseProjectId(projectId),
+      metrics: [
+        { tag: "egress", value: Number(egressSize) },
+        {
+          tag: "ingress",
+          value: Number(ingressSize),
+        },
+      ],
+    })),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamVectorStoragePerDayByProject(
+  teamId: number,
+  period: DateRange | null,
+  componentPrefix: string | null,
+): { data: DailyMetricByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamVectorStorageByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(([_teamId, projectId, ds, vectorStorage]) => ({
+      ds,
+      projectId: parseProjectId(projectId),
+      value: Number(vectorStorage),
+    })),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamVectorBandwidthPerDayByProject(
+  teamId: number,
+  period: DateRange | null,
+  componentPrefix: string | null,
+): { data: DailyPerTagMetricsByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamVectorBandwidthByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(([_teamId, projectId, ds, ingressSize, egressSize]) => ({
+      ds,
+      projectId: parseProjectId(projectId),
+      metrics: [
+        { tag: "egress", value: Number(egressSize) },
+        {
+          tag: "ingress",
+          value: Number(ingressSize),
+        },
+      ],
+    })),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamDatabaseStoragePerDayByProject(
+  teamId: number,
+  period: DateRange | null,
+  componentPrefix: string | null,
+): { data: DailyPerTagMetricsByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamDatabaseStorageByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(
+      ([_teamId, projectId, ds, documentStorage, indexStorage]) => ({
+        ds,
+        projectId: parseProjectId(projectId),
+        metrics: [
+          { tag: "document", value: Number(documentStorage) },
+          {
+            tag: "index",
+            value: Number(indexStorage),
+          },
+        ],
+      }),
+    ),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamActionComputeDailyByProject(
+  teamId: number,
+  period: DateRange | null,
+  componentPrefix: string | null,
+): { data: DailyMetricByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamActionComputeByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(([_teamId, projectId, ds, valueGbS]) => {
+      const valueGbHour = Number(valueGbS) / 60 / 60;
+      return {
+        ds,
+        projectId: parseProjectId(projectId),
+        value: valueGbHour,
+      };
+    }),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamDailyCallsByTagByProject(
+  teamId: number,
+  period: DateRange | null,
+  componentPrefix: string | null,
+): { data: DailyPerTagMetricsByProject[] | undefined; error: any } {
+  const { data: functionData, error: functionError } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamFunctionCallsByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  const { data: storageData, error: storageError } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamStorageCallsByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  if (functionError || storageError) {
+    return { data: undefined, error: functionError || storageError };
+  }
 
   // Start with functionData
   const metrics = functionData?.map(
     ([
       _teamId,
+      projectId,
       ds,
       cachedQueries,
       uncachedQueries,
@@ -324,6 +453,7 @@ export function useUsageTeamDailyCallsByTag(
       httpActions,
     ]) => ({
       ds,
+      projectId: parseProjectId(projectId),
       metrics: [
         { tag: "uncached_query", value: Number(uncachedQueries) },
         {
@@ -347,109 +477,277 @@ export function useUsageTeamDailyCallsByTag(
   );
 
   // Augment with storage data
-  const storageDataByDs = (storageData || []).reduce(
-    (acc, [_teamId, ds, storageCalls]) => {
-      acc[ds] = Number(storageCalls);
+  const storageDataByDsAndProject = (storageData || []).reduce(
+    (acc, [_teamId, projectId, ds, storageCalls]) => {
+      const key = `${ds}-${projectId}`;
+      acc[key] = Number(storageCalls);
       return acc;
     },
     {} as Record<string, number>,
   );
   for (const metric of metrics || []) {
-    const storageCalls = storageDataByDs[metric.ds];
+    const key = `${metric.ds}-${metric.projectId}`;
+    const storageCalls = storageDataByDsAndProject[key];
     if (storageCalls) {
       metric.metrics.push({ tag: "storage_api", value: storageCalls });
-      delete storageDataByDs[metric.ds];
+      delete storageDataByDsAndProject[key];
     }
   }
 
-  return metrics;
+  return { data: metrics, error: undefined };
 }
 
-export function useUsageTeamStoragePerDay(
+export function useUsageTeamStoragePerDayByProject(
   teamId: number,
-  projectId: number | null,
   period: DateRange | null,
   componentPrefix: string | null,
-): DailyPerTagMetrics[] | undefined {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamFileStorage,
+): { data: DailyPerTagMetricsByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamFileStorageByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(
+      ([
+        _teamId,
+        projectId,
+        ds,
+        _totalFileSize,
+        userFileSize,
+        cloudBackupSize,
+      ]) => ({
+        ds,
+        projectId: parseProjectId(projectId),
+        metrics: [
+          { tag: "userFiles", value: Number(userFileSize) },
+          {
+            tag: "cloudBackup",
+            value: Number(cloudBackupSize),
+          },
+        ],
+      }),
+    ),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamStorageThroughputDailyByProject(
+  teamId: number,
+  period: DateRange | null,
+  componentPrefix: string | null,
+): { data: DailyPerTagMetricsByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamFileBandwidthByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(
+      ([
+        _teamId,
+        projectId,
+        ds,
+        servingIngressSize,
+        servingEgressSize,
+        userFunctionIngressSize,
+        userFunctionEgressSize,
+        cloudBackupSize,
+        cloudRestoreSize,
+        snapshotExportSize,
+        snapshotImportSize,
+      ]) => ({
+        ds,
+        projectId: parseProjectId(projectId),
+        metrics: [
+          { tag: "servingEgress", value: Number(servingEgressSize) },
+          {
+            tag: "servingIngress",
+            value: Number(servingIngressSize),
+          },
+          {
+            tag: "userFunctionEgress",
+            value: Number(userFunctionEgressSize),
+          },
+          {
+            tag: "userFunctionIngress",
+            value: Number(userFunctionIngressSize),
+          },
+          {
+            tag: "cloudRestore",
+            value: Number(cloudRestoreSize),
+          },
+          {
+            tag: "cloudBackup",
+            value: Number(cloudBackupSize),
+          },
+          {
+            tag: "snapshotExport",
+            value: Number(snapshotExportSize),
+          },
+          {
+            tag: "snapshotImport",
+            value: Number(snapshotImportSize),
+          },
+        ],
+      }),
+    ),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamDeploymentCountPerDayByProject(
+  teamId: number,
+  period: DateRange | null,
+  componentPrefix: string | null,
+): { data: DailyMetricByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_PROJECT_QUERY_IDS.teamDeploymentCountByProject,
+    teamId,
+    projectId: null,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(([_teamId, projectId, ds, count]) => ({
+      ds,
+      projectId: parseProjectId(projectId),
+      value: Number(count),
+    })),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamDeploymentCountByType(
+  teamId: number,
+  period: DateRange | null,
+  projectId: number | null,
+  componentPrefix: string | null,
+): { data: DailyPerTagMetrics[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_QUERY_IDS.teamDeploymentCountByType,
     teamId,
     projectId,
     period,
     componentPrefix,
   });
-  return data?.map(
-    ([_teamId, ds, _totalFileSize, userFileSize, cloudBackupSize]) => ({
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  if (data === undefined) {
+    return { data: undefined, error: undefined };
+  }
+
+  // Group by date since each row is [teamId, deploymentType, ds, count]
+  const groupedByDate = new Map<string, Map<string, number>>();
+
+  data.forEach(([_teamId, deploymentType, ds, count]) => {
+    if (!groupedByDate.has(ds)) {
+      groupedByDate.set(ds, new Map());
+    }
+    const tag = deploymentType || "deleted";
+    groupedByDate.get(ds)!.set(tag, Number(count));
+  });
+
+  return {
+    data: Array.from(groupedByDate.entries()).map(([ds, metricsMap]) => ({
       ds,
-      metrics: [
-        { tag: "userFiles", value: Number(userFileSize) },
-        {
-          tag: "cloudBackup",
-          value: Number(cloudBackupSize),
-        },
-      ],
-    }),
-  );
+      metrics: Array.from(metricsMap.entries()).map(([tag, value]) => ({
+        tag,
+        value,
+      })),
+    })),
+    error: undefined,
+  };
 }
 
-export function useUsageTeamStorageThroughputDaily(
+// By-table query hooks
+export function useUsageTeamDatabaseStoragePerDayByTable(
   teamId: number,
-  projectId: number | null,
   period: DateRange | null,
+  projectId: number | null,
   componentPrefix: string | null,
-) {
-  const { data } = useUsageQuery({
-    queryId: DATABRICKS_QUERY_IDS.teamFileBandwidth,
+): { data: DailyMetricByTable[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_TABLE_QUERY_IDS.teamDatabaseStorageByTable,
     teamId,
     projectId,
     period,
     componentPrefix,
   });
-  return data?.map(
-    ([
-      _teamId,
-      ds,
-      servingIngressSize,
-      servingEgressSize,
-      userFunctionIngressSize,
-      userFunctionEgressSize,
-      cloudBackupSize,
-      cloudRestoreSize,
-      snapshotExportSize,
-      snapshotImportSize,
-    ]) => ({
-      ds,
-      metrics: [
-        { tag: "servingIngress", value: Number(servingIngressSize) },
-        {
-          tag: "servingEgress",
-          value: Number(servingEgressSize),
-        },
-        {
-          tag: "userFunctionIngress",
-          value: Number(userFunctionIngressSize),
-        },
-        {
-          tag: "userFunctionEgress",
-          value: Number(userFunctionEgressSize),
-        },
-        {
-          tag: "cloudBackup",
-          value: Number(cloudBackupSize),
-        },
-        {
-          tag: "cloudRestore",
-          value: Number(cloudRestoreSize),
-        },
-        {
-          tag: "snapshotExport",
-          value: Number(snapshotExportSize),
-        },
-        {
-          tag: "snapshotImport",
-          value: Number(snapshotImportSize),
-        },
-      ],
-    }),
-  );
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(
+      ([
+        _teamId,
+        rowProjectId,
+        tableName,
+        ds,
+        documentStorage,
+        indexStorage,
+      ]) => ({
+        ds,
+        projectId: parseProjectId(rowProjectId),
+        tableName,
+        value: Number(documentStorage) + Number(indexStorage),
+      }),
+    ),
+    error: undefined,
+  };
+}
+
+export function useUsageTeamDocumentCountPerDayByTable(
+  teamId: number,
+  period: DateRange | null,
+  projectId: number | null,
+  componentPrefix: string | null,
+): { data: DailyMetricByTable[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: DATABRICKS_BY_TABLE_QUERY_IDS.teamDocumentCountByTable,
+    teamId,
+    projectId,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(
+      ([_teamId, rowProjectId, tableName, ds, documentCount]) => ({
+        ds,
+        projectId: parseProjectId(rowProjectId),
+        tableName,
+        value: Number(documentCount),
+      }),
+    ),
+    error: undefined,
+  };
 }

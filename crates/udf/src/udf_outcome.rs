@@ -1,5 +1,11 @@
+use std::time::Duration;
+
 use anyhow::Context;
 use common::{
+    audit_log_lines::{
+        AuditLogLine,
+        AuditLogLines,
+    },
     components::CanonicalizedComponentFunctionPath,
     errors::JsError,
     identity::InertIdentity,
@@ -12,7 +18,6 @@ use common::{
         Runtime,
         UnixTimestamp,
     },
-    value::ConvexArray,
 };
 use pb::{
     common::{
@@ -21,13 +26,11 @@ use pb::{
     },
     outcome::UdfOutcome as UdfOutcomeProto,
 };
-#[cfg(any(test, feature = "testing"))]
-use proptest::prelude::Arbitrary;
-#[cfg(any(test, feature = "testing"))]
-use proptest::prelude::Strategy;
 use rand::Rng;
+use sync_types::types::SerializedArgs;
 use value::{
     heap_size::HeapSize,
+    ConvexValue,
     JsonPackedValue,
 };
 
@@ -37,10 +40,9 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-#[cfg_attr(any(test, feature = "testing"), derive(PartialEq))]
 pub struct UdfOutcome {
     pub path: CanonicalizedComponentFunctionPath,
-    pub arguments: ConvexArray,
+    pub arguments: SerializedArgs,
     pub identity: InertIdentity,
     pub observed_identity: bool,
 
@@ -52,6 +54,7 @@ pub struct UdfOutcome {
 
     pub log_lines: LogLines,
     pub journal: QueryJournal,
+    pub audit_log_lines: AuditLogLines,
 
     // QueryUdfOutcomes are stored in the Udf level cache, which is why we would like
     // them to have more compact representation.
@@ -60,62 +63,9 @@ pub struct UdfOutcome {
     pub syscall_trace: SyscallTrace,
 
     pub udf_server_version: Option<semver::Version>,
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for UdfOutcome {
-    type Parameters = ();
-
-    type Strategy = impl Strategy<Value = UdfOutcome>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        (
-            any::<CanonicalizedComponentFunctionPath>(),
-            any::<ConvexArray>(),
-            any::<InertIdentity>(),
-            any::<[u8; 32]>(),
-            any::<bool>(),
-            any::<UnixTimestamp>(),
-            any::<bool>(),
-            any::<bool>(),
-            any::<LogLines>(),
-            any::<QueryJournal>(),
-            any::<Result<JsonPackedValue, JsError>>(),
-            any::<SyscallTrace>(),
-        )
-            .prop_map(
-                |(
-                    path,
-                    arguments,
-                    identity,
-                    rng_seed,
-                    observed_rng,
-                    unix_timestamp,
-                    observed_time,
-                    observed_identity,
-                    log_lines,
-                    journal,
-                    result,
-                    syscall_trace,
-                )| Self {
-                    path,
-                    arguments,
-                    identity,
-                    rng_seed,
-                    observed_rng,
-                    unix_timestamp,
-                    observed_time,
-                    observed_identity,
-                    log_lines,
-                    journal,
-                    result,
-                    syscall_trace,
-                    // Ok to not generate semver::Version because it is not serialized anyway
-                    udf_server_version: None,
-                },
-            )
-    }
+    pub memory_in_mb: u64,
+    // TODO(ENG-10204): Make required
+    pub user_execution_time: Option<Duration>,
 }
 
 impl HeapSize for UdfOutcome {
@@ -128,6 +78,18 @@ impl HeapSize for UdfOutcome {
             + self.result.heap_size()
             + self.syscall_trace.heap_size()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct NestedUdfOutcome {
+    pub observed_identity: bool,
+    pub observed_rng: bool,
+    pub observed_time: bool,
+    pub log_lines: LogLines,
+    pub audit_log_lines: AuditLogLines,
+    pub journal: QueryJournal,
+    pub result: Result<ConvexValue, JsError>,
+    pub syscall_trace: SyscallTrace,
 }
 
 impl TryFrom<UdfOutcome> for UdfOutcomeProto {
@@ -144,10 +106,13 @@ impl TryFrom<UdfOutcome> for UdfOutcomeProto {
             unix_timestamp,
             observed_time,
             log_lines,
+            audit_log_lines,
             journal,
             result,
             syscall_trace,
             udf_server_version: _,
+            memory_in_mb,
+            user_execution_time,
         }: UdfOutcome,
     ) -> anyhow::Result<Self> {
         let result = match result {
@@ -160,12 +125,15 @@ impl TryFrom<UdfOutcome> for UdfOutcomeProto {
             unix_timestamp: Some(unix_timestamp.into()),
             observed_time: Some(observed_time),
             log_lines: log_lines.into_iter().map(|l| l.into()).collect(),
+            audit_log_lines: audit_log_lines.into_iter().map(|l| l.into()).collect(),
             journal: Some(journal.into()),
             result: Some(FunctionResultProto {
                 result: Some(result),
             }),
             syscall_trace: Some(syscall_trace.try_into()?),
             observed_identity: Some(observed_identity),
+            memory_in_mb,
+            user_execution_time: user_execution_time.map(|t| t.try_into()).transpose()?,
         })
     }
 }
@@ -176,7 +144,7 @@ impl UdfOutcome {
     pub fn from_error(
         js_error: JsError,
         path: CanonicalizedComponentFunctionPath,
-        arguments: ConvexArray,
+        arguments: SerializedArgs,
         identity: InertIdentity,
         rt: impl Runtime,
         udf_server_version: Option<semver::Version>,
@@ -190,11 +158,14 @@ impl UdfOutcome {
             unix_timestamp: rt.unix_timestamp(),
             observed_time: false,
             log_lines: vec![].into(),
+            audit_log_lines: vec![].into(),
             journal: QueryJournal::new(),
             result: Err(js_error),
             syscall_trace: SyscallTrace::new(),
             udf_server_version,
             observed_identity: false,
+            memory_in_mb: 0,
+            user_execution_time: Some(Duration::ZERO),
         })
     }
 
@@ -205,20 +176,23 @@ impl UdfOutcome {
             unix_timestamp,
             observed_time,
             log_lines,
+            audit_log_lines,
             journal,
             result,
             syscall_trace,
             observed_identity,
+            memory_in_mb,
+            user_execution_time,
         }: UdfOutcomeProto,
         path_and_args: ValidatedPathAndArgs,
         identity: InertIdentity,
     ) -> anyhow::Result<Self> {
-        let rng_seed = rng_seed.ok_or_else(|| anyhow::anyhow!("Missing rng_seed"))?;
+        let rng_seed = rng_seed.context("Missing rng_seed")?;
         let rng_seed = rng_seed
             .as_slice()
             .try_into()
             .context("Invalid rng_seed length")?;
-        let result = result.ok_or_else(|| anyhow::anyhow!("Missing result"))?;
+        let result = result.context("Missing result")?;
         let result = match result.result {
             Some(FunctionResultTypeProto::JsonPackedValue(value)) => {
                 Ok(JsonPackedValue::from_network(value)?)
@@ -228,6 +202,10 @@ impl UdfOutcome {
         };
         let (path, arguments, udf_server_version) = path_and_args.consume();
         let log_lines = log_lines.into_iter().map(LogLine::try_from).try_collect()?;
+        let audit_log_lines = audit_log_lines
+            .into_iter()
+            .map(AuditLogLine::try_from)
+            .try_collect()?;
         Ok(Self {
             path: path.for_logging(),
             arguments,
@@ -235,59 +213,19 @@ impl UdfOutcome {
             rng_seed,
             observed_rng: observed_rng.unwrap_or_default(),
             unix_timestamp: unix_timestamp
-                .ok_or_else(|| anyhow::anyhow!("Missing unix_timestamp"))?
+                .context("Missing unix_timestamp")?
                 .try_into()?,
             observed_time: observed_time.unwrap_or_default(),
             log_lines,
-            journal: journal
-                .ok_or_else(|| anyhow::anyhow!("Missing journal"))?
-                .try_into()?,
+            audit_log_lines,
+            journal: journal.context("Missing journal")?.try_into()?,
             result,
-            syscall_trace: syscall_trace
-                .ok_or_else(|| anyhow::anyhow!("Missing syscall_trace"))?
-                .try_into()?,
+            syscall_trace: syscall_trace.context("Missing syscall_trace")?.try_into()?,
             udf_server_version,
             // TODO(lee): Remove the default once we've pushed all services.
             observed_identity: observed_identity.unwrap_or(true),
+            memory_in_mb,
+            user_execution_time: user_execution_time.map(|d| d.try_into()).transpose()?,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-
-    use super::{
-        UdfOutcome,
-        UdfOutcomeProto,
-        ValidatedPathAndArgs,
-    };
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_udf_outcome_roundtrips(udf_outcome in any::<UdfOutcome>()) {
-            let udf_outcome_clone = udf_outcome.clone();
-            let path = udf_outcome.path.clone();
-            let arguments = udf_outcome.arguments.clone();
-            let version = udf_outcome.udf_server_version.clone();
-            let identity = udf_outcome_clone.identity.clone();
-            let path_and_args = ValidatedPathAndArgs::new_for_tests_in_component(
-                path,
-                arguments,
-                version
-            );
-            let proto = UdfOutcomeProto::try_from(udf_outcome_clone).unwrap();
-            let udf_outcome_from_proto = UdfOutcome::from_proto(
-                proto,
-                path_and_args,
-                identity
-            ).unwrap();
-            assert_eq!(udf_outcome, udf_outcome_from_proto);
-        }
     }
 }

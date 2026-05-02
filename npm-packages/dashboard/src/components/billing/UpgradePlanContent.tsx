@@ -1,20 +1,27 @@
 import { Button } from "@ui/Button";
 import { Spinner } from "@ui/Spinner";
+import { Stepper } from "@ui/Stepper";
 import { TextInput } from "@ui/TextInput";
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useDebounce } from "react-use";
 import { Elements } from "@stripe/react-stripe-js";
 import { useGetCoupon, useCreateSubscription } from "api/billing";
 import { FormikProvider, useFormik, useFormikContext } from "formik";
 import * as Yup from "yup";
-import { Address, PlanResponse, Team } from "generatedApi";
+import { Address, PlanResponse, TeamResponse } from "generatedApi";
+import { Link } from "@ui/Link";
+import { PriceSummary } from "components/billing/PriceSummary";
+import { usePostHog } from "hooks/usePostHog";
 import { PaymentDetailsForm } from "./PaymentDetailsForm";
 import { BillingAddressInputs } from "./BillingAddressInputs";
 import { useStripePaymentSetup } from "../../hooks/useStripe";
 import { BillingContactInputs } from "./BillingContactInputs";
-import { SpendingLimits, spendingLimitsSchema } from "./SpendingLimits";
+import {
+  SpendingLimits,
+  spendingLimitsSchema,
+  spendingLimitValueToCents,
+} from "./SpendingLimits";
 import { UpgradeFormState } from "./upgradeFormState";
-import { useLaunchDarkly } from "../../hooks/useLaunchDarkly";
 
 export const debounceDurationMs = 200;
 
@@ -29,6 +36,8 @@ export type UpgradePlanContentProps = {
   setPaymentMethod: (paymentMethod?: string) => void;
   billingAddressInputs: React.ReactNode;
   paymentDetailsForm: React.ReactNode;
+  isChef: boolean;
+  teamManagedBy?: string;
 };
 
 export const CreateSubscriptionSchema = Yup.object().shape({
@@ -48,15 +57,17 @@ export function UpgradePlanContentContainer({
   name: profileName,
   onUpgradeComplete,
   plan,
+  isChef,
   ...props
 }: Pick<UpgradePlanContentProps, "numMembers" | "plan"> & {
-  team: Team;
+  team: TeamResponse;
   email?: string;
   name?: string | null;
   onUpgradeComplete: () => void;
+  isChef: boolean;
 }) {
   const createSubscription = useCreateSubscription(team.id);
-  const { spendingLimits } = useLaunchDarkly();
+  const { capture } = usePostHog();
 
   const formState = useFormik<UpgradeFormState>({
     initialValues: {
@@ -66,19 +77,17 @@ export function UpgradePlanContentContainer({
       planId: plan.id,
       paymentMethod: undefined,
       billingAddress: undefined,
-      spendingLimitWarningThresholdUsd: undefined,
+      spendingLimitWarningThresholdUsd: null,
       spendingLimitDisableThresholdUsd: null,
     },
-    validationSchema: spendingLimits
-      ? CreateSubscriptionSchema.concat(
-          spendingLimitsSchema({
-            // A new billing cycle starts when the user upgrades, so we don’t need to show the
-            // warning about setting a spending limit lower than the amount spent in the current
-            // billing cycle.
-            currentSpending: undefined,
-          }),
-        )
-      : CreateSubscriptionSchema,
+    validationSchema: CreateSubscriptionSchema.concat(
+      spendingLimitsSchema({
+        // A new billing cycle starts when the user upgrades, so we don’t need to show the
+        // warning about setting a spending limit lower than the amount spent in the current
+        // billing cycle.
+        currentSpending: undefined,
+      }),
+    ),
     onSubmit: async (v) => {
       await createSubscription({
         planId: v.planId,
@@ -86,17 +95,11 @@ export function UpgradePlanContentContainer({
         billingAddress: v.billingAddress,
         name: v.name,
         email: v.email,
-        ...(spendingLimits && {
-          warningThresholdCents:
-            typeof v.spendingLimitWarningThresholdUsd === "number"
-              ? v.spendingLimitWarningThresholdUsd * 100
-              : v.spendingLimitWarningThresholdUsd,
-          disableThresholdCents:
-            typeof v.spendingLimitDisableThresholdUsd === "number"
-              ? v.spendingLimitDisableThresholdUsd * 100
-              : v.spendingLimitDisableThresholdUsd,
-        }),
+        ...spendingLimitValueToCents(v),
       });
+      if (plan.planType === "CONVEX_PROFESSIONAL") {
+        capture("upgraded_to_pro");
+      }
       onUpgradeComplete();
     },
   });
@@ -155,6 +158,8 @@ export function UpgradePlanContentContainer({
       <UpgradePlanContent
         {...props}
         plan={plan}
+        isChef={isChef}
+        teamManagedBy={team.managedBy === "vercel" ? team.managedBy : undefined}
         setPaymentMethod={(p) => {
           if (!p) {
             resetClientSecret();
@@ -173,7 +178,7 @@ export function UpgradePlanContentContainer({
         billingAddressInputs={
           options.clientSecret ? (
             <div className="flex flex-col gap-2">
-              <h4>Billing Address</h4>
+              <h5>Billing Address</h5>
               <Elements stripe={stripePromise} options={options}>
                 <BillingAddressInputs onChangeAddress={setBillingAddress} />
               </Elements>
@@ -208,9 +213,11 @@ export function UpgradePlanContent({
   setPaymentMethod,
   billingAddressInputs,
   paymentDetailsForm,
+  isChef,
+  teamManagedBy,
 }: UpgradePlanContentProps) {
   const formState = useFormikContext<UpgradeFormState>();
-  const { spendingLimits } = useLaunchDarkly();
+  const [currentStep, setCurrentStep] = useState(0);
 
   if (teamMemberDiscountPct < 0 || teamMemberDiscountPct > 1) {
     throw new Error(
@@ -218,165 +225,254 @@ export function UpgradePlanContent({
     );
   }
 
-  return (
-    <div className="flex flex-col gap-6">
-      <PriceSummary
-        plan={plan}
-        teamMemberDiscountPct={teamMemberDiscountPct}
-        numMembers={numMembers}
-        requiresPaymentMethod={requiresPaymentMethod}
-        couponDurationInMonths={couponDurationInMonths}
-      />
-      <div className="flex max-w-64 items-center gap-2">
-        <TextInput
-          label="Promo code"
-          placeholder="Enter a promo code"
-          onChange={(e) =>
-            formState.setFieldValue("promoCode", e.target.value.toUpperCase())
+  const steps = useMemo(
+    () => [
+      { label: "Billing Information" },
+      { label: "Spending Limits" },
+      ...(requiresPaymentMethod ? [{ label: "Payment Information" }] : []),
+    ],
+    [requiresPaymentMethod],
+  );
+
+  const totalSteps = steps.length;
+  const isLastStep = currentStep === totalSteps - 1;
+
+  // Clamp step if totalSteps decreases (e.g. promo code removes payment requirement)
+  useEffect(() => {
+    if (currentStep >= totalSteps) {
+      setCurrentStep(totalSteps - 1);
+    }
+  }, [totalSteps, currentStep]);
+
+  const canProceedFromStep0 = useMemo(
+    () =>
+      !!formState.values.name &&
+      !!formState.values.email &&
+      !!formState.values.billingAddress &&
+      !isLoadingPromo,
+    [
+      formState.values.name,
+      formState.values.email,
+      formState.values.billingAddress,
+      isLoadingPromo,
+    ],
+  );
+
+  const stepContent = (index: number) => {
+    if (index === 0) {
+      return (
+        <div className="flex flex-col gap-6">
+          <div className="flex flex-col gap-2">
+            <h5>Billing Contact</h5>
+            <BillingContactInputs formState={formState} />
+          </div>
+
+          {billingAddressInputs}
+
+          {plan.planType === "CONVEX_PROFESSIONAL" && (
+            <PromoCodeField
+              value={formState.values.promoCode}
+              onChange={(value) => formState.setFieldValue("promoCode", value)}
+              isLoading={isLoadingPromo}
+              error={promoCodeError}
+            />
+          )}
+        </div>
+      );
+    }
+    if (index === 1) {
+      return (
+        <div className="flex flex-col gap-6">
+          <div className="flex flex-col gap-2">
+            <p className="text-sm text-content-secondary">
+              We recommend setting spending limit warnings and hard limits to
+              avoid unexpected charges on your Convex usage.
+            </p>
+            <SpendingLimits />
+            {!requiresPaymentMethod && (
+              <p className="text-sm text-content-secondary">
+                Payment information is not required for your promotion code, but
+                you may add spending limits in case payment is applicable in the
+                future.
+              </p>
+            )}
+          </div>
+        </div>
+      );
+    }
+    if (index === 2 && requiresPaymentMethod) {
+      return (
+        <div className="flex flex-col gap-6">
+          {!formState.values.paymentMethod ? (
+            <div className="flex flex-col gap-2">
+              {/* Reduce the amount of space stripe can take up so it doesn't render horizontal overflow */}
+              <div className="max-w-[calc(100%-1rem)]">
+                {paymentDetailsForm}
+              </div>
+            </div>
+          ) : (
+            <Button
+              className="w-fit"
+              size="sm"
+              onClick={() => setPaymentMethod(undefined)}
+              data-testid="update-payment-method-button"
+              variant="neutral"
+            >
+              Change payment method
+            </Button>
+          )}
+        </div>
+      );
+    }
+    return null;
+  };
+
+  const navigationButtons = (
+    <div className="flex gap-2">
+      {currentStep > 0 && (
+        <Button
+          size="sm"
+          variant="neutral"
+          onClick={() => setCurrentStep(currentStep - 1)}
+        >
+          Back
+        </Button>
+      )}
+      {!isLastStep ? (
+        <Button
+          size="sm"
+          onClick={() => setCurrentStep(currentStep + 1)}
+          disabled={
+            (currentStep === 0 && !canProceedFromStep0) ||
+            (currentStep === 1 &&
+              !!(
+                formState.errors.spendingLimitWarningThresholdUsd ||
+                formState.errors.spendingLimitDisableThresholdUsd
+              ))
           }
-          value={formState.values.promoCode}
-          id="promoCode"
-          error={promoCodeError}
-        />
-        {isLoadingPromo && (
-          <span data-testid="loading-spinner" className="mt-4">
-            <Spinner />
-          </span>
-        )}
-      </div>
-
-      <div className="flex flex-col gap-2">
-        <h4>Billing Contact</h4>
-        <BillingContactInputs formState={formState} />
-      </div>
-
-      {billingAddressInputs}
-
-      {spendingLimits && (
-        <div className="flex flex-col gap-2">
-          <h4>Usage Spending Limits</h4>
-          <SpendingLimits />
-        </div>
-      )}
-
-      {requiresPaymentMethod && !formState.values.paymentMethod && (
-        <div className="flex flex-col gap-2">
-          <h4>Payment Details</h4>
-          {/* Reduce the amount of space stripe can take up so it doesn't render horizontal overflow */}
-          <div className="max-w-[calc(100%-1rem)]">{paymentDetailsForm}</div>
-        </div>
-      )}
-
-      {(!requiresPaymentMethod || formState.values.paymentMethod) && (
+          tip={
+            currentStep === 0
+              ? !formState.values.name
+                ? "Enter a billing contact name to continue."
+                : !formState.values.email
+                  ? "Enter a billing contact email to continue."
+                  : !formState.values.billingAddress
+                    ? "Enter a billing address to continue."
+                    : undefined
+              : undefined
+          }
+        >
+          Next
+        </Button>
+      ) : (
         <form
-          className="mt-2 flex flex-col items-start gap-4 text-sm"
           onSubmit={async (e) => {
             e.preventDefault();
             await formState.handleSubmit();
           }}
         >
-          <div className="flex gap-4">
-            {formState.values.paymentMethod && (
-              <Button
-                size="sm"
-                onClick={() => setPaymentMethod(undefined)}
-                data-testid="update-payment-method-button"
-                variant="neutral"
-              >
-                Change payment method
-              </Button>
-            )}
-            <Button
-              data-testid="upgrade-plan-button"
-              className="w-fit"
-              size="sm"
-              disabled={
-                isLoadingPromo ||
-                (requiresPaymentMethod && !formState.values.paymentMethod) ||
-                !formState.values.billingAddress ||
-                !formState.isValid
-              }
-              type="submit"
-              loading={formState.isSubmitting}
-              tip={
-                requiresPaymentMethod && !formState.values.paymentMethod
-                  ? "Add a payment method to continue."
-                  : !formState.values.name
-                    ? "Enter a billing contact name to continue."
-                    : !formState.values.email
-                      ? "Enter a billing contact email to continue."
-                      : !formState.values.billingAddress
-                        ? "Enter a billing address to continue."
-                        : undefined
-              }
-            >
-              Confirm and Upgrade
-            </Button>
-          </div>
+          <Button
+            data-testid="upgrade-plan-button"
+            className="w-fit"
+            size="sm"
+            disabled={
+              isLoadingPromo ||
+              (requiresPaymentMethod && !formState.values.paymentMethod) ||
+              !formState.values.billingAddress
+            }
+            type="submit"
+            loading={formState.isSubmitting}
+            tip={
+              requiresPaymentMethod && !formState.values.paymentMethod
+                ? "Add a payment method to continue."
+                : !formState.values.name
+                  ? "Enter a billing contact name to continue."
+                  : !formState.values.email
+                    ? "Enter a billing contact email to continue."
+                    : !formState.values.billingAddress
+                      ? "Enter a billing address to continue."
+                      : undefined
+            }
+          >
+            Confirm and Upgrade
+          </Button>
         </form>
       )}
     </div>
   );
-}
 
-export function PriceInDollars({
-  price,
-  percentOff,
-}: {
-  price: number;
-  percentOff: number;
-}) {
-  return percentOff ? (
+  return (
     <>
-      <span className="mr-1 line-through">${price}</span>
-      <span className="font-semibold">
-        ${Number((price * (1 - percentOff)).toFixed(2))}
-      </span>
+      {isChef && plan.planType === "CONVEX_STARTER_PLUS" && (
+        <p className="mb-2">
+          {plan.name} is recommended for Convex Chef users.{" "}
+          <Link href="/team/settings/billing">View all plans.</Link>
+        </p>
+      )}
+      <div className="flex flex-col gap-4">
+        <PriceSummary
+          plan={plan}
+          teamMemberDiscountPct={teamMemberDiscountPct}
+          numMembers={numMembers}
+          requiresPaymentMethod={requiresPaymentMethod}
+          couponDurationInMonths={couponDurationInMonths}
+          isUpgrading={false}
+          teamManagedBy={teamManagedBy}
+        />
+
+        <Stepper activeStep={currentStep} onSelectStep={setCurrentStep}>
+          {steps.map((step, index) => (
+            <Stepper.Step key={step.label} label={step.label}>
+              {stepContent(index)}
+              {index === currentStep && navigationButtons}
+            </Stepper.Step>
+          ))}
+        </Stepper>
+      </div>
     </>
-  ) : (
-    <span className="font-semibold">${price}</span>
   );
 }
 
-function PriceSummary({
-  plan,
-  teamMemberDiscountPct,
-  numMembers,
-  couponDurationInMonths,
-  requiresPaymentMethod,
+function PromoCodeField({
+  value,
+  onChange,
+  isLoading,
+  error,
 }: {
-  plan: PlanResponse;
-  teamMemberDiscountPct: number;
-  numMembers: number;
-  couponDurationInMonths?: number;
-  requiresPaymentMethod: boolean;
+  value: string | undefined;
+  onChange: (value: string) => void;
+  isLoading: boolean;
+  error?: string;
 }) {
+  const [isExpanded, setIsExpanded] = useState(() => !!value || !!error);
+
+  if (!isExpanded) {
+    return (
+      <Button
+        variant="unstyled"
+        onClick={() => setIsExpanded(true)}
+        className="self-start text-xs text-content-tertiary underline hover:text-content-secondary"
+      >
+        Have a promo code?
+      </Button>
+    );
+  }
+
   return (
-    <div className="flex flex-col gap-2 text-sm" data-testid="price-summary">
-      <p>
-        The {plan.name} plan costs{" "}
-        <PriceInDollars
-          price={plan.seatPrice}
-          percentOff={!requiresPaymentMethod ? 1 : teamMemberDiscountPct}
-        />{" "}
-        per team member, per month.
-      </p>
-      {couponDurationInMonths && (
-        <p>
-          This discount will be applied for the next {couponDurationInMonths}{" "}
-          months.
-        </p>
-      )}
-      {requiresPaymentMethod && (
-        <p>
-          Your team has {numMembers} member{numMembers > 1 && "s"}. Once you
-          upgrade, you'll be charged{" "}
-          <PriceInDollars
-            price={plan.seatPrice * numMembers}
-            percentOff={teamMemberDiscountPct}
-          />{" "}
-          immediately.{" "}
-        </p>
+    <div className="flex max-w-64 items-center gap-2">
+      <TextInput
+        label="Promo code"
+        placeholder="Enter a promo code"
+        onChange={(e) => onChange(e.target.value.toUpperCase())}
+        value={value}
+        id="promoCode"
+        error={error}
+        autoFocus
+      />
+      {isLoading && (
+        <span data-testid="loading-spinner" className="mt-4">
+          <Spinner />
+        </span>
       )}
     </div>
   );

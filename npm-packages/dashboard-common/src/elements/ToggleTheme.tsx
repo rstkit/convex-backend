@@ -60,12 +60,12 @@ function ThemeRadioInput({
         checked={!currentTheme || currentTheme === theme}
         hidden
       />
-      <Tooltip tip={startCase(theme)} wrapsButton>
+      <Tooltip tip={startCase(theme)} asChild>
         <label
           aria-label="System Theme"
           htmlFor={`${theme}-theme`}
           className={cn(
-            "p-1.5 cursor-pointer",
+            "cursor-pointer p-1.5",
             currentTheme === theme
               ? "bg-util-accent text-white"
               : "hover:bg-background-tertiary",

@@ -386,7 +386,6 @@ function isSlottable(nodeImpl) {
  *
  * Ref: https://dom.spec.whatwg.org/#retarget */
 function retarget(a, _b) {
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     if (!isNode(a)) {
       return a;
@@ -702,7 +701,7 @@ function invokeEventListeners(tuple, eventImpl) {
   innerInvokeEventListeners(eventImpl, getListeners(tuple.item));
 }
 
-class EventTarget {
+export class EventTarget {
   constructor() {
     this[eventTargetData] = getDefaultTargetData();
   }

@@ -1,7 +1,9 @@
-import { Meta, StoryObj } from "@storybook/react";
-import { DeploymentResponse, ProjectDetails } from "generatedApi";
+import { Meta, StoryObj } from "@storybook/nextjs";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
+import { ProjectDetails } from "generatedApi";
 import { AggregatedFunctionMetrics } from "hooks/usageMetrics";
 import { rootComponentPath } from "api/usage";
+import { Sheet } from "@ui/Sheet";
 import {
   FunctionBreakdownMetricActionCompute,
   FunctionBreakdownMetricCalls,
@@ -10,11 +12,18 @@ import {
   TeamUsageByFunctionChart,
 } from "./TeamUsageByFunctionChart";
 
-const meta: Meta<typeof TeamUsageByFunctionChart> = {
+const meta = {
   component: TeamUsageByFunctionChart,
-};
+  render: (args) => (
+    <Sheet>
+      <TeamUsageByFunctionChart {...args} />
+    </Sheet>
+  ),
+  parameters: { a11y: { test: "todo" } },
+} satisfies Meta<typeof TeamUsageByFunctionChart>;
 
 export default meta;
+type Story = StoryObj<typeof meta>;
 
 const team = {
   id: 42,
@@ -35,36 +44,66 @@ const project: ProjectDetails = {
   createTime: 0,
 };
 
-const deployments: DeploymentResponse[] = [
+const deployments: PlatformDeploymentResponse[] = [
   {
     kind: "cloud",
     id: 10,
     projectId: 42,
     name: "fabulous-goldfish-42",
+    deploymentUrl: "https://fabulous-goldfish-42.convex.cloud",
     deploymentType: "dev",
     createTime: 0,
     creator: 1,
     previewIdentifier: null,
+    region: "aws-us-east-1",
+    isDefault: true,
+    reference: "dev/nicolas",
+    class: "s16",
   },
   {
     kind: "cloud",
     id: 20,
     projectId: 42,
     name: "friendly-dog-64",
+    deploymentUrl: "https://friendly-dog-64.convex.cloud",
     deploymentType: "dev",
     createTime: 0,
     creator: 2,
     previewIdentifier: null,
+    region: "aws-us-east-1",
+    isDefault: true,
+    reference: "dev/ari",
+    class: "s16",
   },
   {
     kind: "cloud",
     id: 30,
     projectId: 42,
     name: "wandering-fish-513",
+    deploymentUrl: "https://wandering-fish-513.convex.cloud",
     deploymentType: "prod",
     createTime: 0,
     creator: 1,
     previewIdentifier: null,
+    region: "aws-us-east-1",
+    isDefault: true,
+    reference: "production",
+    class: "s16",
+  },
+  {
+    kind: "cloud",
+    id: 40,
+    projectId: 42,
+    name: "happy-capybara-123",
+    deploymentUrl: "https://happy-capybara-123.convex.cloud",
+    deploymentType: "custom",
+    createTime: 0,
+    creator: 1,
+    previewIdentifier: null,
+    region: "aws-us-east-1",
+    isDefault: false,
+    reference: "staging",
+    class: "s16",
   },
 ];
 
@@ -102,6 +141,18 @@ const rows: AggregatedFunctionMetrics[] = [
     databaseEgressSize: 12345,
     vectorIngressSize: 0,
     vectorEgressSize: 0,
+    actionComputeTime: 0,
+    componentPath: rootComponentPath,
+  },
+  {
+    projectId: 42,
+    deploymentId: 40,
+    function: "module.js:thisFunctionHasAReallyLongName",
+    callCount: 23_456,
+    databaseIngressSize: 34567,
+    databaseEgressSize: 12345,
+    vectorIngressSize: 1234,
+    vectorEgressSize: 5678,
     actionComputeTime: 0,
     componentPath: rootComponentPath,
   },
@@ -251,7 +302,7 @@ const rows: AggregatedFunctionMetrics[] = [
   },
 ];
 
-export const Default: StoryObj<typeof TeamUsageByFunctionChart> = {
+export const Default: Story = {
   args: {
     rows,
     team,
@@ -262,7 +313,7 @@ export const Default: StoryObj<typeof TeamUsageByFunctionChart> = {
   },
 };
 
-export const ForDeletedProject: StoryObj<typeof TeamUsageByFunctionChart> = {
+export const ForDeletedProject: Story = {
   args: {
     rows,
     team,
@@ -273,7 +324,7 @@ export const ForDeletedProject: StoryObj<typeof TeamUsageByFunctionChart> = {
   },
 };
 
-export const DatabaseBandwidth: StoryObj<typeof TeamUsageByFunctionChart> = {
+export const DatabaseBandwidth: Story = {
   args: {
     rows,
     team,
@@ -286,7 +337,7 @@ export const DatabaseBandwidth: StoryObj<typeof TeamUsageByFunctionChart> = {
   },
 };
 
-export const ActionCompute: StoryObj<typeof TeamUsageByFunctionChart> = {
+export const ActionCompute: Story = {
   args: {
     rows,
     team,
@@ -299,7 +350,7 @@ export const ActionCompute: StoryObj<typeof TeamUsageByFunctionChart> = {
   },
 };
 
-export const VectorBandwidth: StoryObj<typeof TeamUsageByFunctionChart> = {
+export const VectorBandwidth: Story = {
   args: {
     rows,
     team,

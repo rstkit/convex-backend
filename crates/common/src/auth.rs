@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     str::FromStr,
     sync::LazyLock,
 };
@@ -11,6 +12,7 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use url::Url;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub enum AuthInfo {
@@ -68,7 +70,7 @@ impl AuthInfo {
             if issuer.starts_with("https://") || issuer.starts_with("http://") {
                 issuer.to_string()
             } else {
-                format!("https://{}", issuer)
+                format!("https://{issuer}")
             };
 
         // Some authentication providers (Auth0, lookin' at you) tell developers that
@@ -81,7 +83,6 @@ impl AuthInfo {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum SignatureAlgorithm {
     RS256,
     ES256,
@@ -116,6 +117,8 @@ impl FromStr for SignatureAlgorithm {
     }
 }
 
+// Keep in sync with `AuthProvider` in
+// `npm-packages/convex/src/server/authentication.ts`
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Ord, PartialOrd)]
 #[serde(tag = "type")]
 pub enum SerializedAuthInfo {
@@ -199,36 +202,42 @@ impl TryFrom<SerializedAuthInfo> for AuthInfo {
 
 static PROTOCOL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w+://").unwrap());
 
+fn invalid_provider_domain_url(msg: impl Into<Cow<'static, str>>) -> ErrorMetadata {
+    ErrorMetadata::bad_request("InvalidProviderDomainUrl", msg)
+}
+
 fn deserialize_issuer_url(original_url: String) -> anyhow::Result<IssuerUrl> {
+    if original_url.starts_with("\"") {
+        anyhow::bail!(invalid_provider_domain_url(format!(
+            "Invalid provider domain URL \"{original_url}\": starts with a double quote (\")"
+        )));
+    }
     let (had_scheme, url) = if PROTOCOL_REGEX.is_match(&original_url) {
         (true, original_url.clone())
     } else {
         (false, format!("https://{original_url}"))
     };
-    if url.starts_with("http://") {
-        let parsed_url = IssuerUrl::new(url)?;
-        if parsed_url.url().host_str() == Some("localhost")
-            || parsed_url.url().host_str() == Some("127.0.0.1")
-        {
-            return Ok(parsed_url);
-        } else {
-            anyhow::bail!("Invalid provider domain URL \"{original_url}\": must use HTTPS");
-        }
-    };
-    if !url.starts_with("https://") {
-        anyhow::bail!("Invalid provider domain URL \"{original_url}\": must use HTTPS");
+    let parsed_url = Url::parse(&url).map_err(|e| {
+        invalid_provider_domain_url(format!(
+            "Invalid provider domain URL \"{original_url}\": {e}"
+        ))
+    })?;
+    if !["http", "https"].contains(&parsed_url.scheme()) {
+        anyhow::bail!(invalid_provider_domain_url(format!(
+            "Invalid provider domain URL \"{original_url}\": scheme should be http or https"
+        )));
     }
-    let parsed_url = IssuerUrl::new(url)?;
     // Check if the input really looks like a URL,
     // to catch mistakes (e.g. putting random tokens in the domain field)
-    if !had_scheme && !parsed_url.url().host_str().is_some_and(ends_with_tld) {
-        anyhow::bail!(
+    if !had_scheme && !parsed_url.host_str().is_some_and(ends_with_tld) {
+        anyhow::bail!(invalid_provider_domain_url(format!(
             "Invalid provider domain URL \"{original_url}\": Does not look like a URL (must have \
              a scheme or end with a top-level domain)"
-        );
+        )));
     }
 
-    Ok(parsed_url)
+    // This re-parses the URL but we assume it will not fail at this point
+    Ok(IssuerUrl::new(url)?)
 }
 
 fn ends_with_tld(host: &str) -> bool {
@@ -242,66 +251,9 @@ fn ends_with_tld(host: &str) -> bool {
 }
 
 impl AuthInfo {
-    #[cfg(any(test, feature = "testing"))]
-    pub fn test_example() -> Self {
-        Self::Oidc {
-            application_id: "12345".to_string(),
-            domain: IssuerUrl::new("https://convex.dev".to_string()).unwrap(),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for AuthInfo {
-    type Parameters = ();
-
-    type Strategy = impl proptest::strategy::Strategy<Value = AuthInfo>;
-
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-
-        prop_oneof![
-            // Generate OIDC variant
-            (any::<String>(), any::<proptest_http::ArbitraryUri>()).prop_filter_map(
-                "String and URI weren't valid OIDC AuthInfo",
-                |(s, uri)| {
-                    IssuerUrl::new(format!("{}", uri.0))
-                        .map(|domain| Self::Oidc {
-                            application_id: s,
-                            domain,
-                        })
-                        .ok()
-                },
-            ),
-            // Generate JWT variant
-            (
-                any::<Option<String>>(),              // application_id
-                any::<proptest_http::ArbitraryUri>(), // issuer
-                any::<proptest_http::ArbitraryUri>(), // jwks
-                any::<SignatureAlgorithm>(),          // algorithm
-            )
-                .prop_filter_map(
-                    "String and URIs weren't valid JWT AuthInfo",
-                    |(app_id, issuer_uri, jwks_uri, algorithm)| {
-                        IssuerUrl::new(format!("{}", issuer_uri.0))
-                            .map(|issuer| Self::CustomJwt {
-                                application_id: app_id,
-                                issuer,
-                                jwks: jwks_uri.0.to_string(),
-                                algorithm,
-                            })
-                            .ok()
-                    }
-                )
-        ]
-    }
 }
 
 #[derive(Debug)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(proptest_derive::Arbitrary, Clone, PartialEq)
-)]
 pub struct AuthConfig {
     pub providers: Vec<AuthInfo>,
 }
@@ -337,85 +289,5 @@ impl TryFrom<SerializedAuthConfig> for AuthConfig {
                 .map(AuthInfo::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::auth::{
-        AuthInfo,
-        SerializedAuthInfo,
-    };
-
-    #[test]
-    fn test_auth_info_https_prefix() -> anyhow::Result<()> {
-        let AuthInfo::Oidc { domain, .. } = serde_json::from_str::<SerializedAuthInfo>(
-            r#"{"applicationID": "123", "domain": "example.com"}"#,
-        )?
-        .try_into()?
-        else {
-            panic!("Expected Oidc AuthInfo");
-        };
-        assert_eq!(domain.to_string(), "https://example.com");
-        let AuthInfo::Oidc { domain, .. } = serde_json::from_str::<SerializedAuthInfo>(
-            r#"{"applicationID": "123", "domain": "localhost"}"#,
-        )?
-        .try_into()?
-        else {
-            panic!("Expected Oidc AuthInfo");
-        };
-        assert_eq!(domain.to_string(), "https://localhost");
-        Ok(())
-    }
-
-    #[test]
-    fn test_auth_info_http_fails() -> anyhow::Result<()> {
-        let serialized = serde_json::from_str::<SerializedAuthInfo>(
-            r#"{"applicationID": "123", "domain": "http://example.com"}"#,
-        )?;
-        AuthInfo::try_from(serialized).unwrap_err();
-        Ok(())
-    }
-
-    #[test]
-    fn test_auth_info_http_localhost() -> anyhow::Result<()> {
-        let AuthInfo::Oidc { domain, .. } = serde_json::from_str::<SerializedAuthInfo>(
-            r#"{"applicationID": "123", "domain": "http://localhost:3211"}"#,
-        )?
-        .try_into()?
-        else {
-            panic!("Expected Oidc AuthInfo");
-        };
-        assert_eq!(domain.to_string(), "http://localhost:3211");
-
-        let AuthInfo::Oidc { domain, .. } = serde_json::from_str::<SerializedAuthInfo>(
-            r#"{"applicationID": "123", "domain": "http://127.0.0.1:3211"}"#,
-        )?
-        .try_into()?
-        else {
-            panic!("Expected Oidc AuthInfo");
-        };
-        assert_eq!(domain.to_string(), "http://127.0.0.1:3211");
-
-        // fails because host is not localhost
-        let serialized = serde_json::from_str::<SerializedAuthInfo>(
-            r#"{"applicationID": "123", "domain": "http://localhost.foo.com:3211"}"#,
-        )?;
-        AuthInfo::try_from(serialized).unwrap_err();
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_auth_info_rejects_bogus_domain() -> anyhow::Result<()> {
-        let serialized = serde_json::from_str::<SerializedAuthInfo>(
-            r#"{"applicationID": "123", "domain": "foobar123"}"#,
-        )?;
-        AuthInfo::try_from(serialized).unwrap_err();
-        let serialized = serde_json::from_str::<SerializedAuthInfo>(
-            r#"{"applicationID": "123", "domain": "idont.looklikeadomain"}"#,
-        )?;
-        AuthInfo::try_from(serialized).unwrap_err();
-        Ok(())
     }
 }

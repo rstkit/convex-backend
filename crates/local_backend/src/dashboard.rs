@@ -1,4 +1,3 @@
-use anyhow::Context;
 use application::{
     deploy_config::ModuleJson,
     valid_identifier::ValidIdentifier,
@@ -12,11 +11,14 @@ use common::{
     components::ComponentId,
     http::{
         extract::{
+            FromMtState,
             Json,
+            MtState,
             Query,
         },
         ExtractClientVersion,
         ExtractRequestId,
+        ExtractRequestMetadata,
         HttpResponseError,
     },
     shapes::{
@@ -24,9 +26,9 @@ use common::{
         reduced::ReducedShape,
     },
     types::FunctionCaller,
+    RequestContext,
 };
 use database::IndexModel;
-use errors::ErrorMetadata;
 use http::StatusCode;
 use isolate::UdfArgsJson;
 use model::{
@@ -38,54 +40,66 @@ use serde::{
     Serialize,
 };
 use serde_json::json;
+use utoipa::ToSchema;
+use utoipa_axum::router::OpenApiRouter;
 use value::{
     TableName,
     TableNamespace,
 };
 
 use crate::{
-    admin::{
-        must_be_admin_from_key,
-        must_be_admin_member,
-        must_be_admin_member_with_write_access,
-    },
+    admin::must_be_admin_from_key,
     authentication::ExtractIdentity,
     public_api::{
         export_value,
         UdfResponse,
     },
+    scheduling::{
+        __path_delete_scheduled_functions_table,
+        delete_scheduled_functions_table,
+    },
     schema::IndexMetadataResponse,
     LocalAppState,
 };
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteTableArgs {
     table_names: Vec<String>,
     component_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteComponentArgs {
     component_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapesArgs {
     component: Option<String>,
 }
 
-#[debug_handler]
+/// Get table shapes
+///
+/// Returns the schema shapes for all tables in the specified component.
+#[utoipa::path(
+    get,
+    path = "/shapes2",
+    params(
+        ("component" = Option<String>, Query, description = "Component ID to get shapes for")
+    ),
+    responses((status = 200, body = serde_json::Value)),
+)]
 pub async fn shapes2(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(ShapesArgs { component }): Query<ShapesArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     let mut out = serde_json::Map::new();
 
-    must_be_admin_member(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ViewData)?;
     let component = ComponentId::deserialize_from_string(component.as_deref())?;
     let snapshot = st.application.latest_snapshot()?;
     let mapping = snapshot.table_mapping().namespace(component.into());
@@ -110,36 +124,50 @@ pub async fn shapes2(
     Ok(Json(out))
 }
 
-#[debug_handler]
+/// Delete database tables
+///
+/// Deletes the specified tables from the database.
+#[utoipa::path(
+    post,
+    path = "/delete_tables",
+    request_body = DeleteTableArgs,
+    responses((status = 200)),
+)]
 pub async fn delete_tables(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(DeleteTableArgs {
         table_names,
         component_id,
     }): Json<DeleteTableArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_member_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::WriteData)?;
     let table_names = table_names
         .into_iter()
         .map(|t| Ok(t.parse::<ValidIdentifier<TableName>>()?.0))
         .collect::<anyhow::Result<_>>()?;
-    let table_namespace = TableNamespace::from(ComponentId::deserialize_from_string(
-        component_id.as_deref(),
-    )?);
+    let component_id = ComponentId::deserialize_from_string(component_id.as_deref())?;
     st.application
-        .delete_tables(&identity, table_names, table_namespace)
+        .delete_tables(&identity, table_names, component_id)
         .await?;
     Ok(StatusCode::OK)
 }
 
-#[debug_handler]
+/// Delete component
+///
+/// Deletes the specified component and all its associated data.
+#[utoipa::path(
+    post,
+    path = "/delete_component",
+    request_body = DeleteComponentArgs,
+    responses((status = 200)),
+)]
 pub async fn delete_component(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(DeleteComponentArgs { component_id }): Json<DeleteComponentArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_member_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::WriteData)?;
     let component_id = ComponentId::deserialize_from_string(component_id.as_deref())?;
     st.application
         .delete_component(&identity, component_id)
@@ -147,25 +175,36 @@ pub async fn delete_component(
     Ok(StatusCode::OK)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GetIndexesArgs {
     component_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct GetIndexesResponse {
+    #[schema(value_type = Vec<Object>)]
     indexes: Vec<IndexMetadataResponse>,
 }
 
-#[debug_handler]
+/// Get database indexes
+///
+/// Returns metadata about database indexes for the specified component.
+#[utoipa::path(
+    get,
+    path = "/get_indexes",
+    params(
+        ("component_id" = Option<String>, Query, description = "Component ID to get indexes for")
+    ),
+    responses((status = 200, body = GetIndexesResponse)),
+)]
 pub async fn get_indexes(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(GetIndexesArgs { component_id }): Query<GetIndexesArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_member(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ViewData)?;
     let component_id = ComponentId::deserialize_from_string(component_id.as_deref())?;
     let mut tx = st.application.begin(identity.clone()).await?;
     let indexes = IndexModel::new(&mut tx)
@@ -179,57 +218,70 @@ pub async fn get_indexes(
     }))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetSourceCodeArgs {
-    path: String,
-    component: Option<String>,
-}
-
-#[debug_handler]
-pub async fn get_source_code(
-    State(st): State<LocalAppState>,
-    ExtractIdentity(identity): ExtractIdentity,
-    Query(GetSourceCodeArgs { path, component }): Query<GetSourceCodeArgs>,
-) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_member(&identity)?;
-    let component = ComponentId::deserialize_from_string(component.as_deref())?;
-    let path = path.parse().context(ErrorMetadata::bad_request(
-        "InvalidModulePath",
-        "Invalid module path",
-    ))?;
-    let source_code = st
-        .application
-        .get_source_code(identity, path, component)
-        .await?;
-    Ok(Json(source_code))
-}
-
-/// This endpoint checks if the admin key included in the header is valid
-/// for this instance.
-#[debug_handler]
+/// Check admin key validity
+///
+/// This endpoint checks if the admin key included in the header is valid for
+/// this instance. Returns the allowed operations and read-only status for the
+/// key so the dashboard can show appropriate disabled states.
+#[utoipa::path(
+    get,
+    path = "/check_admin_key",
+    responses((status = 200, body = serde_json::Value)),
+    tag = "public_api"
+)]
 pub async fn check_admin_key(
-    State(_st): State<LocalAppState>,
+    MtState(_st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_member_with_write_access(&identity)?;
-    Ok(Json(json!({ "success": true })))
+    let admin = match &identity {
+        keybroker::Identity::InstanceAdmin(admin) | keybroker::Identity::ActingUser(admin, _) => {
+            admin
+        },
+        _ => {
+            return Err(
+                anyhow::anyhow!(keybroker::bad_admin_key_error(identity.instance_name())).into(),
+            );
+        },
+    };
+    let allowed_ops = admin.allowed_ops().to_vec();
+    let is_read_only = admin.is_read_only();
+    let serialized_ops: Vec<serde_json::Value> = allowed_ops
+        .iter()
+        .map(|op| serde_json::to_value(op).unwrap())
+        .collect();
+    Ok(Json(json!({
+        "success": true,
+        "allowedOps": serialized_ops,
+        "isReadOnly": is_read_only,
+    })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTestFunctionArgs {
     admin_key: String,
+    #[schema(value_type = Object)]
     bundle: ModuleJson,
+    #[schema(value_type = Object)]
     args: UdfArgsJson,
     format: String,
     component_id: Option<String>,
 }
 
+/// Run test function
+///
+/// Executes a test function with the provided arguments and bundle.
+#[utoipa::path(
+    post,
+    path = "/run_test_function",
+    request_body = RunTestFunctionArgs,
+    responses((status = 200, body = serde_json::Value)),
+)]
 #[debug_handler]
 pub async fn run_test_function(
     State(st): State<LocalAppState>,
     ExtractRequestId(request_id): ExtractRequestId,
+    ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Json(req): Json<RunTestFunctionArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -239,13 +291,15 @@ pub async fn run_test_function(
         req.admin_key.clone(),
     )
     .await?;
-    let args = req.args.into_arg_vec();
+    identity.require_operation(keybroker::DeploymentOp::RunTestQuery)?;
+    let args = req.args.into_serialized_args()?;
     let module: ModuleConfig = req.bundle.try_into()?;
     let component_id = ComponentId::deserialize_from_string(req.component_id.as_deref())?;
+    let request_context = RequestContext::new(request_id, request_metadata);
     let udf_return = st
         .application
         .execute_standalone_module(
-            request_id,
+            request_context,
             module,
             args,
             identity,
@@ -256,7 +310,7 @@ pub async fn run_test_function(
     let value_format = Some(req.format.parse()?);
     let response = match udf_return {
         Ok(result) => UdfResponse::Success {
-            value: export_value(result.value.unpack(), value_format, client_version)?,
+            value: export_value(result.value.unpack()?, value_format, client_version)?,
             log_lines: result.log_lines,
         },
         Err(error) => {
@@ -264,4 +318,23 @@ pub async fn run_test_function(
         },
     };
     Ok(Json(response))
+}
+
+pub fn local_only_dashboard_router() -> OpenApiRouter<crate::LocalAppState> {
+    OpenApiRouter::new()
+}
+
+// Routes with the same handlers for the local backend + closed source backend
+pub fn common_dashboard_api_router<S>() -> OpenApiRouter<S>
+where
+    LocalAppState: FromMtState<S>,
+    S: Clone + Send + Sync + 'static,
+{
+    OpenApiRouter::new()
+        .routes(utoipa_axum::routes!(check_admin_key))
+        .routes(utoipa_axum::routes!(shapes2))
+        .routes(utoipa_axum::routes!(get_indexes))
+        .routes(utoipa_axum::routes!(delete_tables))
+        .routes(utoipa_axum::routes!(delete_component))
+        .routes(utoipa_axum::routes!(delete_scheduled_functions_table))
 }

@@ -2,6 +2,8 @@
 title: "Functions"
 slug: "functions"
 sidebar_position: 10
+description:
+  "Run, test, and monitor Convex functions with metrics and performance data"
 ---
 
 ![Functions Dashboard View](/screenshots/functions.png)
@@ -33,12 +35,12 @@ Mutation and action results will be visible once you click the "Run" button.
 
 Note that these results will show the logs and value returned from the function.
 To see what changed when you ran your function, see the
-[data page](/dashboard/deployments/data.md).
+[data page](/dashboard/deployments/data.mdx).
 
 ![Running a function](/screenshots/run_function.png)
 
 You can also
-[write a custom query function](/dashboard/deployments/data.md#writing-custom-queries)
+[write a custom query function](/dashboard/deployments/data.mdx#writing-custom-queries)
 by choosing the “Custom test query“ option instead of one of your deployed
 functions.
 
@@ -105,7 +107,7 @@ The valid user attributes are:
 ## Metrics
 
 There are four basic charts for each function. For overall team usage metrics,
-see [team settings](/dashboard/teams.md#usage).
+see [team settings](/dashboard/teams/teams.mdx#usage).
 
 ### Invocations
 
@@ -141,6 +143,3 @@ quickly.
 Consider the relationship of the execution time to the cache hit rate. As a
 rule, a cache hit takes well under 1 ms, so the higher your cache hit rate, the
 better your response times will be.
-
-Clicking on any of the charts will give you a larger, detailed view where you
-can customize the time ranges you're inspecting.

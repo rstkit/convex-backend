@@ -6,57 +6,111 @@ import { apiCodegen } from "../codegen_templates/api.js";
 import { apiCjsCodegen } from "../codegen_templates/api_cjs.js";
 import {
   dynamicDataModelDTS,
+  dynamicDataModelTS,
   noSchemaDataModelDTS,
+  noSchemaDataModelTS,
   staticDataModelDTS,
+  staticDataModelTS,
 } from "../codegen_templates/dataModel.js";
 import { readmeCodegen } from "../codegen_templates/readme.js";
 import { serverCodegen } from "../codegen_templates/server.js";
 import { tsconfigCodegen } from "../codegen_templates/tsconfig.js";
+import { Context } from "../../bundler/context.js";
 import {
-  Context,
   logError,
   logMessage,
   logOutput,
   logVerbose,
-} from "../../bundler/context.js";
+} from "../../bundler/log.js";
 import { typeCheckFunctionsInMode, TypeCheckMode } from "./typecheck.js";
-import { readProjectConfig } from "./config.js";
-import { recursivelyDelete } from "./fsUtils.js";
 import {
-  componentServerDTS,
-  componentServerJS,
-  componentServerStubDTS,
-} from "../codegen_templates/component_server.js";
+  readProjectConfig,
+  usesTypeScriptCodegen,
+  usesComponentApiImports,
+} from "./config.js";
+import { recursivelyDelete } from "./fsUtils.js";
+import { componentServerTS } from "../codegen_templates/component_server.js";
 import { ComponentDirectory } from "./components/definition/directoryStructure.js";
 import { StartPushResponse } from "./deployApi/startPush.js";
 import {
   componentApiDTS,
   componentApiJs,
   componentApiStubDTS,
+  componentApiStubTS,
+  componentApiTSWithTypes,
+  componentTS,
   rootComponentApiCJS,
 } from "../codegen_templates/component_api.js";
+import { functionsDir } from "./utils/utils.js";
+import { LargeIndexDeletionCheck } from "./indexes.js";
+
+const PRESERVED_GENERATED_ENTRIES = new Set(["ai"]);
+
+export function cleanupStaleGeneratedEntries(
+  ctx: Context,
+  codegenDir: string,
+  writtenFiles: string[],
+  opts?: { debug?: boolean; force?: boolean; dryRun?: boolean },
+) {
+  // Skip cleanup in debug mode since we don't actually write files in that mode.
+  if (opts?.debug) {
+    return;
+  }
+  for (const file of ctx.fs.listDir(codegenDir)) {
+    if (PRESERVED_GENERATED_ENTRIES.has(file.name)) {
+      continue;
+    }
+    if (!writtenFiles.includes(file.name)) {
+      recursivelyDelete(ctx, path.join(codegenDir, file.name), opts);
+    }
+  }
+}
 
 export type CodegenOptions = {
-  url?: string;
-  adminKey?: string;
+  url?: string | undefined;
+  adminKey?: string | undefined;
   dryRun: boolean;
   debug: boolean;
   typecheck: TypeCheckMode;
   init: boolean;
   commonjs: boolean;
   liveComponentSources: boolean;
+  debugNodeApis: boolean;
+  systemUdfs: boolean;
+  largeIndexDeletionCheck: LargeIndexDeletionCheck;
+  codegenOnlyThisComponent?: string | undefined;
 };
 
-export async function doInitCodegen(
+export async function doInitConvexFolder(
   ctx: Context,
-  functionsDir: string,
-  skipIfExists: boolean,
-  opts?: { dryRun?: boolean; debug?: boolean },
-): Promise<void> {
-  await prepareForCodegen(ctx, functionsDir, opts);
+  functionsFolder?: string,
+  opts?: {
+    dryRun?: boolean;
+    debug?: boolean;
+  },
+) {
+  const skipIfExists = true;
+  let folder: string;
+  if (functionsFolder) {
+    folder = functionsFolder;
+  } else {
+    const { projectConfig, configPath } = await readProjectConfig(ctx);
+    folder = functionsDir(configPath, projectConfig);
+  }
+  const { functionsDirExistedBeforeCodegen } = await prepareForCodegen(
+    ctx,
+    folder,
+    opts,
+  );
   await withTmpDir(async (tmpDir) => {
-    await doReadmeCodegen(ctx, tmpDir, functionsDir, skipIfExists, opts);
-    await doTsconfigCodegen(ctx, tmpDir, functionsDir, skipIfExists, opts);
+    await doReadmeCodegen(
+      ctx,
+      tmpDir,
+      folder,
+      skipIfExists && functionsDirExistedBeforeCodegen,
+      opts,
+    );
+    await doTsconfigCodegen(ctx, tmpDir, folder, skipIfExists, opts);
   });
 }
 
@@ -65,17 +119,17 @@ async function prepareForCodegen(
   functionsDir: string,
   opts?: { dryRun?: boolean },
 ) {
+  const functionsDirExistedBeforeCodegen = ctx.fs.exists(functionsDir);
   // Delete the old _generated.ts because v0.1.2 used to put the react generated
   // code there
   const legacyCodegenPath = path.join(functionsDir, "_generated.ts");
   if (ctx.fs.exists(legacyCodegenPath)) {
     if (opts?.dryRun) {
       logError(
-        ctx,
         `Command would delete legacy codegen file: ${legacyCodegenPath}}`,
       );
     } else {
-      logError(ctx, `Deleting legacy codegen file: ${legacyCodegenPath}}`);
+      logError(`Deleting legacy codegen file: ${legacyCodegenPath}}`);
       ctx.fs.unlink(legacyCodegenPath);
     }
   }
@@ -83,9 +137,10 @@ async function prepareForCodegen(
   // Create the codegen dir if it doesn't already exist.
   const codegenDir = path.join(functionsDir, "_generated");
   ctx.fs.mkdir(codegenDir, { allowExisting: true, recursive: true });
-  return codegenDir;
+  return { codegenDir, functionsDirExistedBeforeCodegen };
 }
 
+/** Codegen only for an application (a root component) */
 export async function doCodegen(
   ctx: Context,
   functionsDir: string,
@@ -93,7 +148,7 @@ export async function doCodegen(
   opts?: { dryRun?: boolean; generateCommonJSApi?: boolean; debug?: boolean },
 ) {
   const { projectConfig } = await readProjectConfig(ctx);
-  const codegenDir = await prepareForCodegen(ctx, functionsDir, opts);
+  const { codegenDir } = await prepareForCodegen(ctx, functionsDir, opts);
 
   await withTmpDir(async (tmpDir) => {
     // Write files in dependency order so a watching dev server doesn't
@@ -102,18 +157,29 @@ export async function doCodegen(
     // and then delete any remaining paths at the end.
     const writtenFiles = [];
 
+    const useTypeScript = usesTypeScriptCodegen(projectConfig);
+    const generateCommonJSApi =
+      opts?.generateCommonJSApi || projectConfig.generateCommonJSApi;
+
     // First, `dataModel.d.ts` imports from the developer's `schema.js` file.
     const schemaFiles = await doDataModelCodegen(
       ctx,
       tmpDir,
       functionsDir,
       codegenDir,
+      useTypeScript,
       opts,
     );
     writtenFiles.push(...schemaFiles);
 
     // Next, the `server.d.ts` file imports from `dataModel.d.ts`.
-    const serverFiles = await doServerCodegen(ctx, tmpDir, codegenDir, opts);
+    const serverFiles = await writeServerFiles(
+      ctx,
+      tmpDir,
+      codegenDir,
+      useTypeScript,
+      opts,
+    );
     writtenFiles.push(...serverFiles);
 
     // The `api.d.ts` file imports from the developer's modules, which then
@@ -124,23 +190,23 @@ export async function doCodegen(
       tmpDir,
       functionsDir,
       codegenDir,
-      opts?.generateCommonJSApi || projectConfig.generateCommonJSApi,
+      useTypeScript,
+      generateCommonJSApi,
       opts,
     );
     writtenFiles.push(...apiFiles);
 
     // Cleanup any files that weren't written in this run.
-    for (const file of ctx.fs.listDir(codegenDir)) {
-      if (!writtenFiles.includes(file.name)) {
-        recursivelyDelete(ctx, path.join(codegenDir, file.name), opts);
-      }
-    }
+    cleanupStaleGeneratedEntries(ctx, codegenDir, writtenFiles, opts);
 
     // Generated code is updated, typecheck the query and mutation functions.
     await typeCheckFunctionsInMode(ctx, typeCheckMode, functionsDir);
   });
 }
 
+// Just enough to be able to bundle code for analysis: we need an api proxy object
+// so that imports aren't broken, we need basics in server, we need something in
+// data model.
 export async function doInitialComponentCodegen(
   ctx: Context,
   tmpDir: TempDir,
@@ -154,27 +220,16 @@ export async function doInitialComponentCodegen(
 ) {
   const { projectConfig } = await readProjectConfig(ctx);
 
-  // This component defined in a dist directory; it is probably in a node_module
-  // directory, installed from a package. It is stuck with the files it has.
-  // Heuristics for this:
-  // - component definition has a dist/ directory as an ancestor
-  // - component definition is a .js file
-  // - presence of .js.map files
-  // We may improve this heuristic.
-  const isPublishedPackage =
-    componentDirectory.definitionPath.endsWith(".js") &&
-    !componentDirectory.isRoot;
-  if (isPublishedPackage) {
+  if (isPublishedPackage(componentDirectory)) {
     if (opts?.verbose) {
       logMessage(
-        ctx,
         `skipping initial codegen for installed package ${componentDirectory.path}`,
       );
     }
     return;
   }
 
-  const codegenDir = await prepareForCodegen(
+  const { codegenDir } = await prepareForCodegen(
     ctx,
     componentDirectory.path,
     opts,
@@ -186,12 +241,21 @@ export async function doInitialComponentCodegen(
   // and then delete any remaining paths at the end.
   const writtenFiles = [];
 
+  // Non-root components always use .ts files; root components respect the config
+  // But for initial (placeholder, stub) codegen we don't care, just use .d.ts and .js.
+  const useTypeScript =
+    !componentDirectory.isRoot || usesTypeScriptCodegen(projectConfig);
+
+  const generateCommonJSApi =
+    opts?.generateCommonJSApi || projectConfig.generateCommonJSApi;
+
   // First, `dataModel.d.ts` imports from the developer's `schema.js` file.
   const dataModelFiles = await doInitialComponentDataModelCodegen(
     ctx,
     tmpDir,
     componentDirectory,
     codegenDir,
+    useTypeScript,
     opts,
   );
   writtenFiles.push(...dataModelFiles);
@@ -202,6 +266,7 @@ export async function doInitialComponentCodegen(
     componentDirectory.isRoot,
     tmpDir,
     codegenDir,
+    useTypeScript,
     opts,
   );
   writtenFiles.push(...serverFiles);
@@ -214,25 +279,49 @@ export async function doInitialComponentCodegen(
     componentDirectory.isRoot,
     tmpDir,
     codegenDir,
-    opts?.generateCommonJSApi || projectConfig.generateCommonJSApi,
+    useTypeScript,
+    generateCommonJSApi,
     opts,
   );
   writtenFiles.push(...apiFiles);
 
-  // Cleanup any files that weren't written in this run.
-  for (const file of ctx.fs.listDir(codegenDir)) {
-    if (!writtenFiles.includes(file.name)) {
-      recursivelyDelete(ctx, path.join(codegenDir, file.name), opts);
+  // component.ts is generated in doFinalComponentCodegen, but don't delete
+  // if it already exists from a previous full codegen run.
+  if (!componentDirectory.isRoot) {
+    const componentTSPath = path.join(codegenDir, "component.ts");
+    if (ctx.fs.exists(componentTSPath)) {
+      writtenFiles.push("component.ts");
     }
   }
+
+  // Cleanup any files that weren't written in this run.
+  cleanupStaleGeneratedEntries(ctx, codegenDir, writtenFiles, opts);
 }
 
+/* This component defined in a dist directory; it is probably in a node_module
+ * directory, installed from a package. It is stuck with the files it has.
+ * Heuristics for this:
+ * - component definition has a dist/ directory as an ancestor
+ * - component definition is a .js file
+ * - presence of .js.map files
+ * We may improve this heuristic.
+ */
+export function isPublishedPackage(componentDirectory: ComponentDirectory) {
+  return (
+    componentDirectory.definitionPath.endsWith(".js") &&
+    !componentDirectory.isRoot
+  );
+}
+
+// Handles root and non-root components; it's "component" codegen because
+// it's not the old legacy path.
 export async function doFinalComponentCodegen(
   ctx: Context,
   tmpDir: TempDir,
   rootComponent: ComponentDirectory,
   componentDirectory: ComponentDirectory,
   startPushResponse: StartPushResponse,
+  componentsMap: Map<string, ComponentDirectory>,
   opts?: {
     dryRun?: boolean;
     debug?: boolean;
@@ -244,6 +333,7 @@ export async function doFinalComponentCodegen(
   const isPublishedPackage =
     componentDirectory.definitionPath.endsWith(".js") &&
     !componentDirectory.isRoot;
+  // We never codegen for a published package (you need to link to the convex.config.ts file instead).
   if (isPublishedPackage) {
     return;
   }
@@ -251,70 +341,138 @@ export async function doFinalComponentCodegen(
   const codegenDir = path.join(componentDirectory.path, "_generated");
   ctx.fs.mkdir(codegenDir, { allowExisting: true, recursive: true });
 
-  // `dataModel.d.ts`, `server.d.ts` and `api.d.ts` depend on analyze results, where we
-  // replace the stub generated during initial codegen with a more precise type.
+  // Non-root components always use .ts files; root components respect the config
+  const useTypeScript =
+    !componentDirectory.isRoot || usesTypeScriptCodegen(projectConfig);
+
+  // `dataModel` and `api` files depend on analyze results so will get replaced
+  // in the later post-analysis codegen phase,  but `server` files don't need
+  // analysis info so the stubs from initial codegen are sufficient.
+
+  // dataModel
   const hasSchemaFile = schemaFileExists(ctx, componentDirectory.path);
   let dataModelContents: string;
   if (hasSchemaFile) {
     if (projectConfig.codegen.staticDataModel) {
-      dataModelContents = await staticDataModelDTS(
-        ctx,
-        startPushResponse,
-        rootComponent,
-        componentDirectory,
-      );
+      dataModelContents = useTypeScript
+        ? await staticDataModelTS(
+            ctx,
+            startPushResponse,
+            rootComponent,
+            componentDirectory,
+          )
+        : await staticDataModelDTS(
+            ctx,
+            startPushResponse,
+            rootComponent,
+            componentDirectory,
+          );
     } else {
-      dataModelContents = dynamicDataModelDTS();
+      dataModelContents = useTypeScript
+        ? dynamicDataModelTS()
+        : dynamicDataModelDTS();
     }
   } else {
-    dataModelContents = noSchemaDataModelDTS();
+    dataModelContents = useTypeScript
+      ? noSchemaDataModelTS()
+      : noSchemaDataModelDTS();
   }
-  const dataModelDTSPath = path.join(codegenDir, "dataModel.d.ts");
+  const dataModelPath = path.join(
+    codegenDir,
+    useTypeScript ? "dataModel.ts" : "dataModel.d.ts",
+  );
   await writeFormattedFile(
     ctx,
     tmpDir,
     dataModelContents,
     "typescript",
-    dataModelDTSPath,
+    dataModelPath,
     opts,
   );
 
-  const serverDTSPath = path.join(codegenDir, "server.d.ts");
-  const serverContents = await componentServerDTS(componentDirectory);
-  await writeFormattedFile(
+  // component.ts
+  if (!componentDirectory.isRoot) {
+    const componentTSPath = path.join(codegenDir, "component.ts");
+    const componentTSContents = await componentTS(
+      ctx,
+      startPushResponse,
+      rootComponent,
+      componentDirectory,
+    );
+    await writeFormattedFile(
+      ctx,
+      tmpDir,
+      componentTSContents,
+      "typescript",
+      componentTSPath,
+      opts,
+    );
+  }
+
+  // server.ts - regenerate it in final codegen for consistency, even though
+  // the stub from initial codegen would be sufficient.
+  await writeServerFilesForComponent(
     ctx,
+    componentDirectory.isRoot,
     tmpDir,
-    serverContents,
-    "typescript",
-    serverDTSPath,
+    codegenDir,
+    useTypeScript,
     opts,
   );
 
-  const apiDTSPath = path.join(codegenDir, "api.d.ts");
-  const apiContents = await componentApiDTS(
-    ctx,
-    startPushResponse,
-    rootComponent,
-    componentDirectory,
-    { staticApi: projectConfig.codegen.staticApi },
-  );
-  await writeFormattedFile(
-    ctx,
-    tmpDir,
-    apiContents,
-    "typescript",
-    apiDTSPath,
-    opts,
-  );
-
-  if (opts?.generateCommonJSApi || projectConfig.generateCommonJSApi) {
-    const apiCjsDTSPath = path.join(codegenDir, "api_cjs.d.ts");
+  // api
+  if (!useTypeScript) {
+    const apiDTSPath = path.join(codegenDir, "api.d.ts");
+    const apiContents = await componentApiDTS(
+      ctx,
+      startPushResponse,
+      rootComponent,
+      componentDirectory,
+      componentsMap,
+      {
+        staticApi: projectConfig.codegen.staticApi,
+        useComponentApiImports: usesComponentApiImports(projectConfig),
+      },
+    );
     await writeFormattedFile(
       ctx,
       tmpDir,
       apiContents,
       "typescript",
-      apiCjsDTSPath,
+      apiDTSPath,
+      opts,
+    );
+
+    if (opts?.generateCommonJSApi || projectConfig.generateCommonJSApi) {
+      const apiCjsDTSPath = path.join(codegenDir, "api_cjs.d.cts");
+      await writeFormattedFile(
+        ctx,
+        tmpDir,
+        apiContents,
+        "typescript",
+        apiCjsDTSPath,
+        opts,
+      );
+    }
+  } else {
+    const apiTSPath = path.join(codegenDir, "api.ts");
+    const apiContents = await componentApiTSWithTypes(
+      ctx,
+      startPushResponse,
+      rootComponent,
+      componentDirectory,
+      componentsMap,
+      {
+        staticApi: projectConfig.codegen.staticApi,
+        useComponentApiImports: usesComponentApiImports(projectConfig),
+      },
+    );
+    await writeFormattedFile(
+      ctx,
+      tmpDir,
+      apiContents,
+      "typescript",
+      apiTSPath,
       opts,
     );
   }
@@ -324,12 +482,12 @@ async function doReadmeCodegen(
   ctx: Context,
   tmpDir: TempDir,
   functionsDir: string,
-  skipIfExists: boolean,
+  skip: boolean,
   opts?: { dryRun?: boolean; debug?: boolean },
 ) {
   const readmePath = path.join(functionsDir, "README.md");
-  if (skipIfExists && ctx.fs.exists(readmePath)) {
-    logVerbose(ctx, `Not overwriting README.md.`);
+  if (skip) {
+    logVerbose(`Not overwriting README.md.`);
     return;
   }
   await writeFormattedFile(
@@ -351,7 +509,7 @@ async function doTsconfigCodegen(
 ) {
   const tsconfigPath = path.join(functionsDir, "tsconfig.json");
   if (skipIfExists && ctx.fs.exists(tsconfigPath)) {
-    logVerbose(ctx, `Not overwriting tsconfig.json.`);
+    logVerbose(`Not overwriting tsconfig.json.`);
     return;
   }
   await writeFormattedFile(
@@ -379,50 +537,119 @@ async function doDataModelCodegen(
   tmpDir: TempDir,
   functionsDir: string,
   codegenDir: string,
+  useTypeScript: boolean,
   opts?: { dryRun?: boolean; debug?: boolean },
 ) {
   const hasSchemaFile = schemaFileExists(ctx, functionsDir);
   const schemaContent = hasSchemaFile
-    ? dynamicDataModelDTS()
-    : noSchemaDataModelDTS();
+    ? useTypeScript
+      ? dynamicDataModelTS()
+      : dynamicDataModelDTS()
+    : useTypeScript
+      ? noSchemaDataModelTS()
+      : noSchemaDataModelDTS();
 
+  const filename = useTypeScript ? "dataModel.ts" : "dataModel.d.ts";
   await writeFormattedFile(
     ctx,
     tmpDir,
     schemaContent,
     "typescript",
-    path.join(codegenDir, "dataModel.d.ts"),
+    path.join(codegenDir, filename),
     opts,
   );
-  return ["dataModel.d.ts"];
+  return [filename];
 }
 
-async function doServerCodegen(
+/**
+ * Write server.ts/.js/.d.ts files for root components.
+ * Returns list of filenames written.
+ */
+async function writeServerFiles(
+  ctx: Context,
+  tmpDir: TempDir,
+  codegenDir: string,
+  useTypeScript: boolean,
+  opts?: { dryRun?: boolean; debug?: boolean },
+): Promise<string[]> {
+  if (!useTypeScript) {
+    const serverContent = serverCodegen({ useTypeScript: false });
+    await writeFormattedFile(
+      ctx,
+      tmpDir,
+      serverContent.JS!,
+      "typescript",
+      path.join(codegenDir, "server.js"),
+      opts,
+    );
+
+    await writeFormattedFile(
+      ctx,
+      tmpDir,
+      serverContent.DTS!,
+      "typescript",
+      path.join(codegenDir, "server.d.ts"),
+      opts,
+    );
+
+    return ["server.js", "server.d.ts"];
+  } else {
+    const serverContent = serverCodegen({ useTypeScript: true });
+    await writeFormattedFile(
+      ctx,
+      tmpDir,
+      serverContent.TS!,
+      "typescript",
+      path.join(codegenDir, "server.ts"),
+      opts,
+    );
+
+    return ["server.ts"];
+  }
+}
+
+/**
+ * Write server.ts file for non-root components.
+ * Returns list of filenames written.
+ */
+async function writeComponentServerFile(
   ctx: Context,
   tmpDir: TempDir,
   codegenDir: string,
   opts?: { dryRun?: boolean; debug?: boolean },
-) {
-  const serverContent = serverCodegen();
+): Promise<string[]> {
+  const serverTSPath = path.join(codegenDir, "server.ts");
+  const serverTSContents = componentServerTS(false);
   await writeFormattedFile(
     ctx,
     tmpDir,
-    serverContent.JS,
+    serverTSContents,
     "typescript",
-    path.join(codegenDir, "server.js"),
+    serverTSPath,
     opts,
   );
+  return ["server.ts"];
+}
 
-  await writeFormattedFile(
-    ctx,
-    tmpDir,
-    serverContent.DTS,
-    "typescript",
-    path.join(codegenDir, "server.d.ts"),
-    opts,
-  );
-
-  return ["server.js", "server.d.ts"];
+/**
+ * Write server files for either root or non-root components.
+ * Root components get server.ts/server.js/server.d.ts based on useTypeScript.
+ * Non-root components always get server.ts.
+ * Returns list of filenames written.
+ */
+async function writeServerFilesForComponent(
+  ctx: Context,
+  isRoot: boolean,
+  tmpDir: TempDir,
+  codegenDir: string,
+  useTypeScript: boolean,
+  opts?: { dryRun?: boolean; debug?: boolean },
+): Promise<string[]> {
+  if (isRoot) {
+    return await writeServerFiles(ctx, tmpDir, codegenDir, useTypeScript, opts);
+  } else {
+    return await writeComponentServerFile(ctx, tmpDir, codegenDir, opts);
+  }
 }
 
 async function doInitialComponentServerCodegen(
@@ -430,32 +657,17 @@ async function doInitialComponentServerCodegen(
   isRoot: boolean,
   tmpDir: TempDir,
   codegenDir: string,
+  useTypeScript: boolean,
   opts?: { dryRun?: boolean; debug?: boolean },
 ) {
-  await writeFormattedFile(
+  return await writeServerFilesForComponent(
     ctx,
+    isRoot,
     tmpDir,
-    componentServerJS(),
-    "typescript",
-    path.join(codegenDir, "server.js"),
+    codegenDir,
+    useTypeScript,
     opts,
   );
-
-  // Don't write our stub if the file already exists: It probably
-  // has better type information than this stub.
-  const serverDTSPath = path.join(codegenDir, "server.d.ts");
-  if (!ctx.fs.exists(serverDTSPath)) {
-    await writeFormattedFile(
-      ctx,
-      tmpDir,
-      componentServerStubDTS(isRoot),
-      "typescript",
-      path.join(codegenDir, "server.d.ts"),
-      opts,
-    );
-  }
-
-  return ["server.js", "server.d.ts"];
 }
 
 async function doInitialComponentDataModelCodegen(
@@ -463,13 +675,19 @@ async function doInitialComponentDataModelCodegen(
   tmpDir: TempDir,
   componentDirectory: ComponentDirectory,
   codegenDir: string,
+  useTypeScript: boolean,
   opts?: { dryRun?: boolean; debug?: boolean },
 ) {
   const hasSchemaFile = schemaFileExists(ctx, componentDirectory.path);
-  const dataModelContext = hasSchemaFile
-    ? dynamicDataModelDTS()
-    : noSchemaDataModelDTS();
-  const dataModelPath = path.join(codegenDir, "dataModel.d.ts");
+  const dataModelContent = hasSchemaFile
+    ? useTypeScript
+      ? dynamicDataModelTS()
+      : dynamicDataModelDTS()
+    : useTypeScript
+      ? noSchemaDataModelTS()
+      : noSchemaDataModelDTS();
+  const filename = useTypeScript ? "dataModel.ts" : "dataModel.d.ts";
+  const dataModelPath = path.join(codegenDir, filename);
 
   // Don't write our stub if the file already exists, since it may have
   // better type information from `doFinalComponentDataModelCodegen`.
@@ -477,13 +695,13 @@ async function doInitialComponentDataModelCodegen(
     await writeFormattedFile(
       ctx,
       tmpDir,
-      dataModelContext,
+      dataModelContent,
       "typescript",
       dataModelPath,
       opts,
     );
   }
-  return ["dataModel.d.ts"];
+  return [filename];
 }
 
 async function doInitialComponentApiCodegen(
@@ -491,58 +709,78 @@ async function doInitialComponentApiCodegen(
   isRoot: boolean,
   tmpDir: TempDir,
   codegenDir: string,
+  useTypeScript: boolean,
   generateCommonJSApi: boolean,
   opts?: { dryRun?: boolean; debug?: boolean },
 ) {
-  const apiJS = componentApiJs();
-  await writeFormattedFile(
-    ctx,
-    tmpDir,
-    apiJS,
-    "typescript",
-    path.join(codegenDir, "api.js"),
-    opts,
-  );
+  const writtenFiles: string[] = [];
 
-  // Don't write the `.d.ts` stub if it already exists.
-  const apiDTSPath = path.join(codegenDir, "api.d.ts");
-  const apiStubDTS = componentApiStubDTS();
-  if (!ctx.fs.exists(apiDTSPath)) {
+  if (!useTypeScript) {
+    const apiJS = componentApiJs();
     await writeFormattedFile(
       ctx,
       tmpDir,
-      apiStubDTS,
+      apiJS,
       "typescript",
-      apiDTSPath,
-      opts,
-    );
-  }
-
-  const writtenFiles = ["api.js", "api.d.ts"];
-
-  if (generateCommonJSApi && isRoot) {
-    const apiCjsJS = rootComponentApiCJS();
-    await writeFormattedFile(
-      ctx,
-      tmpDir,
-      apiCjsJS,
-      "typescript",
-      path.join(codegenDir, "api_cjs.cjs"),
+      path.join(codegenDir, "api.js"),
       opts,
     );
 
-    const cjsStubPath = path.join(codegenDir, "api_cjs.d.cts");
-    if (!ctx.fs.exists(cjsStubPath)) {
+    // Don't write the `.d.ts` stub if it already exists.
+    const apiDTSPath = path.join(codegenDir, "api.d.ts");
+    const apiStubDTS = componentApiStubDTS();
+    if (!ctx.fs.exists(apiDTSPath)) {
       await writeFormattedFile(
         ctx,
         tmpDir,
         apiStubDTS,
         "typescript",
-        cjsStubPath,
+        apiDTSPath,
         opts,
       );
     }
-    writtenFiles.push("api_cjs.cjs", "api_cjs.d.cts");
+
+    writtenFiles.push("api.js", "api.d.ts");
+
+    if (generateCommonJSApi && isRoot) {
+      const apiCjsJS = rootComponentApiCJS();
+      await writeFormattedFile(
+        ctx,
+        tmpDir,
+        apiCjsJS,
+        "typescript",
+        path.join(codegenDir, "api_cjs.cjs"),
+        opts,
+      );
+
+      const cjsStubPath = path.join(codegenDir, "api_cjs.d.cts");
+      if (!ctx.fs.exists(cjsStubPath)) {
+        await writeFormattedFile(
+          ctx,
+          tmpDir,
+          apiStubDTS,
+          "typescript",
+          cjsStubPath,
+          opts,
+        );
+      }
+      writtenFiles.push("api_cjs.cjs", "api_cjs.d.cts");
+    }
+  } else {
+    const apiTSPath = path.join(codegenDir, "api.ts");
+    const apiTS = componentApiStubTS();
+    // Don't write the `.ts` stub if it already exists.
+    if (!ctx.fs.exists(apiTSPath)) {
+      await writeFormattedFile(
+        ctx,
+        tmpDir,
+        apiTS,
+        "typescript",
+        apiTSPath,
+        opts,
+      );
+    }
+    writtenFiles.push("api.ts");
   }
 
   return writtenFiles;
@@ -553,50 +791,68 @@ async function doApiCodegen(
   tmpDir: TempDir,
   functionsDir: string,
   codegenDir: string,
+  useTypeScript: boolean,
   generateCommonJSApi: boolean,
   opts?: { dryRun?: boolean; debug?: boolean },
 ) {
   const absModulePaths = await entryPoints(ctx, functionsDir);
-  const modulePaths = absModulePaths.map((p) => path.relative(functionsDir, p));
+  const modulePaths = absModulePaths
+    .map((p) => path.relative(functionsDir, p))
+    .sort();
 
-  const apiContent = apiCodegen(modulePaths);
-  await writeFormattedFile(
-    ctx,
-    tmpDir,
-    apiContent.JS,
-    "typescript",
-    path.join(codegenDir, "api.js"),
-    opts,
-  );
-  await writeFormattedFile(
-    ctx,
-    tmpDir,
-    apiContent.DTS,
-    "typescript",
-    path.join(codegenDir, "api.d.ts"),
-    opts,
-  );
-  const writtenFiles = ["api.js", "api.d.ts"];
+  const writtenFiles: string[] = [];
 
-  if (generateCommonJSApi) {
-    const apiCjsContent = apiCjsCodegen(modulePaths);
+  if (!useTypeScript) {
+    const apiContent = apiCodegen(modulePaths, { useTypeScript: false });
     await writeFormattedFile(
       ctx,
       tmpDir,
-      apiCjsContent.JS,
+      apiContent.JS!,
       "typescript",
-      path.join(codegenDir, "api_cjs.cjs"),
+      path.join(codegenDir, "api.js"),
       opts,
     );
     await writeFormattedFile(
       ctx,
       tmpDir,
-      apiCjsContent.DTS,
+      apiContent.DTS!,
       "typescript",
-      path.join(codegenDir, "api_cjs.d.cts"),
+      path.join(codegenDir, "api.d.ts"),
       opts,
     );
-    writtenFiles.push("api_cjs.cjs", "api_cjs.d.cts");
+    writtenFiles.push("api.js", "api.d.ts");
+
+    if (generateCommonJSApi) {
+      const apiCjsContent = apiCjsCodegen(modulePaths);
+      await writeFormattedFile(
+        ctx,
+        tmpDir,
+        apiCjsContent.JS!,
+        "typescript",
+        path.join(codegenDir, "api_cjs.cjs"),
+        opts,
+      );
+      await writeFormattedFile(
+        ctx,
+        tmpDir,
+        apiCjsContent.DTS!,
+        "typescript",
+        path.join(codegenDir, "api_cjs.d.cts"),
+        opts,
+      );
+      writtenFiles.push("api_cjs.cjs", "api_cjs.d.cts");
+    }
+  } else {
+    const apiContent = apiCodegen(modulePaths, { useTypeScript: true });
+    await writeFormattedFile(
+      ctx,
+      tmpDir,
+      apiContent.TS!,
+      "typescript",
+      path.join(codegenDir, "api.ts"),
+      opts,
+    );
+    writtenFiles.push("api.ts");
   }
 
   return writtenFiles;
@@ -624,8 +880,8 @@ async function writeFormattedFile(
   if (options?.debug) {
     // NB: The `test_codegen_projects_are_up_to_date` smoke test depends
     // on this output format.
-    logOutput(ctx, `# ${path.resolve(destination)}`);
-    logOutput(ctx, formattedContents);
+    logOutput(`# ${path.resolve(destination)}`);
+    logOutput(formattedContents);
     return;
   }
   try {
@@ -640,7 +896,7 @@ async function writeFormattedFile(
     }
   }
   if (options?.dryRun) {
-    logOutput(ctx, `Command would write file: ${destination}`);
+    logOutput(`Command would write file: ${destination}`);
     return;
   }
   const tmpPath = tmpDir.writeUtf8File(formattedContents);

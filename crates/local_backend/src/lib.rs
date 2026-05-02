@@ -1,5 +1,5 @@
-#![feature(let_chains)]
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(iterator_try_collect)]
 #![feature(coroutines)]
 #![feature(exhaustive_patterns)]
@@ -29,29 +29,39 @@ use common::{
     },
     knobs::{
         ACTION_USER_TIMEOUT,
+        DOCUMENT_RETENTION_RATE_LIMIT,
         UDF_CACHE_MAX_SIZE,
     },
-    log_streaming::NoopLogSender,
     persistence::Persistence,
-    runtime::Runtime,
+    runtime::{
+        new_rate_limiter,
+        Runtime,
+    },
     shutdown::ShutdownSignal,
     types::{
         ConvexOrigin,
         ConvexSite,
+        DeploymentClass,
+        DeploymentMetadata,
+        TEST_REGION_NAME,
     },
 };
 use config::LocalConfig;
 use database::Database;
 use events::usage::NoOpUsageEventLogger;
+use exports::interface::InProcessExportProvider;
 use file_storage::{
     FileStorage,
     TransactionalFileStorage,
 };
 use function_runner::{
     in_process_function_runner::InProcessFunctionRunner,
-    server::InstanceStorage,
+    server::DeploymentStorage,
     FunctionRunner,
 };
+use governor::Quota;
+use http_client::CachedHttpClient;
+use indexing::index_cache::SharedIndexCache;
 use model::{
     initialize_application_system_tables,
     virtual_system_mapping,
@@ -79,8 +89,11 @@ pub mod custom_headers;
 pub mod dashboard;
 pub mod deploy_config;
 pub mod deploy_config2;
+pub mod deployment_info;
+pub mod deployment_state;
 pub mod environment_variables;
 pub mod http_actions;
+pub mod log_sinks;
 pub mod logs;
 pub mod node_action_callbacks;
 pub mod parse;
@@ -92,11 +105,9 @@ pub mod schema;
 pub mod snapshot_export;
 pub mod snapshot_import;
 pub mod storage;
+pub mod streaming_export;
 pub mod streaming_import;
 pub mod subs;
-#[cfg(test)]
-mod test_helpers;
-
 pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 
 #[derive(Clone)]
@@ -139,18 +150,24 @@ pub async fn make_app(
     preempt_tx: ShutdownSignal,
 ) -> anyhow::Result<LocalAppState> {
     let key_broker = config.key_broker()?;
-    let in_process_searcher = InProcessSearcher::new(runtime.clone()).await?;
-    let searcher: Arc<dyn Searcher> = Arc::new(in_process_searcher.clone());
+    let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
+    let searcher: Arc<dyn Searcher> = in_process_searcher.clone();
     // TODO(CX-6572) Separate `SegmentMetadataFetcher` from `SearcherImpl`
-    let segment_metadata_fetcher: Arc<dyn SegmentTermMetadataFetcher> =
-        Arc::new(in_process_searcher);
+    let segment_metadata_fetcher: Arc<dyn SegmentTermMetadataFetcher> = in_process_searcher;
+    let (deleted_tablet_sender, deleted_tablet_receiver) = tokio::sync::mpsc::channel(100);
+    let usage_event_logger = Arc::new(NoOpUsageEventLogger);
     let database = Database::load(
         persistence.clone(),
         runtime.clone(),
         searcher.clone(),
-        preempt_tx,
+        preempt_tx.clone(),
         virtual_system_mapping().clone(),
-        Arc::new(NoOpUsageEventLogger),
+        Some(SharedIndexCache),
+        Arc::new(new_rate_limiter(
+            runtime.clone(),
+            Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
+        )),
+        deleted_tablet_sender,
     )
     .await?;
     initialize_application_system_tables(&database).await?;
@@ -171,6 +188,11 @@ pub async fn make_app(
         database: database.clone(),
     };
 
+    let deployment = DeploymentMetadata {
+        name: config.name(),
+        region: None,
+        class: DeploymentClass::S16,
+    };
     let node_process_timeout = *ACTION_USER_TIMEOUT + Duration::from_secs(5);
     let node_executor = Arc::new(LocalNodeExecutor::new(node_process_timeout).await?);
     let actions = Actions::new(
@@ -178,6 +200,7 @@ pub async fn make_app(
         config.convex_origin_url()?,
         *ACTION_USER_TIMEOUT,
         runtime.clone(),
+        deployment.clone(),
     );
 
     #[cfg(not(debug_assertions))]
@@ -189,32 +212,40 @@ pub async fn make_app(
     let fetch_client = Arc::new(ProxiedFetchClient::new(
         config.convex_http_proxy.clone(),
         config.name(),
+        reqwest::redirect::Policy::none(),
     ));
-    let function_runner: Arc<dyn FunctionRunner<ProdRuntime>> = Arc::new(
-        InProcessFunctionRunner::new(
-            config.name().clone(),
-            config.secret()?,
+    let oidc_http_client = CachedHttpClient::new(
+        config.convex_http_proxy.clone(),
+        config.name(),
+        reqwest::redirect::Policy::default(),
+    );
+    let function_runner: Arc<dyn FunctionRunner<ProdRuntime>> =
+        Arc::new(InProcessFunctionRunner::new(
+            deployment,
+            key_broker.function_runner_keybroker(),
             config.convex_origin_url()?,
             runtime.clone(),
             persistence.reader(),
-            InstanceStorage {
+            DeploymentStorage {
                 files_storage: application_storage.files_storage.clone(),
                 modules_storage: application_storage.modules_storage.clone(),
             },
             database.clone(),
-            fetch_client,
-        )
-        .await?,
-    );
+            fetch_client.clone(),
+        )?);
 
     let application = Application::new(
         runtime.clone(),
         database.clone(),
         file_storage.clone(),
         application_storage,
-        database.usage_counter(),
+        usage_event_logger,
         key_broker.clone(),
-        config.name(),
+        DeploymentMetadata {
+            name: config.name(),
+            region: Some(TEST_REGION_NAME.clone()),
+            class: DeploymentClass::S16,
+        },
         function_runner,
         config.convex_origin_url()?,
         config.convex_site_url()?,
@@ -222,18 +253,23 @@ pub async fn make_app(
         segment_metadata_fetcher,
         persistence,
         actions,
-        Arc::new(NoopLogSender),
         Arc::new(RedactLogsToClient::new(config.redact_logs_to_client)),
         Arc::new(ApplicationAuth::new(
             key_broker.clone(),
             Arc::new(NullAccessTokenAuth),
         )),
         QueryCache::new(*UDF_CACHE_MAX_SIZE),
+        fetch_client,
+        config.local_log_sink.clone(),
+        preempt_tx.clone(),
+        Arc::new(InProcessExportProvider),
+        deleted_tablet_receiver,
+        oidc_http_client,
     )
     .await?;
 
     let origin = config.convex_origin_url()?;
-    let instance_name = config.name().clone();
+    let instance_name = config.name();
 
     if !config.disable_beacon {
         let beacon_future = beacon::start_beacon(

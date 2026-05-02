@@ -1,7 +1,7 @@
 import type { UserIdentityAttributes } from "../../server/authentication.js";
 export type { UserIdentityAttributes } from "../../server/authentication.js";
 import { JSONValue, Base64 } from "../../values/index.js";
-import { Long } from "../long.js";
+import { Long } from "../../vendor/long.js";
 
 /**
  * Shared schema
@@ -19,11 +19,12 @@ export function longToU64(raw: U64): EncodedU64 {
 
 export function parseServerMessage(
   encoded: EncodedServerMessage,
-): ServerMessage {
+): WireServerMessage {
   switch (encoded.type) {
     case "FatalError":
     case "AuthError":
     case "ActionResponse":
+    case "TransitionChunk":
     case "Ping": {
       return { ...encoded };
     }
@@ -48,7 +49,7 @@ export function parseServerMessage(
       };
     }
     default: {
-      const _exhaustivenessCheck: never = encoded;
+      encoded satisfies never;
     }
   }
   return undefined as never;
@@ -76,7 +77,7 @@ export function encodeClientMessage(
       }
     }
     default: {
-      const _exhaustivenessCheck: never = message;
+      message satisfies never;
     }
   }
   return undefined as never;
@@ -120,7 +121,8 @@ type Connect = {
   sessionId: string;
   connectionCount: number;
   lastCloseReason: string | null;
-  maxObservedTimestamp?: TS;
+  maxObservedTimestamp?: TS | undefined;
+  clientTs: number;
 };
 
 export type AddQuery = {
@@ -128,11 +130,11 @@ export type AddQuery = {
   queryId: QueryId;
   udfPath: string;
   args: JSONValue[];
-  journal?: QueryJournal;
+  journal?: QueryJournal | undefined;
   /**
    * @internal
    */
-  componentPath?: string;
+  componentPath?: string | undefined;
 };
 
 export type RemoveQuery = {
@@ -154,7 +156,7 @@ export type MutationRequest = {
   args: JSONValue[];
   // Execute the mutation on a specific component.
   // Only admin auth is allowed to run mutations on non-root components.
-  componentPath?: string;
+  componentPath?: string | undefined;
 };
 
 export type ActionRequest = {
@@ -164,7 +166,7 @@ export type ActionRequest = {
   args: JSONValue[];
   // Execute the action on a specific component.
   // Only admin auth is allowed to run actions on non-root components.
-  componentPath?: string;
+  componentPath?: string | undefined;
 };
 
 export type AdminAuthentication = {
@@ -172,7 +174,7 @@ export type AdminAuthentication = {
   tokenType: "Admin";
   value: string;
   baseVersion: IdentityVersion;
-  impersonating?: UserIdentityAttributes;
+  impersonating?: UserIdentityAttributes | undefined;
 };
 
 export type Authenticate =
@@ -203,9 +205,12 @@ export type ClientMessage =
   | Event;
 
 type EncodedConnect = Omit<Connect, "maxObservedTimestamp"> & {
-  maxObservedTimestamp?: EncodedTS;
+  maxObservedTimestamp?: EncodedTS | undefined;
 };
 
+// It's not a big deal to add `| undefined` to any optional properties here because
+// these messages are bound for JSON.stringify() serialization, which removes properties
+// that are undefined.
 type EncodedClientMessage =
   | EncodedConnect
   | Authenticate
@@ -254,6 +259,16 @@ export type Transition = {
   startVersion: StateVersion;
   endVersion: StateVersion;
   modifications: StateModification[];
+  clientClockSkew?: number;
+  serverTs?: number;
+};
+
+export type TransitionChunk = {
+  type: "TransitionChunk";
+  chunk: string;
+  partNumber: number;
+  totalParts: number;
+  transitionId: string;
 };
 
 type MutationSuccess = {
@@ -306,8 +321,17 @@ type Ping = {
   type: "Ping";
 };
 
+// Server Messages without the messages only visible to WebSocketManager
 export type ServerMessage =
   | Transition
+  | MutationResponse
+  | ActionResponse
+  | FatalError
+  | AuthError;
+
+export type WireServerMessage =
+  | Transition
+  | TransitionChunk
   | MutationResponse
   | ActionResponse
   | FatalError
@@ -323,6 +347,7 @@ type EncodedMutationResponse = MutationFailed | EncodedMutationSuccess;
 
 type EncodedServerMessage =
   | EncodedTransition
+  | TransitionChunk
   | EncodedMutationResponse
   | ActionResponse
   | FatalError

@@ -7,8 +7,6 @@ use application::snapshot_import::{
 };
 use axum::{
     body::Body,
-    debug_handler,
-    extract::State,
     response::IntoResponse,
 };
 use common::{
@@ -16,6 +14,7 @@ use common::{
     http::{
         extract::{
             Json,
+            MtState,
             Query,
         },
         HttpResponseError,
@@ -44,7 +43,6 @@ use value::{
 };
 
 use crate::{
-    admin::must_be_admin_with_write_access,
     authentication::ExtractIdentity,
     LocalAppState,
 };
@@ -127,7 +125,7 @@ fn parse_format_arg(
 }
 
 pub async fn import(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(ImportQueryArgs {
         table_name,
@@ -137,7 +135,7 @@ pub async fn import(
     }): Query<ImportQueryArgs>,
     stream: Body,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
     let format = parse_format_arg(table_name, format)?;
     let component_path = ComponentPath::deserialize(component_path.as_deref())?;
     let body_stream = stream
@@ -163,10 +161,9 @@ pub struct StartUploadResponse {
 }
 
 pub async fn import_start_upload(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
     let token = st
         .application
         .start_upload_for_snapshot_import(identity)
@@ -176,9 +173,8 @@ pub async fn import_start_upload(
     }))
 }
 
-#[debug_handler]
 pub async fn import_upload_part(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(ImportUploadPartArgs {
         upload_token,
@@ -186,7 +182,6 @@ pub async fn import_upload_part(
     }): Query<ImportUploadPartArgs>,
     body_stream: Body,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
     let body_bytes = body_stream
         .into_data_stream()
         .map_ok(|chunk| chunk.to_vec())
@@ -215,7 +210,7 @@ pub struct ImportFinishUploadResponse {
 }
 
 pub async fn import_finish_upload(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(ImportFinishUploadArgs {
         import:
@@ -229,7 +224,6 @@ pub async fn import_finish_upload(
         part_tokens,
     }): Json<ImportFinishUploadArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
     let format = parse_format_arg(table_name, format)?;
     let component_path = ComponentPath::deserialize(component_path.as_deref())?;
     let import_id = st
@@ -258,11 +252,10 @@ pub struct PerformImportArgs {
 }
 
 pub async fn perform_import(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(PerformImportArgs { import_id }): Json<PerformImportArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
     let import_id = DeveloperDocumentId::decode(&import_id).context(ErrorMetadata::bad_request(
         "InvalidImport",
         format!("invalid import id {import_id}"),
@@ -278,7 +271,7 @@ pub struct CancelImportArgs {
 }
 
 pub async fn cancel_import(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(CancelImportArgs { import_id }): Json<CancelImportArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {

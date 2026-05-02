@@ -16,10 +16,6 @@ use super::size::{
 };
 use crate::{
     field_path::FieldPath,
-    heap_size::{
-        HeapSize,
-        WithHeapSize,
-    },
     size::check_system_size,
     utils::display_map,
     ConvexValue,
@@ -42,7 +38,7 @@ pub struct ConvexObject {
     // Precomputed 1 + max(nesting(v1), ..., nesting(vN))
     nesting: usize,
 
-    fields: WithHeapSize<BTreeMap<FieldName, ConvexValue>>,
+    fields: BTreeMap<FieldName, ConvexValue>,
 }
 
 impl PartialEq for ConvexObject {
@@ -85,7 +81,7 @@ impl TryFrom<BTreeMap<FieldName, ConvexValue>> for ConvexObject {
         Ok(Self {
             size,
             nesting,
-            fields: fields.into(),
+            fields,
         })
     }
 }
@@ -96,7 +92,7 @@ impl ConvexObject {
         Self {
             size: 1 + 1,
             nesting: 1,
-            fields: WithHeapSize::default(),
+            fields: BTreeMap::default(),
         }
     }
 
@@ -198,7 +194,7 @@ impl fmt::Display for ConvexObject {
 
 impl From<ConvexObject> for BTreeMap<FieldName, ConvexValue> {
     fn from(o: ConvexObject) -> Self {
-        o.fields.into()
+        o.fields
     }
 }
 
@@ -349,70 +345,8 @@ impl Deref for ConvexObject {
     }
 }
 
-impl HeapSize for ConvexObject {
-    fn heap_size(&self) -> usize {
-        self.fields.heap_size()
-    }
-}
-
 impl Hash for ConvexObject {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.fields.hash(state);
     }
 }
-
-#[cfg(any(test, feature = "testing"))]
-mod proptest {
-    use proptest::prelude::*;
-
-    use super::ConvexObject;
-    use crate::{
-        field_name::FieldName,
-        proptest::{
-            RestrictNaNs,
-            ValueBranching,
-        },
-        ConvexValue,
-        ExcludeSetsAndMaps,
-    };
-
-    impl Arbitrary for ConvexObject {
-        type Parameters = (
-            prop::collection::SizeRange,
-            <FieldName as Arbitrary>::Parameters,
-            ValueBranching,
-            ExcludeSetsAndMaps,
-            RestrictNaNs,
-        );
-
-        type Strategy = impl Strategy<Value = ConvexObject>;
-
-        fn arbitrary_with(
-            (size, field_params, branching, exclude_sets_and_maps, restrict_nans): Self::Parameters,
-        ) -> Self::Strategy {
-            resolved_object_strategy(
-                any_with::<FieldName>(field_params),
-                any_with::<ConvexValue>((
-                    field_params,
-                    branching,
-                    exclude_sets_and_maps,
-                    restrict_nans,
-                )),
-                size,
-            )
-        }
-    }
-
-    pub fn resolved_object_strategy(
-        field_strategy: impl Strategy<Value = FieldName>,
-        value_strategy: impl Strategy<Value = ConvexValue>,
-        size: impl Into<prop::collection::SizeRange>,
-    ) -> impl Strategy<Value = ConvexObject> {
-        prop::collection::btree_map(field_strategy, value_strategy, size)
-            .prop_filter_map("Map wasn't a valid Convex value", |s| {
-                ConvexObject::try_from(s).ok()
-            })
-    }
-}
-#[cfg(any(test, feature = "testing"))]
-pub use self::proptest::resolved_object_strategy;

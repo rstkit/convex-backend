@@ -1,3 +1,12 @@
+/**
+ * BaseConvexClient should not be used directly and does not provide a stable
+ * interface. It is a "Base" client not because it expects to be inherited from
+ * but because other clients are built around it.
+ *
+ * BaseConvexClient is not Convex Function type-aware: it deals
+ * with queries as functions that return Value, not the specific value.
+ * Use a higher-level library to get types.
+ */
 import { version } from "../../index.js";
 import { convexToJson, Value } from "../../values/index.js";
 import {
@@ -23,8 +32,8 @@ import {
   MutationRequest,
   QueryId,
   QueryJournal,
-  RequestId,
   ServerMessage,
+  RequestId,
   TS,
   UserIdentityAttributes,
 } from "./protocol.js";
@@ -41,6 +50,7 @@ export { type AuthTokenFetcher } from "./authentication_manager.js";
 import { getMarksReport, mark, MarkName } from "./metrics.js";
 import { parseArgs, validateDeploymentUrl } from "../../common/index.js";
 import { ConvexError } from "../../values/errors.js";
+import { jwtDecode } from "../../vendor/jwt-decode/index.js";
 
 /**
  * Options for {@link BaseConvexClient}.
@@ -75,6 +85,8 @@ export interface BaseConvexClientOptions {
    * If `false`, logs are not printed anywhere.
    *
    * You can construct your own logger to customize logging to log elsewhere.
+   * A logger is an object with 4 methods: log(), warn(), error(), and logVerbose().
+   * These methods can receive multiple arguments of any types, like console.log().
    */
   logger?: Logger | boolean;
   /**
@@ -83,6 +95,20 @@ export interface BaseConvexClientOptions {
    * The default value is `false`.
    */
   reportDebugInfoToConvex?: boolean;
+  /**
+   * This API is experimental: it may change or disappear.
+   *
+   * A function to call on receiving abnormal WebSocket close messages from the
+   * connected Convex deployment. The content of these messages is not stable,
+   * it is an implementation detail that may change.
+   *
+   * Consider this API an observability stopgap until higher level codes with
+   * recommendations on what to do are available, which could be a more stable
+   * interface instead of `string`.
+   *
+   * Check `connectionState` for more quantitative metrics about connection status.
+   */
+  onServerDisconnectError?: (message: string) => void;
   /**
    * Skip validating that the Convex deployment URL looks like
    * `https://happy-animal-123.convex.cloud` or localhost.
@@ -96,9 +122,21 @@ export interface BaseConvexClientOptions {
   /**
    * If using auth, the number of seconds before a token expires that we should refresh it.
    *
-   * The default value is `2`.
+   * The default value is `10`.
    */
   authRefreshTokenLeewaySeconds?: number;
+  /**
+   * This API is experimental: it may change or disappear.
+   *
+   * Whether query, mutation, and action requests should be held back
+   * until the first auth token can be sent.
+   *
+   * Opting into this behavior works well for pages that should
+   * only be viewed by authenticated clients.
+   *
+   * Defaults to false, not waiting for an auth token.
+   */
+  expectAuth?: boolean;
 }
 
 /**
@@ -154,7 +192,7 @@ export interface SubscribeOptions {
   /**
    * @internal
    */
-  componentPath?: string;
+  componentPath?: string | undefined;
 }
 
 /**
@@ -169,7 +207,7 @@ export interface MutationOptions {
    * An optimistic update locally updates queries while a mutation is pending.
    * Once the mutation completes, the update will be rolled back.
    */
-  optimisticUpdate?: OptimisticUpdate<any>;
+  optimisticUpdate?: OptimisticUpdate<any> | undefined;
 }
 
 /**
@@ -185,7 +223,7 @@ export type QueryModification =
  * Object describing a transition passed into the `onTransition` handler.
  *
  * These can be from receiving a transition from the server, or from applying an
- * optimistc update locally.
+ * optimistic update locally.
  *
  * @public
  */
@@ -221,6 +259,12 @@ export class BaseConvexClient {
   private readonly debug: boolean;
   private readonly logger: Logger;
   private maxObservedTimestamp: TS | undefined;
+  private connectionStateSubscribers = new Map<
+    number,
+    (connectionState: ConnectionState) => void
+  >();
+  private nextConnectionStateSubscriberId: number = 0;
+  private _lastPublishedConnectionState: ConnectionState | undefined;
 
   /**
    * @param address - The url of your Convex deployment, often provided
@@ -245,7 +289,7 @@ export class BaseConvexClient {
     }
     options = { ...options };
     const authRefreshTokenLeewaySeconds =
-      options.authRefreshTokenLeewaySeconds ?? 2;
+      options.authRefreshTokenLeewaySeconds ?? 10;
     let webSocketConstructor = options.webSocketConstructor;
     if (!webSocketConstructor && typeof WebSocket === "undefined") {
       throw new Error(
@@ -283,7 +327,18 @@ export class BaseConvexClient {
       (queryId) => this.state.queryPath(queryId),
       this.logger,
     );
-    this.requestManager = new RequestManager(this.logger);
+    this.requestManager = new RequestManager(
+      this.logger,
+      this.markConnectionStateDirty,
+    );
+
+    // This is a callback for AuthenticationManager (which can't call
+    // this synchronously, the callback wouldn't work) so the initial
+    // pause for expectAuth we call it at the end of this constructor.
+    const pauseSocket = () => {
+      this.webSocketManager.pause();
+      this.state.pause();
+    };
     this.authenticationManager = new AuthenticationManager(
       this.state,
       {
@@ -294,10 +349,7 @@ export class BaseConvexClient {
         },
         stopSocket: () => this.webSocketManager.stop(),
         tryRestartSocket: () => this.webSocketManager.tryRestart(),
-        pauseSocket: () => {
-          this.webSocketManager.pause();
-          this.state.pause();
-        },
+        pauseSocket,
         resumeSocket: () => this.webSocketManager.resume(),
         clearAuth: () => {
           this.clearAuth();
@@ -337,7 +389,10 @@ export class BaseConvexClient {
           // browsers but we tried.
           const confirmationMessage =
             "Are you sure you want to leave? Your changes may not be saved.";
-          (e || window.event).returnValue = confirmationMessage;
+          // Recommended method for legacy (IE) browsers.
+          // casts to avoid deprecation notices
+          ((e || (window as any).event) as any).returnValue =
+            confirmationMessage;
           return confirmationMessage;
         }
       });
@@ -358,16 +413,11 @@ export class BaseConvexClient {
 
           // Throw out our remote query, reissue queries
           // and outstanding mutations, and reauthenticate.
-          const oldRemoteQueryResults = new Set(
-            this.remoteQuerySet.remoteQueryResults().keys(),
-          );
           this.remoteQuerySet = new RemoteQuerySet(
             (queryId) => this.state.queryPath(queryId),
             this.logger,
           );
-          const [querySetModification, authModification] = this.state.restart(
-            oldRemoteQueryResults,
-          );
+          const [querySetModification, authModification] = this.state.restart();
           if (authModification) {
             this.webSocketManager.sendMessage(authModification);
           }
@@ -439,10 +489,8 @@ export class BaseConvexClient {
               void this.webSocketManager.terminate();
               throw error;
             }
-            case "Ping":
-              break; // do nothing
             default: {
-              const _typeCheck: never = serverMessage;
+              serverMessage satisfies never;
             }
           }
 
@@ -450,11 +498,19 @@ export class BaseConvexClient {
             hasSyncedPastLastReconnect: this.hasSyncedPastLastReconnect(),
           };
         },
+        onServerDisconnectError: options.onServerDisconnectError,
       },
       webSocketConstructor,
       this.logger,
+      this.markConnectionStateDirty,
+      this.debug,
     );
     this.mark("convexClientConstructed");
+
+    // Begin client in a paused state waiting for an auth token.
+    if (options.expectAuth) {
+      pauseSocket();
+    }
   }
 
   /**
@@ -464,7 +520,7 @@ export class BaseConvexClient {
    */
   private hasSyncedPastLastReconnect() {
     const hasSyncedPastLastReconnect =
-      this.requestManager.hasSyncedPastLastReconnect() ||
+      this.requestManager.hasSyncedPastLastReconnect() &&
       this.state.hasSyncedPastLastReconnect();
     return hasSyncedPastLastReconnect;
   }
@@ -510,6 +566,10 @@ export class BaseConvexClient {
         queryTokenToValue.set(queryToken, query);
       }
     }
+
+    // Query tokens that are new (because of new server results or new local optimistic updates)
+    // or differ from old values (because of changes from local optimistic updates or new results
+    // from the server).
     const changedQueryTokens =
       this.optimisticQueryResults.ingestQueryResultsFromServer(
         queryTokenToValue,
@@ -517,13 +577,17 @@ export class BaseConvexClient {
       );
 
     this.handleTransition({
-      queries: changedQueryTokens.map((token) => ({
-        token,
-        modification: {
-          kind: "Updated",
-          result: queryTokenToValue.get(token)!.result,
-        },
-      })),
+      queries: changedQueryTokens.map((token) => {
+        const optimisticResult =
+          this.optimisticQueryResults.rawQueryResult(token);
+        return {
+          token,
+          modification: {
+            kind: "Updated" as const,
+            result: optimisticResult,
+          },
+        };
+      }),
       reflectedMutations: Array.from(completedRequests).map(
         ([requestId, result]) => ({
           requestId,
@@ -553,6 +617,26 @@ export class BaseConvexClient {
     const id = this._transitionHandlerCounter++;
     this._onTransitionFns.set(id, fn);
     return () => this._onTransitionFns.delete(id);
+  }
+
+  /**
+   * Get the current JWT auth token and decoded claims.
+   */
+  getCurrentAuthClaims():
+    | { token: string; decoded: Record<string, any> }
+    | undefined {
+    const authToken = this.state.getAuth();
+    let decoded: Record<string, any> = {};
+    if (authToken && authToken.tokenType === "User") {
+      try {
+        decoded = authToken ? jwtDecode(authToken.value) : {};
+      } catch {
+        decoded = {};
+      }
+    } else {
+      return undefined;
+    }
+    return { token: authToken.value, decoded };
   }
 
   /**
@@ -654,7 +738,7 @@ export class BaseConvexClient {
   }
 
   /**
-   * Whether local query result is available for a toke.
+   * Whether local query result is available for a token.
    *
    * This method does not throw if the result is an error.
    *
@@ -712,6 +796,47 @@ export class BaseConvexClient {
         this.requestManager.timeOfOldestInflightRequest(),
       inflightMutations: this.requestManager.inflightMutations(),
       inflightActions: this.requestManager.inflightActions(),
+    };
+  }
+
+  /**
+   * Call this whenever the connection state may have changed in a way that could
+   * require publishing it. Schedules a possibly update.
+   */
+  private markConnectionStateDirty = () => {
+    void Promise.resolve().then(() => {
+      const curConnectionState = this.connectionState();
+      if (
+        JSON.stringify(curConnectionState) !==
+        JSON.stringify(this._lastPublishedConnectionState)
+      ) {
+        this._lastPublishedConnectionState = curConnectionState;
+        for (const cb of this.connectionStateSubscribers.values()) {
+          // One of these callback throwing will prevent other callbacks
+          // from running but will not leave the client in a undefined state.
+          cb(curConnectionState);
+        }
+      }
+    });
+  };
+
+  /**
+   * Subscribe to the {@link ConnectionState} between the client and the Convex
+   * backend, calling a callback each time it changes.
+   *
+   * Subscribed callbacks will be called when any part of ConnectionState changes.
+   * ConnectionState may grow in future versions (e.g. to provide a array of
+   * inflight requests) in which case callbacks would be called more frequently.
+   *
+   * @returns An unsubscribe function to stop listening.
+   */
+  subscribeToConnectionState(
+    cb: (connectionState: ConnectionState) => void,
+  ): () => void {
+    const id = this.nextConnectionStateSubscriberId++;
+    this.connectionStateSubscribers.set(id, cb);
+    return () => {
+      this.connectionStateSubscribers.delete(id);
     };
   }
 

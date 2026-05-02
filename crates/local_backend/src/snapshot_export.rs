@@ -3,8 +3,6 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::{
     body::Body,
-    debug_handler,
-    extract::State,
     response::IntoResponse,
 };
 use axum_extra::{
@@ -19,6 +17,7 @@ use common::{
     http::{
         extract::{
             Json,
+            MtState,
             Path,
             Query,
         },
@@ -29,12 +28,15 @@ use common::{
 use either::Either;
 use errors::ErrorMetadata;
 use http::StatusCode;
-use model::exports::{
-    types::{
-        ExportFormat,
-        ExportRequestor,
+use model::{
+    deployment_audit_log::types::DeploymentAuditLogEvent,
+    exports::{
+        types::{
+            ExportFormat,
+            ExportRequestor,
+        },
+        ExportsModel,
     },
-    ExportsModel,
 };
 use serde::Deserialize;
 use storage::StorageGetStream;
@@ -42,7 +44,6 @@ use sync_types::Timestamp;
 use value::DeveloperDocumentId;
 
 use crate::{
-    admin::must_be_admin_with_write_access,
     authentication::ExtractIdentity,
     custom_headers::ContentDispositionAttachment,
     LocalAppState,
@@ -61,14 +62,13 @@ pub struct RequestZipExport {
 
 #[fastrace::trace]
 pub async fn request_zip_export(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(RequestZipExport {
         include_storage,
         component,
     }): Query<RequestZipExport>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
     let component = ComponentId::deserialize_from_string(component.as_deref())?;
     st.application
         .request_export(
@@ -88,13 +88,12 @@ pub struct ZipExportRequest {
     id: String,
 }
 
-#[debug_handler]
 pub async fn get_zip_export(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Path(ZipExportRequest { id }): Path<ZipExportRequest>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::DownloadBackups)?;
     let id: Either<DeveloperDocumentId, Timestamp> = match id.parse() {
         Ok(id) => Either::Left(id),
         Err(_) => Either::Right(id.parse().context(ErrorMetadata::bad_request(
@@ -129,20 +128,14 @@ pub struct SetExportExpirationPathArgs {
     snapshot_id: String,
 }
 
-#[debug_handler]
 #[fastrace::trace]
 pub async fn set_export_expiration(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Path(SetExportExpirationPathArgs { snapshot_id }): Path<SetExportExpirationPathArgs>,
     Json(SetExportExpirationRequest { expiration_ts_ns }): Json<SetExportExpirationRequest>,
 ) -> Result<StatusCode, HttpResponseError> {
-    if !(identity.is_system() || identity.is_admin()) {
-        Err(anyhow::anyhow!(ErrorMetadata::forbidden(
-            "SetExportExpirationForbidden",
-            "Must have system or admin identity to set export expiration"
-        )))?;
-    }
+    identity.require_operation(keybroker::DeploymentOp::DeleteBackups)?;
     let snapshot_id: DeveloperDocumentId = snapshot_id
         .parse::<DeveloperDocumentId>()
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -150,29 +143,39 @@ pub async fn set_export_expiration(
     ExportsModel::new(&mut tx)
         .set_expiration(snapshot_id, expiration_ts_ns)
         .await?;
-    st.application.commit(tx, "set_export_expiration").await?;
+    st.application
+        .commit_with_audit_log_events(
+            tx,
+            vec![DeploymentAuditLogEvent::SetExportExpiration {
+                id: snapshot_id.encode(),
+                expiration_ts_ms: (expiration_ts_ns / 1_000_000) as i64,
+            }],
+            "set_export_expiration",
+        )
+        .await?;
     Ok(StatusCode::OK)
 }
 
-#[debug_handler]
 #[fastrace::trace]
 pub async fn cancel_export(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Path(SetExportExpirationPathArgs { snapshot_id }): Path<SetExportExpirationPathArgs>,
 ) -> Result<StatusCode, HttpResponseError> {
-    // This route is accessed directly from the admin dashboard
-    if !(identity.is_system() || identity.is_admin()) {
-        Err(anyhow::anyhow!(ErrorMetadata::forbidden(
-            "CancelExportForbidden",
-            "Must have system or admin identity to cancel cloud export"
-        )))?;
-    }
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
     let snapshot_id: DeveloperDocumentId = snapshot_id
         .parse::<DeveloperDocumentId>()
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut tx = st.application.begin(identity).await?;
     ExportsModel::new(&mut tx).cancel(snapshot_id).await?;
-    st.application.commit(tx, "cancel_export").await?;
+    st.application
+        .commit_with_audit_log_events(
+            tx,
+            vec![DeploymentAuditLogEvent::CancelExport {
+                id: snapshot_id.encode(),
+            }],
+            "cancel_export",
+        )
+        .await?;
     Ok(StatusCode::OK)
 }

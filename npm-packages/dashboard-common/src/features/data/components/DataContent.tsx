@@ -14,8 +14,7 @@ import udfs from "@common/udfs";
 import classNames from "classnames";
 import {
   Filter,
-  FilterByIndex,
-  FilterByIndexRange,
+  FilterExpression,
   SchemaJson,
 } from "system-udfs/convex/_system/frontend/lib/filters";
 import { Shape } from "shapes";
@@ -27,7 +26,7 @@ import { useSelectionState } from "@common/features/data/lib/useSelectionState";
 import { useDataToolbarActions } from "@common/features/data/lib/useDataToolbarActions";
 import { useTableFilters } from "@common/features/data/lib/useTableFilters";
 import { useToolPopup } from "@common/features/data/lib/useToolPopup";
-import { useAuthorizeProdEdits } from "@common/features/data/lib/useAuthorizeProdEdits";
+import { useEditsAuthorization } from "@common/features/data/lib/useEditsAuthorization";
 import { usePatchDocumentField } from "@common/features/data/components/Table/utils/usePatchDocumentField";
 import {
   Table,
@@ -38,7 +37,11 @@ import {
   DataToolbarSkeleton,
 } from "@common/features/data/components/DataToolbar/DataToolbar";
 import { EmptyDataContent } from "@common/features/data/components/EmptyData";
-import { useDataColumns } from "@common/features/data/components/Table/utils/useDataColumns";
+import {
+  useDataColumns,
+  useStoredHiddenColumns,
+  useStoredColumnOrder,
+} from "@common/features/data/components/Table/utils/useDataColumns";
 import { useQueryFilteredTable } from "@common/features/data/components/Table/utils/useQueryFilteredTable";
 import { useSingleTableSchemaStatus } from "@common/features/data/components/TableSchema";
 import { DataFilters } from "@common/features/data/components/DataFilters/DataFilters";
@@ -50,22 +53,27 @@ import {
   PanelGroup,
 } from "react-resizable-panels";
 import { cn } from "@ui/cn";
-import { useTableIndexes } from "@common/features/data/lib/api";
+
 import { getDefaultIndex } from "@common/features/data/components/DataFilters/IndexFilters";
-import { useMount } from "react-use";
+import { api } from "system-udfs/convex/_generated/api";
+import { useNents } from "@common/lib/useNents";
+import omit from "lodash/omit";
+import { clearFilters } from "./DataFilters/clearFilters";
 
 export function DataContent({
   tableName,
   shape,
   componentId,
   activeSchema,
+  onDocumentsAdded,
 }: {
   tableName: string;
   componentId: string | null;
   shape: Shape | null;
   activeSchema: SchemaJson | null;
+  onDocumentsAdded?: (count: number) => void;
 }) {
-  const { filters, changeFilters, hasFilters } = useTableFilters(
+  const { filters, applyFiltersWithHistory, hasFilters } = useTableFilters(
     tableName,
     componentId,
   );
@@ -99,10 +107,12 @@ export function DataContent({
 
   const numRowsRead = Math.min(numRowsReadEstimate, numRowsInTable || 0);
 
-  const { useCurrentDeployment } = useContext(DeploymentInfoContext);
-
+  const { useCurrentDeployment, useIsProtectedDeployment } = useContext(
+    DeploymentInfoContext,
+  );
   const deployment = useCurrentDeployment();
   const isProd = deployment?.deploymentType === "prod";
+  const isProtectedDeployment = useIsProtectedDeployment();
 
   const localStorageKey =
     router.query && `${router.query.deploymentName}/${tableName}`;
@@ -116,7 +126,7 @@ export function DataContent({
 
   const selectedRows = useSelectionState(allIds, status === "Exhausted");
 
-  const tableFields = useTableFields(tableName, shape, data);
+  const tableFields = useTableFields(tableName, shape, activeSchema, data);
 
   const columns = useDataColumns({
     tableName,
@@ -127,6 +137,77 @@ export function DataContent({
     // and one more on the right side of the last column.
     width: (ref.current?.getSize() || 1000) - 3,
   });
+
+  const [hiddenColumnsRaw, setHiddenColumnsRaw] =
+    useStoredHiddenColumns(localStorageKey);
+
+  // Default to showing only 25 fields (including _id and _creationTime)
+  const hiddenColumns = useMemo(() => {
+    if (hiddenColumnsRaw !== undefined) {
+      return hiddenColumnsRaw;
+    }
+
+    // First time - hide fields beyond the first 25
+    // Ensure _id and _creationTime are always visible
+    const visibleFields: string[] = [];
+    const allTableFields = [...tableFields];
+
+    // Add _id and _creationTime first if they exist
+    if (allTableFields.includes("_id")) {
+      visibleFields.push("_id");
+    }
+    if (allTableFields.includes("_creationTime")) {
+      visibleFields.push("_creationTime");
+    }
+
+    // Add remaining fields up to 25 total
+    for (const field of allTableFields) {
+      if (
+        field !== "_id" &&
+        field !== "_creationTime" &&
+        visibleFields.length < 25
+      ) {
+        visibleFields.push(field);
+      }
+    }
+
+    // Hide everything else
+    return allTableFields.filter((field) => !visibleFields.includes(field));
+  }, [hiddenColumnsRaw, tableFields]);
+
+  // Wrap the setter to handle undefined -> [] conversion for functional updates
+  const setHiddenColumns = useCallback(
+    (newHiddenColumns: string[] | ((prev: string[]) => string[])) => {
+      if (typeof newHiddenColumns === "function") {
+        setHiddenColumnsRaw((prev) => newHiddenColumns(prev || []));
+      } else {
+        setHiddenColumnsRaw(newHiddenColumns);
+      }
+    },
+    [setHiddenColumnsRaw],
+  );
+
+  // Column order management
+  const [columnOrderRaw, setColumnOrderRaw] =
+    useStoredColumnOrder(localStorageKey);
+
+  const columnOrder = useMemo(() => columnOrderRaw || [], [columnOrderRaw]);
+
+  // Wrap the setter to handle undefined -> [] conversion for functional updates
+  const setColumnOrder = useCallback(
+    (newColumnOrder: string[] | ((prev: string[]) => string[])) => {
+      if (typeof newColumnOrder === "function") {
+        setColumnOrderRaw((prev) => newColumnOrder(prev || []));
+      } else {
+        setColumnOrderRaw(newColumnOrder);
+      }
+    },
+    [setColumnOrderRaw],
+  );
+
+  // Use tableFields directly for the combobox instead of deriving from columns
+  // to avoid circular dependencies
+  const allFields = useMemo(() => ["*select", ...tableFields], [tableFields]);
 
   const listRef = useRef<FixedSizeList>(null);
 
@@ -143,9 +224,7 @@ export function DataContent({
 
   const patchDocumentField = usePatchDocumentField(tableName);
 
-  const [areEditsAuthorized, onAuthorizeEdits] = useAuthorizeProdEdits({
-    isProd,
-  });
+  const { areEditsAuthorized, authorizeEdits } = useEditsAuthorization();
 
   const { addDocuments, patchFields, clearTable, deleteTable, deleteRows } =
     useDataToolbarActions({
@@ -155,6 +234,7 @@ export function DataContent({
       clearSelectedRows,
       loadMore: loadNextPage,
       tableName,
+      onDocumentsAdded,
     });
 
   const allRowsSelected =
@@ -171,15 +251,35 @@ export function DataContent({
     numRows: numRowsInTable,
     tableName,
     areEditsAuthorized,
-    onAuthorizeEdits,
+    authorizeEdits,
     activeSchema,
   });
   const { popupEl } = popupState;
 
+  // Handle query parameter to open the indexes panel
+  useEffect(() => {
+    if (!!router.query.showIndexes && !popupState.popup) {
+      popupState.setPopup({ type: "viewIndexes", tableName });
+      void router.push(
+        {
+          pathname: router.pathname,
+          query: omit(router.query, "showIndexes"),
+        },
+        undefined,
+        { shallow: true },
+      );
+    }
+  }, [router.query.showIndexes, router, popupState, tableName]);
+
   const selectedDocumentId = rowsThatAreSelected.values().next().value;
   const selectedDocument = data.find((row) => row._id === selectedDocumentId);
   const defaultDocument = useDefaultDocument(tableName);
-  const { indexes } = useTableIndexes(tableName);
+  const { selectedNent } = useNents();
+  const indexes =
+    useQuery(api._system.frontend.indexes.default, {
+      tableName,
+      tableNamespace: selectedNent?.id ?? null,
+    }) ?? undefined;
   const sortField =
     (
       indexes?.find((index) => index.name === filters?.index?.name)?.fields as
@@ -187,11 +287,34 @@ export function DataContent({
         | undefined
     )?.[0] || "_creationTime";
 
+  const { captureMessage } = useContext(DeploymentInfoContext);
+  useEffect(() => {
+    if (
+      status !== "LoadingFirstPage" &&
+      !(data.length || status === "CanLoadMore") &&
+      !hasFiltersAndAtLeastOneDocument &&
+      !isLoading
+    ) {
+      captureMessage(
+        `Encountered unexpected state in data page: status: ${status}, numRowsInTable: ${numRowsInTable}, numRowsRead: ${numRowsRead}, isLoading: ${isLoading}`,
+        "warning",
+      );
+    }
+  }, [
+    status,
+    data.length,
+    hasFiltersAndAtLeastOneDocument,
+    isLoading,
+    numRowsInTable,
+    numRowsRead,
+    captureMessage,
+  ]);
+
   return (
     <PanelGroup
       direction="horizontal"
       className={cn(
-        "flex w-full h-full overflow-x-auto scrollbar pl-6 min-w-[20rem]",
+        "scrollbar flex h-full w-full min-w-[20rem] overflow-x-auto pl-6",
         popupEl ? "pr-0" : "pr-6",
       )}
       autoSaveId="data-content"
@@ -215,11 +338,10 @@ export function DataContent({
           numRows={numRowsInTable}
           tableSchemaStatus={tableSchemaStatus}
           tableName={tableName}
-          isProd={isProd}
           isLoadingMore={isLoading && !isPaused}
         />
 
-        <div className="flex h-full max-h-full flex-col overflow-y-hidden rounded">
+        <div className="flex h-full max-h-full flex-col overflow-y-hidden rounded-b-lg">
           {numRowsInTable !== undefined && numRowsInTable > 0 && (
             <DataFilters
               tableName={tableName}
@@ -227,7 +349,7 @@ export function DataContent({
               tableFields={tableFields}
               defaultDocument={defaultDocument}
               filters={filters}
-              onChangeFilters={changeFilters}
+              onFiltersChange={applyFiltersWithHistory}
               dataFetchErrors={errors}
               draftFilters={draftFilters}
               setDraftFilters={setDraftFilters}
@@ -237,12 +359,17 @@ export function DataContent({
               hasFilters={hasFiltersAndAtLeastOneDocument}
               showFilters={showFilters}
               setShowFilters={setShowFilters}
+              allFields={allFields}
+              hiddenColumns={hiddenColumns}
+              setHiddenColumns={setHiddenColumns}
+              columnOrder={columnOrder}
+              setColumnOrder={setColumnOrder}
             />
           )}
 
           <LoadingTransition
             loadingState={
-              <div className="flex h-full flex-col items-center justify-center gap-8 rounded border bg-background-secondary">
+              <div className="flex h-full flex-col items-center justify-center gap-8 rounded-b-lg border bg-background-secondary">
                 <LoadingLogo />
               </div>
             }
@@ -262,6 +389,7 @@ export function DataContent({
                     />
                   )}
                   <Table
+                    key={columnOrder.join(",")}
                     activeSchema={activeSchema}
                     listRef={listRef}
                     loadMore={loadNextPage}
@@ -282,10 +410,10 @@ export function DataContent({
                     patchDocument={patchDocumentField}
                     selectedRows={selectedRows}
                     areEditsAuthorized={areEditsAuthorized}
-                    onAuthorizeEdits={onAuthorizeEdits}
+                    authorizeEdits={authorizeEdits}
                     tableName={tableName}
                     componentId={componentId}
-                    isProd={isProd}
+                    isProtectedDeployment={isProtectedDeployment}
                     data={data}
                     columns={columns}
                     localStorageKey={localStorageKey}
@@ -293,6 +421,8 @@ export function DataContent({
                     setPopup={popupState.setPopup}
                     deleteRows={deleteRows}
                     defaultDocument={defaultDocument}
+                    hiddenColumns={hiddenColumns}
+                    onColumnOrderChange={setColumnOrder}
                     onAddDraftFilter={(filter: Filter) => {
                       setDraftFilters((prev) =>
                         prev
@@ -320,6 +450,20 @@ export function DataContent({
                       numRowsInTable={numRowsInTable}
                     />
                   </Sheet>
+                ) : isEmptySearchFilter(filters) ? (
+                  <div className="flex h-full flex-1 flex-col items-center gap-2 rounded-t-none border bg-background-secondary pt-8">
+                    <div className="text-content-secondary">
+                      Enter a search term to find matching documents.
+                    </div>
+                    <Button
+                      onClick={() =>
+                        applyFiltersWithHistory(clearFilters(filters))
+                      }
+                      size="xs"
+                    >
+                      Clear filters
+                    </Button>
+                  </div>
                 ) : (
                   <div className="flex h-full flex-1 flex-col items-center gap-2 rounded-t-none border bg-background-secondary pt-8">
                     <div className="text-content-secondary">
@@ -327,25 +471,7 @@ export function DataContent({
                     </div>
                     <Button
                       onClick={() =>
-                        changeFilters({
-                          clauses: [],
-                          index: {
-                            name: filters?.index?.name || "_creationTime",
-                            clauses: (filters?.index?.clauses.map((clause) => ({
-                              ...clause,
-                              enabled: false,
-                            })) as
-                              | FilterByIndex[]
-                              | [...FilterByIndex[], FilterByIndexRange]) || [
-                              {
-                                enabled: false,
-                                lowerOp: "lte",
-                                lowerValue: new Date().getTime(),
-                              },
-                            ],
-                          },
-                          order: filters?.order,
-                        })
+                        applyFiltersWithHistory(clearFilters(filters))
                       }
                       size="xs"
                     >
@@ -354,14 +480,8 @@ export function DataContent({
                   </div>
                 )
               ) : isLoading ||
-                (numRowsInTable !== undefined && numRowsInTable > 0) ? (
-                <UnexpectedLoadingState
-                  status={status}
-                  numRowsInTable={numRowsInTable}
-                  numRowsRead={numRowsRead}
-                  isLoading={isLoading}
-                />
-              ) : (
+                (numRowsInTable !== undefined &&
+                  numRowsInTable > 0) ? null /* Loading */ : (
                 <EmptyDataContent
                   openAddDocuments={() =>
                     popupState.setPopup({ type: "addDocuments", tableName })
@@ -413,25 +533,10 @@ export function DataContentSkeleton() {
   );
 }
 
-function UnexpectedLoadingState({
-  status,
-  numRowsInTable,
-  numRowsRead,
-  isLoading,
-}: {
-  status: string;
-  numRowsInTable: number | undefined;
-  numRowsRead: number;
-  isLoading: boolean;
-}) {
-  const { captureMessage } = useContext(DeploymentInfoContext);
-
-  useMount(() => {
-    !isLoading &&
-      captureMessage(
-        `Encountered unexpected state in data page: status: ${status}, numRowsInTable: ${numRowsInTable}, numRowsRead: ${numRowsRead}, isLoading: ${isLoading}`,
-      );
-  });
-
-  return null;
+function isEmptySearchFilter(filters: FilterExpression | undefined) {
+  return (
+    filters?.index &&
+    "search" in filters.index &&
+    filters.index.search.trim() === ""
+  );
 }

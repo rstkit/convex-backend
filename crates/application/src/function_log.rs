@@ -13,6 +13,7 @@ use std::{
     },
 };
 
+use anyhow::Context as _;
 use common::{
     components::{
         CanonicalizedComponentFunctionPath,
@@ -24,20 +25,25 @@ use common::{
     },
     execution_context::ExecutionContext,
     identity::InertIdentity,
-    knobs,
+    knobs::{
+        self,
+    },
     log_lines::{
         LogLine,
         LogLines,
     },
     log_streaming::{
         self,
+        FunctionConcurrencyStats,
         FunctionEventSource,
         LogEvent,
         LogSender,
+        SchedulerInfo,
         StructuredLogEvent,
     },
     runtime::{
         Runtime,
+        SpawnHandle,
         UnixTimestamp,
     },
     types::{
@@ -51,7 +57,6 @@ use common::{
         UdfType,
     },
 };
-use float_next_after::NextAfter;
 use http::{
     Method,
     StatusCode,
@@ -62,6 +67,7 @@ use serde_json::{
     json,
     Value as JsonValue,
 };
+use sync_types::types::SerializedArgs;
 use tokio::sync::oneshot;
 use udf::{
     validation::{
@@ -98,8 +104,12 @@ use value::{
         WithHeapSize,
     },
     sha256::Sha256Digest,
-    ConvexArray,
 };
+
+pub enum OutstandingFunctionState {
+    Running,
+    Queued,
+}
 
 /// A function's execution is summarized by this structure and stored in the
 /// UdfExecutionLog
@@ -129,6 +139,8 @@ pub struct FunctionExecution {
     pub cached_result: bool,
     /// How long (in seconds) did executing this UDF take?
     pub execution_time: f64,
+    /// How long (in seconds) did the user's code execute?
+    pub user_execution_time: Option<Duration>,
 
     /// Who called this UDF?
     pub caller: FunctionCaller,
@@ -143,7 +155,10 @@ pub struct FunctionExecution {
 
     /// Usage statistics for this instance
     pub usage_stats: AggregatedFunctionUsageStats,
-    pub action_memory_used_mb: Option<u64>,
+    pub memory_used_mb: u64,
+    /// Size of the returned value in bytes if the function execution was
+    /// successful, excluding HTTP actions.
+    pub return_bytes: Option<u64>,
 
     /// The Convex NPM package version pushed with the module version executed.
     pub udf_server_version: Option<semver::Version>,
@@ -162,7 +177,12 @@ pub struct FunctionExecution {
     // Number of retries prior to a successful execution. Only applicable for mutations.
     pub mutation_retry_count: Option<usize>,
 
+    // If this execution resulted in an OCC error, this will be Some.
     pub occ_info: Option<OccInfo>,
+
+    /// Whether this function will be retried (e.g. a mutation that OCCs or hits
+    /// write throughput limits)
+    pub will_retry: bool,
 }
 
 impl HeapSize for FunctionExecution {
@@ -225,7 +245,7 @@ impl FunctionExecution {
         match log_line {
             LogLine::Structured(log_line) => {
                 vec![LogEvent {
-                    timestamp: log_line.timestamp,
+                    timestamp: self.unix_timestamp,
                     event: StructuredLogEvent::Console {
                         source: self.event_source(sub_function_path),
                         log_line: log_line.clone(),
@@ -255,24 +275,32 @@ impl FunctionExecution {
                 source: self.event_source(None),
                 error: self.params.err().cloned(),
                 execution_time,
-                occ_info: match &self.occ_info {
-                    Some(occ_info) => Some(log_streaming::OccInfo {
-                        table_name: occ_info.table_name.clone(),
-                        document_id: occ_info.document_id.clone(),
-                        write_source: occ_info.write_source.clone(),
-                        retry_count: occ_info.retry_count,
+                user_execution_time: self.user_execution_time,
+                occ_info: self.occ_info.clone(),
+                will_retry: self.will_retry,
+                scheduler_info: match self.caller {
+                    FunctionCaller::Scheduler { job_id, .. } => Some(SchedulerInfo {
+                        job_id: job_id.to_string(),
                     }),
-                    None => None,
+                    _ => None,
                 },
                 usage_stats: log_streaming::AggregatedFunctionUsageStats {
                     database_read_bytes: self.usage_stats.database_read_bytes,
                     database_write_bytes: self.usage_stats.database_write_bytes,
+                    database_io_read_bytes: self.usage_stats.database_io_read_bytes,
+                    database_io_write_bytes: self.usage_stats.database_io_write_bytes,
                     database_read_documents: self.usage_stats.database_read_documents,
                     storage_read_bytes: self.usage_stats.storage_read_bytes,
                     storage_write_bytes: self.usage_stats.storage_write_bytes,
                     vector_index_read_bytes: self.usage_stats.vector_index_read_bytes,
                     vector_index_write_bytes: self.usage_stats.vector_index_write_bytes,
-                    action_memory_used_mb: self.action_memory_used_mb,
+                    text_index_write_query_bytes: self.usage_stats.text_index_write_query_bytes,
+                    text_index_query_bytes: self.usage_stats.text_index_query_bytes,
+                    vector_index_read_query_bytes: self.usage_stats.vector_index_read_query_bytes,
+                    vector_index_write_query_bytes: self.usage_stats.vector_index_write_query_bytes,
+                    network_egress_bytes: self.usage_stats.network_egress_bytes,
+                    memory_used_mb: self.memory_used_mb,
+                    return_bytes: self.return_bytes,
                 },
             },
         }];
@@ -360,7 +388,6 @@ impl HeapSize for FunctionExecutionPart {
 }
 
 #[derive(Clone)]
-#[cfg_attr(any(test, feature = "testing"), derive(Debug))]
 pub struct ActionCompletion {
     pub outcome: ValidatedActionOutcome,
     pub execution_time: Duration,
@@ -406,8 +433,8 @@ impl HeapSize for UdfParams {
 impl UdfParams {
     pub fn is_err(&self) -> bool {
         match self {
-            UdfParams::Function { ref error, .. } => error.is_some(),
-            UdfParams::Http { ref result, .. } => result.is_err(),
+            UdfParams::Function { error, .. } => error.is_some(),
+            UdfParams::Http { result, .. } => result.is_err(),
         }
     }
 
@@ -472,11 +499,13 @@ pub enum TrackUsage {
     SystemError,
 }
 
+#[derive(PartialEq)]
 pub enum UdfRate {
     Invocations,
     Errors,
     CacheHits,
     CacheMisses,
+    SubscriptionInvalidations,
 }
 
 impl FromStr for UdfRate {
@@ -488,6 +517,7 @@ impl FromStr for UdfRate {
             "errors" => UdfRate::Errors,
             "cacheHits" => UdfRate::CacheHits,
             "cacheMisses" => UdfRate::CacheMisses,
+            "subscriptionInvalidations" => UdfRate::SubscriptionInvalidations,
             _ => anyhow::bail!("Invalid UDF rate: {}", r),
         };
         Ok(udf_rate)
@@ -517,12 +547,13 @@ pub struct FunctionExecutionLog<RT: Runtime> {
     inner: Arc<Mutex<Inner<RT>>>,
     usage_tracking: UsageCounter,
     rt: RT,
+    concurrency_stats_logger: Arc<Mutex<Box<dyn SpawnHandle>>>,
 }
 
 impl<RT: Runtime> FunctionExecutionLog<RT> {
     pub fn new(rt: RT, usage_tracking: UsageCounter, log_manager: Arc<dyn LogSender>) -> Self {
         let base_ts = rt.system_time();
-        let inner = Inner {
+        let inner = Arc::new(Mutex::new(Inner {
             rt: rt.clone(),
             num_execution_completions: 0,
             log: WithHeapSize::default(),
@@ -538,12 +569,67 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
                     histogram_significant_figures: *knobs::UDF_METRICS_SIGNIFICANT_FIGURES,
                 },
             ),
-        };
+        }));
+
+        let inner_for_task = inner.clone();
+
+        // Spawn a background task to periodically send concurrency stats
+        let concurrency_stats_logger = Arc::new(Mutex::new(rt.spawn(
+            "concurrency_stats_logger",
+            async move {
+                let runtime = inner_for_task.lock().rt.clone();
+                loop {
+                    let bucket_width = *knobs::UDF_METRICS_BUCKET_WIDTH;
+                    runtime.wait(bucket_width).await;
+
+                    let now = runtime.system_time();
+
+                    // Query all outstanding_functions gauges to get current concurrency stats
+                    let inner = inner_for_task.lock();
+                    let metrics = inner.metrics.clone();
+                    drop(inner);
+
+                    let start_time = now - bucket_width;
+
+                    // Get stats for current and previous buckets
+                    let current_stats =
+                        Self::query_all_concurrency_stats(&metrics, start_time, now);
+                    let prev_start_time = start_time - bucket_width;
+                    let previous_stats =
+                        Self::query_all_concurrency_stats(&metrics, prev_start_time, start_time);
+
+                    // Only send event if stats have changed
+                    if current_stats != previous_stats {
+                        let (query, mutation, action, node_action, http_action) = current_stats;
+                        let event = LogEvent {
+                            timestamp: UnixTimestamp::from_system_time(start_time)
+                                .unwrap_or_else(|| UnixTimestamp::from_system_time(now).unwrap()),
+                            event: StructuredLogEvent::ConcurrencyStats {
+                                query,
+                                mutation,
+                                action,
+                                node_action,
+                                http_action,
+                            },
+                        };
+
+                        let inner = inner_for_task.lock();
+                        inner.log_manager.send_logs(vec![event]);
+                    }
+                }
+            },
+        )));
+
         Self {
-            inner: Arc::new(Mutex::new(inner)),
+            inner,
             rt,
             usage_tracking,
+            concurrency_stats_logger,
         }
+    }
+
+    pub fn shutdown(&self) {
+        self.concurrency_stats_logger.lock().shutdown();
     }
 
     pub async fn log_query(
@@ -572,7 +658,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         &self,
         e: &anyhow::Error,
         path: CanonicalizedComponentFunctionPath,
-        arguments: ConvexArray,
+        arguments: SerializedArgs,
         identity: InertIdentity,
         start: tokio::time::Instant,
         caller: FunctionCaller,
@@ -620,12 +706,16 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
                 self.usage_tracking
                     .track_call(
                         UdfIdentifier::Function(outcome.path.clone()),
-                        context.execution_id.clone(),
+                        context.execution_id,
                         context.request_id.clone(),
                         if was_cached {
                             CallType::CachedQuery
                         } else {
-                            CallType::UncachedQuery
+                            CallType::UncachedQuery {
+                                duration: execution_time,
+                                user_execution_time: outcome.user_execution_time,
+                                memory_in_mb: outcome.memory_in_mb,
+                            }
                         },
                         outcome.result.is_ok(),
                         usage_stats,
@@ -638,6 +728,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         if outcome.path.is_system() {
             return;
         }
+        let return_bytes = outcome.result.as_ref().ok().map(|v| v.heap_size() as u64);
         let execution = FunctionExecution {
             params: UdfParams::Function {
                 error: match &outcome.result {
@@ -654,18 +745,21 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             tables_touched: tables_touched.into(),
             cached_result: was_cached,
             execution_time: execution_time.as_secs_f64(),
+            user_execution_time: outcome.user_execution_time,
             caller,
             environment: ModuleEnvironment::Isolate,
             syscall_trace: outcome.syscall_trace.clone(),
             usage_stats: aggregated,
-            action_memory_used_mb: None,
+            memory_used_mb: outcome.memory_in_mb,
+            return_bytes,
             udf_server_version: outcome.udf_server_version.clone(),
             identity: outcome.identity.clone(),
             context,
             mutation_retry_count: None,
             occ_info: None,
+            will_retry: false,
         };
-        self.log_execution(execution, true);
+        self.log_execution(execution, true, true);
     }
 
     pub async fn log_mutation(
@@ -689,6 +783,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             None,
             mutation_queue_length,
             mutation_retry_count,
+            false,
         )
         .await
     }
@@ -697,7 +792,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         &self,
         e: &anyhow::Error,
         path: CanonicalizedComponentFunctionPath,
-        arguments: ConvexArray,
+        arguments: SerializedArgs,
         identity: InertIdentity,
         start: tokio::time::Instant,
         caller: FunctionCaller,
@@ -726,6 +821,44 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             None,
             mutation_queue_length,
             mutation_retry_count,
+            false,
+        )
+        .await;
+        Ok(())
+    }
+
+    pub async fn log_mutation_write_throughput_error(
+        &self,
+        e: &anyhow::Error,
+        path: CanonicalizedComponentFunctionPath,
+        arguments: SerializedArgs,
+        identity: InertIdentity,
+        start: tokio::time::Instant,
+        caller: FunctionCaller,
+        context: ExecutionContext,
+        mutation_queue_length: Option<usize>,
+        mutation_retry_count: usize,
+        will_retry: bool,
+    ) -> anyhow::Result<()> {
+        let outcome = ValidatedUdfOutcome::from_error(
+            JsError::from_error_ref(e),
+            path,
+            arguments,
+            identity,
+            self.rt.clone(),
+            None,
+        )?;
+        self._log_mutation(
+            outcome,
+            Default::default(),
+            start.elapsed(),
+            caller,
+            TrackUsage::SystemError,
+            context,
+            None,
+            mutation_queue_length,
+            mutation_retry_count,
+            will_retry,
         )
         .await;
         Ok(())
@@ -739,10 +872,12 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         caller: FunctionCaller,
         usage: FunctionUsageTracker,
         context: ExecutionContext,
-        occ_info: OccInfo,
+        mut occ_info: OccInfo,
         mutation_queue_length: Option<usize>,
         mutation_retry_count: usize,
+        will_retry: bool,
     ) {
+        occ_info.retry_count = Some(mutation_retry_count as u64);
         self._log_mutation(
             outcome,
             tables_touched,
@@ -753,6 +888,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             Some(occ_info),
             mutation_queue_length,
             mutation_retry_count,
+            will_retry,
         )
         .await;
     }
@@ -768,6 +904,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         occ_info: Option<OccInfo>,
         mutation_queue_length: Option<usize>,
         mutation_retry_count: usize,
+        will_retry: bool,
     ) {
         let aggregated = match usage {
             TrackUsage::Track(usage_tracker) => {
@@ -776,9 +913,12 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
                 self.usage_tracking
                     .track_call(
                         UdfIdentifier::Function(outcome.path.clone()),
-                        context.execution_id.clone(),
+                        context.execution_id,
                         context.request_id.clone(),
                         CallType::Mutation {
+                            duration: execution_time,
+                            user_execution_time: outcome.user_execution_time,
+                            memory_in_mb: outcome.memory_in_mb,
                             occ_info: occ_info.clone(),
                         },
                         outcome.result.is_ok(),
@@ -792,12 +932,10 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         if outcome.path.udf_path.is_system() {
             return;
         }
+        let return_bytes = outcome.result.as_ref().ok().map(|v| v.heap_size() as u64);
         let execution = FunctionExecution {
             params: UdfParams::Function {
-                error: match outcome.result {
-                    Ok(_) => None,
-                    Err(e) => Some(e),
-                },
+                error: outcome.result.err(),
                 identifier: outcome.path,
             },
             unix_timestamp: self.rt.unix_timestamp(),
@@ -808,18 +946,21 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             tables_touched: tables_touched.into(),
             cached_result: false,
             execution_time: execution_time.as_secs_f64(),
+            user_execution_time: outcome.user_execution_time,
             caller,
             environment: ModuleEnvironment::Isolate,
             syscall_trace: outcome.syscall_trace,
             usage_stats: aggregated,
-            action_memory_used_mb: None,
+            memory_used_mb: outcome.memory_in_mb,
+            return_bytes,
             udf_server_version: outcome.udf_server_version,
             identity: outcome.identity,
             context,
             mutation_retry_count: Some(mutation_retry_count),
             occ_info,
+            will_retry,
         };
-        self.log_execution(execution, true);
+        self.log_execution(execution, true, true);
     }
 
     pub async fn log_action(&self, completion: ActionCompletion, usage: FunctionUsageTracker) {
@@ -830,7 +971,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         &self,
         e: &anyhow::Error,
         path: CanonicalizedComponentFunctionPath,
-        arguments: ConvexArray,
+        arguments: SerializedArgs,
         identity: InertIdentity,
         start: tokio::time::Instant,
         caller: FunctionCaller,
@@ -869,11 +1010,12 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
                 self.usage_tracking
                     .track_call(
                         UdfIdentifier::Function(outcome.path.clone()),
-                        completion.context.execution_id.clone(),
+                        completion.context.execution_id,
                         completion.context.request_id.clone(),
                         CallType::Action {
                             env: completion.environment,
                             duration: completion.execution_time,
+                            user_execution_time: outcome.user_execution_time,
                             memory_in_mb: completion.memory_in_mb,
                         },
                         outcome.result.is_ok(),
@@ -887,12 +1029,10 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         if outcome.path.udf_path.is_system() {
             return;
         }
+        let return_bytes = outcome.result.as_ref().ok().map(|v| v.heap_size() as u64);
         let execution = FunctionExecution {
             params: UdfParams::Function {
-                error: match outcome.result {
-                    Ok(_) => None,
-                    Err(e) => Some(e),
-                },
+                error: outcome.result.err(),
                 identifier: outcome.path,
             },
             unix_timestamp: self.rt.unix_timestamp(),
@@ -903,18 +1043,21 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             tables_touched: WithHeapSize::default(),
             cached_result: false,
             execution_time: completion.execution_time.as_secs_f64(),
+            user_execution_time: outcome.user_execution_time,
             caller: completion.caller,
             environment: completion.environment,
             syscall_trace: outcome.syscall_trace,
             usage_stats: aggregated,
-            action_memory_used_mb: Some(completion.memory_in_mb),
+            memory_used_mb: completion.memory_in_mb,
+            return_bytes,
             udf_server_version: outcome.udf_server_version,
             identity: outcome.identity,
             context: completion.context,
             mutation_retry_count: None,
             occ_info: None,
+            will_retry: false,
         };
-        self.log_execution(execution, /* send_console_events */ false)
+        self.log_execution(execution, /* send_console_events */ false, true)
     }
 
     pub fn log_action_progress(
@@ -986,6 +1129,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             udf::HttpActionResult::Error(js_err.clone()),
             None,
             None,
+            Duration::ZERO,
         );
         self._log_http_action(
             outcome,
@@ -1011,17 +1155,31 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         context: ExecutionContext,
         response_sha256: Sha256Digest,
     ) {
+        // For usage tracking, substitute "[unmatched]" when the JS router
+        // didn't match a route. This avoids route explosion from every unique
+        // 404 URL becoming a separate billing entry. Function execution logs
+        // preserve the actual URL for debugging.
+        let usage_route = if outcome.route.matched {
+            outcome.route.clone()
+        } else {
+            HttpActionRoute {
+                method: outcome.route.method,
+                path: "[unmatched]".to_string(),
+                matched: false,
+            }
+        };
         let aggregated = match usage {
             TrackUsage::Track(usage_tracker) => {
                 let usage_stats = usage_tracker.gather_user_stats();
                 let aggregated = usage_stats.aggregate();
                 self.usage_tracking
                     .track_call(
-                        UdfIdentifier::Http(outcome.route.clone()),
-                        context.execution_id.clone(),
+                        UdfIdentifier::Http(usage_route),
+                        context.execution_id,
                         context.request_id.clone(),
                         CallType::HttpAction {
                             duration: execution_time,
+                            user_execution_time: outcome.user_execution_time,
                             memory_in_mb: outcome.memory_in_mb(),
                             response_sha256,
                         },
@@ -1046,18 +1204,25 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             tables_touched: WithHeapSize::default(),
             cached_result: false,
             execution_time: execution_time.as_secs_f64(),
+            user_execution_time: outcome.user_execution_time,
             caller,
             environment: ModuleEnvironment::Isolate,
             usage_stats: aggregated,
-            action_memory_used_mb: Some(outcome.memory_in_mb()),
+            memory_used_mb: outcome.memory_in_mb(),
+            return_bytes: None,
             syscall_trace: outcome.syscall_trace,
             udf_server_version: outcome.udf_server_version,
             identity: outcome.identity,
             context,
             mutation_retry_count: None,
             occ_info: None,
+            will_retry: false,
         };
-        self.log_execution(execution, /* send_console_events */ false);
+        self.log_execution(
+            execution,
+            /* send_console_events */ false,
+            /* log_app_metrics */ outcome.route.matched,
+        );
     }
 
     pub fn log_http_action_progress(
@@ -1083,11 +1248,16 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         self.log_execution_progress(log_lines, event_source, unix_timestamp)
     }
 
-    fn log_execution(&self, execution: FunctionExecution, send_console_events: bool) {
-        if let Err(mut e) = self
-            .inner
-            .lock()
-            .log_execution(execution, send_console_events)
+    fn log_execution(
+        &self,
+        execution: FunctionExecution,
+        send_console_events: bool,
+        log_app_metrics: bool,
+    ) {
+        if let Err(mut e) =
+            self.inner
+                .lock()
+                .log_execution(execution, send_console_events, log_app_metrics)
         {
             report_error_sync(&mut e);
         }
@@ -1110,13 +1280,35 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
 
     /// Indicates that as of now (`timestamp`), the next scheduled job is at
     /// `next_job_ts` (None if there are no pending jobs)
-    pub fn log_scheduled_job_lag(&self, next_job_ts: Option<SystemTime>, timestamp: SystemTime) {
-        if let Err(mut e) = self
-            .inner
-            .lock()
-            .log_scheduled_job_lag(next_job_ts, timestamp)
+    pub fn log_scheduled_job_stats(
+        &self,
+        next_job_ts: Option<SystemTime>,
+        timestamp: SystemTime,
+        num_running_jobs: u64,
+    ) {
+        if let Err(mut e) =
+            self.inner
+                .lock()
+                .log_scheduled_job_stats(next_job_ts, timestamp, num_running_jobs)
         {
             report_error_sync(&mut e);
+        }
+    }
+
+    pub fn record_subscription_invalidations(&self, events: Vec<database::InvalidationEvent>) {
+        let ts = self.rt.system_time();
+        let mut inner = self.inner.lock();
+        for event in &events {
+            if let Some(display_name) = event.write_source.as_ref().and_then(|ws| ws.display_name())
+            {
+                let name: MetricName = format!(
+                    "subscription_invalidations:{display_name}:{}",
+                    event.tablet_id
+                );
+                if let Err(e) = inner.metrics.add_counter(&name, ts, event.count as f32) {
+                    Inner::<RT>::log_metrics_error(e);
+                }
+            }
         }
     }
 
@@ -1135,6 +1327,19 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             UdfRate::Errors => udf_errors_metric(&identifier),
             UdfRate::CacheHits => udf_cache_hits_metric(&identifier),
             UdfRate::CacheMisses => udf_cache_misses_metric(&identifier),
+            UdfRate::SubscriptionInvalidations => {
+                // Aggregate across all tablets for this mutation.
+                let mutation_name = udf_metric_name(&identifier);
+                let by_table = Self::get_subscription_invalidation_counter(
+                    &window,
+                    &metrics,
+                    Some(&mutation_name),
+                )?;
+                if by_table.is_empty() {
+                    return window.resample_counters(&metrics, vec![], true);
+                }
+                return sum_timeseries(&window, by_table.values());
+            },
         };
         let buckets = metrics.query_counter(&name, window.start..window.end)?;
         window.resample_counters(&metrics, buckets, true)
@@ -1195,6 +1400,145 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         let misses = Self::get_udf_metric_counter(&window, &metrics, "cache_misses")?;
 
         Self::top_k_for_rate(&window, hits, misses, k, cache_hit_percentage, true)
+    }
+
+    pub fn get_all_function_calls(
+        &self,
+        window: &MetricsWindow,
+    ) -> anyhow::Result<HashMap<String, Timeseries>> {
+        let metrics = {
+            let inner = self.inner.lock();
+            inner.metrics.clone()
+        };
+        Self::get_udf_metric_counter(window, &metrics, "invocations")
+    }
+
+    pub fn function_call_count_top_k(
+        &self,
+        window: MetricsWindow,
+        k: usize,
+    ) -> anyhow::Result<Vec<(String, Timeseries)>> {
+        let metrics = {
+            let inner = self.inner.lock();
+            inner.metrics.clone()
+        };
+
+        let mut invocations = Self::get_udf_metric_counter(&window, &metrics, "invocations")?;
+
+        let mut overall: HashMap<&str, f64> = HashMap::new();
+        for (udf_id, series) in invocations.iter() {
+            let sum = series.iter().filter_map(|&(_, value)| value).sum1();
+            if let Some(total) = sum {
+                overall.insert(udf_id, total);
+            }
+        }
+
+        let top_k = Self::top_k(&overall, k, false);
+
+        let mut ret = vec![];
+        for udf_id in top_k {
+            let series = invocations
+                .remove(&udf_id)
+                .expect("everything in topk came from invocations");
+            ret.push((udf_id.to_string(), series));
+        }
+
+        if !invocations.is_empty() {
+            let rest = sum_timeseries(&window, invocations.values())?;
+            ret.push(("_rest".to_string(), rest));
+        }
+
+        Ok(ret)
+    }
+
+    /// Returns the top-k subscription invalidation pairs.
+    /// If `identifier` is provided, filters to that mutation and returns
+    /// top-k by tablet. Otherwise returns top-k by (mutation, tablet) pairs.
+    pub fn subscription_invalidations_top_k(
+        &self,
+        window: MetricsWindow,
+        k: usize,
+        identifier: Option<&UdfIdentifier>,
+    ) -> anyhow::Result<Vec<(String, Timeseries)>> {
+        let metrics = {
+            let inner = self.inner.lock();
+            inner.metrics.clone()
+        };
+        let mutation_filter = identifier.map(udf_metric_name);
+        let mut counters = Self::get_subscription_invalidation_counter(
+            &window,
+            &metrics,
+            mutation_filter.as_deref(),
+        )?;
+
+        let mut overall: HashMap<&str, f64> = HashMap::new();
+        for (key, series) in counters.iter() {
+            let sum = series.iter().filter_map(|&(_, value)| value).sum1();
+            if let Some(total) = sum {
+                overall.insert(key, total);
+            }
+        }
+
+        let top_k = Self::top_k(&overall, k, false);
+
+        let mut ret = vec![];
+        for key in top_k {
+            let series = counters
+                .remove(&key)
+                .expect("everything in topk came from counters");
+            ret.push((key.to_string(), series));
+        }
+
+        if !counters.is_empty() {
+            let rest = sum_timeseries(&window, counters.values())?;
+            ret.push(("_rest".to_string(), rest));
+        }
+
+        Ok(ret)
+    }
+
+    /// Queries `subscription_invalidations:{mutation}:{tablet_id}` metrics.
+    /// If `mutation_filter` is Some, only returns metrics for that mutation
+    /// (with the mutation prefix stripped, so keys are tablet IDs).
+    /// If None, returns all pairs (keys are `{mutation}:{tablet_id}`).
+    fn get_subscription_invalidation_counter(
+        window: &MetricsWindow,
+        metrics: &MetricStore,
+        mutation_filter: Option<&str>,
+    ) -> anyhow::Result<HashMap<String, Timeseries>> {
+        let metric_names = metrics.metric_names_for_type(MetricType::Counter);
+        let prefix = match mutation_filter {
+            Some(mutation) => format!("subscription_invalidations:{mutation}:"),
+            None => "subscription_invalidations:".to_string(),
+        };
+
+        let filtered: Vec<_> = metric_names
+            .iter()
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+
+        let mut results: HashMap<String, Vec<&CounterBucket>> = HashMap::new();
+        for name in filtered {
+            let result = metrics.query_counter(name, window.start..window.end)?;
+            let key = if mutation_filter.is_some() {
+                // Strip prefix → tablet_id
+                name[prefix.len()..].to_string()
+            } else {
+                // Strip "subscription_invalidations:" → "{mutation}:{tablet_id}"
+                name["subscription_invalidations:".len()..].to_string()
+            };
+            results.insert(key, result);
+        }
+
+        results
+            .into_iter()
+            .map(|(k, v)| {
+                Ok((
+                    k,
+                    window.resample_counters(metrics, v, false /* is_rate */)?,
+                ))
+            })
+            .collect()
     }
 
     fn get_udf_metric_counter(
@@ -1439,6 +1783,104 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         }
     }
 
+    /// Get the gauge value from the first complete bucket in the time range
+    fn get_gauge_value(
+        metrics: &MetricStore,
+        env: &ModuleEnvironment,
+        udf_type: &UdfType,
+        state: &OutstandingFunctionState,
+        start_time: SystemTime,
+        now: SystemTime,
+    ) -> u64 {
+        let metric_name = outstanding_functions_metric(env, udf_type, state);
+        metrics
+            .query_gauge(&metric_name, start_time..now)
+            .ok()
+            .and_then(|buckets| buckets.first().map(|b| b.value.max(0.0) as u64))
+            .unwrap_or(0)
+    }
+
+    /// Get both running and queued stats for a function type
+    fn get_concurrency_stats(
+        metrics: &MetricStore,
+        env: ModuleEnvironment,
+        udf_type: UdfType,
+        start_time: SystemTime,
+        now: SystemTime,
+    ) -> FunctionConcurrencyStats {
+        FunctionConcurrencyStats {
+            num_running: Self::get_gauge_value(
+                metrics,
+                &env,
+                &udf_type,
+                &OutstandingFunctionState::Running,
+                start_time,
+                now,
+            ),
+            num_queued: Self::get_gauge_value(
+                metrics,
+                &env,
+                &udf_type,
+                &OutstandingFunctionState::Queued,
+                start_time,
+                now,
+            ),
+        }
+    }
+
+    /// Query concurrency stats for all function types within a time window.
+    /// Returns a tuple of (query, mutation, action, node_action, http_action)
+    /// stats.
+    fn query_all_concurrency_stats(
+        metrics: &MetricStore,
+        start_time: SystemTime,
+        end_time: SystemTime,
+    ) -> (
+        FunctionConcurrencyStats,
+        FunctionConcurrencyStats,
+        FunctionConcurrencyStats,
+        FunctionConcurrencyStats,
+        FunctionConcurrencyStats,
+    ) {
+        (
+            Self::get_concurrency_stats(
+                metrics,
+                ModuleEnvironment::Isolate,
+                UdfType::Query,
+                start_time,
+                end_time,
+            ),
+            Self::get_concurrency_stats(
+                metrics,
+                ModuleEnvironment::Isolate,
+                UdfType::Mutation,
+                start_time,
+                end_time,
+            ),
+            Self::get_concurrency_stats(
+                metrics,
+                ModuleEnvironment::Isolate,
+                UdfType::Action,
+                start_time,
+                end_time,
+            ),
+            Self::get_concurrency_stats(
+                metrics,
+                ModuleEnvironment::Node,
+                UdfType::Action,
+                start_time,
+                end_time,
+            ),
+            Self::get_concurrency_stats(
+                metrics,
+                ModuleEnvironment::Isolate,
+                UdfType::HttpAction,
+                start_time,
+                end_time,
+            ),
+        )
+    }
+
     pub fn scheduled_job_lag(&self, window: MetricsWindow) -> anyhow::Result<Timeseries> {
         let metrics = {
             let inner = self.inner.lock();
@@ -1467,6 +1909,52 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             }
         }
         Ok(timeseries)
+    }
+
+    /// Log the current number of outstanding functions as a gauge that tracks
+    /// the maximum.
+    pub fn log_outstanding_functions(
+        &self,
+        total: usize,
+        env: ModuleEnvironment,
+        udf_type: UdfType,
+        state: OutstandingFunctionState,
+    ) {
+        let now = self.rt.system_time();
+        let name = outstanding_functions_metric(&env, &udf_type, &state);
+        // Use gauge with max operation to track maximum value within each bucket.
+        let _ = self
+            .inner
+            .lock()
+            .metrics
+            .add_gauge_max(&name, now, total as f32);
+    }
+
+    pub fn function_concurrency(
+        &self,
+        window: MetricsWindow,
+    ) -> anyhow::Result<BTreeMap<String, Timeseries>> {
+        let metrics = {
+            let inner = self.inner.lock();
+            inner.metrics.clone()
+        };
+
+        let mut result = BTreeMap::new();
+
+        // Query all outstanding_functions metrics
+        let metric_names = metrics.metric_names_for_type(MetricType::Gauge);
+        for metric_name in metric_names {
+            if metric_name.starts_with("outstanding_functions:") {
+                let buckets = metrics
+                    .query_gauge(&metric_name, window.start..window.end)?
+                    .into_iter()
+                    .collect();
+                let timeseries = window.resample_gauges(&metrics, buckets)?;
+                result.insert(metric_name.to_string(), timeseries);
+            }
+        }
+
+        Ok(result)
     }
 }
 
@@ -1542,10 +2030,11 @@ impl<RT: Runtime> Inner<RT> {
         &mut self,
         execution: FunctionExecution,
         send_console_events: bool,
+        log_app_metrics: bool,
     ) -> anyhow::Result<()> {
-        if let Err(e) = self.log_execution_metrics(&execution) {
+        if log_app_metrics && let Err(e) = self.log_execution_app_metrics(&execution) {
             Self::log_metrics_error(e);
-        };
+        }
         let next_time = self.next_time()?;
 
         // Gather log lines
@@ -1602,7 +2091,7 @@ impl<RT: Runtime> Inner<RT> {
         }
     }
 
-    fn log_execution_metrics(
+    fn log_execution_app_metrics(
         &mut self,
         execution: &FunctionExecution,
     ) -> Result<(), UdfMetricsError> {
@@ -1669,21 +2158,29 @@ impl<RT: Runtime> Inner<RT> {
         Ok(())
     }
 
-    fn log_scheduled_job_lag(
+    fn log_scheduled_job_stats(
         &mut self,
         next_job_ts: Option<SystemTime>,
         now: SystemTime,
+        num_running_jobs: u64,
     ) -> anyhow::Result<()> {
         let name = scheduled_job_next_ts_metric();
         // -Infinity means there is no scheduled job
         let value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(now, ts));
         if value > 0.0 {
             self.log_manager.send_logs(vec![LogEvent {
-                timestamp: UnixTimestamp::from_secs_f64(
-                    now.duration_since(SystemTime::UNIX_EPOCH)?.as_secs_f64(),
-                ),
+                timestamp: UnixTimestamp::from_system_time(now).context("now < UNIX_EPOCH?")?,
                 event: StructuredLogEvent::ScheduledJobLag {
                     lag_seconds: Duration::from_secs_f32(value.max(0.0)),
+                },
+            }]);
+        }
+        if value > 0.0 || num_running_jobs > 0 {
+            self.log_manager.send_logs(vec![LogEvent {
+                timestamp: UnixTimestamp::from_system_time(now).context("now < UNIX_EPOCH?")?,
+                event: StructuredLogEvent::SchedulerStats {
+                    lag_seconds: Duration::from_secs_f32(value.max(0.0)),
+                    num_running_jobs,
                 },
             }]);
         }
@@ -1709,7 +2206,7 @@ impl<RT: Runtime> Inner<RT> {
         let mut next_time =
             (since_epoch.as_secs() as f64 * 1e3) + (since_epoch.subsec_nanos() as f64 * 1e-6);
         if let Some((last_time, _)) = self.log.back() {
-            let lower_bound = last_time.next_after(f64::INFINITY);
+            let lower_bound = last_time.next_up();
             if lower_bound > next_time {
                 next_time = lower_bound;
             }
@@ -1808,22 +2305,170 @@ fn udf_execution_time_metric(identifier: &UdfIdentifier) -> MetricName {
 
 // TODO: Thread component path through here.
 fn table_rows_read_metric(table_name: &TableName) -> MetricName {
-    format!("table:{}:rows_read", table_name)
+    format!("table:{table_name}:rows_read")
 }
 
 fn table_rows_written_metric(table_name: &TableName) -> MetricName {
-    format!("table:{}:rows_written", table_name)
+    format!("table:{table_name}:rows_written")
 }
 
 fn scheduled_job_next_ts_metric() -> &'static str {
     "scheduled_jobs:next_ts"
 }
 
+fn outstanding_functions_metric(
+    env: &ModuleEnvironment,
+    udf_type: &UdfType,
+    state: &OutstandingFunctionState,
+) -> MetricName {
+    let env_str = match env {
+        ModuleEnvironment::Isolate => "isolate",
+        ModuleEnvironment::Node => "node",
+        ModuleEnvironment::Invalid => "invalid",
+    };
+    let state_str = match state {
+        OutstandingFunctionState::Running => "running",
+        OutstandingFunctionState::Queued => "queued",
+    };
+    format!("outstanding_functions:{env_str}:{udf_type}:{state_str}")
+}
+
+/// View over `FunctionExecutionLog` that only exposes metrics methods.
+/// Obtained by checking `DeploymentOp::ViewMetrics`.
+pub struct FunctionMetricsLog<'a, RT: Runtime> {
+    log: &'a FunctionExecutionLog<RT>,
+}
+
+impl<'a, RT: Runtime> FunctionMetricsLog<'a, RT> {
+    pub(crate) fn new(log: &'a FunctionExecutionLog<RT>) -> Self {
+        Self { log }
+    }
+
+    pub fn udf_rate(
+        &self,
+        identifier: UdfIdentifier,
+        metric: UdfRate,
+        window: MetricsWindow,
+    ) -> anyhow::Result<Timeseries> {
+        self.log.udf_rate(identifier, metric, window)
+    }
+
+    pub fn cache_hit_percentage(
+        &self,
+        identifier: UdfIdentifier,
+        window: MetricsWindow,
+    ) -> anyhow::Result<Timeseries> {
+        self.log.cache_hit_percentage(identifier, window)
+    }
+
+    pub fn failure_percentage_top_k(
+        &self,
+        window: MetricsWindow,
+        k: usize,
+    ) -> anyhow::Result<Vec<(String, Timeseries)>> {
+        self.log.failure_percentage_top_k(window, k)
+    }
+
+    pub fn cache_hit_percentage_top_k(
+        &self,
+        window: MetricsWindow,
+        k: usize,
+    ) -> anyhow::Result<Vec<(String, Timeseries)>> {
+        self.log.cache_hit_percentage_top_k(window, k)
+    }
+
+    pub fn get_all_function_calls(
+        &self,
+        window: &MetricsWindow,
+    ) -> anyhow::Result<HashMap<String, Timeseries>> {
+        self.log.get_all_function_calls(window)
+    }
+
+    pub fn function_call_count_top_k(
+        &self,
+        window: MetricsWindow,
+        k: usize,
+    ) -> anyhow::Result<Vec<(String, Timeseries)>> {
+        self.log.function_call_count_top_k(window, k)
+    }
+
+    pub fn subscription_invalidations_top_k(
+        &self,
+        window: MetricsWindow,
+        k: usize,
+        identifier: Option<&UdfIdentifier>,
+    ) -> anyhow::Result<Vec<(String, Timeseries)>> {
+        self.log
+            .subscription_invalidations_top_k(window, k, identifier)
+    }
+
+    pub fn latency_percentiles(
+        &self,
+        identifier: UdfIdentifier,
+        percentiles: Vec<Percentile>,
+        window: MetricsWindow,
+    ) -> anyhow::Result<BTreeMap<Percentile, Timeseries>> {
+        self.log
+            .latency_percentiles(identifier, percentiles, window)
+    }
+
+    pub fn table_rate(
+        &self,
+        table_name: TableName,
+        metric: TableRate,
+        window: MetricsWindow,
+    ) -> anyhow::Result<Timeseries> {
+        self.log.table_rate(table_name, metric, window)
+    }
+
+    pub fn scheduled_job_lag(&self, window: MetricsWindow) -> anyhow::Result<Timeseries> {
+        self.log.scheduled_job_lag(window)
+    }
+
+    pub fn function_concurrency(
+        &self,
+        window: MetricsWindow,
+    ) -> anyhow::Result<BTreeMap<String, Timeseries>> {
+        self.log.function_concurrency(window)
+    }
+
+    pub fn udf_summary(
+        &self,
+        cursor: Option<CursorMs>,
+    ) -> (Option<UdfMetricSummary>, Option<CursorMs>) {
+        self.log.udf_summary(cursor)
+    }
+}
+
+/// View over `FunctionExecutionLog` that only exposes log entry streaming
+/// methods. Obtained by checking `DeploymentOp::ViewLogs`.
+pub struct FunctionEntriesLog<'a, RT: Runtime> {
+    log: &'a FunctionExecutionLog<RT>,
+}
+
+impl<'a, RT: Runtime> FunctionEntriesLog<'a, RT> {
+    pub(crate) fn new(log: &'a FunctionExecutionLog<RT>) -> Self {
+        Self { log }
+    }
+
+    pub async fn stream(&self, cursor: CursorMs) -> (Vec<FunctionExecution>, CursorMs) {
+        self.log.stream(cursor).await
+    }
+
+    pub async fn stream_parts(&self, cursor: CursorMs) -> (Vec<FunctionExecutionPart>, CursorMs) {
+        self.log.stream_parts(cursor).await
+    }
+
+    pub fn latest_cursor(&self) -> CursorMs {
+        self.log.latest_cursor()
+    }
+}
+
 fn udf_metric_name(identifier: &UdfIdentifier) -> String {
     let (component, id) = identifier.clone().into_component_and_udf_path();
     match component {
         Some(component) => {
-            format!("{}/{}", component, id)
+            format!("{component}/{id}")
         },
         None => id,
     }

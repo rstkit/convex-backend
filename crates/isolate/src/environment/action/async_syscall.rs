@@ -11,6 +11,7 @@ use common::{
         Runtime,
         UnixTimestamp,
     },
+    try_anyhow,
 };
 use errors::{
     ErrorMetadata,
@@ -57,7 +58,7 @@ impl<RT: Runtime> TaskExecutor<RT> {
     pub async fn run_async_syscall(&self, name: String, args: JsonValue) -> anyhow::Result<String> {
         let start = self.rt.monotonic_now();
         let timer = async_syscall_timer(&name);
-        let result: anyhow::Result<_> = try {
+        let result: anyhow::Result<_> = try_anyhow!({
             match &name[..] {
                 "1.0/actions/query" => self.async_syscall_actions_runQuery(args).await?.into(),
                 "1.0/actions/mutation" => {
@@ -67,6 +68,9 @@ impl<RT: Runtime> TaskExecutor<RT> {
                 "1.0/actions/schedule" => self.async_syscall_schedule(args).await?.into(),
                 "1.0/actions/cancel_job" => self.async_syscall_cancel_job(args).await?.into(),
                 "1.0/actions/vectorSearch" => self.async_syscall_vectorSearch(args).await?.into(),
+                "1.0/getFunctionMetadata" => self.async_syscall_getFunctionMetadata()?.into(),
+                "1.0/getDeploymentMetadata" => self.async_syscall_getDeploymentMetadata()?.into(),
+                "1.0/getRequestMetadata" => self.async_syscall_getRequestMetadata()?.into(),
                 "1.0/getUserIdentity" => self.async_syscall_getUserIdentity(args).await?.into(),
                 "1.0/storageDelete" => self.async_syscall_storageDelete(args).await?.into(),
                 "1.0/storageGetMetadata" => {
@@ -80,6 +84,12 @@ impl<RT: Runtime> TaskExecutor<RT> {
                 "1.0/createFunctionHandle" => {
                     self.async_syscall_createFunctionHandle(args).await?.into()
                 },
+                "1.0/auditLog" => {
+                    anyhow::bail!(ErrorMetadata::bad_request(
+                        "AuditLogNotSupportedInAction",
+                        "Audit logging is not yet supported in actions",
+                    ));
+                },
                 _ => {
                     anyhow::bail!(ErrorMetadata::bad_request(
                         "UnknownAsyncOperation",
@@ -87,7 +97,7 @@ impl<RT: Runtime> TaskExecutor<RT> {
                     ));
                 },
             }
-        };
+        });
         self.syscall_trace
             .lock()
             .log_async_syscall(name, start.elapsed(), result.is_ok());
@@ -150,7 +160,7 @@ impl<RT: Runtime> TaskExecutor<RT> {
                     function_path.component.is_root(),
                 ),
                 function_path,
-                args.into_arg_vec(),
+                args.into_serialized_args()?,
                 self.context.clone(),
             )
             .await
@@ -200,7 +210,7 @@ impl<RT: Runtime> TaskExecutor<RT> {
                     function_path.component.is_root(),
                 ),
                 function_path,
-                args.into_arg_vec(),
+                args.into_serialized_args()?,
                 self.context.clone(),
             )
             .await
@@ -250,7 +260,7 @@ impl<RT: Runtime> TaskExecutor<RT> {
                     function_path.component.is_root(),
                 ),
                 function_path,
-                args.into_arg_vec(),
+                args.into_serialized_args()?,
                 self.context.clone(),
             )
             .await
@@ -290,14 +300,14 @@ impl<RT: Runtime> TaskExecutor<RT> {
                 self.resolve_function(&reference)?
             },
         };
-        let scheduled_ts = UnixTimestamp::from_secs_f64(ts);
+        let scheduled_ts = with_argument_error("ts", || UnixTimestamp::from_secs_f64(ts))?;
         let virtual_id = self
             .action_callbacks
             .schedule_job(
                 self.identity.clone(),
                 self.component_id(),
                 path,
-                args.into_arg_vec(),
+                args.into_serialized_args()?,
                 scheduled_ts,
                 self.context.clone(),
             )
@@ -342,6 +352,30 @@ impl<RT: Runtime> TaskExecutor<RT> {
         self.usage_tracker.add(usage_stats);
         let results: Vec<_> = results.into_iter().map(JsonValue::from).collect();
         Ok(json!({ "results": results }))
+    }
+
+    fn async_syscall_getFunctionMetadata(&self) -> anyhow::Result<JsonValue> {
+        Ok(json!({
+            "name": self.udf_path.clone().strip().to_string(),
+            "componentPath": self.component_path.to_string(),
+        }))
+    }
+
+    fn async_syscall_getDeploymentMetadata(&self) -> anyhow::Result<JsonValue> {
+        Ok(json!({
+            "name": self.deployment.name,
+            "region": self.deployment.region,
+            "class": self.deployment.class,
+        }))
+    }
+
+    fn async_syscall_getRequestMetadata(&self) -> anyhow::Result<JsonValue> {
+        let metadata = &self.context.request_metadata;
+        Ok(json!({
+            "ip": metadata.ip.as_ref().map(|ip| ip.as_str()),
+            "userAgent": metadata.user_agent.as_ref().map(|ua| ua.as_str()),
+            "requestId": self.context.request_id.as_str(),
+        }))
     }
 
     #[convex_macro::instrument_future]

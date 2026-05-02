@@ -4,8 +4,14 @@ import classNames from "classnames";
 import { FunctionResult } from "convex/browser";
 import { useQuery } from "convex/react";
 // special case: too annoying to move convexServerTypes to a separate file right now
-import { useTheme } from "next-themes";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import udfs from "@common/udfs";
 import { Uri } from "monaco-editor/esm/vs/editor/editor.api";
 import { Button } from "@ui/Button";
@@ -14,6 +20,8 @@ import { stringifyValue } from "@common/lib/stringifyValue";
 import { SchemaJson, displaySchema } from "@common/lib/format";
 import { useRunTestFunction } from "@common/features/functionRunner/lib/client";
 import { ComponentId } from "@common/lib/useNents";
+import { useCurrentTheme } from "@common/lib/useCurrentTheme";
+import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import { Result } from "@common/features/functionRunner/components/Result";
 import {
   RunHistory,
@@ -37,7 +45,7 @@ declare global {
    * @returns The wrapped query. Include this as an \`export\` to name it and make it accessible.
    */
   const query: QueryBuilder<DataModel, "public">;
-  
+
   /**
    * Define a query that is only accessible from other Convex functions (but not from the client).
    *
@@ -89,7 +97,7 @@ export type Doc = any;
  * Convex documents are uniquely identified by their \`Id\`, which is accessible
  * on the \`_id\` field. To learn more, see [Document IDs](https://docs.convex.dev/using/document-ids).
  *
- * Documents can be loaded using \`db.get(id)\` in query and mutation functions.
+ * Documents can be loaded using \`db.get(tableName, id)\` in query and mutation functions.
  *
  * IDs are just strings at runtime, but this type can be used to distinguish them from other
  * strings when type checking.
@@ -139,7 +147,7 @@ export type Doc<TableName extends TableNames> = DocumentByName<
  * Convex documents are uniquely identified by their \`Id\`, which is accessible
  * on the \`_id\` field. To learn more, see [Document IDs](https://docs.convex.dev/using/document-ids).
  *
- * Documents can be loaded using \`db.get(id)\` in query and mutation functions.
+ * Documents can be loaded using \`db.get(tableName, id)\` in query and mutation functions.
  *
  * IDs are just strings at runtime, but this type can be used to distinguish them from other
  * strings when type checking.
@@ -176,8 +184,11 @@ export function useFunctionEditor(
   componentId: ComponentId,
   runHistoryItem: RunHistoryItem | undefined,
   setRunHistoryItem: (item: RunHistoryItem) => void,
+  onRanCustomQuery?: () => void,
 ) {
-  const { resolvedTheme: currentTheme } = useTheme();
+  const { useIsOperationAllowed } = useContext(DeploymentInfoContext);
+  const canRunTestQuery = useIsOperationAllowed("RunTestQuery");
+  const currentTheme = useCurrentTheme();
   const prefersDark = currentTheme === "dark";
 
   const [prevInitialTable, setPrevInitialTable] = useState<
@@ -317,13 +328,13 @@ export function useFunctionEditor(
             functionIdentifier="_testQuery"
             componentId={componentId}
             selectItem={(item) => {
-              item.type === "custom" && setCode(item.code);
+              if (item.type === "custom") setCode(item.code);
               setRunHistoryItem(item);
             }}
           />
         </div>
         <div
-          className="h-full min-h-0 animate-fadeInFromLoading rounded border"
+          className="h-full min-h-0 animate-fadeInFromLoading rounded-sm border"
           key={runHistoryItem ? stringifyValue(runHistoryItem) : ""}
         >
           <Editor
@@ -380,8 +391,9 @@ export function useFunctionEditor(
                 CONVEX_SERVER_FILES,
               )) {
                 const uri = monaco_.Uri.parse(fileName);
-                !monaco_.editor.getModel(uri) &&
+                if (!monaco_.editor.getModel(uri)) {
                   monaco_.editor.createModel(content, "typescript", uri);
+                }
               }
             }}
             onMount={(editor, m) => {
@@ -393,12 +405,16 @@ export function useFunctionEditor(
                 label: "Save value",
                 keybindings,
                 run() {
-                  !isInFlight && void saveActionRef.current();
+                  if (!isInFlight) {
+                    void saveActionRef.current();
+                  }
                 },
               });
             }}
             onChange={(value) => {
-              value && setCode(value);
+              if (value) {
+                setCode(value);
+              }
             }}
           />
         </div>
@@ -418,9 +434,18 @@ export function useFunctionEditor(
     ),
     runCustomQueryButton: (
       <Button
-        onClick={onSave}
+        onClick={() => {
+          void onSave();
+          onRanCustomQuery?.();
+        }}
         size="sm"
         className={classNames("items-center justify-center", "w-full")}
+        disabled={!canRunTestQuery}
+        tip={
+          !canRunTestQuery
+            ? "You do not have permission to run custom queries in this deployment."
+            : undefined
+        }
         loading={isInFlight}
         icon={<PlayIcon />}
       >

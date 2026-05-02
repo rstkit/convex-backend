@@ -7,33 +7,25 @@ use common::{
     types::Timestamp,
     RequestId,
 };
-#[cfg(any(test, feature = "testing"))]
-use proptest::prelude::*;
 use serde::{
     Deserialize,
     Serialize,
 };
 use serde_bytes::ByteBuf;
 use serde_json::Value as JsonValue;
+use sync_types::types::SerializedArgs;
 use value::{
     codegen_convex_serialization,
     ConvexArray,
+    DeveloperDocumentId,
 };
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
+#[derive(Clone)]
 pub struct ScheduledJob {
     /// This ScheduledJob lives the queue / _scheduled_jobs table of the
     /// component that scheduled it. But it can run jobs in a different
     /// component.
     pub path: CanonicalizedComponentFunctionPath,
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(
-            strategy = "proptest::arbitrary::any_with::<ConvexArray>((0..4).into()).\
-                        prop_map(args_to_bytes).prop_filter_map(\"invalid json\", |b| b.ok())"
-        )
-    )]
     pub udf_args_bytes: ByteBuf,
 
     pub state: ScheduledJobState,
@@ -52,15 +44,74 @@ pub struct ScheduledJob {
     pub attempts: ScheduledJobAttempts,
 }
 
-fn args_to_bytes(args: ConvexArray) -> anyhow::Result<ByteBuf> {
+impl ScheduledJob {
+    pub fn udf_args(&self) -> anyhow::Result<SerializedArgs> {
+        Ok(SerializedArgs::from_slice(&self.udf_args_bytes)?)
+    }
+}
+
+pub trait MatchesScheduledJobMetadata {
+    fn matches_metadata(&self, metadata: &ScheduledJobMetadata) -> bool;
+}
+
+impl MatchesScheduledJobMetadata for ScheduledJob {
+    fn matches_metadata(&self, metadata: &ScheduledJobMetadata) -> bool {
+        self.path == metadata.path
+            && self.state == metadata.state
+            && self.next_ts == metadata.next_ts
+            && self.completed_ts == metadata.completed_ts
+            && self.original_scheduled_ts == metadata.original_scheduled_ts
+            && self.attempts == metadata.attempts
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+/// Corresponds to a document in the `_scheduled_jobs` table.
+pub struct ScheduledJobMetadata {
+    /// This ScheduledJob lives the queue / _scheduled_jobs table of the
+    /// component that scheduled it. But it can run jobs in a different
+    /// component.
+    pub path: CanonicalizedComponentFunctionPath,
+    /// We no longer write this field in favor of storing arguments in the
+    /// `_scheduled_job_args` table, but it is not safe to remove it because we
+    /// are not migrating existing scheduled job documents.
+    pub udf_args_bytes: Option<ByteBuf>,
+
+    /// ID for the document in the `_scheduled_jobs_args` table in the same
+    /// namespace as this scheduled job that has the arguments for the job.
+    pub args_id: Option<DeveloperDocumentId>,
+
+    pub state: ScheduledJobState,
+
+    // next_ts is the timestamp when the job was scheduled, and should only be set on pending and
+    // in-progress states. completed_ts is the timestamp when the job was completed, and should
+    // only be set on success, failed, and canceled states. This allows us to use an index to find
+    // jobs that still need to be processed and jobs that can be garbage collected without doing
+    // multiple queries on different states and merging the results. original_scheduled_ts is the
+    // timestamp when the job was scheduled, but does not get mutated as the job transitions
+    // between states.
+    pub next_ts: Option<Timestamp>,
+    pub completed_ts: Option<Timestamp>,
+    pub original_scheduled_ts: Timestamp,
+
+    pub attempts: ScheduledJobAttempts,
+}
+
+impl MatchesScheduledJobMetadata for ScheduledJobMetadata {
+    fn matches_metadata(&self, metadata: &ScheduledJobMetadata) -> bool {
+        metadata == self
+    }
+}
+
+pub fn args_to_bytes(args: ConvexArray) -> anyhow::Result<ByteBuf> {
     let args_bytes = args.json_serialize()?.into_bytes();
     Ok(ByteBuf::from(args_bytes))
 }
 
-impl ScheduledJob {
+impl ScheduledJobMetadata {
     pub fn new(
         path: CanonicalizedComponentFunctionPath,
-        udf_args: ConvexArray,
+        args_id: DeveloperDocumentId,
         state: ScheduledJobState,
         next_ts: Option<Timestamp>,
         completed_ts: Option<Timestamp>,
@@ -69,7 +120,8 @@ impl ScheduledJob {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             path,
-            udf_args_bytes: args_to_bytes(udf_args)?,
+            udf_args_bytes: None,
+            args_id: Some(args_id),
             state,
             next_ts,
             completed_ts,
@@ -77,12 +129,12 @@ impl ScheduledJob {
             attempts,
         })
     }
+}
 
-    pub fn udf_args(&self) -> anyhow::Result<ConvexArray> {
-        let args_json: JsonValue = serde_json::from_slice(&self.udf_args_bytes)?;
-        let args = args_json.try_into()?;
-        Ok(args)
-    }
+pub fn args_from_bytes(args_bytes: ByteBuf) -> anyhow::Result<ConvexArray> {
+    let args_json: JsonValue = serde_json::from_slice(&args_bytes)?;
+    let args = args_json.try_into()?;
+    Ok(args)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,7 +144,8 @@ pub struct SerializedScheduledJob {
     udf_path: String,
     // Serialize the udf arguments as binary since we restrict what
     // field names can be used in a `Document`'s top-level object.
-    udf_args: ByteBuf,
+    udf_args: Option<ByteBuf>,
+    args_id: Option<String>,
     state: SerializedScheduledJobState,
     next_ts: Option<i64>,
     completed_ts: Option<i64>,
@@ -100,14 +153,15 @@ pub struct SerializedScheduledJob {
     attempts: Option<ScheduledJobAttempts>,
 }
 
-impl TryFrom<ScheduledJob> for SerializedScheduledJob {
+impl TryFrom<ScheduledJobMetadata> for SerializedScheduledJob {
     type Error = anyhow::Error;
 
-    fn try_from(job: ScheduledJob) -> anyhow::Result<Self> {
+    fn try_from(job: ScheduledJobMetadata) -> anyhow::Result<Self> {
         Ok(SerializedScheduledJob {
             component: Some(String::from(job.path.component)),
             udf_path: String::from(job.path.udf_path),
             udf_args: job.udf_args_bytes,
+            args_id: job.args_id.map(|id| id.to_string()),
             state: job.state.try_into()?,
             next_ts: job.next_ts.map(|ts| ts.into()),
             completed_ts: job.completed_ts.map(|ts| ts.into()),
@@ -117,7 +171,7 @@ impl TryFrom<ScheduledJob> for SerializedScheduledJob {
     }
 }
 
-impl TryFrom<SerializedScheduledJob> for ScheduledJob {
+impl TryFrom<SerializedScheduledJob> for ScheduledJobMetadata {
     type Error = anyhow::Error;
 
     fn try_from(value: SerializedScheduledJob) -> anyhow::Result<Self> {
@@ -128,6 +182,7 @@ impl TryFrom<SerializedScheduledJob> for ScheduledJob {
             .unwrap_or_else(ComponentPath::root);
         let udf_path = value.udf_path.parse()?;
         let udf_args_bytes = value.udf_args;
+        let args_id = value.args_id.map(|id| id.parse()).transpose()?;
         let state = value.state.try_into()?;
         let next_ts = value.next_ts.map(|ts| ts.try_into()).transpose()?;
         let completed_ts = value.completed_ts.map(|ts| ts.try_into()).transpose()?;
@@ -144,12 +199,13 @@ impl TryFrom<SerializedScheduledJob> for ScheduledJob {
             },
         };
 
-        Ok(ScheduledJob {
+        Ok(ScheduledJobMetadata {
             path: CanonicalizedComponentFunctionPath {
                 component,
                 udf_path,
             },
             udf_args_bytes,
+            args_id,
             state,
             next_ts,
             completed_ts,
@@ -160,10 +216,11 @@ impl TryFrom<SerializedScheduledJob> for ScheduledJob {
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledJobAttempts {
     pub system_errors: u32,
+    // Deprecated field that's no longer used for tracking OCCs since we changed to retry
+    // indefinitely on OCCs
     pub occ_errors: u32,
 }
 
@@ -177,7 +234,6 @@ impl ScheduledJobAttempts {
 /// InProgress state. Mutations jump straight from Pending to one of the
 /// completion states.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ScheduledJobState {
     /// Job has not started yet.
     Pending,
@@ -258,7 +314,7 @@ impl TryFrom<SerializedScheduledJobState> for ScheduledJobState {
     }
 }
 
-codegen_convex_serialization!(ScheduledJob, SerializedScheduledJob);
+codegen_convex_serialization!(ScheduledJobMetadata, SerializedScheduledJob);
 
 mod state {
     use value::codegen_convex_serialization;
@@ -270,3 +326,40 @@ mod state {
 
     codegen_convex_serialization!(ScheduledJobState, SerializedScheduledJobState);
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduledJobArgs {
+    pub args: ByteBuf,
+}
+
+impl TryFrom<ConvexArray> for ScheduledJobArgs {
+    type Error = anyhow::Error;
+
+    fn try_from(args: ConvexArray) -> anyhow::Result<Self> {
+        Ok(ScheduledJobArgs {
+            args: args_to_bytes(args)?,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializedScheduledJobArgs {
+    args: ByteBuf,
+}
+
+impl From<ScheduledJobArgs> for SerializedScheduledJobArgs {
+    fn from(value: ScheduledJobArgs) -> SerializedScheduledJobArgs {
+        SerializedScheduledJobArgs { args: value.args }
+    }
+}
+
+impl TryFrom<SerializedScheduledJobArgs> for ScheduledJobArgs {
+    type Error = anyhow::Error;
+
+    fn try_from(value: SerializedScheduledJobArgs) -> anyhow::Result<Self> {
+        Ok(ScheduledJobArgs { args: value.args })
+    }
+}
+
+codegen_convex_serialization!(ScheduledJobArgs, SerializedScheduledJobArgs);

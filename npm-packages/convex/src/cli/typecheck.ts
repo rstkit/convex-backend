@@ -1,13 +1,13 @@
-import chalk from "chalk";
+import { chalkStderr } from "chalk";
 import { functionsDir, ensureHasConvexDependency } from "./lib/utils/utils.js";
-import { Command } from "@commander-js/extra-typings";
+import { Command, Option } from "@commander-js/extra-typings";
 import { readConfig } from "./lib/config.js";
-import { typeCheckFunctions } from "./lib/typecheck.js";
 import {
-  logFinishedStep,
-  logMessage,
-  oneoffContext,
-} from "../bundler/context.js";
+  typeCheckFunctions,
+  resolveTypescriptCompiler,
+} from "./lib/typecheck.js";
+import { oneoffContext } from "../bundler/context.js";
+import { logFinishedStep, logMessage } from "../bundler/log.js";
 
 // Experimental (it's going to fail sometimes) TypeScript type checking.
 // Includes a separate command to help users debug their TypeScript configs.
@@ -20,21 +20,32 @@ export const typecheck = new Command("typecheck")
     "Run TypeScript typechecking on your Convex functions with `tsc --noEmit`.",
   )
   .allowExcessArguments(false)
-  .action(async () => {
+  .addOption(
+    new Option(
+      "--typescript-compiler <compiler>",
+      "TypeScript compiler to use for typechecking (`@typescript/native-preview` must be installed to use `tsgo`)",
+    ).choices(["tsc", "tsgo"] as const),
+  )
+  .action(async (cmdOptions) => {
     const ctx = await oneoffContext({
       url: undefined,
       adminKey: undefined,
       envFile: undefined,
     });
+    const typescriptCompiler = await resolveTypescriptCompiler(
+      ctx,
+      cmdOptions.typescriptCompiler,
+    );
     const { configPath, config: localConfig } = await readConfig(ctx, false);
     await ensureHasConvexDependency(ctx, "typecheck");
     await typeCheckFunctions(
       ctx,
+      typescriptCompiler,
       functionsDir(configPath, localConfig.projectConfig),
       async (typecheckResult, logSpecificError, runOnError) => {
         logSpecificError?.();
         if (typecheckResult === "typecheckFailed") {
-          logMessage(ctx, chalk.gray("Typecheck failed"));
+          logMessage(chalkStderr.gray("Typecheck failed"));
           try {
             await runOnError?.();
             // If runOnError doesn't throw then it worked the second time.
@@ -49,8 +60,7 @@ export const typecheck = new Command("typecheck")
           });
         } else if (typecheckResult === "cantTypeCheck") {
           logMessage(
-            ctx,
-            chalk.gray("Unable to typecheck; is TypeScript installed?"),
+            chalkStderr.gray("Unable to typecheck; is TypeScript installed?"),
           );
           return await ctx.crash({
             exitCode: 1,
@@ -59,8 +69,7 @@ export const typecheck = new Command("typecheck")
           });
         } else {
           logFinishedStep(
-            ctx,
-            "Typecheck passed: `tsc --noEmit` completed with exit code 0.",
+            `Typecheck passed: \`${typescriptCompiler} --noEmit\` completed with exit code 0.`,
           );
           return await ctx.flushAndExit(0);
         }

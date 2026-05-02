@@ -2,6 +2,9 @@
 title: "Project Configuration"
 sidebar_label: "Project Configuration"
 sidebar_position: 3
+description:
+  "Configure your Convex project for development and production deployment using
+  convex.json, environment variables, and deployment settings."
 ---
 
 ## Local development
@@ -41,8 +44,7 @@ property:
 
 ```json title="convex.json"
 {
-  "$schema": "https://raw.githubusercontent.com/get-convex/convex-backend/refs/heads/main/npm-packages/convex/schemas/convex.schema.json",
-  "functions": "src/convex/"
+  "$schema": "./node_modules/convex/schemas/convex.schema.json"
 }
 ```
 
@@ -57,7 +59,48 @@ have the following config:
 
 ```json title="convex.json"
 {
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
   "functions": "src/convex/"
+}
+```
+
+### Configuring AI files messages
+
+Convex can install AI helper files (for tools like Cursor and Claude Code) and
+show install or update suggestions during `npx convex dev`.
+
+:::caution
+
+This setting is supported in Convex CLI `1.34.1` and later.
+
+:::
+
+To suppress those suggestions, set `aiFiles.enabled` to `false` in
+`convex.json`:
+
+```json title="convex.json"
+{
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
+  "aiFiles": {
+    "enabled": false
+  }
+}
+```
+
+When this is `false`, `npx convex dev` will not show the AI files install or
+staleness messages.
+
+You can also configure which agents the Convex skills are installed for
+(defaults to `["claude-code", "codex"]`):
+
+```json title="convex.json"
+{
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
+  "aiFiles": {
+    "skills": {
+      "agents": ["claude-code", "codex", "cursor"]
+    }
+  }
 }
 ```
 
@@ -73,6 +116,36 @@ The Convex code generation can be configured to generate a CommonJS-version of
 the `_generated/api.js` file via the `generateCommonJSApi` field.
 [Read more](/client/javascript/node.mdx#javascript-with-commonjs-require-syntax).
 
+### Configuring the Node.js version
+
+You can specify which Node.js version is used by Node actions via the
+`node.nodeVersion` field. The currently supported values are `"20"` and `"22"`.
+[Read more](/functions/runtimes.mdx#nodejs-version-configuration).
+
+<Admonition type="info" title="Convex version requirement">
+
+To change the Node.js version used by your project, you must use the `convex`
+NPM package version 1.27.0 or later.
+
+</Admonition>
+
+```json title="convex.json"
+{
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
+  "node": {
+    "nodeVersion": "22"
+  }
+}
+```
+
+Note: This configuration is not supported when running the self-hosted Convex
+backend. The Node version that is specified in the
+[.nvmrc](https://github.com/get-convex/convex-backend/blob/main/.nvmrc) will be
+used instead.
+
+When pushing a new Node.js version to the server, the new code for your
+functions may be executed in the old Node.js version for up a few minutes.
+
 ### Using static code generation (beta)
 
 Convex's code generation heavily relies on TypeScript's type inference. This
@@ -85,6 +158,7 @@ Convex CLI to generate static versions of the `_generated/api.d.ts` and
 
 ```json title="convex.json"
 {
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
   "codegen": {
     "staticApi": true,
     "staticDataModel": true
@@ -106,3 +180,112 @@ but it does have some tradeoffs:
 
 This feature is currently in beta, and we'd love to improve these limitations.
 Let us know if you run into any issues or have any feedback!
+
+### Configuring the TypeScript compiler
+
+By default, Convex will use the `tsc` binary installed in your project for
+typechecking. If you would like to use the TypeScript 7 native preview instead,
+you can set the `typescriptCompiler` option to `tsgo`. Note that
+`@typescript/native-preview` must be installed in your project to use `tsgo`.
+
+<Admonition type="info" title="Convex version requirement">
+
+To use the TypeScript 7 native preview, you must use the `convex` NPM package
+version 1.31.1 or later.
+
+</Admonition>
+
+```json title="convex.json"
+{
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
+  "typescriptCompiler": "tsgo"
+}
+```
+
+### Configuring bundler options
+
+Convex includes sourcemaps when bundling your source code to provide stack
+traces and to display your code on the dashboard. If your code bundle is
+especially large, you can improve CLI upload times by excluding the source code
+content from the bundle. Set the `includeSourcesContent` property to `false` in
+the `bundler` options. Stack traces will continue to function as usual, but you
+will no longer be able to view your source code in the dashboard.
+
+<Admonition type="info" title="Convex version requirement">
+
+This configuration option is only available in version 1.31.3 or later of the
+`convex` NPM package.
+
+</Admonition>
+
+```json title="convex.json"
+{
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
+  "bundler": {
+    "includeSourcesContent": false
+  }
+}
+```
+
+### Configuring WorkOS AuthKit integration
+
+If you're using [WorkOS AuthKit](/auth/authkit/index.mdx) for authentication,
+you can configure automatic provisioning (development only) and configuration of
+WorkOS environments via the `authKit` field.
+
+<Admonition type="info" title="Convex version requirement">
+
+This configuration option is only available in version 1.31.6 or later of the
+`convex` NPM package.
+
+</Admonition>
+
+```json title="convex.json"
+{
+  "$schema": "./node_modules/convex/schemas/convex.schema.json",
+  "authKit": {
+    "dev": {
+      "configure": {
+        "redirectUris": ["http://localhost:3000/callback"],
+        "appHomepageUrl": "http://localhost:3000",
+        "corsOrigins": ["http://localhost:3000"]
+      },
+      "localEnvVars": {
+        "WORKOS_CLIENT_ID": "${authEnv.WORKOS_CLIENT_ID}",
+        "WORKOS_API_KEY": "${authEnv.WORKOS_API_KEY}",
+        "NEXT_PUBLIC_WORKOS_REDIRECT_URI": "http://localhost:3000/callback"
+      }
+    },
+    "preview": {
+      "configure": {
+        "redirectUris": ["https://${buildEnv.VERCEL_BRANCH_URL}/callback"],
+        "appHomepageUrl": "https://${buildEnv.VERCEL_PROJECT_PRODUCTION_URL}",
+        "corsOrigins": ["https://${buildEnv.VERCEL_BRANCH_URL}"]
+      }
+    },
+    "prod": {
+      "environmentType": "production",
+      "configure": {
+        "redirectUris": [
+          "https://${buildEnv.VERCEL_PROJECT_PRODUCTION_URL}/callback"
+        ],
+        "appHomepageUrl": "https://${buildEnv.VERCEL_PROJECT_PRODUCTION_URL}",
+        "corsOrigins": ["https://${buildEnv.VERCEL_PROJECT_PRODUCTION_URL}"]
+      }
+    }
+  }
+}
+```
+
+This configuration controls how WorkOS environments are provisioned and
+configured for each deployment type (dev, preview, prod). See the
+[Automatic AuthKit Configuration](/auth/authkit/auto-provision.mdx) guide for
+complete details.
+
+<Admonition type="info">
+  Provisioning the Convex-managed WorkOS team and disconnecting it require the
+  you to be an admin of the team. Provisioning a per-deployment WorkOS
+  environment uses the deployment's own management permission, any team member
+  can self-serve one for their dev/preview deployment via `npx convex dev`, but
+  production deployments require you to be a team or project admin.
+</Admonition>

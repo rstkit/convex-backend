@@ -36,10 +36,8 @@ export function NentSwitcher({
         className="static truncate"
         Option={NentNameOption}
         setSelectedOption={(nent) => {
-          nent === null
-            ? void setSelectedNent(undefined)
-            : void setSelectedNent(nent?.id ?? undefined);
-          onChange && onChange(nent?.id || null);
+          void setSelectedNent(nent?.id ?? undefined);
+          onChange?.(nent?.id || null);
         }}
         searchPlaceholder="Search components..."
         options={[
@@ -76,7 +74,7 @@ export function NentNameOption({
       }
       side="right"
       className={cn(
-        "w-full flex items-center",
+        "flex w-full items-center",
         value && value.state !== "active" && "text-content-tertiary",
       )}
     >

@@ -1,5 +1,4 @@
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
     FnArg,
@@ -12,123 +11,6 @@ use syn::{
     Signature,
     Type,
 };
-
-/// Macro to use for tests that need ProdRuntime and tokio runtime.
-/// Example:
-/// ```
-/// #[convex_macro::prod_rt_test]
-/// async fn test_database(rt: ProdRuntime) -> anyhow::Result<()> {
-///     // Supports tokio-postgres and await.
-///     let TestDbSetup { _postgres_url, .. } = setup_db().await?;
-///     // Gives a runtime argument for passing to libraries.
-///     let _db = new_test_database(rt).await?;
-///     Ok(())
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn prod_rt_test(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let ast: ItemFn = syn::parse(item).unwrap();
-    let sig = &ast.sig;
-    let name = &sig.ident;
-    sig.asyncness
-        .expect("#[prod_rt_test] only works on async functions");
-    let args = &sig.inputs;
-    let output = &sig.output;
-    let Some(FnArg::Typed(_)) = args.first() else {
-        panic!("#[prod_rt_test] requires `{name}` to have `rt: ProdRuntime` as the first arg");
-    };
-    let attrs = ast.attrs.iter();
-    let gen = quote! {
-        #[test]
-        #( #attrs )*
-        fn #name() #output {
-            #ast
-            // Set a consistent thread stack size regardless of environment.
-            let builder = std::thread::Builder::new().stack_size(
-                *::common::knobs::RUNTIME_STACK_SIZE);
-            let handler = builder
-                .spawn(|| {
-                    let tokio = ::runtime::prod::ProdRuntime::init_tokio()?;
-                    let rt = ::runtime::prod::ProdRuntime::new(&tokio);
-                    let rt2 = rt.clone();
-                    let test_future = #name(rt);
-                    rt2.block_on("test", test_future)
-                })
-                .unwrap();
-            handler.join().unwrap()
-        }
-    };
-    gen.into()
-}
-
-/// Macro to use for tests that need TestRuntime.
-/// Example:
-/// ```
-/// #[convex_macro::test_runtime]
-/// async fn test_database(rt: TestRuntime) -> anyhow::Result<()> {
-///     // Gives a runtime argument for passing to libraries, and supports await.
-///     let _db = new_test_database(rt).await?;
-///     Ok(())
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn test_runtime(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let ast: ItemFn = syn::parse(item).unwrap();
-    let sig = &ast.sig;
-    let name = &sig.ident;
-    sig.asyncness
-        .expect("#[test_runtime] only works on async functions");
-    let args = &sig.inputs;
-    let output = &sig.output;
-    let Some(FnArg::Typed(_)) = args.first() else {
-        panic!("#[test_runtime] requires `{name}` to have `rt: TestRuntime` as the first arg");
-    };
-    let is_pauseable = if let Some(arg1) = args.get(1) {
-        assert!(
-            matches!(arg1, FnArg::Typed(pat) if matches!(&*pat.ty, syn::Type::Path(p) if p.path.is_ident("PauseController")))
-        );
-        true
-    } else {
-        false
-    };
-    let run_test = if is_pauseable {
-        quote! {
-            let (__pause_controller, __pause_client) = ::common::pause::PauseController::new();
-            let mut __test_driver = ::runtime::testing::TestDriver::new_with_pause_client(
-                __pause_client
-            );
-            let rt = __test_driver.rt();
-            let test_future = #name(rt, __pause_controller);
-            __test_driver.run_until(test_future)
-        }
-    } else {
-        quote! {
-            let mut __test_driver = ::runtime::testing::TestDriver::new();
-            let rt = __test_driver.rt();
-            let test_future = #name(rt);
-            __test_driver.run_until(test_future)
-        }
-    };
-
-    let attrs = ast.attrs.iter();
-    let gen = quote! {
-        #[test]
-        #( #attrs )*
-        fn #name() #output {
-            #ast
-            // Set a consistent thread stack size regardless of environment.
-            let builder = std::thread::Builder::new().stack_size(
-                *::common::knobs::RUNTIME_STACK_SIZE);
-            let handler = builder
-                .spawn(|| {
-                    #run_test
-                })
-                .unwrap();
-            handler.join().unwrap()
-        }
-    };
-    gen.into()
-}
 
 #[proc_macro_attribute]
 pub fn instrument_future(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -149,14 +31,14 @@ pub fn instrument_future(_attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     let Signature {
-        ref ident,
-        ref generics,
-        ref inputs,
-        ref output,
+        ident,
+        generics,
+        inputs,
+        output,
         ..
     } = sig;
 
-    let gen = quote! {
+    let r#gen = quote! {
         #(#attrs)*
         #vis async fn #ident #generics (#inputs) #output {
             ::common::run_instrumented!(
@@ -165,11 +47,11 @@ pub fn instrument_future(_attr: TokenStream, item: TokenStream) -> TokenStream {
             )
         }
     };
-    gen.into()
+    r#gen.into()
 }
 
 /// Use as #[convex_macro::v8_op] to annotate "ops" (Rust code callable from
-/// Javascript that is shipped with backend).
+/// JavaScript that is shipped with backend).
 /// Must be used within the `isolate` crate.
 ///
 /// Types:
@@ -200,10 +82,10 @@ pub fn v8_op(_attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     let Signature {
-        ref ident,
-        ref generics,
-        ref inputs,
-        ref output,
+        ident,
+        generics,
+        inputs,
+        output,
         ..
     } = sig;
 
@@ -215,16 +97,27 @@ pub fn v8_op(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let provider_ident = &first_pat_ident.ident;
 
-    let arg_parsing: TokenStream2 = inputs
+    let arg_pats: Vec<_> = inputs
+        .iter()
+        .skip(1)
+        .map(|input| {
+            let FnArg::Typed(pat) = input else {
+                panic!("input must be typed")
+            };
+            &pat.pat
+        })
+        .collect();
+    let arg_parsing: Vec<_> = inputs
         .iter()
         .enumerate()
         .skip(1)
         .map(|(idx, input)| {
             let idx = idx as i32;
+            let arg_info = format!("{ident} arg{idx}");
             let FnArg::Typed(pat) = input else {
                 panic!("input must be typed")
             };
-            let arg_info = format!("{} arg{}", ident, idx);
+            let ty = &pat.ty;
             // NOTE: deno has special case when pat.ty is &mut [u8].
             // While that would make some ops more efficient, it also makes them
             // unsafe because it's hard to prove that the same buffer isn't
@@ -233,13 +126,12 @@ pub fn v8_op(_attr: TokenStream, item: TokenStream) -> TokenStream {
             //
             // Forego all special casing and just use serde_v8.
             quote! {
-                let #pat = {
+                {
                     let __raw_arg = __args.get(#idx);
-                    ::deno_core::serde_v8::from_v8(
-                        &mut __scope,
-                        __raw_arg,
-                    ).context(#arg_info)?
-                };
+                    use ::anyhow::Context as _;
+                    <#ty as crate::convert_v8::FromV8>::from_v8(__scope, __raw_arg)
+                        .context(#arg_info)?
+                }
             }
         })
         .collect();
@@ -266,26 +158,28 @@ pub fn v8_op(_attr: TokenStream, item: TokenStream) -> TokenStream {
         panic!("op must return anyhow::Result<...>");
     };
 
-    let gen = quote! {
+    let r#gen = quote! {
         #(#attrs)*
         #vis fn #ident #generics (
             #first_pat_type,
             __args: ::deno_core::v8::FunctionCallbackArguments,
             mut __rv: ::deno_core::v8::ReturnValue,
         ) -> ::anyhow::Result<()> {
-            let mut __scope = ::deno_core::v8::HandleScope::new(OpProvider::scope(#provider_ident));
-            #arg_parsing
-            drop(__scope);
+            #[allow(clippy::unused_unit)]
+            let ( #(#arg_pats,)*) = {
+                let mut __scope = OpProvider::scope(#provider_ident);
+                ::deno_core::v8::scope!(let __scope, &mut __scope);
+                (#(#arg_parsing,)*)
+            };
             let __result_v = (|| #output { #block })()?;
             {
-                let mut __scope = ::deno_core::v8::HandleScope::new(
-                    OpProvider::scope(#provider_ident),
-                );
-                let __value_v8 = deno_core::serde_v8::to_v8(&mut __scope, __result_v)?;
+                let mut __scope = OpProvider::scope(#provider_ident);
+                ::deno_core::v8::scope!(let __scope, &mut __scope);
+                let __value_v8 = crate::convert_v8::ToV8::to_v8(__result_v, __scope)?;
                 __rv.set(__value_v8);
             }
             Ok(())
         }
     };
-    gen.into()
+    r#gen.into()
 }

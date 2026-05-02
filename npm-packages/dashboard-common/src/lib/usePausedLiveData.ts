@@ -151,7 +151,7 @@ export function usePausedLiveData<TResult, TArgs>({
       setPausedData(result.page);
       setLastCursor(result.continueCursor);
       setCanLoadMore(!result.isDone);
-    } catch (e) {
+    } catch {
       toast("error", "Failed to load data", "loadData");
     } finally {
       setIsLoadingPausedData(false);
@@ -168,7 +168,7 @@ export function usePausedLiveData<TResult, TArgs>({
       setPausedData((prev) => [...prev, ...result.page]);
       setLastCursor(result.continueCursor);
       setCanLoadMore(!result.isDone);
-    } catch (e) {
+    } catch {
       toast("error", "Failed to load more data", "loadMoreData");
     } finally {
       setIsLoadingMore(false);
@@ -182,7 +182,9 @@ export function usePausedLiveData<TResult, TArgs>({
   ]);
 
   useMount(() => {
-    isPaused && void loadFirstPage();
+    if (isPaused) {
+      void loadFirstPage();
+    }
   });
 
   // Check if args have changed, and if isPaused, reload the data

@@ -1,5 +1,6 @@
 import { Command } from "@commander-js/extra-typings";
-import { logFinishedStep, oneoffContext } from "../bundler/context.js";
+import { oneoffContext } from "../bundler/context.js";
+import { logFinishedStep } from "../bundler/log.js";
 import { deploymentCredentialsOrConfigure } from "./configure.js";
 import {
   modifyGlobalConfig,
@@ -47,12 +48,11 @@ export const disableLocalDeployments = new Command("disable-local-deployments")
       configuredDeployment?.type !== null &&
       configuredDeployment?.type !== "local"
     ) {
-      logFinishedStep(ctx, "Local development is already not being used.");
+      logFinishedStep("Local development is already not being used.");
       return;
     }
 
     await deploymentCredentialsOrConfigure(ctx, deploymentSelection, "ask", {
-      selectionWithinProject: { kind: "ownDev" },
       prod: false,
       localOptions: {
         forceUpgrade: false,
@@ -61,7 +61,6 @@ export const disableLocalDeployments = new Command("disable-local-deployments")
     });
 
     logFinishedStep(
-      ctx,
       "You are no longer using a local deployment for development.",
     );
   });
@@ -100,7 +99,6 @@ async function disableLocalDeploymentsGloballyUntilBetaOver(
       !config.optOutOfLocalDevDeploymentsUntilBetaOver
     ) {
       logFinishedStep(
-        ctx,
         "You are already opted into allowing local deployents on this machine.",
       );
       return;
@@ -111,7 +109,6 @@ async function disableLocalDeploymentsGloballyUntilBetaOver(
     });
 
     logFinishedStep(
-      ctx,
       "You have been opted back into allowing local deployents on this machine.",
     );
     return;
@@ -122,7 +119,6 @@ async function disableLocalDeploymentsGloballyUntilBetaOver(
     config.optOutOfLocalDevDeploymentsUntilBetaOver
   ) {
     logFinishedStep(
-      ctx,
       "You are already opted out of local deployents on this machine.",
     );
     return;
@@ -133,7 +129,6 @@ async function disableLocalDeploymentsGloballyUntilBetaOver(
   });
 
   logFinishedStep(
-    ctx,
     "You have been opted out of local deployents on this machine until the beta is over. Run `npx convex disable-local-deployments --undo-global` to opt back in.",
   );
 }

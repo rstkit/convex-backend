@@ -3,10 +3,10 @@ import { Combobox } from "@ui/Combobox";
 import { useState } from "react";
 import { Sheet } from "@ui/Sheet";
 import { Callout } from "@ui/Callout";
-import { Team } from "generatedApi";
+import { TeamResponse } from "generatedApi";
 import { Loading } from "@ui/Loading";
 import { ReferralsBenefits } from "components/referral/ReferralsBenefits";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { MAX_REFERRALS } from "./Referrals";
 
 type TeamEligibilityError =
@@ -35,9 +35,9 @@ export function RedeemReferralForm({
         exhausted: boolean;
       }
     | undefined;
-  teams: Team[] | undefined;
-  selectedTeam: Team | null;
-  onTeamSelect: (team: Team) => void;
+  teams: TeamResponse[] | undefined;
+  selectedTeam: TeamResponse | null;
+  onTeamSelect: (team: TeamResponse) => void;
   onSubmit: () => Promise<void>;
   isTeamSelectorShown: boolean;
   onShowTeamSelector: () => void;
@@ -85,7 +85,7 @@ export function RedeemReferralForm({
               plan limits:
             </p>
 
-            <ul className="mb-3 mt-4 grid gap-x-2 gap-y-4 sm:grid-cols-2">
+            <ul className="mt-4 mb-3 grid gap-x-2 gap-y-4 sm:grid-cols-2">
               <ReferralsBenefits />
             </ul>
 
@@ -182,8 +182,8 @@ function teamEligibilityErrorMessage(error: TeamEligibilityError) {
     case "not_admin":
       return "You must be an admin of the team to redeem a referral code.";
     default: {
-      const exhaustiveCheck: never = error;
-      throw new Error(`Unknown team eligibility error: ${exhaustiveCheck}`);
+      error satisfies never;
+      throw new Error(`Unknown team eligibility error: ${error}`);
     }
   }
 }
@@ -204,11 +204,7 @@ function CodeError({
       <p>
         No worries, you can still use another referral link later. In the
         meantime, you can get started using Convex with the{" "}
-        <Link
-          href="https://www.convex.dev/pricing"
-          target="_blank"
-          className="text-content-link hover:underline"
-        >
+        <Link href="https://www.convex.dev/pricing" target="_blank">
           default limits
         </Link>{" "}
         and also refer others to increase your quota.

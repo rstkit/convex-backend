@@ -2,20 +2,28 @@
 name = "convex"
 description = "Client library for Convex (convex.dev)"
 authors = ["Convex, Inc. <no-reply@convex.dev>"]
-version = "0.9.0"
+version = "0.10.4"
 edition = "2021"
-rust-version = "1.80.1"
+rust-version = "1.85"
 resolver = "2"
 license = "Apache-2.0"
 repository = "https://github.com/get-convex/convex-rs"
 homepage = "https://www.convex.dev/"
+
+[features]
+default = ["native-tls-vendored"]
+native-tls = ["tokio-tungstenite/native-tls"]
+native-tls-vendored = ["tokio-tungstenite/native-tls-vendored"]
+rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots"]
+rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots"]
+testing = ["convex_sync_types/testing", "proptest", "proptest-derive", "parking_lot"]
 
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-convex_sync_types = { path = "./sync_types", version = "=0.9.0" }
+convex_sync_types = { path = "./sync_types", version = "=0.10.4" }
 futures = { workspace = true }
 imbl = { workspace = true }
 parking_lot = { workspace = true, optional = true }
@@ -25,6 +33,7 @@ rand = { workspace = true }
 serde_json = { workspace = true, features = [
     "float_roundtrip",
     "preserve_order",
+    "raw_value",
 ] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
@@ -36,7 +45,7 @@ uuid = { workspace = true, features = ["serde", "v4"] }
 
 [dev-dependencies]
 colored = { workspace = true }
-convex_sync_types = { path = "./sync_types", version = "=0.9.0", features = [
+convex_sync_types = { path = "./sync_types", version = "=0.10.4", features = [
     "testing",
 ] }
 dotenvy = { workspace = true }
@@ -46,19 +55,6 @@ pretty_assertions = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-
-[features]
-default = ["native-tls-vendored"]
-native-tls = ["tokio-tungstenite/native-tls"]
-native-tls-vendored = ["tokio-tungstenite/native-tls-vendored"]
-rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots"]
-rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots"]
-testing = [
-    "convex_sync_types/testing",
-    "proptest",
-    "proptest-derive",
-    "parking_lot",
-]
 
 [lints]
 workspace = true

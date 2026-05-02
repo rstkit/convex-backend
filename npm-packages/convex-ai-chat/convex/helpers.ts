@@ -2,6 +2,7 @@ import { PaginationResult } from "convex/server";
 import { internal } from "./_generated/api";
 import { Doc, TableNames } from "./_generated/dataModel";
 import { ActionCtx, QueryCtx, internalQuery } from "./_generated/server";
+import { v } from "convex/values";
 
 export async function paginate<T extends TableNames>(
   ctx: ActionCtx,
@@ -25,8 +26,13 @@ export async function paginate<T extends TableNames>(
   }
 }
 
-export const paginateQuery = internalQuery(
-  async <T extends TableNames>(
+export const paginateQuery = internalQuery({
+  args: {
+    table: v.string(),
+    cursor: v.union(v.string(), v.null()),
+    numItems: v.number(),
+  },
+  handler: async <T extends TableNames>(
     ctx: QueryCtx,
     args: { table: T; cursor: any; numItems: number },
   ) => {
@@ -34,4 +40,4 @@ export const paginateQuery = internalQuery(
       .query(args.table)
       .paginate({ cursor: args.cursor, numItems: args.numItems });
   },
-);
+});

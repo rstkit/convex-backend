@@ -14,9 +14,7 @@ export const mockDeploymentInfo: DeploymentInfo = {
     slug: "team",
   }),
   useTeamMembers: () => [],
-  useTeamEntitlements: () => ({
-    auditLogsEnabled: true,
-  }),
+  useTeamEntitlements: () => ({}),
   useCurrentUsageBanner: () => null,
   useCurrentProject: () => ({
     id: 0,
@@ -25,6 +23,37 @@ export const mockDeploymentInfo: DeploymentInfo = {
     teamId: 0,
   }),
   useLogDeploymentEvent: () => () => {},
+  workOSOperations: {
+    useDeploymentWorkOSEnvironment: () => undefined,
+    useTeamWorkOSIntegration: () => undefined,
+    useWorkOSTeamHealth: () => undefined,
+    useWorkOSEnvironmentHealth: () => ({ data: undefined, error: undefined }),
+    useDisconnectWorkOSTeam: (_teamId?: string) => async () => undefined,
+    useInviteWorkOSTeamMember: () => async () => undefined,
+    useWorkOSInvitationEligibleEmails: () => undefined,
+    useAvailableWorkOSTeamEmails: () => undefined,
+    useProvisionWorkOSTeam: (_teamId?: string) => async () => undefined,
+    useProvisionWorkOSEnvironment: (_deploymentName?: string) => async () =>
+      undefined,
+    useDeleteWorkOSEnvironment: (_deploymentName?: string) => async () =>
+      undefined,
+    useProjectWorkOSEnvironments: () => undefined,
+    useGetProjectWorkOSEnvironment: () => undefined,
+    useCheckProjectEnvironmentHealth: () => async () => null,
+    useProvisionProjectWorkOSEnvironment: () => async () => ({
+      workosEnvironmentId: "",
+      workosEnvironmentName: "",
+      workosClientId: "",
+      workosApiKey: "",
+      newlyProvisioned: true,
+      userEnvironmentName: "",
+    }),
+    useDeleteProjectWorkOSEnvironment: () => async () => ({
+      workosEnvironmentId: "",
+      workosEnvironmentName: "",
+      workosTeamId: "",
+    }),
+  },
   useCurrentDeployment: () => ({
     id: 0,
     name: "local",
@@ -32,8 +61,15 @@ export const mockDeploymentInfo: DeploymentInfo = {
     projectId: 0,
     kind: "local",
     previewIdentifier: null,
+    port: 123,
+    isActive: true,
+    deviceName: "Local Device",
+    creator: 0,
+    createTime: 0,
   }),
+  useIsProtectedDeployment: () => false,
   useHasProjectAdminPermissions: () => true,
+  useIsOperationAllowed: () => true,
   useIsDeploymentPaused: () => false,
   useProjectEnvironmentVariables: () => ({ configs: [] }),
   CloudImport: ({ sourceCloudBackupId }: { sourceCloudBackupId: number }) => (
@@ -45,10 +81,28 @@ export const mockDeploymentInfo: DeploymentInfo = {
   TeamMemberLink: ({ name }: { name: string }) => (
     <span className="font-semibold">{name}</span>
   ),
+  Link: ({
+    href,
+    children,
+    ...props
+  }: {
+    href: string;
+    children?: React.ReactNode;
+    className?: string;
+    target?: string;
+    rel?: string;
+  }) => (
+    <a href={href} {...props}>
+      {children}
+    </a>
+  ),
+  DisconnectOverlay: () => <div>Disconnected</div>,
   useTeamUsageState: () => "Default",
   teamsURI: "",
   projectsURI: "",
   deploymentsURI: "",
   isSelfHosted: true,
-  enableIndexFilters: false,
+  workosIntegrationEnabled: false,
+  connectionStateCheckIntervalMs: 2500,
+  showScheduledJobArgsInComponents: false,
 };

@@ -9,6 +9,7 @@ use common::{
     components::ComponentId,
     document::{
         DeveloperDocument,
+        PackedDocument,
         ResolvedDocument,
     },
     query::CursorPosition,
@@ -24,12 +25,11 @@ use indexing::backend_in_memory_indexes::{
     BatchKey,
     RangeRequest,
 };
+use itertools::Itertools;
 use value::{
-    check_user_size,
     ConvexObject,
     DeveloperDocumentId,
     ResolvedDocumentId,
-    Size,
     TableName,
     TableNamespace,
 };
@@ -39,10 +39,7 @@ use crate::{
         log_virtual_table_get,
         log_virtual_table_query,
     },
-    query::{
-        DeveloperIndexRangeResponse,
-        IndexRangeResponse,
-    },
+    query::IndexRangeResponse,
     transaction::{
         IndexRangeRequest,
         MAX_PAGE_SIZE,
@@ -76,27 +73,6 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
         Self { tx, namespace }
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    pub fn new_root_for_test(tx: &'a mut Transaction<RT>) -> Self {
-        Self {
-            tx,
-            namespace: TableNamespace::test_user(),
-        }
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    #[convex_macro::instrument_future]
-    pub async fn get(
-        &mut self,
-        id: DeveloperDocumentId,
-        version: Option<Version>,
-    ) -> anyhow::Result<Option<DeveloperDocument>> {
-        Ok(self
-            .get_with_ts(id, version)
-            .await?
-            .map(|(document, _)| document))
-    }
-
     #[fastrace::trace]
     #[convex_macro::instrument_future]
     pub async fn get_with_ts(
@@ -118,29 +94,16 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
             .table_mapping()
             .namespace(self.namespace)
             .tablet_name(id_.tablet_id)?;
-        if let Some(table_name) = self
+        if self
             .tx
             .virtual_system_mapping()
-            .system_to_virtual_table(&physical_table_name)
-            .cloned()
+            .primary_system_to_virtual_table(&physical_table_name)
+            .is_some()
         {
             log_virtual_table_get();
-            let result = VirtualTable::new(self.tx)
+            VirtualTable::new(self.tx)
                 .get(self.namespace, id, version)
-                .await;
-            if let Ok(Some((document, _))) = &result {
-                let component_path = self
-                    .tx
-                    .must_component_path(ComponentId::from(self.namespace))?;
-                self.tx.reads.record_read_document(
-                    component_path,
-                    table_name,
-                    document.size(),
-                    &self.tx.usage_tracker,
-                    true,
-                )?;
-            }
-            result
+                .await
         } else {
             let table_name = self.tx.table_mapping().tablet_name(id_.tablet_id)?;
             let result = self.tx.get_inner(id_, table_name).await?;
@@ -190,8 +153,6 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
             ));
         }
 
-        check_user_size(value.size())?;
-        self.tx.retention_validator.fail_if_falling_behind()?;
         let internal_id = self.tx.id_generator.generate_internal();
 
         let creation_time = self.tx.next_creation_time.increment()?;
@@ -231,6 +192,7 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
             creation_time,
             value,
         )?;
+        document.check_user_size()?;
         let document_id = self.tx.insert_document(document).await?;
 
         Ok(document_id.into())
@@ -251,7 +213,6 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
             anyhow::bail!(unauthorized_error("patch"))
         }
         self.require_active_component().await?;
-        self.tx.retention_validator.fail_if_falling_behind()?;
 
         let id_ = self.tx.resolve_developer_id(&id, self.namespace)?;
 
@@ -259,7 +220,7 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
 
         // Check the size of the patched document.
         if !self.tx.is_system(self.namespace, id.table()) {
-            check_user_size(new_document.size())?;
+            new_document.check_user_size()?;
         }
 
         let developer_document = new_document.to_developer();
@@ -280,13 +241,12 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
             anyhow::bail!(unauthorized_error("replace"))
         }
         self.require_active_component().await?;
-        if !self.tx.is_system(self.namespace, id.table()) {
-            check_user_size(value.size())?;
-        }
-        self.tx.retention_validator.fail_if_falling_behind()?;
         let id_ = self.tx.resolve_developer_id(&id, self.namespace)?;
 
         let new_document = self.tx.replace_inner(id_, value).await?;
+        if !self.tx.is_system(self.namespace, id.table()) {
+            new_document.check_user_size()?;
+        }
         let developer_document = new_document.to_developer();
         Ok(developer_document)
     }
@@ -302,7 +262,6 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
             anyhow::bail!(unauthorized_error("delete"))
         }
         self.require_active_component().await?;
-        self.tx.retention_validator.fail_if_falling_behind()?;
 
         let id_ = self.tx.resolve_developer_id(&id, self.namespace)?;
         let document = self.tx.delete_inner(id_).await?;
@@ -311,13 +270,9 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
 
     pub fn record_read_document(
         &mut self,
-        document: &DeveloperDocument,
+        document: &PackedDocument,
         table_name: &TableName,
     ) -> anyhow::Result<()> {
-        let is_virtual_table = self
-            .tx
-            .virtual_system_mapping()
-            .is_virtual_table(table_name);
         let component_path = self
             .tx
             .must_component_path(ComponentId::from(self.namespace))?;
@@ -326,7 +281,7 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
             table_name.clone(),
             document.size(),
             &self.tx.usage_tracker,
-            is_virtual_table,
+            &self.tx.virtual_system_mapping,
         )
     }
 }
@@ -334,12 +289,9 @@ impl<'a, RT: Runtime> UserFacingModel<'a, RT> {
 fn start_index_range<RT: Runtime>(
     tx: &mut Transaction<RT>,
     request: IndexRangeRequest,
-) -> anyhow::Result<Result<DeveloperIndexRangeResponse, RangeRequest>> {
+) -> anyhow::Result<Result<(), RangeRequest>> {
     if request.interval.is_empty() {
-        return Ok(Ok(DeveloperIndexRangeResponse {
-            page: vec![],
-            cursor: CursorPosition::End,
-        }));
+        return Ok(Ok(()));
     }
 
     let max_rows = cmp::min(request.max_rows, MAX_PAGE_SIZE);
@@ -350,7 +302,7 @@ fn start_index_range<RT: Runtime>(
                 .clone()
                 .map_table(&tx.table_mapping().tablet_to_name())?;
             Ok(Err(RangeRequest {
-                index_name: tablet_index_name.clone(),
+                index_name: tablet_index_name,
                 printable_index_name: index_name,
                 interval: request.interval.clone(),
                 order: request.order,
@@ -360,17 +312,14 @@ fn start_index_range<RT: Runtime>(
         StableIndexName::Virtual(index_name, tablet_index_name) => {
             log_virtual_table_query();
             Ok(Err(RangeRequest {
-                index_name: tablet_index_name.clone(),
-                printable_index_name: index_name.clone(),
+                index_name: tablet_index_name,
+                printable_index_name: index_name,
                 interval: request.interval.clone(),
                 order: request.order,
                 max_size: max_rows,
             }))
         },
-        StableIndexName::Missing(_) => Ok(Ok(DeveloperIndexRangeResponse {
-            page: vec![],
-            cursor: CursorPosition::End,
-        })),
+        StableIndexName::Missing(_) => Ok(Ok(())),
     }
 }
 
@@ -381,21 +330,23 @@ fn start_index_range<RT: Runtime>(
 pub async fn index_range_batch<RT: Runtime>(
     tx: &mut Transaction<RT>,
     requests: BTreeMap<BatchKey, IndexRangeRequest>,
-) -> BTreeMap<BatchKey, anyhow::Result<DeveloperIndexRangeResponse>> {
+) -> BTreeMap<BatchKey, anyhow::Result<IndexRangeResponse>> {
     let batch_size = requests.len();
     let mut results = BTreeMap::new();
     let mut fetch_requests = BTreeMap::new();
-    let mut virtual_table_versions = BTreeMap::new();
     for (batch_key, request) in requests {
-        if matches!(request.stable_index_name, StableIndexName::Virtual(_, _)) {
-            virtual_table_versions.insert(batch_key, request.version.clone());
-        }
         match start_index_range(tx, request) {
             Err(e) => {
                 results.insert(batch_key, Err(e));
             },
-            Ok(Ok(result)) => {
-                results.insert(batch_key, Ok(result));
+            Ok(Ok(())) => {
+                results.insert(
+                    batch_key,
+                    Ok(IndexRangeResponse {
+                        page: vec![],
+                        cursor: CursorPosition::End,
+                    }),
+                );
             },
             Ok(Err(request)) => {
                 fetch_requests.insert(batch_key, request);
@@ -403,32 +354,15 @@ pub async fn index_range_batch<RT: Runtime>(
         }
     }
 
-    let fetch_results = tx.index.range_batch(&mut tx.reads, fetch_requests).await;
+    let fetch_results = tx
+        .index
+        .range_batch(&fetch_requests.values().collect_vec())
+        .await;
 
-    for (batch_key, fetch_result) in fetch_results {
-        let virtual_table_version = virtual_table_versions.get(&batch_key).cloned();
-        let result = fetch_result.and_then(|IndexRangeResponse { page, cursor }| {
-            let developer_results = match virtual_table_version {
-                Some(version) => page
-                    .into_iter()
-                    .map(|(key, doc, ts)| {
-                        let doc = VirtualTable::new(tx)
-                            .map_system_doc_to_virtual_doc(doc, version.clone())?;
-                        anyhow::Ok((key, doc, ts))
-                    })
-                    .try_collect()?,
-                None => page
-                    .into_iter()
-                    .map(|(key, doc, ts)| (key, doc.to_developer(), ts))
-                    .collect(),
-            };
-            anyhow::Ok(DeveloperIndexRangeResponse {
-                page: developer_results,
-                cursor,
-            })
-        });
-        results.insert(batch_key, result);
+    for (&batch_key, fetch_result) in fetch_requests.keys().zip(fetch_results) {
+        results.insert(batch_key, fetch_result);
     }
+
     assert_eq!(results.len(), batch_size);
     results
 }

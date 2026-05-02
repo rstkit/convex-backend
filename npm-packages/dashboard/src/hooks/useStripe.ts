@@ -5,13 +5,13 @@ import {
 } from "@stripe/stripe-js";
 import { useCreateSetupIntent } from "api/billing";
 import { useState, useEffect, useCallback } from "react";
-import { Team } from "generatedApi";
-import { useTheme } from "next-themes";
+import { TeamResponse } from "generatedApi";
+import { useCurrentTheme } from "@common/lib/useCurrentTheme";
 
 const stripePromise = loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLIC_KEY!);
 
 export function useStripePaymentSetup(
-  team: Team,
+  team: TeamResponse,
   paymentMethod: string | undefined,
   setPaymentMethod: (paymentMethod?: string) => Promise<void>,
   hasAdminPermissions = true,
@@ -30,7 +30,7 @@ export function useStripePaymentSetup(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paymentMethod, hasAdminPermissions]);
 
-  const { resolvedTheme: currentTheme } = useTheme();
+  const currentTheme = useCurrentTheme();
   const prefersDark = currentTheme === "dark";
 
   // Unfortunately, the Stripe API does not allow for dynamic theming via CSS variables,
@@ -88,7 +88,7 @@ export function useStripePaymentSetup(
           fontSize: "0.875rem",
           boxShadow: "none",
           border: `1px solid ${borderTransparent}`,
-          padding: "0.5rem 1rem",
+          padding: "0.375rem 0.5rem",
         },
         ".Input--invalid": {
           border: `1px solid ${borderTransparent}`,
@@ -165,7 +165,7 @@ export function useStripePaymentSetup(
 }
 
 export function useStripeAddressSetup(
-  team: Team,
+  team: TeamResponse,
   hasAdminPermissions: boolean,
 ) {
   // Reuse the existing stripe initialization for collecting the payment method,

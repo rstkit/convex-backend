@@ -1,19 +1,19 @@
 import React from "react";
-import { ReferralState, Team } from "generatedApi";
+import { ReferralState, TeamResponse } from "generatedApi";
 import { useTeamOrbSubscription } from "api/billing";
 import { Sheet } from "@ui/Sheet";
 import { Callout } from "@ui/Callout";
 import { useReferralState } from "api/referrals";
 import { Loading } from "@ui/Loading";
 import { CopyTextButton } from "@common/elements/CopyTextButton";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { ReferralsBenefits } from "./ReferralsBenefits";
 import { ReferralProgress } from "./ReferralProgress";
 
 // Keep in sync with MAX_REFERRALS_BONUS in big_brain_lib/src/model/referrals.rs
 export const MAX_REFERRALS = 5;
 
-export function Referrals({ team }: { team: Team }) {
+export function Referrals({ team }: { team: TeamResponse }) {
   const { subscription } = useTeamOrbSubscription(team.id);
   const isPaidPlan =
     subscription === undefined ? undefined : subscription !== null;
@@ -62,14 +62,10 @@ export function ReferralsInner({
 
       <Sheet>
         <h3>Refer friends and earn free Convex resources</h3>
-        <p className="mt-1 max-w-lg text-content-secondary">
+        <p className="mt-1 max-w-prose">
           Each time you refer someone, both of your teams get the following
           benefits on top of your{" "}
-          <Link
-            href="https://www.convex.dev/pricing"
-            target="_blank"
-            className="text-content-link hover:underline"
-          >
+          <Link href="https://www.convex.dev/pricing" target="_blank">
             free plan limits
           </Link>
           .
@@ -83,7 +79,7 @@ export function ReferralsInner({
           <hr className="grow" />
         </div>
 
-        <ul className="mb-3 mt-4 grid gap-x-2 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
+        <ul className="mt-4 mb-3 grid gap-x-2 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
           <ReferralsBenefits />
         </ul>
 

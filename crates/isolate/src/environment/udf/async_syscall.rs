@@ -1,16 +1,20 @@
 #![allow(non_snake_case)]
 use std::{
     collections::BTreeMap,
+    fmt,
     marker::PhantomData,
+    str::FromStr,
     time::Duration,
 };
 
 use anyhow::Context;
 use common::{
+    audit_log_lines::AuditLogLine,
     bootstrap_model::components::handles::FunctionHandle,
     components::{
         CanonicalizedComponentFunctionPath,
         ComponentId,
+        ComponentPath,
         PublicFunctionPath,
         Reference,
         ResolvedComponentFunctionPath,
@@ -21,6 +25,13 @@ use common::{
     knobs::{
         MAX_REACTOR_CALL_DEPTH,
         MAX_SYSCALL_BATCH_SIZE,
+        TRANSACTION_MAX_NUM_SCHEDULED,
+        TRANSACTION_MAX_NUM_USER_WRITES,
+        TRANSACTION_MAX_READ_SET_INTERVALS,
+        TRANSACTION_MAX_READ_SIZE_BYTES,
+        TRANSACTION_MAX_READ_SIZE_ROWS,
+        TRANSACTION_MAX_SCHEDULED_TOTAL_ARGUMENT_SIZE_BYTES,
+        TRANSACTION_MAX_USER_WRITE_SIZE_BYTES,
     },
     query::{
         Cursor,
@@ -32,9 +43,10 @@ use common::{
         Runtime,
         UnixTimestamp,
     },
+    try_anyhow,
     types::{
         AllowedVisibility,
-        PersistenceVersion,
+        DeploymentMetadata,
         UdfType,
     },
     value::ConvexValue,
@@ -60,11 +72,15 @@ use errors::{
     ErrorMetadataAnyhowExt,
 };
 use itertools::Itertools;
-use keybroker::KeyBroker;
+use keybroker::FunctionRunnerKeyBroker;
 use model::{
     components::{
         handles::FunctionHandlesModel,
         ComponentsModel,
+    },
+    deployment_audit_log::{
+        types::DeploymentAuditLogEvent,
+        DeploymentAuditLogModel,
     },
     file_storage::{
         types::FileStorageEntry,
@@ -82,17 +98,22 @@ use serde_json::{
     json,
     Value as JsonValue,
 };
+use sync_types::{
+    types::SerializedArgs,
+    udf_path::CanonicalizedUdfPath,
+};
 use udf::{
     validation::{
         validate_schedule_args,
         ValidatedPathAndArgs,
     },
-    FunctionOutcome,
-    UdfOutcome,
+    NestedUdfOutcome,
 };
 use value::{
     heap_size::HeapSize,
     id_v6::DeveloperDocumentId,
+    obj,
+    serialized_args_ext::SerializedArgsExt,
     ConvexArray,
     ConvexObject,
     TableName,
@@ -100,10 +121,15 @@ use value::{
 
 use super::DatabaseUdfEnvironment;
 use crate::{
-    client::EnvironmentData,
+    client::{
+        EnvironmentData,
+        UdfCallback,
+        UdfRequest,
+    },
     environment::{
         action::parse_name_or_reference,
         helpers::{
+            check_table_name,
             parse_version,
             remove_rejected_before_execution,
             with_argument_error,
@@ -111,13 +137,60 @@ use crate::{
         },
     },
     helpers::UdfArgsJson,
-    isolate2::client::QueryId,
     metrics::{
         async_syscall_timer,
         log_component_get_user_identity,
         log_run_udf,
     },
 };
+
+/// A type for UDFs that can be run as subtransactions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NestedUdfType {
+    Query,
+    Mutation,
+    SnapshotQuery,
+}
+
+impl NestedUdfType {
+    /// Returns the underlying UdfType used for execution.
+    pub fn execution_type(&self) -> UdfType {
+        match self {
+            Self::Query | Self::SnapshotQuery => UdfType::Query,
+            Self::Mutation => UdfType::Mutation,
+        }
+    }
+}
+
+impl fmt::Display for NestedUdfType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Query => write!(f, "Query"),
+            Self::Mutation => write!(f, "Mutation"),
+            Self::SnapshotQuery => write!(f, "SnapshotQuery"),
+        }
+    }
+}
+
+impl FromStr for NestedUdfType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "snapshotQuery" => Ok(Self::SnapshotQuery),
+            _ => {
+                let udf_type: UdfType = s.parse()?;
+                match udf_type {
+                    UdfType::Query => Ok(Self::Query),
+                    UdfType::Mutation => Ok(Self::Mutation),
+                    _ => anyhow::bail!(
+                        "Only queries and mutations can be called as nested UDFs, got {udf_type}"
+                    ),
+                }
+            },
+        }
+    }
+}
 
 pub struct PendingSyscall {
     pub name: String,
@@ -271,22 +344,29 @@ pub enum ManagedQuery<RT: Runtime> {
     Active(DeveloperQuery<RT>),
 }
 
-// Trait for allowing code reuse between `DatabaseUdfEnvironment` and isolate2.
+pub type QueryId = u32;
+
 #[allow(async_fn_in_trait)]
-pub trait AsyncSyscallProvider<RT: Runtime> {
+pub trait AsyncSyscallProvider<RT: Runtime>: Sized {
     fn rt(&self) -> &RT;
     fn tx(&mut self) -> anyhow::Result<&mut Transaction<RT>>;
-    fn key_broker(&self) -> &KeyBroker;
+    fn key_broker(&self) -> &FunctionRunnerKeyBroker;
     fn context(&self) -> &ExecutionContext;
 
     fn observe_identity(&mut self) -> anyhow::Result<()>;
 
-    fn persistence_version(&self) -> PersistenceVersion;
     fn is_system(&self) -> bool;
     fn table_filter(&self) -> TableFilter;
     fn component(&self) -> anyhow::Result<ComponentId>;
 
     fn log_async_syscall(&mut self, name: String, duration: Duration, is_success: bool);
+
+    fn audit_log(&mut self, body: JsonValue) -> anyhow::Result<()>;
+
+    fn udf_type(&self) -> UdfType;
+    fn udf_path(&self) -> &CanonicalizedUdfPath;
+    fn component_path(&self) -> &ComponentPath;
+    fn deployment(&self) -> &DeploymentMetadata;
 
     fn take_query(&mut self, query_id: QueryId) -> Option<ManagedQuery<RT>>;
     fn insert_query(&mut self, query_id: QueryId, query: DeveloperQuery<RT>);
@@ -315,9 +395,10 @@ pub trait AsyncSyscallProvider<RT: Runtime> {
 
     async fn run_udf(
         &mut self,
-        udf_type: UdfType,
+        udf_type: NestedUdfType,
         path: ResolvedComponentFunctionPath,
         args: ConvexObject,
+        udf_callback: impl UdfCallback<RT>,
     ) -> anyhow::Result<ConvexValue>;
 
     async fn create_function_handle(
@@ -345,7 +426,7 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
         self.phase.component()
     }
 
-    fn key_broker(&self) -> &KeyBroker {
+    fn key_broker(&self) -> &FunctionRunnerKeyBroker {
         &self.key_broker
     }
 
@@ -355,10 +436,6 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
 
     fn observe_identity(&mut self) -> anyhow::Result<()> {
         self.phase.observe_identity()
-    }
-
-    fn persistence_version(&self) -> PersistenceVersion {
-        self.persistence_version
     }
 
     fn is_system(&self) -> bool {
@@ -376,6 +453,27 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
     fn log_async_syscall(&mut self, name: String, duration: Duration, is_success: bool) {
         self.syscall_trace
             .log_async_syscall(name, duration, is_success);
+    }
+
+    fn audit_log(&mut self, body: JsonValue) -> anyhow::Result<()> {
+        self.emit_audit_log_line(AuditLogLine { body });
+        Ok(())
+    }
+
+    fn udf_type(&self) -> UdfType {
+        self.udf_type
+    }
+
+    fn udf_path(&self) -> &CanonicalizedUdfPath {
+        &self.path.udf_path
+    }
+
+    fn component_path(&self) -> &ComponentPath {
+        &self.path.component_path
+    }
+
+    fn deployment(&self) -> &DeploymentMetadata {
+        &self.deployment
     }
 
     fn take_query(&mut self, query_id: QueryId) -> Option<ManagedQuery<RT>> {
@@ -473,21 +571,25 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
     #[fastrace::trace]
     async fn run_udf(
         &mut self,
-        udf_type: UdfType,
+        nested_udf_type: NestedUdfType,
         path: ResolvedComponentFunctionPath,
         args: ConvexObject,
+        udf_callback: impl UdfCallback<RT>,
     ) -> anyhow::Result<ConvexValue> {
-        match (self.udf_type, udf_type) {
-            // Queries can call other queries.
-            (UdfType::Query, UdfType::Query) => (),
-            // Mutations can call queries or mutations,
-            (UdfType::Mutation, UdfType::Query | UdfType::Mutation) => (),
+        match (self.udf_type, nested_udf_type) {
+            // Queries can call other queries, but not snapshot queries.
+            (UdfType::Query, NestedUdfType::Query) => (),
+            // Mutations can call queries (including snapshot queries) or mutations.
+            (
+                UdfType::Mutation,
+                NestedUdfType::Query | NestedUdfType::SnapshotQuery | NestedUdfType::Mutation,
+            ) => (),
             _ => {
                 anyhow::bail!(ErrorMetadata::bad_request(
                     "InvalidFunctionCall",
                     format!(
                         "Cannot call a {} function from a {} function",
-                        udf_type, self.udf_type
+                        nested_udf_type, self.udf_type
                     )
                 ));
             },
@@ -495,12 +597,13 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
         let tx = self.phase.tx()?;
         let called_component_id = path.component;
 
+        let execution_type = nested_udf_type.execution_type();
         let path_and_args_result = ValidatedPathAndArgs::new_with_returns_validator(
             AllowedVisibility::All,
             tx,
             PublicFunctionPath::ResolvedComponent(path.clone()),
-            ConvexArray::try_from(vec![args.into()])?,
-            udf_type,
+            SerializedArgs::from_args(vec![args.into()])?,
+            execution_type,
         )
         .await?;
         let (path_and_args, returns_validator) = match path_and_args_result {
@@ -513,82 +616,79 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
 
         // NB: Since this is a user error, we need to do this check before we take the
         // transaction below.
-        let new_reactor_depth = if matches!(udf_type, UdfType::Query | UdfType::Mutation) {
-            if self.reactor_depth >= *MAX_REACTOR_CALL_DEPTH {
-                anyhow::bail!(ErrorMetadata::bad_request(
-                    "MaximumCallDepthExceeded",
-                    "Cross component call depth limit exceeded. Do you have an infinite loop in \
-                     your app?"
-                ));
-            }
-            self.reactor_depth + 1
-        } else {
-            0
+        if self.reactor_depth >= *MAX_REACTOR_CALL_DEPTH {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "MaximumCallDepthExceeded",
+                "Cross component call depth limit exceeded. Do you have an infinite loop in your \
+                 app?"
+            ));
+        }
+        let new_reactor_depth = self.reactor_depth + 1;
+
+        let (initial_tx, rng_seed, unix_timestamp) = self.phase.start_nested_udf()?;
+        let (mut nested_tx, saved_tx) = match nested_udf_type {
+            NestedUdfType::SnapshotQuery => {
+                (initial_tx.clone_for_snapshot_query()?, Some(initial_tx))
+            },
+            _ => (initial_tx, None),
         };
 
-        let mut tx = self.phase.take_tx()?;
-        let tokens = tx.begin_subtransaction();
+        let tokens = nested_tx.begin_subtransaction();
 
-        let query_journal = if self.is_system() && udf_type == UdfType::Query {
+        let query_journal = if self.is_system() && nested_udf_type == NestedUdfType::Query {
             self.prev_journal.clone()
         } else {
             QueryJournal::new()
         };
-        let (mut tx, outcome) = self
-            .udf_callback
-            .execute_udf(
+        let (mut result_tx, outcome) = udf_callback
+            .execute_nested_udf(
                 self.client_id.clone(),
-                udf_type,
-                path_and_args,
+                UdfRequest {
+                    udf_type: execution_type,
+                    path_and_args,
+                    transaction: nested_tx,
+                    unix_timestamp,
+                    journal: query_journal,
+                    context: self.context.clone(),
+                },
                 EnvironmentData {
                     key_broker: self.key_broker.clone(),
                     default_system_env_vars: BTreeMap::new(),
                     file_storage: self.file_storage.clone(),
                     module_loader: self.phase.module_loader().clone(),
+                    deployment: self.deployment.clone(),
                 },
-                tx,
-                query_journal,
-                self.context.clone(),
+                rng_seed,
                 new_reactor_depth,
             )
             .await
             .map_err(remove_rejected_before_execution)?;
-        match (udf_type, &outcome) {
-            (UdfType::Mutation, FunctionOutcome::Mutation(UdfOutcome { result: Err(_), .. })) => {
-                tx.rollback_subtransaction(tokens)?
+        match nested_udf_type {
+            NestedUdfType::Mutation if outcome.result.is_err() => {
+                result_tx.rollback_subtransaction(tokens)?
             },
-            _ => tx.commit_subtransaction(tokens)?,
+            _ => result_tx.commit_subtransaction(tokens)?,
         }
-        self.phase.put_tx(tx)?;
+        if let Some(tx) = saved_tx {
+            self.phase.put_tx(tx)?;
+        } else {
+            self.phase.put_tx(result_tx)?;
+        }
 
-        let outcome = match (udf_type, outcome) {
-            (UdfType::Query, FunctionOutcome::Query(outcome))
-            | (UdfType::Mutation, FunctionOutcome::Mutation(outcome)) => outcome,
-            _ => anyhow::bail!("Unexpected outcome for {udf_type:?}"),
-        };
-
-        let UdfOutcome {
+        let NestedUdfOutcome {
             result,
             observed_identity,
-            // TODO: initialize the inner UDF's seed from the outer RNG seed
-            observed_rng: _,
-            // TODO: use the same timestamp for the inner UDF as the outer
-            observed_time: _,
-            // TODO: consider propagating syscall traces
-            syscall_trace: _,
+            observed_rng,
+            observed_time,
+            syscall_trace,
+            audit_log_lines,
             log_lines,
             journal,
-            arguments: _,
-            identity: _,
-            path: _,
-            udf_server_version: _,
-            unix_timestamp: _,
-            rng_seed: _,
         } = outcome;
 
         log_run_udf(
             self.udf_type,
-            udf_type,
+            execution_type,
             self.phase.observed_identity(),
             observed_identity,
         );
@@ -597,7 +697,17 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
             self.observe_identity()?;
         }
 
-        if self.is_system() && udf_type == UdfType::Query && result.is_ok() {
+        if observed_rng {
+            self.phase.observe_rng();
+        }
+
+        if observed_time {
+            self.phase.unix_timestamp()?;
+        }
+
+        self.syscall_trace.merge(&syscall_trace);
+
+        if self.is_system() && nested_udf_type == NestedUdfType::Query && result.is_ok() {
             self.next_journal = journal;
         }
 
@@ -605,13 +715,12 @@ impl<RT: Runtime> AsyncSyscallProvider<RT> for DatabaseUdfEnvironment<RT> {
         // limiting them only when they are returned to the parent.
         self.emit_sub_function_log_lines(path.for_logging(), log_lines);
 
-        let result = match result {
-            Ok(r) => r.unpack(),
-            Err(e) => {
-                // TODO: How do we want to propagate stack traces between component calls?
-                anyhow::bail!(e);
-            },
-        };
+        for audit_log_line in audit_log_lines {
+            self.emit_audit_log_line(audit_log_line);
+        }
+
+        // TODO: How do we want to propagate stack traces between component calls?
+        let result = result?;
         let tx = self.phase.tx()?;
         let table_mapping = tx.table_mapping().namespace(called_component_id.into());
         if let Some(e) =
@@ -669,6 +778,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
     pub async fn run_async_syscall_batch(
         provider: &mut P,
         batch: AsyncSyscallBatch,
+        udf_callback: impl UdfCallback<RT>,
     ) -> Vec<anyhow::Result<String>> {
         let start = provider.rt().monotonic_now();
         let batch_name = batch.name().to_string();
@@ -690,6 +800,10 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                     "1.0/replace" => Box::pin(Self::replace(provider, args)).await,
                     "1.0/remove" => Box::pin(Self::remove(provider, args)).await,
                     "1.0/queryPage" => Box::pin(Self::query_page(provider, args)).await,
+                    "1.0/getTransactionMetrics" => Self::tx_metrics(provider),
+                    "1.0/getFunctionMetadata" => Self::function_metadata(provider),
+                    "1.0/getDeploymentMetadata" => Self::deployment_metadata(provider),
+                    "1.0/getRequestMetadata" => Self::request_metadata(provider),
                     // Auth
                     "1.0/getUserIdentity" => {
                         Box::pin(Self::get_user_identity(provider, args)).await
@@ -706,22 +820,19 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                     "1.0/schedule" => Box::pin(Self::schedule(provider, args)).await,
                     "1.0/cancel_job" => Box::pin(Self::cancel_job(provider, args)).await,
 
+                    // Audit logging
+                    "1.0/auditLog" => Box::pin(Self::audit_log(provider, args)).await,
+                    // Audit logging (system UDFs only)
+                    "1.0/writeDeploymentAuditLog" => {
+                        Box::pin(Self::write_deployment_audit_log(provider, args)).await
+                    },
+
                     // Components
-                    "1.0/runUdf" => Box::pin(Self::run_udf(provider, args)).await,
+                    "1.0/runUdf" => Box::pin(Self::run_udf(provider, args, udf_callback)).await,
                     "1.0/createFunctionHandle" => {
                         Box::pin(Self::create_function_handle(provider, args)).await
                     },
 
-                    #[cfg(test)]
-                    "slowSyscall" => {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        Ok(JsonValue::Number(1017.into()))
-                    },
-                    #[cfg(test)]
-                    "reallySlowSyscall" => {
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        Ok(JsonValue::Number(1017.into()))
-                    },
                     _ => Err(ErrorMetadata::bad_request(
                         "UnknownAsyncOperation",
                         format!("Unknown async operation {name}"),
@@ -741,6 +852,67 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
             .into_iter()
             .map(|result| anyhow::Ok(serde_json::to_string(&result?)?))
             .collect()
+    }
+
+    /// Returns the remaining headroom for this transaction before hitting
+    /// limits.
+    fn tx_metrics(provider: &mut P) -> anyhow::Result<JsonValue> {
+        let tx = provider.tx()?;
+        let s = tx.execution_size();
+        let limit_value = |limit: usize, used: usize| {
+            let remaining = limit as isize - used as isize;
+            json!({
+                "used": used,
+                "remaining": remaining,
+            })
+        };
+        Ok(json!({
+            "bytesRead": limit_value(*TRANSACTION_MAX_READ_SIZE_BYTES, s.read_size.total_document_size),
+            "bytesWritten": limit_value(*TRANSACTION_MAX_USER_WRITE_SIZE_BYTES, s.write_size.size),
+            "databaseQueries": limit_value(*TRANSACTION_MAX_READ_SET_INTERVALS, s.num_intervals),
+            "documentsRead": limit_value(*TRANSACTION_MAX_READ_SIZE_ROWS, s.read_size.total_document_count),
+            "documentsWritten": limit_value(*TRANSACTION_MAX_NUM_USER_WRITES, s.write_size.num_writes),
+            "functionsScheduled": limit_value(*TRANSACTION_MAX_NUM_SCHEDULED, s.scheduled_size.num_writes),
+            "scheduledFunctionArgsBytes": limit_value(*TRANSACTION_MAX_SCHEDULED_TOTAL_ARGUMENT_SIZE_BYTES, s.scheduled_size.size),
+        }))
+    }
+
+    /// Returns metadata about the currently executing function.
+    fn function_metadata(provider: &mut P) -> anyhow::Result<JsonValue> {
+        let udf_path = provider.udf_path();
+        let component_path = provider.component_path();
+        Ok(json!({
+            "name": udf_path.clone().strip().to_string(),
+            "componentPath": component_path.to_string(),
+        }))
+    }
+
+    /// Returns metadata about the deployment this function is running on.
+    fn deployment_metadata(provider: &mut P) -> anyhow::Result<JsonValue> {
+        let deployment = provider.deployment();
+        Ok(json!({
+            "name": deployment.name,
+            "region": deployment.region,
+            "class": deployment.class,
+        }))
+    }
+
+    /// Returns metadata about the originating HTTP request.
+    fn request_metadata(provider: &mut P) -> anyhow::Result<JsonValue> {
+        anyhow::ensure!(
+            provider.udf_type() == UdfType::Mutation,
+            ErrorMetadata::bad_request(
+                "RequestMetadataNotAllowed",
+                format!("Cannot get request metadata in a {}", provider.udf_type())
+            )
+        );
+        let context = provider.context();
+        let metadata = &context.request_metadata;
+        Ok(json!({
+            "ip": metadata.ip.as_ref().map(|ip| ip.as_str()),
+            "userAgent": metadata.user_agent.as_ref().map(|ua| ua.as_str()),
+            "requestId": context.request_id.as_str(),
+        }))
     }
 
     #[convex_macro::instrument_future]
@@ -765,7 +937,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
 
         // Trim to u32 and check for overflow.
         let result = u32::try_from(result)?;
-        // Return as f64, which converts to number type in Javascript.
+        // Return as f64, which converts to number type in JavaScript.
         let result = f64::from(result);
         Ok(ConvexValue::from(result).to_internal_json())
     }
@@ -937,9 +1109,13 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
 
         let scheduling_component = provider.component()?;
 
-        let scheduled_ts = UnixTimestamp::from_secs_f64(ts);
+        let scheduled_ts = with_argument_error("ts", || UnixTimestamp::from_secs_f64(ts))?;
         let (path, udf_args) = provider
-            .validate_schedule_args(path, args.into_arg_vec(), scheduled_ts)
+            .validate_schedule_args(
+                path,
+                args.into_serialized_args()?.into_args()?,
+                scheduled_ts,
+            )
             .await?;
 
         let context = provider.context().clone();
@@ -969,6 +1145,66 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
 
         VirtualSchedulerModel::new(tx, component.into())
             .cancel(virtual_id_v6)
+            .await?;
+
+        Ok(JsonValue::Null)
+    }
+
+    async fn audit_log(provider: &mut P, args: JsonValue) -> anyhow::Result<JsonValue> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AuditLogArgs {
+            body: JsonValue,
+        }
+        let args: AuditLogArgs =
+            with_argument_error("auditLog", || Ok(serde_json::from_value(args)?))?;
+        provider.audit_log(args.body)?;
+        Ok(JsonValue::Null)
+    }
+
+    async fn write_deployment_audit_log(
+        provider: &mut P,
+        args: JsonValue,
+    ) -> anyhow::Result<JsonValue> {
+        if !provider.is_system() {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "Unauthorized",
+                "writeDeploymentAuditLog is only available in system UDFs"
+            ));
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AuditLogArgs {
+            action: String,
+            metadata: serde_json::Map<String, JsonValue>,
+        }
+        let args: AuditLogArgs = serde_json::from_value(args)?;
+
+        let component_id = provider.component()?;
+        let tx = provider.tx()?;
+        let component_path = tx.must_component_path(component_id)?;
+
+        // Inject component_id and component into metadata
+        let mut metadata = args.metadata;
+        metadata.insert(
+            "component_id".to_string(),
+            component_id
+                .serialize_to_string()
+                .map_or(JsonValue::Null, JsonValue::String),
+        );
+        metadata.insert(
+            "component".to_string(),
+            component_path
+                .serialize()
+                .map_or(JsonValue::Null, JsonValue::String),
+        );
+
+        let metadata_value: JsonValue = JsonValue::Object(metadata);
+        let metadata: ConvexObject = metadata_value.try_into()?;
+
+        let event_obj = obj!("action" => args.action, "metadata" => metadata)?;
+        DeploymentAuditLogModel::new(tx)
+            .insert(vec![DeploymentAuditLogEvent::try_from(event_obj)?])
             .await?;
 
         Ok(JsonValue::Null)
@@ -1010,6 +1246,8 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct UpdateArgs {
+            #[serde(default)]
+            table: Option<String>,
             id: String,
             value: JsonValue,
         }
@@ -1020,12 +1258,13 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
             let args: UpdateArgs = serde_json::from_value(args)?;
 
             let id = DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
-            let table_name = tx
+            let actual_table_name = tx
                 .resolve_idv6(id, component.into(), table_filter)
                 .context(ArgName("id"))?;
+            check_table_name(&args.table, &actual_table_name)?;
 
             let value = PatchValue::try_from(args.value).context(ArgName("value"))?;
-            Ok((id, value, table_name))
+            Ok((id, value, actual_table_name))
         })?;
 
         system_table_guard(&table_name, false)?;
@@ -1042,6 +1281,8 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct ReplaceArgs {
+            #[serde(default)]
+            table: Option<String>,
             id: String,
             value: JsonValue,
         }
@@ -1052,12 +1293,17 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
             let args: ReplaceArgs = serde_json::from_value(args)?;
 
             let id = DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
-            let table_name = tx
+            let actual_table_name = tx
                 .resolve_idv6(id, component.into(), table_filter)
                 .context(ArgName("id"))?;
+            check_table_name(&args.table, &actual_table_name)?;
 
             let value = ConvexValue::try_from(args.value).context(ArgName("value"))?;
-            Ok((id, value.try_into().context(ArgName("value"))?, table_name))
+            Ok((
+                id,
+                value.try_into().context(ArgName("value"))?,
+                actual_table_name,
+            ))
         })?;
 
         system_table_guard(&table_name, false)?;
@@ -1077,6 +1323,8 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct GetArgs {
+            #[serde(default)]
+            table: Option<String>,
             id: String,
             #[serde(default)]
             is_system: bool,
@@ -1094,7 +1342,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         let mut results = BTreeMap::new();
         let batch_size = batch_args.len();
         for (idx, args) in batch_args.into_iter().enumerate() {
-            let result: anyhow::Result<_> = try {
+            let result: anyhow::Result<_> = try_anyhow!({
                 match args {
                     AsyncRead::QueryStreamNext(args) => {
                         let query_id = with_argument_error("queryStreamNext", || {
@@ -1126,8 +1374,17 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                     AsyncRead::Get(args) => {
                         let component = provider.component()?;
                         let tx = provider.tx()?;
-                        let (id, is_system, version) = with_argument_error("db.get", || {
-                            let args: GetArgs = serde_json::from_value(args)?;
+
+                        let args = with_argument_error("db.get", || {
+                            Ok(serde_json::from_value::<GetArgs>(args)?)
+                        })?;
+                        let method_name = if args.is_system {
+                            "db.system.get"
+                        } else {
+                            "db.get"
+                        };
+
+                        let (id, is_system, version) = with_argument_error(method_name, || {
                             let id =
                                 DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
                             let version = parse_version(args.version)?;
@@ -1142,6 +1399,10 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                         }
                         match tx.resolve_idv6(id, component.into(), table_filter) {
                             Ok(table_name) => {
+                                with_argument_error(method_name, || {
+                                    check_table_name(&args.table, &table_name)
+                                })?;
+
                                 let query = Query::get(table_name, id);
                                 Some((
                                     None,
@@ -1162,7 +1423,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                         }
                     },
                 }
-            };
+            });
             match result {
                 Err(e) => {
                     assert!(results.insert(idx, Err(e)).is_none());
@@ -1201,7 +1462,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         }
 
         for (batch_key, (query_id, local_query)) in queries_to_fetch {
-            let result: anyhow::Result<_> = try {
+            let result: anyhow::Result<_> = try_anyhow!({
                 if let Some(query_id) = query_id {
                     provider.insert_query(query_id, local_query);
                 }
@@ -1226,7 +1487,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                 } else {
                     value.into()
                 }
-            };
+            });
             results.insert(batch_key, result);
         }
         assert_eq!(results.len(), batch_size);
@@ -1245,6 +1506,8 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct RemoveArgs {
+            #[serde(default)]
+            table: Option<String>,
             id: String,
         }
 
@@ -1254,10 +1517,11 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
         let (id, table_name) = with_argument_error("db.delete", || {
             let args: RemoveArgs = serde_json::from_value(args)?;
             let id = DeveloperDocumentId::decode(&args.id).context(ArgName("id"))?;
-            let table_name = tx
+            let actual_table_name = tx
                 .resolve_idv6(id, component.into(), table_filter)
                 .context(ArgName("id"))?;
-            Ok((id, table_name))
+            check_table_name(&args.table, &actual_table_name)?;
+            Ok((id, actual_table_name))
         })?;
 
         system_table_guard(&table_name, false)?;
@@ -1269,7 +1533,11 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
     }
 
     #[convex_macro::instrument_future]
-    async fn run_udf(provider: &mut P, args: JsonValue) -> anyhow::Result<JsonValue> {
+    async fn run_udf(
+        provider: &mut P,
+        args: JsonValue,
+        udf_callback: impl UdfCallback<RT>,
+    ) -> anyhow::Result<JsonValue> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct RunUdfArgs {
@@ -1287,7 +1555,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
             args,
         } = with_argument_error("runUdf", || Ok(serde_json::from_value(args)?))?;
         let (udf_type, args) = with_argument_error("runUdf", || {
-            let udf_type: UdfType = udf_type.parse().context(ArgName("udfType"))?;
+            let udf_type: NestedUdfType = udf_type.parse().context(ArgName("udfType"))?;
             let args: ConvexObject = ConvexValue::try_from(args)
                 .context(ArgName("args"))?
                 .try_into()
@@ -1305,7 +1573,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                 ResolvedComponentFunctionPath {
                     component,
                     udf_path: path.udf_path,
-                    component_path: Some(path.component),
+                    component_path: path.component,
                 }
             },
             None => {
@@ -1326,13 +1594,13 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsV1<RT, P> {
                         ResolvedComponentFunctionPath {
                             component,
                             udf_path: path.udf_path,
-                            component_path: Some(path.component),
+                            component_path: path.component,
                         }
                     },
                 }
             },
         };
-        let value = provider.run_udf(udf_type, path, args).await?;
+        let value = provider.run_udf(udf_type, path, args, udf_callback).await?;
         Ok(value.into())
     }
 
@@ -1499,6 +1767,12 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsShared<RT, P> {
                 "Must request at least 1 document while paginating"
             ));
         }
+        if page_size > *TRANSACTION_MAX_READ_SIZE_ROWS {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "PageSizeTooLarge",
+                format!("Requested too many items: {page_size}")
+            ));
+        }
         if args.maximum_rows_read == Some(0) || args.maximum_bytes_read == Some(0) {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "InvalidPaginationLimit",
@@ -1508,19 +1782,11 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsShared<RT, P> {
 
         let start_cursor = args
             .cursor
-            .map(|c| {
-                provider
-                    .key_broker()
-                    .decrypt_cursor(c, provider.persistence_version())
-            })
+            .map(|c| provider.key_broker().decrypt_cursor(c))
             .transpose()?;
 
         let end_cursor = match args.end_cursor {
-            Some(end_cursor) => Some(
-                provider
-                    .key_broker()
-                    .decrypt_cursor(end_cursor, provider.persistence_version())?,
-            ),
+            Some(end_cursor) => Some(provider.key_broker().decrypt_cursor(end_cursor)?),
             None => provider.prev_journal().end_cursor.clone(),
         };
 
@@ -1528,7 +1794,7 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsShared<RT, P> {
         if !component.is_root() && !provider.is_system() {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "PaginationUnsupportedInComponents",
-                "paginate() is only supported in the app.",
+                "paginate() is only supported in the app. Learn more at https://docs.convex.dev/components/authoring#pagination",
             ));
         }
 
@@ -1563,15 +1829,9 @@ impl<RT: Runtime, P: AsyncSyscallProvider<RT>> DatabaseSyscallsShared<RT, P> {
         let page_status = page_status.map(|s| s.as_str());
 
         // Place split_cursor in the middle.
-        let split_cursor = split_cursor.map(|split| {
-            provider
-                .key_broker()
-                .encrypt_cursor(&split, provider.persistence_version())
-        });
+        let split_cursor = split_cursor.map(|split| provider.key_broker().encrypt_cursor(&split));
 
-        let continue_cursor = provider
-            .key_broker()
-            .encrypt_cursor(&cursor, provider.persistence_version());
+        let continue_cursor = provider.key_broker().encrypt_cursor(&cursor);
 
         let is_done = matches!(
             cursor,

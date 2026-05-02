@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     ffi,
     ptr,
     sync::Arc,
@@ -10,11 +9,15 @@ use anyhow::Context as _;
 use common::{
     knobs::{
         FUNRUN_INITIAL_PERMIT_TIMEOUT,
+        ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE,
         ISOLATE_MAX_USER_HEAP_SIZE,
     },
     runtime::Runtime,
 };
-use deno_core::v8;
+use deno_core::v8::{
+    self,
+    callback_scope,
+};
 use derive_more::{
     Add,
     AddAssign,
@@ -28,9 +31,9 @@ use humansize::{
     FormatSize,
     BINARY,
 };
-use value::heap_size::WithHeapSize;
 
 use crate::{
+    array_buffer_allocator::ArrayBufferMemoryLimit,
     concurrency_limiter::ConcurrencyLimiter,
     environment::IsolateEnvironment,
     helpers::pump_message_loop,
@@ -42,9 +45,9 @@ use crate::{
     strings,
     termination::{
         IsolateHandle,
-        TerminationReason,
+        IsolateTerminationReason,
     },
-    timeout::Timeout,
+    Timeout,
 };
 
 pub const CONVEX_SCHEME: &str = "convex";
@@ -64,6 +67,8 @@ pub struct Isolate<RT: Runtime> {
     // we reclaim after removing the callback.
     heap_ctx_ptr: *mut HeapContext,
     limiter: ConcurrencyLimiter,
+    array_buffer_memory_limit: Arc<ArrayBufferMemoryLimit>,
+    max_user_heap_size: usize,
 
     created: tokio::time::Instant,
 }
@@ -72,10 +77,6 @@ pub struct Isolate<RT: Runtime> {
 pub enum IsolateNotClean {
     #[error("Isolate failed with system error.")]
     SystemError,
-    #[error("Isolate failed with uncatchable developer error.")]
-    UncatchableDeveloperError,
-    #[error("Isolate failed with unhandled promise rejection.")]
-    UnhandledPromiseRejection,
     #[error("Isolate hit user timeout")]
     UserTimeout,
     #[error("Isolate hit system timeout")]
@@ -95,8 +96,6 @@ impl IsolateNotClean {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::SystemError => "system_error",
-            Self::UncatchableDeveloperError => "uncatchable_developer_error",
-            Self::UnhandledPromiseRejection => "unhandled_promise_rejection",
             Self::UserTimeout => "user_timeout",
             Self::SystemTimeout => "system_timeout",
             Self::OutOfMemory => "out_of_memory",
@@ -122,15 +121,15 @@ pub struct IsolateHeapStats {
     // Heap used for syscalls and similar related to processing the request.
     pub environment_heap_size: usize,
 
-    pub blobs_heap_size: usize,
     pub streams_heap_size: usize,
+    pub array_buffer_size: usize,
 }
 
 impl IsolateHeapStats {
     pub fn new(
         stats: v8::HeapStatistics,
-        blobs_heap_size: usize,
         streams_heap_size: usize,
+        array_buffer_size: usize,
     ) -> Self {
         Self {
             v8_total_heap_size: stats.total_heap_size(),
@@ -140,20 +139,32 @@ impl IsolateHeapStats {
             v8_malloced_memory: stats.malloced_memory(),
             v8_external_memory_bytes: stats.external_memory(),
             environment_heap_size: 0,
-            blobs_heap_size,
             streams_heap_size,
+            array_buffer_size,
         }
     }
 
     pub fn env_heap_size(&self) -> usize {
-        self.environment_heap_size + self.blobs_heap_size + self.streams_heap_size
+        self.environment_heap_size + self.streams_heap_size
     }
 }
 
 impl<RT: Runtime> Isolate<RT> {
-    pub fn new(rt: RT, max_user_timeout: Option<Duration>, limiter: ConcurrencyLimiter) -> Self {
+    pub fn new(
+        rt: RT,
+        max_user_timeout: Option<Duration>,
+        limiter: ConcurrencyLimiter,
+        max_user_heap_size: usize,
+    ) -> Self {
         let _timer = create_isolate_timer();
-        let mut v8_isolate = crate::udf_runtime::create_isolate_with_udf_runtime();
+        let (array_buffer_memory_limit, array_buffer_allocator) =
+            crate::array_buffer_allocator::limited_array_buffer_allocator(
+                *ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE,
+            );
+        let mut v8_isolate = crate::udf_runtime::create_isolate_with_udf_runtime(
+            v8::CreateParams::default().array_buffer_allocator(array_buffer_allocator),
+            max_user_heap_size,
+        );
 
         // Tells V8 to capture current stack trace when uncaught exception occurs and
         // report it to the message listeners. The option is off by default.
@@ -189,6 +200,7 @@ impl<RT: Runtime> Isolate<RT> {
         );
 
         assert!(v8_isolate.set_slot(handle.clone()));
+        assert!(v8_isolate.set_slot(array_buffer_memory_limit.clone()));
 
         Self {
             created: rt.monotonic_now(),
@@ -198,6 +210,8 @@ impl<RT: Runtime> Isolate<RT> {
             heap_ctx_ptr,
             max_user_timeout,
             limiter,
+            array_buffer_memory_limit,
+            max_user_heap_size,
         }
     }
 
@@ -206,7 +220,7 @@ impl<RT: Runtime> Isolate<RT> {
         _module: v8::Local<v8::Module>,
         _meta: v8::Local<v8::Object>,
     ) {
-        let scope = &mut unsafe { v8::CallbackScope::new(context) };
+        callback_scope!(unsafe let scope, context);
         let message = strings::import_meta_unsupported
             .create(scope)
             .expect("Failed to create exception string");
@@ -215,7 +229,7 @@ impl<RT: Runtime> Isolate<RT> {
     }
 
     pub fn error_dynamic_import_callback<'s>(
-        scope: &mut v8::HandleScope<'s>,
+        scope: &mut v8::PinScope<'s, '_>,
         _host_defined_options: v8::Local<'s, v8::Data>,
         _resource_name: v8::Local<'s, v8::Value>,
         _specifier: v8::Local<'s, v8::String>,
@@ -232,10 +246,14 @@ impl<RT: Runtime> Isolate<RT> {
         Some(promise)
     }
 
+    pub fn max_user_heap_size(&self) -> usize {
+        self.max_user_heap_size
+    }
+
     // Heap stats for an isolate that has no associated state or environment.
     pub fn heap_stats(&mut self) -> IsolateHeapStats {
         let stats = self.v8_isolate.get_heap_statistics();
-        IsolateHeapStats::new(stats, 0, 0)
+        IsolateHeapStats::new(stats, 0, self.array_buffer_memory_limit.used())
     }
 
     pub fn check_isolate_clean(&mut self) -> Result<(), IsolateNotClean> {
@@ -243,7 +261,7 @@ impl<RT: Runtime> Isolate<RT> {
         // v8 doesn't expose whether it's empty, so we empty it ourselves.
         // TODO(CX-2874) use a different microtask queue for each context.
         self.v8_isolate.perform_microtask_checkpoint();
-        pump_message_loop(&mut self.v8_isolate);
+        pump_message_loop(&self.v8_isolate);
 
         // Isolate has not been terminated by heap overflow, system error, or timeout.
         if let Some(not_clean) = self.handle.is_not_clean() {
@@ -253,7 +271,8 @@ impl<RT: Runtime> Isolate<RT> {
         let stats = self.v8_isolate.get_heap_statistics();
         log_heap_statistics(&stats);
         if stats.total_available_size() < *ISOLATE_MAX_USER_HEAP_SIZE {
-            self.handle.terminate(TerminationReason::OutOfMemory);
+            self.handle
+                .terminate(IsolateTerminationReason::OutOfMemory.into());
             return Err(IsolateNotClean::TooMuchMemoryCarryOver(
                 stats.total_available_size().format_size(BINARY),
                 stats.heap_size_limit().format_size(BINARY),
@@ -272,7 +291,7 @@ impl<RT: Runtime> Isolate<RT> {
         &mut self,
         client_id: Arc<String>,
         environment: E,
-    ) -> anyhow::Result<(IsolateHandle, RequestState<RT, E>)> {
+    ) -> anyhow::Result<(IsolateHandle, RequestState<RT, E>, Timeout<RT>)> {
         // Double check that the isolate is clean.
         // It's unexpected to encounter this error, since we are supposed to
         // have already checked after the last request finished, but in practice
@@ -295,7 +314,7 @@ impl<RT: Runtime> Isolate<RT> {
                 ));
             }
         };
-        let context_handle = self.handle.new_context_created();
+        let context_id = self.handle.push_context(false /* nested */);
         let mut user_timeout = environment.user_timeout();
         if let Some(max_user_timeout) = self.max_user_timeout {
             // We apply the minimum between the timeout from the environment
@@ -304,27 +323,17 @@ impl<RT: Runtime> Isolate<RT> {
         }
         let timeout = Timeout::new(
             self.rt.clone(),
-            context_handle,
+            self.handle.clone(),
             Some(user_timeout),
             Some(environment.system_timeout()),
+            permit,
         );
-        let state = RequestState {
-            rt: self.rt.clone(),
-            environment,
-            timeout,
-            permit: Some(permit),
-            blob_parts: WithHeapSize::default(),
-            streams: WithHeapSize::default(),
-            stream_listeners: WithHeapSize::default(),
-            request_stream_state: None,
-            console_timers: WithHeapSize::default(),
-            text_decoders: BTreeMap::new(),
-        };
-        Ok((self.handle.clone(), state))
+        let state = RequestState::new(self.rt.clone(), environment, context_id);
+        Ok((self.handle.clone(), state, timeout))
     }
 
-    pub fn handle_scope(&mut self) -> v8::HandleScope<()> {
-        v8::HandleScope::new(&mut self.v8_isolate)
+    pub fn isolate(&mut self) -> &mut v8::Isolate {
+        &mut self.v8_isolate
     }
 
     pub fn created(&self) -> &tokio::time::Instant {
@@ -350,7 +359,7 @@ impl<RT: Runtime> Drop for Isolate<RT> {
         // NotifyIsolateShutdown, so the isolate's foreground task runner is
         // going to leak. Before that happens, let's pump the message loop to at
         // least drain all the tasks from it.
-        pump_message_loop(&mut self.v8_isolate);
+        pump_message_loop(&self.v8_isolate);
     }
 }
 
@@ -370,7 +379,9 @@ extern "C" fn near_heap_limit_callback(
         ]
     }));
     let heap_ctx = unsafe { &mut *(data as *mut HeapContext) };
-    heap_ctx.handle.terminate(TerminationReason::OutOfMemory);
+    heap_ctx
+        .handle
+        .terminate(IsolateTerminationReason::OutOfMemory.into());
 
     // Raise the heap limit a lot to avoid a hard OOM.
     // This is unfortunate but there is some C++ code in V8 that will abort the

@@ -1,6 +1,8 @@
 import { withAuthenticatedPage } from "lib/withAuthenticatedPage";
-import { ProvisionProductionDeploymentPage } from "components/productionProvision/ProvisionProductionDeploymentPage";
+import { ProvisionDeploymentPage } from "components/provisionDeployment/ProvisionDeploymentPage";
 
 export { getServerSideProps } from "lib/ssr";
 
-export default withAuthenticatedPage(ProvisionProductionDeploymentPage);
+export default withAuthenticatedPage(() => (
+  <ProvisionDeploymentPage deploymentType="prod" />
+));

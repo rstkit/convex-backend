@@ -40,7 +40,7 @@ export function displayNameToIdentifier(path: string) {
       try {
         const url = new URL(route);
         route = url.pathname + url.search + url.hash;
-      } catch (e) {
+      } catch {
         // Not a valid URL, keep route as is
       }
       return `${method} ${route}`;
@@ -71,7 +71,7 @@ function FunctionsProvider({ children }: { children: ReactNode }) {
 
   if (!modules || !nents) {
     return (
-      <div className={cn("flex items-center justify-center w-full h-full")}>
+      <div className={cn("flex h-full w-full items-center justify-center")}>
         <LoadingLogo />
       </div>
     );
@@ -155,6 +155,7 @@ export function useModuleFunctions(): ModuleFunction[] {
     if (!nents) {
       captureMessage(
         "File tree map called before modules or nents were loaded",
+        "error",
       );
       return [];
     }
@@ -195,7 +196,7 @@ export function useRootEntries() {
 
   const rootEntries = useMemo(() => {
     if (!nents) {
-      captureMessage("Root entries called before nents were loaded");
+      captureMessage("Root entries called before nents were loaded", "error");
       return [];
     }
 
@@ -218,7 +219,7 @@ export function useRootEntries() {
     );
 
     if (rootDirectory && rootDirectory.type !== "folder") {
-      captureMessage("Root directory is not a folder");
+      captureMessage("Root directory is not a folder", "error");
       return [];
     }
 

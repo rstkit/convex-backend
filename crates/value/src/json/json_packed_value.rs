@@ -1,17 +1,14 @@
 use std::sync::Arc;
 
-#[cfg(any(test, feature = "testing"))]
-use proptest::prelude::*;
+use anyhow::Context as _;
 use serde_json::Value as JsonValue;
 
-use super::json_deserialize;
 use crate::{
     heap_size::HeapSize,
     ConvexValue,
 };
 
 #[derive(Clone, Debug)]
-#[cfg_attr(any(test, feature = "testing"), derive(PartialEq))]
 pub struct JsonPackedValue(Arc<str>);
 
 impl JsonPackedValue {
@@ -22,8 +19,11 @@ impl JsonPackedValue {
         Self(serialized.into())
     }
 
-    pub fn unpack(&self) -> ConvexValue {
-        ConvexValue::try_from(self.json_value()).expect("Parsed JSON value wasn't a valid Value")
+    /// This should never return an error, but in theory
+    /// `JsonPackedValue::from_network` could accept an invalid value
+    pub fn unpack(&self) -> anyhow::Result<ConvexValue> {
+        ConvexValue::try_from(self.json_value())
+            .context("JsonPackedValue wasn't a valid ConvexValue")
     }
 
     pub fn json_value(&self) -> JsonValue {
@@ -35,9 +35,8 @@ impl JsonPackedValue {
     }
 
     pub fn from_network(json: String) -> anyhow::Result<Self> {
-        // TODO: just check JSON validity & size/depth constraints, then pass
-        // the string data through
-        json_deserialize(&json).map(Self::pack)
+        // TODO: consider checking JSON validity here
+        Ok(Self(json.into()))
     }
 }
 
@@ -53,16 +52,5 @@ impl HeapSize for JsonPackedValue {
 impl From<JsonPackedValue> for JsonValue {
     fn from(value: JsonPackedValue) -> Self {
         value.json_value()
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for JsonPackedValue {
-    type Parameters = ();
-
-    type Strategy = impl Strategy<Value = JsonPackedValue>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        any::<ConvexValue>().prop_map(JsonPackedValue::pack)
     }
 }

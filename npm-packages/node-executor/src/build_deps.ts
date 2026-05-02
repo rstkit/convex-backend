@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { execSync } from "child_process";
 import archiver from "archiver";
 import { createHash } from "node:crypto";
-import fetch from "node-fetch"; // TODO(rakeeb): use native fetch instead of node-fetch polyfill
+import { Readable } from "node:stream";
 import path from "node:path";
 import os from "node:os";
 import { logDurationMs } from "./log";
@@ -42,6 +42,7 @@ export async function buildDeps(
   try {
     return await buildDepsInner(url, request.deps);
   } catch (e: any) {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
     e.stack;
     return {
       type: "error",
@@ -178,7 +179,9 @@ async function buildDepsInner(
         headers: {
           "Content-Length": zippedSizeBytes.toString(),
         },
-        body: readStream,
+        // @ts-expect-error incompatible ReadableStream definitions
+        body: Readable.toWeb(readStream),
+        duplex: "half",
       });
       break;
     default:

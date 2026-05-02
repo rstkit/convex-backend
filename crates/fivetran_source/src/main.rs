@@ -6,10 +6,8 @@ mod connector;
 mod convert;
 mod convex_api;
 mod log;
+mod schema;
 mod sync;
-
-#[cfg(test)]
-mod tests;
 
 use std::net::{
     IpAddr,
@@ -19,10 +17,7 @@ use std::net::{
 
 use clap::Parser;
 use connector::ConvexConnector;
-use convex_fivetran_common::{
-    config::AllowAllHosts,
-    fivetran_sdk::source_connector_server::SourceConnectorServer,
-};
+use fivetran_common::fivetran_sdk::source_connector_server::SourceConnectorServer;
 use tonic::{
     codec::CompressionEncoding,
     transport::Server,
@@ -35,11 +30,6 @@ struct Args {
     /// The port the connector receives gRPC requests from
     #[arg(long, default_value_t = 50051)]
     port: u16,
-
-    /// Whether the connector is allowed to use any host as deployment URL,
-    /// instead of only Convex cloud deployments.
-    #[arg(long)]
-    allow_all_hosts: bool,
 }
 
 #[tokio::main]
@@ -47,11 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.port);
 
-    let connector = ConvexConnector {
-        allow_all_hosts: AllowAllHosts(args.allow_all_hosts),
-    };
+    let connector = ConvexConnector;
 
-    log::log(&format!("Starting the connector on {}", addr));
+    log::log(&format!("Starting the connector on {addr}"));
     Server::builder()
         .add_service(
             SourceConnectorServer::new(connector)

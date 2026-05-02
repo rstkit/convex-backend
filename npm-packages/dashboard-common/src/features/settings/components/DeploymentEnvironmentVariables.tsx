@@ -2,7 +2,7 @@ import { useContext, useEffect, useState } from "react";
 import { useQuery } from "convex/react";
 import udfs from "@common/udfs";
 import { useRouter } from "next/router";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { InfoCircledIcon } from "@radix-ui/react-icons";
 import { EnvironmentVariable } from "system-udfs/convex/_system/frontend/common";
 import {
@@ -14,19 +14,31 @@ import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import { Button } from "@ui/Button";
 import { Sheet } from "@ui/Sheet";
 import { ProjectEnvVarConfig } from "@common/features/settings/lib/types";
+import { NoPermissionMessage } from "@common/elements/NoPermissionMessage";
 
-export function DeploymentEnvironmentVariables() {
-  const { useCurrentDeployment, useHasProjectAdminPermissions, projectsURI } =
-    useContext(DeploymentInfoContext);
+export function DeploymentEnvironmentVariables({
+  onEnvironmentVariablesAdded,
+}: {
+  onEnvironmentVariablesAdded?: (count: number) => void;
+}) {
+  const {
+    useCurrentDeployment,
+    useHasProjectAdminPermissions,
+    useIsOperationAllowed,
+    projectsURI,
+  } = useContext(DeploymentInfoContext);
   const deployment = useCurrentDeployment();
   const hasAdminPermissions = useHasProjectAdminPermissions(
     deployment?.projectId,
   );
+  const canViewEnvVars = useIsOperationAllowed("ViewEnvironmentVariables");
+  const canWriteEnvVars = useIsOperationAllowed("WriteEnvironmentVariables");
   const canManageEnvironmentVariables =
-    deployment?.deploymentType !== "prod" || hasAdminPermissions;
+    (deployment?.deploymentType !== "prod" || hasAdminPermissions) &&
+    canWriteEnvVars;
   const environmentVariables: undefined | Array<EnvironmentVariable> = useQuery(
     udfs.listEnvironmentVariables.default,
-    {},
+    canViewEnvVars ? {} : "skip",
   );
   const updateEnvironmentVariables = useUpdateEnvVars();
 
@@ -50,12 +62,7 @@ export function DeploymentEnvironmentVariables() {
           <InfoCircledIcon />
           <p className="flex-1">
             This deployment has different environment variables from the{" "}
-            <Link
-              className="text-content-link underline"
-              href={projectSettingsURI}
-            >
-              project defaults.
-            </Link>
+            <Link href={projectSettingsURI}>project defaults.</Link>
           </p>
         </div>
         <Button
@@ -77,6 +84,15 @@ export function DeploymentEnvironmentVariables() {
       </div>
     );
   };
+
+  if (!canViewEnvVars) {
+    return (
+      <Sheet className="flex flex-col gap-4 text-sm">
+        <h3>Environment Variables</h3>
+        <NoPermissionMessage message="You do not have permission to view environment variables in this deployment." />
+      </Sheet>
+    );
+  }
 
   return (
     <Sheet className="flex flex-col gap-4 text-sm">
@@ -124,10 +140,16 @@ export function DeploymentEnvironmentVariables() {
           setInitialValues([]);
         }}
         initialFormValues={initialValues}
+        onEnvironmentVariablesAdded={onEnvironmentVariablesAdded}
+        initEnvVar={initEnvVarDefault}
       />
       {renderEnvironmentVariableDiffCallout()}
     </Sheet>
   );
+}
+
+function initEnvVarDefault(envVar: { name: string; value: string }) {
+  return envVar;
 }
 
 type EnvironmentVariableDiff =
@@ -141,7 +163,7 @@ type EnvironmentVariableDiff =
 export const diffEnvironmentVariables = (
   projectEnvVariables: { configs: ProjectEnvVarConfig[] },
   deploymentEnvVariables: EnvironmentVariable[],
-  deploymentType: "dev" | "preview" | "prod",
+  deploymentType: "dev" | "preview" | "prod" | "custom",
 ): EnvironmentVariableDiff => {
   const deploymentEnvVarMap = new Map(
     deploymentEnvVariables.map((e) => [e.name, e.value]),
@@ -151,13 +173,17 @@ export const diffEnvironmentVariables = (
       .filter((config) => config.deploymentTypes.includes(deploymentType))
       .map((config) => [config.name, config.value]);
   const projectEnvVariableMap = new Map(projectEnvVariableArray);
+  const missingOrDifferent = new Map<string, string>();
   for (const [name, value] of projectEnvVariableMap) {
     if (deploymentEnvVarMap.get(name) !== value) {
-      return {
-        status: "different",
-        projectEnvVariables: projectEnvVariableMap,
-      };
+      missingOrDifferent.set(name, value);
     }
+  }
+  if (missingOrDifferent.size > 0) {
+    return {
+      status: "different",
+      projectEnvVariables: missingOrDifferent,
+    };
   }
   return {
     status: "same",
@@ -165,15 +191,17 @@ export const diffEnvironmentVariables = (
 };
 
 function useEnvironmentVariablesDiff(): EnvironmentVariableDiff {
-  const environmentVariables: undefined | Array<EnvironmentVariable> = useQuery(
-    udfs.listEnvironmentVariables.default,
-    {},
-  );
   const {
     useCurrentProject,
     useCurrentDeployment,
     useProjectEnvironmentVariables,
+    useIsOperationAllowed,
   } = useContext(DeploymentInfoContext);
+  const canViewEnvVars = useIsOperationAllowed("ViewEnvironmentVariables");
+  const environmentVariables: undefined | Array<EnvironmentVariable> = useQuery(
+    udfs.listEnvironmentVariables.default,
+    canViewEnvVars ? {} : "skip",
+  );
   const projectId = useCurrentProject()?.id;
   const deploymentType = useCurrentDeployment()?.deploymentType;
   const projectEnvironmentVariables = useProjectEnvironmentVariables(

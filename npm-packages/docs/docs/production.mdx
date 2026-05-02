@@ -2,6 +2,7 @@
 title: "Deploying Your App to Production"
 hide_table_of_contents: true
 pagination_prev: search
+description: "Tips for building safe and reliable production apps"
 ---
 
 Convex is built to serve live, production app traffic. Here we cover how to
@@ -10,10 +11,11 @@ deploy and maintain a production version of your app.
 ## Project management
 
 When you sign up for Convex, a Convex team is created for you. You can
-[create more teams from the dashboard](/dashboard/teams.md) and add other people
-to them as members. You can upgrade your team to the
-[Pro plan](https://www.convex.dev/pricing) for additional features, higher
-limits and usage-based pricing.
+[create more teams from the dashboard](/dashboard/teams/teams.mdx) and add other
+people to them as members. You can upgrade your team to the
+[Starter](https://www.convex.dev/pricing) plan to pay as you go or the
+[Professional](https://www.convex.dev/pricing) for additional features, higher
+built-in limits, 24h support, and discounted usage-based pricing.
 
 Each team can have multiple projects. When you run `npx convex dev` for the
 first time, a project is created for you automatically. You can also create a
@@ -41,7 +43,7 @@ more.
 
 ## Staging environment
 
-With Convex [preview deployments](/production/hosting/preview-deployments.mdx)
+With Convex [preview deployments](/production/multiple-deployments.mdx#preview)
 your team can test out changes before deploying them to production. If you need
 a more permanent staging environment, you can use a separate Convex project, and
 deploy to it by setting the `CONVEX_DEPLOY_KEY` environment variable when
@@ -69,7 +71,7 @@ Teams developing on Convex usually follow this workflow:
      dev deployment with synthetic seed data.
    - Members of a team with the [Pro plan](https://www.convex.dev/pricing) can
      get separate
-     [preview deployments](/production/hosting/preview-deployments.mdx) to test
+     [preview deployments](/production/multiple-deployments.mdx#preview) to test
      each other's pull-requests.
 6. Deployment to production can happen
    [automatically](/production/hosting/hosting.mdx) when changes get merged to

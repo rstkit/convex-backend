@@ -1,9 +1,8 @@
 #![feature(iter_from_coroutine, coroutines)]
-#![feature(let_chains)]
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(ptr_metadata)]
 #![feature(iterator_try_collect)]
-#![feature(assert_matches)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(trait_alias)]
 
@@ -37,7 +36,7 @@ use aggregation::PostingListMatchAggregator;
 use anyhow::Context;
 use common::{
     bootstrap_model::index::{
-        text_index::DeveloperTextIndexConfig,
+        text_index::TextIndexSpec,
         IndexConfig,
     },
     document::ResolvedDocument,
@@ -54,6 +53,7 @@ use common::{
     },
     types::{
         IndexName,
+        SearchIndexMetricLabels,
         Timestamp,
     },
 };
@@ -206,10 +206,6 @@ pub type EditDistance = u8;
 pub struct FieldPosition(u32);
 
 impl FieldPosition {
-    #[cfg(test)]
-    pub fn new_for_test(pos: u32) -> Self {
-        Self(pos)
-    }
 }
 
 impl From<FieldPosition> for u32 {
@@ -225,6 +221,9 @@ impl TryFrom<&Token> for FieldPosition {
         Ok(Self(u32::try_from(value.position)?))
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextIndexWriteSize(pub u64);
 
 #[derive(Clone)]
 pub struct TantivySearchIndexSchema {
@@ -257,7 +256,7 @@ impl From<&TantivySearchIndexSchema> for pb::searchlight::SearchIndexConfig {
 }
 
 impl TantivySearchIndexSchema {
-    pub fn new(index_config: &DeveloperTextIndexConfig) -> Self {
+    pub fn new(index_config: &TextIndexSpec) -> Self {
         let analyzer = convex_en();
 
         let mut schema_builder = Schema::builder();
@@ -305,21 +304,17 @@ impl TantivySearchIndexSchema {
         index: &Index,
         printable_index_name: &IndexName,
     ) -> anyhow::Result<TantivySearchIndexSchema> {
-        let IndexConfig::Text {
-            ref developer_config,
-            ..
-        } = index.metadata().config
-        else {
+        let IndexConfig::Text { ref spec, .. } = index.metadata().config else {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "IndexNotASearchIndexError",
-                format!("Index {} is not a search index", printable_index_name),
+                format!("Index {printable_index_name} is not a search index"),
             ));
         };
-        Ok(Self::new(developer_config))
+        Ok(Self::new(spec))
     }
 
-    pub fn to_index_config(&self) -> DeveloperTextIndexConfig {
-        DeveloperTextIndexConfig {
+    pub fn to_index_config(&self) -> TextIndexSpec {
+        TextIndexSpec {
             search_field: self.search_field_path.clone(),
             filter_fields: self.filter_fields.keys().cloned().collect(),
         }
@@ -335,7 +330,7 @@ impl TantivySearchIndexSchema {
     /// when a super rough estimate is sufficient (e.g. capping the maximum
     /// size of a new segment).
     pub fn estimate_size(&self, document: &ResolvedDocument) -> u64 {
-        let document_size = if let Some(ConvexValue::String(ref s)) =
+        let document_size = if let Some(ConvexValue::String(s)) =
             document.value().get_path(&self.search_field_path)
         {
             s.len()
@@ -357,8 +352,7 @@ impl TantivySearchIndexSchema {
         let _timer = metrics::index_into_terms_timer();
 
         let mut doc_terms = vec![];
-        if let Some(ConvexValue::String(ref s)) = document.value().get_path(&self.search_field_path)
-        {
+        if let Some(ConvexValue::String(s)) = document.value().get_path(&self.search_field_path) {
             let mut token_stream = self.analyzer.token_stream(&s[..]);
 
             while let Some(token) = token_stream.next() {
@@ -396,8 +390,7 @@ impl TantivySearchIndexSchema {
         let creation_time = document.creation_time();
         tantivy_document.add_f64(self.creation_time_field, creation_time.into());
 
-        if let Some(ConvexValue::String(ref s)) = document.value().get_path(&self.search_field_path)
-        {
+        if let Some(ConvexValue::String(s)) = document.value().get_path(&self.search_field_path) {
             tantivy_document.add_text(self.search_field, s);
         }
         for (field_path, tantivy_field) in &self.filter_fields {
@@ -410,12 +403,12 @@ impl TantivySearchIndexSchema {
 
     pub fn document_lengths(&self, document: &TantivyDocument) -> DocumentLengths {
         let mut search_field = 0;
-        if let Some(tantivy::schema::Value::Str(ref s)) = document.get_first(self.search_field) {
+        if let Some(tantivy::schema::Value::Str(s)) = document.get_first(self.search_field) {
             search_field += s.len();
         }
         let mut filter_fields = BTreeMap::new();
         for (field_path, tantivy_field) in &self.filter_fields {
-            if let Some(tantivy::schema::Value::Bytes(ref b)) = document.get_first(*tantivy_field) {
+            if let Some(tantivy::schema::Value::Bytes(b)) = document.get_first(*tantivy_field) {
                 filter_fields.insert(field_path.clone(), b.len());
             }
         }
@@ -434,8 +427,10 @@ impl TantivySearchIndexSchema {
         segments: Vec<FragmentedTextStorageKeys>,
         disk_index_ts: Timestamp,
         searcher: Arc<dyn Searcher>,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<RevisionWithKeys> {
         log_num_segments_searched_total(segments.len());
+        let labels = labels.to_owned();
 
         // Step 1: Map the old `CompiledQuery` struct onto `TokenQuery`s.
         let mut token_queries = vec![];
@@ -449,8 +444,10 @@ impl TantivySearchIndexSchema {
             token_queries.push(query);
         }
         let mut exist_filter_conditions = false;
+        let mut num_expected_filter_conditions = 0;
         for CompiledFilterCondition::Must(term) in compiled_query.filter_conditions {
             exist_filter_conditions = true;
+            num_expected_filter_conditions += 1;
             let query = TokenQuery {
                 term,
                 max_distance: 0,
@@ -469,6 +466,7 @@ impl TantivySearchIndexSchema {
             let search_storage = search_storage.clone();
             let segment = segment.clone();
             let token_queries = token_queries.clone();
+            let labels = labels.clone();
             token_query_futures.spawn("query_tokens", async move {
                 searcher
                     .query_tokens(
@@ -476,6 +474,7 @@ impl TantivySearchIndexSchema {
                         segment,
                         token_queries,
                         MAX_UNIQUE_QUERY_TERMS,
+                        labels,
                     )
                     .await
             });
@@ -518,12 +517,12 @@ impl TantivySearchIndexSchema {
         }
         let terms = results_by_term.keys().cloned().collect_vec();
         // If there are no matches, short-circuit and return an empty result.
-        let no_and_tokens_present = results_by_term
+        let not_enough_and_tokens_present = results_by_term
             .iter()
             .filter(|(_, (_, _, token_ord))| *token_ord >= num_text_query_terms)
             .count()
-            == 0;
-        let no_filter_matches = exist_filter_conditions && no_and_tokens_present;
+            < num_expected_filter_conditions;
+        let no_filter_matches = exist_filter_conditions && not_enough_and_tokens_present;
         if terms.is_empty() || no_filter_matches {
             return Ok(vec![]);
         }
@@ -536,9 +535,10 @@ impl TantivySearchIndexSchema {
             let search_storage = search_storage.clone();
             let segment = segment.clone();
             let terms = terms.clone();
+            let labels = labels.clone();
             bm25_futures.spawn("query_bm25_stats", async move {
                 searcher
-                    .query_bm25_stats(search_storage, segment, terms)
+                    .query_bm25_stats(search_storage, segment, terms, labels)
                     .await
             });
         }
@@ -616,9 +616,10 @@ impl TantivySearchIndexSchema {
             let search_storage = search_storage.clone();
             let segment = segment.clone();
             let query = query.clone();
+            let labels = labels.clone();
             posting_list_futures.spawn("query_posting_lists", async move {
                 searcher
-                    .query_posting_lists(search_storage, segment, query)
+                    .query_posting_lists(search_storage, segment, query, labels)
                     .await
             });
         }
@@ -830,32 +831,4 @@ pub enum SearchFileType {
     TextIdTracker,
     TextAliveBitset,
     TextDeletedTerms,
-}
-
-#[cfg(test)]
-mod test {
-    use std::collections::BTreeSet;
-
-    use common::bootstrap_model::index::text_index::DeveloperTextIndexConfig;
-
-    use crate::{
-        TantivySearchIndexSchema,
-        SEARCH_FIELD_ID,
-    };
-
-    /// DO NOT CHANGE CONSTANTS!
-    /// This test ensures that we don't accidentally change our field IDs in
-    /// tantivy.
-    #[test]
-    fn test_field_ids_dont_change() -> anyhow::Result<()> {
-        let schema = TantivySearchIndexSchema::new(&DeveloperTextIndexConfig {
-            search_field: "mySearchField".parse()?,
-            filter_fields: BTreeSet::new(),
-        });
-        assert_eq!(schema.internal_id_field.field_id(), 0);
-        assert_eq!(schema.ts_field.field_id(), 1);
-        assert_eq!(schema.creation_time_field.field_id(), 2);
-        assert_eq!(schema.search_field.field_id(), SEARCH_FIELD_ID);
-        Ok(())
-    }
 }

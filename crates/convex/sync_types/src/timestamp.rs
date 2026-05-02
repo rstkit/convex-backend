@@ -7,15 +7,17 @@ use std::{
     },
 };
 
-use anyhow::Context;
+use anyhow::{
+    anyhow,
+    Context,
+};
 use derive_more::FromStr;
-use serde::Serialize;
 use serde_json::json;
 
 /// Database transaction timestamp.
 /// This is unique across all transactions.
 /// Units are nanoseconds since epoch.
-#[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Ord, Eq, FromStr, Hash, Serialize, Default)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Ord, Eq, FromStr, Hash, Default)]
 pub struct Timestamp(u64);
 
 impl Timestamp {
@@ -25,18 +27,32 @@ impl Timestamp {
     pub const MAX: Self = Self(i64::MAX as u64);
     pub const MIN: Self = Self(0);
 
-    pub fn succ(&self) -> anyhow::Result<Self> {
+    #[inline]
+    pub fn succ_opt(&self) -> Option<Self> {
         if *self >= Self::MAX {
-            anyhow::bail!("timestamp {self} already at max");
+            None
+        } else {
+            Some(Self(self.0 + 1))
         }
-        Ok(Self(self.0 + 1))
+    }
+
+    pub fn succ(&self) -> anyhow::Result<Self> {
+        self.succ_opt()
+            .ok_or_else(|| anyhow!("timestamp {self} already at max"))
+    }
+
+    #[inline]
+    pub fn pred_opt(&self) -> Option<Self> {
+        if *self <= Self::MIN {
+            None
+        } else {
+            Some(Self(self.0 - 1))
+        }
     }
 
     pub fn pred(&self) -> anyhow::Result<Self> {
-        if *self <= Self::MIN {
-            anyhow::bail!("timestamp {self} already at min");
-        }
-        Ok(Self(self.0 - 1))
+        self.pred_opt()
+            .ok_or_else(|| anyhow!("timestamp {self} already at min"))
     }
 
     pub fn add(&self, duration: Duration) -> anyhow::Result<Self> {
@@ -64,20 +80,17 @@ impl Timestamp {
     // This is similar to `self - base` but it works if `self` is before `base`.
     // Since Duration is always positive, `self - base` can overflow.
     pub fn secs_since_f64(self, base: Timestamp) -> f64 {
-        if self > base {
+        if self >= base {
             (self - base).as_secs_f64()
         } else {
             -(base - self).as_secs_f64()
         }
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    pub fn must(value: i32) -> Self {
-        if value < Self::MIN.0 as i32 || value as u64 > Self::MAX.0 {
-            panic!("timestamp {value} out of bounds");
-        }
-        Self(value as u64)
+    pub fn size(&self) -> usize {
+        8
     }
+
 }
 
 impl fmt::Display for Timestamp {
@@ -152,19 +165,6 @@ impl TryFrom<serde_json::Value> for Timestamp {
 impl From<Timestamp> for serde_json::Value {
     fn from(ts: Timestamp) -> Self {
         json!(i64::from(ts))
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for Timestamp {
-    type Parameters = ();
-    type Strategy = proptest::strategy::BoxedStrategy<Self>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        use proptest::strategy::Strategy;
-        (Timestamp::MIN.0..=Timestamp::MAX.0)
-            .prop_map(Timestamp)
-            .boxed()
     }
 }
 

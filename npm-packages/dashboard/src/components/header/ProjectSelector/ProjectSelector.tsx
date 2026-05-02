@@ -1,20 +1,15 @@
-import { ProjectDetails, Team } from "generatedApi";
+import { ProjectDetails, TeamResponse } from "generatedApi";
 
 import classNames from "classnames";
-import React, { useRef, useState } from "react";
-import { useCurrentProject, useProjects } from "api/projects";
+import React, { useState } from "react";
 import { Button } from "@ui/Button";
-import { Popover } from "@ui/Popover";
 import { CaretSortIcon, GearIcon, ResetIcon } from "@radix-ui/react-icons";
 import { Avatar } from "elements/Avatar";
-import { useScrolling, useWindowSize } from "react-use";
-import { usePopper } from "react-popper";
 import { cn } from "@ui/cn";
 import { logEvent } from "convex-analytics";
-import { SafeZone } from "elements/SafeZone";
-import { DeploymentDisplay } from "elements/DeploymentDisplay";
+import { useWindowSize } from "react-use";
+import { Popover } from "@ui/Popover";
 import { Breadcrumbs } from "../Breadcrumbs/Breadcrumbs";
-import { DeploymentMenuOptions } from "./DeploymentMenuOptions";
 import { ProjectMenuOptions } from "./ProjectMenuOptions";
 import { TeamMenuOptions } from "./TeamMenuOptions";
 
@@ -26,30 +21,26 @@ export function ProjectSelector({
   onCreateProjectClick,
   onCreateTeamClick,
 }: {
-  teams?: Team[];
+  teams?: TeamResponse[];
   selectedTeamSlug?: string;
   selectedProject?: ProjectDetails;
   className?: string;
   onCreateTeamClick: () => void;
-  onCreateProjectClick: (team: Team) => void;
+  onCreateProjectClick: (team: TeamResponse) => void;
 }) {
   const team = teams?.find((t) => t.slug === selectedTeamSlug) ?? null;
-
-  const projectsForHoveredTeam = useProjects(team?.id);
-
-  const currentProject = useCurrentProject();
-
-  const [lastHoveredProject, setLastHoveredProject] =
-    useState<ProjectDetails | null>(currentProject || null);
 
   const { width } = useWindowSize();
 
   const selected =
     team === undefined ? null : (
       <Breadcrumbs>
+        {team && selectedProject ? (
+          <Avatar name={team.name} hashKey={team.id.toString()} />
+        ) : null}
         {selectedProject ? (
           <div
-            className="truncate"
+            className="truncate font-semibold"
             style={{
               maxWidth: width > 1024 ? "14rem" : width > 640 ? "10rem" : "6rem",
             }}
@@ -57,16 +48,14 @@ export function ProjectSelector({
             {selectedProject.name}
           </div>
         ) : null}
-        {selectedProject ? (
-          <DeploymentDisplay project={selectedProject} />
-        ) : (
+        {selectedProject ? null : (
           <div
             className="flex max-w-[14rem] items-center gap-2"
             style={{
               maxWidth: width > 1024 ? "14rem" : width > 640 ? "10rem" : "6rem",
             }}
           >
-            <Avatar size="small" name={team?.name} />
+            <Avatar name={team?.name} hashKey={team?.id.toString() ?? ""} />
             <span className="grow truncate">{team?.name}</span>
           </div>
         )}
@@ -79,26 +68,21 @@ export function ProjectSelector({
       variant="unstyled"
       type="button"
       className={classNames(
-        "rounded",
-        selectedProject ? "items-center h-12" : "items-center h-10",
+        "items-center h-10",
         "px-3 py-2 w-fit flex gap-2 select-none",
         ...(className !== undefined
           ? [className]
           : ["text-content-primary", "hover:bg-background-tertiary"]),
+        "rounded-full",
+        "cursor-pointer",
+        "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-border-selected",
       )}
       onClick={() => {
         logEvent("click project selector");
       }}
     >
-      <div className="flex w-fit select-none flex-col items-start truncate text-sm">
-        {team && selectedProject && (
-          <span className="text-xs font-semibold">{team.name}</span>
-        )}
-        {selected}
-      </div>
-      <CaretSortIcon
-        className={classNames("h-5 w-5", selectedProject && "mt-4")}
-      />
+      {selected}
+      <CaretSortIcon className="size-5" />
     </Button>
   );
 
@@ -109,10 +93,7 @@ export function ProjectSelector({
       className="-mt-0.5"
       portal
       placement="bottom-start"
-      openButtonClassName="bg-background-tertiary rounded"
-      onClose={() => {
-        setLastHoveredProject(selectedProject || null);
-      }}
+      openButtonClassName="bg-background-tertiary rounded-full"
       button={button}
     >
       {({ close }) => (
@@ -122,9 +103,6 @@ export function ProjectSelector({
           onCreateTeamClick={onCreateTeamClick}
           onCreateProjectClick={onCreateProjectClick}
           team={team}
-          projectsForHoveredTeam={projectsForHoveredTeam}
-          lastHoveredProject={lastHoveredProject}
-          setLastHoveredProject={setLastHoveredProject}
         />
       )}
     </Popover>
@@ -137,75 +115,38 @@ function ProjectSelectorPanel({
   onCreateProjectClick,
   close,
   team,
-  projectsForHoveredTeam,
-  lastHoveredProject,
-  setLastHoveredProject,
 }: {
-  teams?: Team[];
+  teams?: TeamResponse[];
   onCreateTeamClick: () => void;
-  onCreateProjectClick: (team: Team) => void;
+  onCreateProjectClick: (team: TeamResponse) => void;
   close: () => void;
-  team: Team | null;
-  projectsForHoveredTeam: ProjectDetails[] | undefined;
-  lastHoveredProject: ProjectDetails | null;
-  setLastHoveredProject: (project: ProjectDetails | null) => void;
+  team: TeamResponse | null;
 }) {
-  const menuRef = useRef<HTMLDivElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const optionsRef = useRef<HTMLDivElement>(null);
-  const [popperElement, setPopperElement] = useState<HTMLDivElement | null>(
-    null,
-  );
-  const { styles, attributes } = usePopper(optionsRef.current, popperElement, {
-    placement: "right-start",
-  });
-  const isScrolling = useScrolling(scrollRef);
-
   const [switchingTeams, setSwitchingTeams] = useState(false);
-
-  const [isInSafeZone, setIsInSafeZone] = useState(false);
 
   return (
     // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-    <div
-      ref={menuRef}
-      role="dialog"
-      onKeyDown={(event) => {
-        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
-          return;
-        }
-
-        const elementToFocus =
-          event.key === "ArrowRight"
-            ? popperElement?.querySelectorAll<HTMLAnchorElement>(
-                ".SelectorItem:not([disabled])",
-              )[0]
-            : (popperElement?.parentElement!.children[0].querySelector(
-                ".SelectorItem-active",
-              ) as HTMLElement);
-        elementToFocus?.focus();
-      }}
-    >
+    <div role="dialog">
       {team && (
         <div className="flex max-h-[calc(100vh-3.625rem)] w-[12rem] flex-col py-2 sm:h-fit sm:w-[21.5rem]">
           <div className="my-0.5 flex w-full items-center justify-between gap-2 px-0.5">
-            <h5 className="flex h-full items-center gap-1 truncate">
+            <h5 className="mb-1 flex h-fit items-center gap-1 truncate">
               {switchingTeams ? (
                 <div className="px-1.5 py-2 text-sm">Select Team</div>
               ) : (
                 <Button
                   variant="unstyled"
-                  className="group flex items-center gap-1 px-1.5 py-2"
+                  className="mx-1.5 flex cursor-pointer items-center gap-1 rounded-full border px-1.5 py-1 hover:bg-background-tertiary"
                   onClick={() => setSwitchingTeams(true)}
-                  onMouseOver={() => setLastHoveredProject(null)}
                   tip="Select team"
                   tipSide="right"
                 >
+                  <Avatar name={team.name} hashKey={team.id.toString()} />
                   <span className="max-w-[12rem] truncate">{team.name}</span>
                   <CaretSortIcon
                     className={cn(
                       "text-content-primary",
-                      "min-h-[1rem] min-w-[1rem] group-hover:bg-background-tertiary rounded-full",
+                      "min-h-[1rem] min-w-[1rem] rounded-full",
                     )}
                   />
                 </Button>
@@ -236,7 +177,7 @@ function ProjectSelectorPanel({
               />
             )}
           </div>
-          <div className="flex flex-col items-start gap-0.5 overflow-y-auto overflow-x-hidden scrollbar sm:max-h-[22rem]">
+          <div className="flex flex-col items-start gap-0.5 overflow-x-hidden">
             {switchingTeams ? (
               <TeamMenuOptions
                 teams={teams}
@@ -247,60 +188,13 @@ function ProjectSelectorPanel({
             ) : (
               <ProjectMenuOptions
                 onCreateProjectClick={onCreateProjectClick}
-                projectsForHoveredTeam={projectsForHoveredTeam}
-                lastHoveredProject={lastHoveredProject}
                 team={team}
-                setLastHoveredProject={(p) =>
-                  !isInSafeZone && setLastHoveredProject(p)
-                }
-                optionRef={optionsRef}
-                scrollRef={scrollRef}
                 close={close}
               />
             )}
           </div>
         </div>
       )}
-      {menuRef.current && popperElement && (
-        <SafeZone
-          anchor={menuRef.current}
-          submenu={popperElement}
-          setIsInSafeZone={setIsInSafeZone}
-        />
-      )}
-      {!isScrolling &&
-        !switchingTeams &&
-        team &&
-        lastHoveredProject &&
-        !lastHoveredProject.isDemo && (
-          <div
-            key={lastHoveredProject.id}
-            ref={setPopperElement}
-            style={styles.popper}
-            className="max-h-[30rem] min-w-[8rem] max-w-[12rem] overflow-y-auto rounded border bg-background-secondary shadow-sm scrollbar sm:min-w-[12rem] sm:max-w-[20rem]"
-            {...attributes.popper}
-          >
-            <div className="flex items-center justify-between gap-2 px-2 pt-2">
-              <p className="truncate text-xs font-semibold text-content-secondary">
-                Deployments
-              </p>
-              <Button
-                size="xs"
-                href={`/t/${team.slug}/${lastHoveredProject.slug}/settings`}
-                onClickOfAnchorLink={close}
-                inline
-                variant="neutral"
-                icon={<GearIcon />}
-                tip={`Project settings for ${lastHoveredProject.slug}`}
-              />
-            </div>
-            <DeploymentMenuOptions
-              team={team}
-              project={lastHoveredProject}
-              close={close}
-            />
-          </div>
-        )}
     </div>
   );
 }

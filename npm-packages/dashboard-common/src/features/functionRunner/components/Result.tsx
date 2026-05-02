@@ -20,6 +20,7 @@ function ResultImpl({
   queryStatus,
   requestFilter,
   startCursor,
+  onCopiedQueryResult,
 }: {
   result?: FunctionResult;
   // If the request is in flight.
@@ -33,6 +34,7 @@ function ResultImpl({
   queryStatus?: React.ReactNode;
   requestFilter: RequestFilter | null;
   startCursor: number;
+  onCopiedQueryResult?: () => void;
 }) {
   const {
     loading: isFormattingCode,
@@ -52,7 +54,7 @@ function ResultImpl({
   return (
     <div className="flex max-w-full grow flex-col">
       <div className="sticky top-0 z-10 flex items-center gap-4 border-y bg-background-primary px-4 py-2">
-        <h5 className="whitespace-nowrap text-xs text-content-secondary">
+        <h5 className="text-xs whitespace-nowrap text-content-secondary">
           Output
         </h5>
         {queryStatus}
@@ -92,6 +94,7 @@ function ResultImpl({
             className="h-4 p-0"
             tip="Copy Result Value"
             disabled={loading || result === undefined}
+            onCopied={onCopiedQueryResult}
           />
         )}
       </div>
@@ -102,7 +105,7 @@ function ResultImpl({
         key={lastRequestTiming?.startedAt}
       >
         {result === undefined && !loading ? (
-          <div className="py-2 pl-4 text-sm italic text-content-secondary">
+          <div className="py-2 pl-4 text-sm text-content-secondary italic">
             Run this function to produce a result.
           </div>
         ) : (

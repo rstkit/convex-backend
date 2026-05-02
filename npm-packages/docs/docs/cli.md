@@ -2,6 +2,7 @@
 title: "CLI"
 sidebar_position: 110
 slug: "cli"
+description: "Command-line interface for managing Convex projects and functions"
 ---
 
 The Convex command-line interface (CLI) is your interface for managing Convex
@@ -112,6 +113,33 @@ code to the deployment before running the function.
 
 Use `--prod` to run functions in the production deployment for a project.
 
+#### Run an inline query
+
+You can also evaluate a readonly inline query on your deployment:
+
+```sh
+npx convex run --inline-query 'await ctx.db.query("messages").take(5)'
+```
+
+For multi-statement queries, use an explicit `return`:
+
+```sh
+npx convex run --inline-query 'const firstMessage = await ctx.db.query("messages").first(); console.log(firstMessage?._id); return firstMessage;'
+```
+
+If you need full control, you can pass a full module source that exports a
+default query:
+
+```sh
+npx convex run --inline-query 'export default query({ handler: async (ctx) => { console.log("Write and test your query function here!"); return await ctx.db.query("YOUR_TABLE_NAME").take(10); }, })'
+```
+
+The function call is also completely sandboxed, so it can only read data and
+cannot modify the database or access the network.
+
+Use `--component <path>` to run the inline query inside a mounted component. Use
+`--prod` to run the inline query on the production deployment for a project.
+
 ### Tail deployment logs
 
 You can choose how to pipe logs from your dev deployment to your console:
@@ -161,7 +189,7 @@ npx convex data <table>
 ```
 
 Display a simple view of the
-[dashboard data page](/dashboard/deployments/data.md) in the command line.
+[dashboard data page](/dashboard/deployments/data.mdx) in the command line.
 
 The command supports `--limit` and `--order` flags to change data displayed. For
 more complex filters, use the dashboard data page or write a
@@ -170,6 +198,22 @@ more complex filters, use the dashboard data page or write a
 The `npx convex data <table>` command works with
 [system tables](/database/advanced/system-tables.mdx), such as `_storage`, in
 addition to your own tables.
+
+### Show deployment health insights
+
+```sh
+npx convex insights
+npx convex insights --details
+npx convex insights --prod
+```
+
+Show health insights for a Convex deployment over the last 72 hours. Reports
+[OCC (Optimistic Concurrency Control)](/error#1) conflicts and resource limit
+issues that may indicate performance problems.
+
+Add `--details` to include recent events for each insight. Use `--prod` to check
+the production deployment, `--preview-name <name>` for a preview deployment, or
+`--deployment-name <name>` for a specific deployment.
 
 ### Read and write environment variables
 
@@ -180,9 +224,40 @@ npx convex env set <name> <value>
 npx convex env remove <name>
 ```
 
-See and update the deployment environment variables which you can otherwise
-manage on the dashboard
-[environment variables settings page](/dashboard/deployments/settings.md#environment-variables).
+See and update the
+[deployment environment variables](/production/environment-variables). You can
+alternatively use the
+[settings page on the dashboard](/dashboard/deployments/settings.mdx#environment-variables).
+
+Tip: to avoid secrets from ending up in your terminal shell history, you can
+pass the value via stdin, from a file, or interactively.
+
+Useful commands:
+
+```sh
+# Set a value interactively
+npx convex env set API_KEY
+
+# Set from MacOS clipboard
+pbpaste | npx convex env set API_KEY
+# Windows PowerShell
+Get-Clipboard | npx convex env set API_KEY
+
+# Read a value from a file
+npx convex env set PUBLIC_KEY --from-file key.pub
+
+# Set multiple variables via a file
+npx convex env set --from-file .env.defaults
+
+# Save environment variables to a file
+npx convex env list >> .env.convex  # append
+npx convex env list >  .env.convex  # overwrite
+
+# Update values after editing them locally:
+npx convex env set --force < .env.convex
+```
+
+Note: to set variables on your production deployment, pass `--prod`.
 
 ## Deploy
 
@@ -223,20 +298,21 @@ This command will:
 
 Once this command succeeds the new functions will be available immediately.
 
-### Deploy Convex functions to a [preview deployment](/production/hosting/preview-deployments.mdx)
+### Deploy Convex functions to a [preview deployment](/production/multiple-deployments.mdx#preview)
 
 ```sh
 npx convex deploy
 ```
 
-When run with the `CONVEX_DEPLOY_KEY` environment variable containing a Preview
-Deploy Key, this command will:
+When run with the `CONVEX_DEPLOY_KEY` environment variable containing a
+[Preview Deploy Key](docs/cli/deploy-key-types.mdx#deploying-to-preview-deployments),
+this command will:
 
-1. Create a deployment with the specified name. `npx convex deploy` will infer
-   the Git branch name for Vercel, Netlify, GitHub, and GitLab environments, but
-   the `--preview-create` option can be used to customize the name associated
-   with the newly created deployment.
-   ```
+1. Create a new Convex deployment. `npx convex deploy` will infer the Git branch
+   name for Vercel, Netlify, GitHub, and GitLab environments, or the
+   `--preview-create` option can be used to customize the name associated with
+   the newly created deployment.
+   ```sh
    npx convex deploy --preview-create my-branch-name
    ```
 1. Run a command if specified with `--cmd`. The command will have CONVEX_URL (or
@@ -276,5 +352,14 @@ setting up frontend and backend previews together.
 npx convex codegen
 ```
 
-Update the [generated code](/generated-api/) in `convex/_generated` without
-pushing. This can be useful for orchestrating build steps in CI.
+The [generated code](/generated-api/) in the `convex/_generated` directory
+includes types required for a TypeScript typecheck. This code is generated
+whenever necessary while running `npx convex dev` and this code should be
+committed to the repo (your code won't typecheck without it!).
+
+In the rare cases it's useful to regenerate code (e.g. in CI to ensure that the
+correct code was checked it) you can use this command.
+
+Generating code can require communicating with a convex deployment in order to
+evaluate configuration files in the Convex JavaScript runtime. This doesn't
+modify the code running on the deployment.

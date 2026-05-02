@@ -19,11 +19,13 @@ export function QueryResult({
   parameters,
   reactClient,
   paused,
+  onCopiedQueryResult,
 }: {
   reactClient: ConvexReactClient;
   module: FunctionTypes.ModuleFunction;
   parameters: DefaultFunctionArgs;
   paused: boolean;
+  onCopiedQueryResult?: () => void;
 }) {
   if (module.udfType !== "Query") {
     throw new Error("Invalid udf type");
@@ -66,7 +68,7 @@ export function QueryResult({
             </Tooltip>
           ) : (
             <Tooltip tip="This query is subscribed to updates." side="left">
-              <div className="flex select-none items-center gap-1 text-sm text-green-700 motion-safe:animate-blink dark:text-green-200">
+              <div className="flex items-center gap-1 text-sm text-green-700 select-none motion-safe:animate-blink dark:text-green-200">
                 <div className="h-2.5 w-2.5 rounded-full bg-green-700 dark:bg-green-200" />{" "}
               </div>
             </Tooltip>
@@ -74,6 +76,7 @@ export function QueryResult({
         }
         requestFilter={null}
         startCursor={0}
+        onCopiedQueryResult={onCopiedQueryResult}
       />
     </div>
   );

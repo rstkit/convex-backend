@@ -1,41 +1,37 @@
-use std::str::FromStr;
-
 use serde::{
     Deserialize,
     Serialize,
 };
 use sync_types::Timestamp;
-use value::{
-    codegen_convex_serialization,
-    InternalId,
-};
+use value::codegen_convex_serialization;
 
 use super::segment::{
     FragmentedVectorSegment,
     SerializedFragmentedVectorSegment,
 };
+use crate::bootstrap_model::index::search_index::{
+    BackfillState,
+    SearchBackfillCursor,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
-pub struct VectorIndexBackfillState {
-    pub segments: Vec<FragmentedVectorSegment>,
-    // Both of these variables will be None at the start of backfill.
-    // They will be set after the first backfill iteration.
-    pub cursor: Option<InternalId>,
-    pub backfill_snapshot_ts: Option<Timestamp>,
-}
+pub type VectorIndexBackfillState = BackfillState<FragmentedVectorSegment>;
 
 #[derive(Serialize, Deserialize)]
 pub struct SerializedVectorIndexBackfillState {
     segments: Option<Vec<SerializedFragmentedVectorSegment>>,
-    document_cursor: Option<String>,
-    backfill_snapshot_ts: Option<i64>,
+    table_scan_cursor: Option<Vec<u8>>,
+    last_segment_ts: Option<i64>,
+    staged: Option<bool>,
 }
 
 impl TryFrom<VectorIndexBackfillState> for SerializedVectorIndexBackfillState {
     type Error = anyhow::Error;
 
     fn try_from(backfill_state: VectorIndexBackfillState) -> Result<Self, Self::Error> {
+        let last_segment_ts = backfill_state
+            .cursor
+            .as_ref()
+            .map(|c| c.last_segment_ts.into());
         Ok(SerializedVectorIndexBackfillState {
             segments: Some(
                 backfill_state
@@ -44,8 +40,9 @@ impl TryFrom<VectorIndexBackfillState> for SerializedVectorIndexBackfillState {
                     .map(|s| s.try_into())
                     .collect::<anyhow::Result<Vec<_>>>()?,
             ),
-            document_cursor: backfill_state.cursor.map(|id| id.to_string()),
-            backfill_snapshot_ts: backfill_state.backfill_snapshot_ts.map(|ts| ts.into()),
+            table_scan_cursor: backfill_state.cursor.map(|c| c.table_scan_cursor),
+            last_segment_ts,
+            staged: Some(backfill_state.staged),
         })
     }
 }
@@ -54,10 +51,21 @@ impl TryFrom<SerializedVectorIndexBackfillState> for VectorIndexBackfillState {
     type Error = anyhow::Error;
 
     fn try_from(serialized: SerializedVectorIndexBackfillState) -> Result<Self, Self::Error> {
-        // The fields cursor, backfill_snapshot_ts, and segments are not present in old
-        // indexes in Backfilling state. Thus, these all support being deserialized when
-        // missing using empty defaults (None or vec![]). This allows backfilling to be
-        // backwards-compatible.
+        let table_scan_cursor = serialized.table_scan_cursor;
+        let last_segment_ts = serialized
+            .last_segment_ts
+            .map(Timestamp::try_from)
+            .transpose()?;
+        let cursor = match (table_scan_cursor, last_segment_ts) {
+            (Some(table_scan_cursor), Some(last_segment_ts)) => Some(SearchBackfillCursor {
+                last_segment_ts,
+                table_scan_cursor,
+            }),
+            (None, None) => None,
+            _ => anyhow::bail!(
+                "VectorIndexBackfillState must have both table_scan_cursor and last_segment_ts"
+            ),
+        };
         Ok(VectorIndexBackfillState {
             segments: serialized
                 .segments
@@ -65,14 +73,8 @@ impl TryFrom<SerializedVectorIndexBackfillState> for VectorIndexBackfillState {
                 .into_iter()
                 .map(|s| s.try_into())
                 .collect::<anyhow::Result<Vec<_>>>()?,
-            cursor: serialized
-                .document_cursor
-                .map(|id| InternalId::from_str(&id))
-                .transpose()?,
-            backfill_snapshot_ts: serialized
-                .backfill_snapshot_ts
-                .map(Timestamp::try_from)
-                .transpose()?,
+            cursor,
+            staged: serialized.staged.unwrap_or_default(),
         })
     }
 }

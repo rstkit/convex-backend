@@ -44,7 +44,7 @@ impl ShutdownSignal {
             },
             Mode::Panic => {
                 // We don't have the shutdown signal configured. Just panic.
-                panic!("Shutting down due to fatal error: {}", fatal_error);
+                panic!("Shutting down due to fatal error: {fatal_error}");
             },
         }
     }
@@ -54,10 +54,4 @@ impl ShutdownSignal {
         Self { mode: Mode::Panic }
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    pub fn no_op() -> Self {
-        Self {
-            mode: Mode::Notify(Arc::new(Mutex::new(None))),
-        }
-    }
 }

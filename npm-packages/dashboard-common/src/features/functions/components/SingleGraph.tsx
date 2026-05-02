@@ -12,7 +12,7 @@ import {
 import { ChartDataSource, ChartData } from "@common/lib/charts/types";
 import { HealthCard } from "@common/elements/HealthCard";
 import { ChartTooltip } from "@common/elements/ChartTooltip";
-import { timeLabel } from "@common/elements/BigChart";
+import { timeLabelForMinute } from "@common/lib/format";
 import { LoadingTransition } from "@ui/Loading";
 
 export function SingleGraph({
@@ -52,7 +52,7 @@ export function SingleGraph({
           }}
         >
           {chartData && (
-            <ResponsiveContainer width="95%" height="100%">
+            <ResponsiveContainer width="100%" height="100%">
               <LineChart
                 syncId={syncId}
                 key={force}
@@ -64,16 +64,15 @@ export function SingleGraph({
               >
                 <XAxis
                   dataKey="time"
+                  axisLine={{ className: "stroke-content-tertiary/30" }}
                   tickLine={false}
-                  axisLine={false}
                   strokeWidth={1}
                   domain={["auto", "auto"]}
                   minTickGap={25}
-                  className="stroke-content-secondary"
                   tick={{ fontSize: 11, fill: "currentColor" }}
                 />
                 <YAxis
-                  axisLine={false}
+                  axisLine={{ className: "stroke-content-tertiary/30" }}
                   tickLine={false}
                   ticks={
                     title === "Cache Hit Rate"
@@ -86,7 +85,6 @@ export function SingleGraph({
                       compactDisplay: "short",
                     }).format(value) + (title === "Cache Hit Rate" ? "%" : "")
                   }
-                  className="stroke-content-secondary"
                   tick={{ fontSize: 11, fill: "currentColor" }}
                   width={60}
                 />
@@ -95,19 +93,16 @@ export function SingleGraph({
                     <ChartTooltip
                       active={active}
                       payload={payload}
-                      label={timeLabel(label)}
+                      label={timeLabelForMinute(label)}
                       showLegend
                     />
                   )}
                   animationDuration={100}
                 />
                 <CartesianGrid
-                  className="stroke-content-tertiary/40"
+                  className="stroke-content-tertiary/30"
                   horizontal
                   strokeWidth={1}
-                  vertical={false}
-                  horizontalFill={["rgba(var(--background-tertiary), 0.33)"]}
-                  verticalFill={[]}
                   syncWithTicks
                 />
                 {chartData.lineKeys.map((line) => {
@@ -117,7 +112,7 @@ export function SingleGraph({
                   return (
                     <Line
                       isAnimationActive={false}
-                      strokeWidth={1.5}
+                      strokeWidth={1}
                       activeDot={{ r: 4, className: "stroke-none" }}
                       key={dataKey}
                       dataKey={dataKey}

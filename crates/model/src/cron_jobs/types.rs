@@ -12,7 +12,10 @@ use anyhow::{
 };
 use common::{
     components::ComponentId,
-    document::ParsedDocument,
+    document::{
+        ParsedDocument,
+        MAX_USER_SIZE,
+    },
     execution_context::ExecutionId,
     log_lines::RawLogLines,
     types::Timestamp,
@@ -25,6 +28,7 @@ use serde::{
 };
 use serde_json::Value as JsonValue;
 use sync_types::{
+    types::SerializedArgs,
     CanonicalizedUdfPath,
     UdfPath,
 };
@@ -38,6 +42,7 @@ use value::{
     ConvexObject,
     ConvexValue,
     ResolvedDocumentId,
+    Size,
 };
 
 #[derive(thiserror::Error, Debug, Clone)]
@@ -51,7 +56,6 @@ pub enum CronValidationError {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CronJob {
     // Id into _cron_jobs table
     pub id: ResolvedDocumentId,
@@ -107,7 +111,6 @@ impl CronJob {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CronJobMetadata {
     // Unique identifier of a cron
     pub name: CronIdentifier,
@@ -195,29 +198,10 @@ impl Borrow<str> for CronIdentifier {
 
 pub const CRON_IDENTIFIER_REGEX: &str = "[-_ 'a-zA-Z]+";
 
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for CronIdentifier {
-    type Parameters = ();
-
-    type Strategy = impl proptest::strategy::Strategy<Value = CronIdentifier>;
-
-    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        use proptest::strategy::Strategy;
-        CRON_IDENTIFIER_REGEX.prop_filter_map("Generated invalid CronIdentifier", |s| {
-            CronIdentifier::from_str(&s).ok()
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CronSpec {
     pub udf_path: CanonicalizedUdfPath,
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "proptest::arbitrary::any_with::<ConvexArray>((0..4).into())")
-    )]
-    pub udf_args: ConvexArray,
+    pub udf_args: SerializedArgs,
     pub cron_schedule: CronSchedule,
 }
 
@@ -242,7 +226,7 @@ impl TryFrom<CronSpec> for SerializedCronSpec {
     fn try_from(spec: CronSpec) -> anyhow::Result<Self, Self::Error> {
         // Serialize the udf arguments as binary since we restrict what
         // field names can be used in a `Document`'s top-level object.
-        let udf_args_bytes = spec.udf_args.json_serialize()?.into_bytes();
+        let udf_args_bytes = spec.udf_args.into_bytes();
         Ok(Self {
             udf_path: String::from(spec.udf_path),
             udf_args: Some(udf_args_bytes),
@@ -257,11 +241,8 @@ impl TryFrom<SerializedCronSpec> for CronSpec {
     fn try_from(value: SerializedCronSpec) -> anyhow::Result<Self, Self::Error> {
         let udf_path = value.udf_path.parse()?;
         let udf_args = match value.udf_args {
-            Some(b) => {
-                let udf_args_json: JsonValue = serde_json::from_slice(&b)?;
-                udf_args_json.try_into()?
-            },
-            None => ConvexArray::try_from(vec![])?,
+            Some(b) => SerializedArgs::from_slice(&b)?,
+            None => ConvexArray::empty().into_serialized_args()?,
         };
         let cron_schedule = value.cron_schedule.try_into()?;
         Ok(Self {
@@ -366,20 +347,20 @@ impl TryFrom<JsonValue> for CronSpec {
                 if num_time_fields != 1 {
                     anyhow::bail!(CronValidationError::SecondsMinutesHours);
                 }
-                if let Some(seconds) = seconds {
-                    if seconds <= 0 {
-                        anyhow::bail!(CronValidationError::InvalidIntervalValue)
-                    }
+                if let Some(seconds) = seconds
+                    && seconds <= 0
+                {
+                    anyhow::bail!(CronValidationError::InvalidIntervalValue)
                 }
-                if let Some(minutes) = minutes {
-                    if minutes <= 0 {
-                        anyhow::bail!(CronValidationError::InvalidIntervalValue)
-                    }
+                if let Some(minutes) = minutes
+                    && minutes <= 0
+                {
+                    anyhow::bail!(CronValidationError::InvalidIntervalValue)
                 }
-                if let Some(hours) = hours {
-                    if hours <= 0 {
-                        anyhow::bail!(CronValidationError::InvalidIntervalValue)
-                    }
+                if let Some(hours) = hours
+                    && hours <= 0
+                {
+                    anyhow::bail!(CronValidationError::InvalidIntervalValue)
                 }
                 let seconds =
                     seconds.unwrap_or(0) + minutes.unwrap_or(0) * 60 + hours.unwrap_or(0) * 3600;
@@ -484,16 +465,23 @@ impl TryFrom<JsonValue> for CronSpec {
 
         let udf_path: UdfPath = j.name.parse()?;
         let udf_path_canonicalized = udf_path.canonicalize();
+        let udf_args = ConvexArray::try_from(j.args)?;
+        // CronSpec is stored in the database, so enforce document size limits
+        anyhow::ensure!(
+            udf_args.size() < MAX_USER_SIZE,
+            "Cron job args too large ({} > maximum size {})",
+            udf_args.size(),
+            MAX_USER_SIZE
+        );
         Ok(Self {
             udf_path: udf_path_canonicalized,
-            udf_args: ConvexArray::try_from(j.args)?,
+            udf_args: udf_args.into_serialized_args()?,
             cron_schedule: schedule,
         })
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum CronJobState {
     // Yet to be attempted.
@@ -509,7 +497,6 @@ pub enum CronJobState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum CronSchedule {
     Interval {
         seconds: i64,
@@ -775,16 +762,11 @@ impl CronSchedule {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CronJobLog {
     pub name: CronIdentifier,
     pub ts: Timestamp,
     pub udf_path: CanonicalizedUdfPath,
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "proptest::arbitrary::any_with::<ConvexArray>((0..4).into())")
-    )]
-    pub udf_args: ConvexArray,
+    pub udf_args: SerializedArgs,
     pub status: CronJobStatus,
     pub log_lines: CronJobLogLines,
     pub execution_time: f64,
@@ -796,7 +778,7 @@ impl TryFrom<CronJobLog> for ConvexObject {
     fn try_from(log: CronJobLog) -> anyhow::Result<Self, Self::Error> {
         // Serialize the udf arguments as binary since we restrict what
         // field names can be used in a `Document`'s top-level object.
-        let udf_args_bytes = log.udf_args.json_serialize()?.into_bytes();
+        let udf_args_bytes = log.udf_args.into_bytes();
 
         obj!(
             "name" => log.name.to_string(),
@@ -836,12 +818,9 @@ impl TryFrom<ConvexObject> for CronJobLog {
         };
         let udf_path: CanonicalizedUdfPath = udf_path
             .parse()
-            .context(format!("Failed to deserialize udf_path {}", udf_path))?;
+            .context(format!("Failed to deserialize udf_path {udf_path}"))?;
         let udf_args = match fields.remove("udfArgs") {
-            Some(ConvexValue::Bytes(b)) => {
-                let udf_args_json: JsonValue = serde_json::from_slice(&b)?;
-                udf_args_json.try_into()?
-            },
+            Some(ConvexValue::Bytes(b)) => SerializedArgs::from_slice(&b)?,
             _ => anyhow::bail!(
                 "Missing or invalid `udfArgs` field for CronJobLog: {:?}",
                 fields
@@ -882,7 +861,6 @@ impl TryFrom<ConvexObject> for CronJobLog {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum CronJobStatus {
     Success(CronJobResult),
     Err(String),
@@ -960,7 +938,6 @@ impl TryFrom<ConvexObject> for CronJobStatus {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum CronJobResult {
     Default(ConvexValue),
     Truncated(String),
@@ -1024,7 +1001,6 @@ impl TryFrom<ConvexObject> for CronJobResult {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CronJobLogLines {
     pub log_lines: RawLogLines,
     pub is_truncated: bool,
@@ -1075,69 +1051,7 @@ impl TryFrom<ConvexObject> for CronJobLogLines {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-    use sync_types::testing::assert_roundtrips;
-    use value::{
-        assert_obj,
-        ConvexObject,
-        ConvexValue,
-    };
-
-    use crate::cron_jobs::types::{
-        CronJobLog,
-        CronJobLogLines,
-        CronJobMetadata,
-        CronJobResult,
-        CronJobStatus,
-    };
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-        #[test]
-        fn test_cron_job_log_roundtrips(v in any::<CronJobLog>()) {
-            assert_roundtrips::<CronJobLog, ConvexObject>(v);
-        }
-
-        #[test]
-        fn test_cron_job_status_roundtrips(v in any::<CronJobStatus>()) {
-            assert_roundtrips::<CronJobStatus, ConvexObject>(v);
-        }
-
-        #[test]
-        fn test_cron_job_result_roundtrips(v in any::<CronJobResult>()) {
-            assert_roundtrips::<CronJobResult, ConvexObject>(v);
-        }
-
-        #[test]
-        fn test_cron_job_log_lines_roundtrips(v in any::<CronJobLogLines>()) {
-            assert_roundtrips::<CronJobLogLines, ConvexObject>(v);
-        }
-    }
-
-    #[test]
-    fn test_cron_args_bytes() {
-        // Regression test with an example cron job from prod that has udf_args as
-        // bytes.
-        let cron_job_obj = assert_obj!(
-            "cronSpec" => {
-                "cronSchedule" => {"hourUTC" => 4, "minuteUTC" => 20, "type" => "daily"},
-                // b"W3t9XQ=="
-                "udfArgs" => ConvexValue::Bytes(b"[{}]".to_vec().try_into().unwrap()),
-                "udfPath" => "crons.js:vacuumOldEntries"
-            },
-            "name" => "vacuum old entries",
-        );
-        assert_roundtrips::<_, CronJobMetadata>(cron_job_obj);
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CronNextRun {
     // Internally tracked metadata to execute the current run of the cron
     pub cron_job_id: DeveloperDocumentId,

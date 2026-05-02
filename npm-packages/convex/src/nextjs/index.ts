@@ -29,13 +29,13 @@
  *
  * And pass it to a Client Component:
  * ```typescript
- * import { Preloaded, usePreloadedQuery } from "convex/nextjs";
+ * import { Preloaded, usePreloadedQuery } from "convex/react";
  * import { api } from "@/convex/_generated/api";
  *
  * export function ClientComponent(props: {
  *   preloaded: Preloaded<typeof api.foo.baz>;
  * }) {
- *   const data = await usePreloadedQuery(props.preloaded);
+ *   const data = usePreloadedQuery(props.preloaded);
  *   // render `data`...
  * }
  * ```
@@ -64,7 +64,9 @@ export type NextjsOptions = {
   token?: string;
   /**
    * The URL of the Convex deployment to use for the function call.
-   * Defaults to `process.env.NEXT_PUBLIC_CONVEX_URL`.
+   * Defaults to `process.env.NEXT_PUBLIC_CONVEX_URL` if not provided.
+   *
+   * Explicitly passing undefined here (such as from missing ENV variables) will throw an error in the future.
    */
   url?: string;
 
@@ -137,7 +139,7 @@ export async function fetchQuery<Query extends FunctionReference<"query">>(
 ): Promise<FunctionReturnType<Query>> {
   const [fnArgs, options] = args;
   const client = setupClient(options ?? {});
-  return client.query(query, fnArgs);
+  return client.query(query, fnArgs || {});
 }
 
 /**
@@ -158,7 +160,7 @@ export async function fetchMutation<
 ): Promise<FunctionReturnType<Mutation>> {
   const [fnArgs, options] = args;
   const client = setupClient(options ?? {});
-  return client.mutation(mutation, fnArgs);
+  return client.mutation(mutation, fnArgs || {});
 }
 
 /**
@@ -177,10 +179,17 @@ export async function fetchAction<Action extends FunctionReference<"action">>(
 ): Promise<FunctionReturnType<Action>> {
   const [fnArgs, options] = args;
   const client = setupClient(options ?? {});
-  return client.action(action, fnArgs);
+  return client.action(action, fnArgs || {});
 }
 
 function setupClient(options: NextjsOptions) {
+  if ("url" in options && options.url === undefined) {
+    // This will be an error in the future.
+    // eslint-disable-next-line no-console
+    console.error(
+      "deploymentUrl is undefined, are your environment variables set? In the future explicitly passing undefined will cause an error. To explicitly use the default, pass `process.env.NEXT_PUBLIC_CONVEX_URL`.",
+    );
+  }
   const client = new ConvexHttpClient(
     getConvexUrl(options.url, options.skipConvexDeploymentUrlCheck ?? false),
   );
@@ -195,6 +204,13 @@ function setupClient(options: NextjsOptions) {
 }
 
 function getConvexUrl(
+  /**
+   * The URL of the Convex deployment to use for the function call.
+   *
+   * Defaults to `process.env.NEXT_PUBLIC_CONVEX_URL` if not provided.
+   *
+   * Explicitly passing undefined here (such as in broken ENV variables) will throw an error in the future
+   */
   deploymentUrl: string | undefined,
   skipConvexDeploymentUrlCheck: boolean,
 ) {

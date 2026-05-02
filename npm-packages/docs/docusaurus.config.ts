@@ -2,9 +2,12 @@ import { themes } from "prism-react-renderer";
 const lightCodeTheme = themes.github;
 import darkCodeTheme from "./src/theme/prism-theme/oneDark.js";
 import * as dotenv from "dotenv";
-import { resolve } from "path";
+import { execSync } from "child_process";
+import { mkdirSync, writeFileSync } from "fs";
+import { join, resolve } from "path";
 import type { Config, ThemeConfig } from "@docusaurus/types";
 import type { Options as PresetClassicOptions } from "@docusaurus/preset-classic";
+import type * as OpenApiPlugin from "docusaurus-plugin-openapi-docs";
 
 // Load environment variables.
 dotenv.config({ path: ".env.local" });
@@ -20,12 +23,19 @@ const ENTRY_POINTS_TO_DOCUMENT = [
 ];
 
 const config: Config = {
+  future: {
+    v4: true,
+  },
   title: "Convex Developer Hub",
   tagline: "The source for documentation about Convex.",
   url: "https://docs.convex.dev",
   baseUrl: "/",
   onBrokenLinks: "throw",
-  onBrokenMarkdownLinks: "throw",
+  markdown: {
+    hooks: {
+      onBrokenMarkdownLinks: "throw",
+    },
+  },
   favicon: "img/favicon.ico",
   organizationName: "get-convex", // Usually your GitHub org/user name.
   projectName: "Convex", // Usually your repo name.
@@ -46,6 +56,9 @@ const config: Config = {
     POST_HOG_HOST: process.env.POST_HOG_HOST,
   },
   themeConfig: {
+    colorMode: {
+      respectPrefersColorScheme: true,
+    },
     // Replace with your project's social card
     // image: "img/docusaurus-social-card.jpg", // TODO!
     docs: {
@@ -56,7 +69,7 @@ const config: Config = {
     },
     navbar: {
       hideOnScroll: true,
-      // If you change the Convex logo or the “docs” link, also update
+      // If you change the Convex logo or the "docs" link, also update
       // src/theme/DocSidebar/Desktop/index.js to make sure the appearance
       // when the navbar disappears on scroll is consistent.
       logo: {
@@ -67,7 +80,7 @@ const config: Config = {
       },
       items: [
         {
-          // See the comment above if you’re modifying this link
+          // See the comment above if you're modifying this link
           type: "docSidebar",
           position: "left",
           sidebarId: "docs",
@@ -129,7 +142,7 @@ const config: Config = {
         },
         {
           label: "Twitter",
-          href: "https://twitter.com/convex_dev",
+          href: "https://twitter.com/convex",
           className: "convex-twitter-logo convex-icon-link",
         },
       ],
@@ -138,13 +151,27 @@ const config: Config = {
     prism: {
       theme: lightCodeTheme,
       darkTheme: darkCodeTheme,
-      additionalLanguages: ["rust", "kotlin", "swift"],
+      additionalLanguages: ["rust", "kotlin", "swift", "bash", "shell-session"],
     },
     image: "img/social.png",
     metadata: [
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:image:alt", content: "Convex Docs logo" },
       { name: "og:image:alt", content: "Convex Docs logo" },
+    ],
+    languageTabs: [
+      // We'll provide a typed client instead.
+      /*
+      {
+        highlight: "javascript",
+        language: "javascript",
+        logoClass: "nodejs",
+        variants: ["fetch"],
+        options: {
+          followRedirect: false,
+        },
+      },
+      */
     ],
   } satisfies ThemeConfig,
   presets: [
@@ -156,6 +183,7 @@ const config: Config = {
         },
         docs: {
           sidebarPath: resolve("./sidebars.js"),
+          docItemComponent: "@theme/ApiItem",
           routeBasePath: "/",
           async sidebarItemsGenerator({
             defaultSidebarItemsGenerator,
@@ -324,40 +352,130 @@ const config: Config = {
         },
       },
     ],
+    [
+      "@signalwire/docusaurus-plugin-llms-txt",
+      {
+        siteTitle: "Convex Documentation",
+        siteDescription:
+          "For general information about Convex, read [https://www.convex.dev/llms.txt](https://www.convex.dev/llms.txt).",
+        content: {
+          enableLlmsFullTxt: true,
+          excludeRoutes: [
+            "/",
+            "/home",
+            "/quickstarts",
+            "/understanding/best-practices/other-recommendations",
+          ],
+        },
+        includeOrder: [
+          "/understanding/**",
+          "/quickstart/**",
+
+          "/functions/**",
+          "/database/**",
+          "/realtime/**",
+          "/auth/**",
+          "/scheduling/**",
+          "/file-storage/**",
+          "/search/**",
+          "/components/**",
+
+          "/ai/**",
+          "/agents/**",
+          "/testing/**",
+          "/production/**",
+          "/self-hosting/**",
+
+          "/cli/**",
+          "/client/**",
+          "/dashboard/**",
+          "/error/**",
+          "/eslint/**",
+          "/home/**",
+          "/tutorial/**",
+
+          "/api/**",
+          "/generated-api/**",
+          "/http-api/**",
+        ],
+        onRouteError: "throw",
+      },
+    ],
+    [
+      "docusaurus-plugin-openapi-docs",
+      {
+        id: "openapi", // plugin id
+        docsPluginId: "classic", // configured for preset-classic
+        config: {
+          management: {
+            specPath: ".openapi-filtered/management-openapi.json",
+            outputDir: "docs/management-api",
+            sidebarOptions: {
+              groupPathsBy: "tag",
+            },
+            hideSendButton: false,
+          } satisfies OpenApiPlugin.Options,
+          publicDeployment: {
+            specPath: ".openapi-filtered/public-deployment-openapi.json",
+            outputDir: "docs/public-deployment-api",
+            sidebarOptions: {
+              groupPathsBy: "tag",
+            },
+            hideSendButton: false,
+          } satisfies OpenApiPlugin.Options,
+          deployment: {
+            specPath: ".openapi-filtered/deployment-openapi.json",
+            outputDir: "docs/deployment-api",
+            sidebarOptions: {
+              groupPathsBy: "tag",
+            },
+            hideSendButton: false,
+          } satisfies OpenApiPlugin.Options,
+        },
+      },
+    ],
     "./src/plugins/metrics",
     "./src/plugins/prefixIds",
+    "./src/plugins/imageZoomPlugin",
+    async function versionPlugin() {
+      // Exposes a /api/version route used by isitout
+      return {
+        name: "version-plugin",
+        async postBuild({ outDir }: { outDir: string }) {
+          const sha = execSync("git rev-parse HEAD").toString().trim();
+          mkdirSync(join(outDir, "api"), { recursive: true });
+          writeFileSync(
+            join(outDir, "api", "version"),
+            JSON.stringify({ sha }),
+          );
+        },
+      };
+    },
     async function tailwindPlugin() {
       return {
         name: "docusaurus-tailwindcss",
         configurePostCss(postcssOptions) {
-          postcssOptions.plugins.push(require("tailwindcss"));
-          postcssOptions.plugins.push(require("autoprefixer"));
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          postcssOptions.plugins.push(require("@tailwindcss/postcss"));
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
           postcssOptions.plugins.push(require("postcss-nested"));
           return postcssOptions;
         },
       };
     },
   ],
+  themes: ["docusaurus-theme-openapi-docs"],
   scripts: [
     {
       src: "https://plausible.io/js/script.js",
       defer: true,
       "data-domain": "docs.convex.dev",
     },
-    {
-      src: "https://widget.kapa.ai/kapa-widget.bundle.js",
-      "data-button-hide": "true",
-      "data-modal-override-open-class": "js-launch-kapa-ai",
-      "data-website-id": "a20c0988-f33e-452b-9174-5045a58b965d",
-      "data-project-name": "Convex",
-      "data-project-color": "#141414",
-      "data-project-logo":
-        "https://img.stackshare.io/service/41143/default_f1d33b63d360437ba28c8ac981dd68d7d2478b22.png",
-      "data-user-analytics-fingerprint-enabled": "true",
-      async: true,
-    },
   ],
-  clientModules: [resolve("./src/components/Analytics/analyticsModule.ts")],
+  clientModules: [
+    resolve("./src/components/Analytics/analyticsModule.ts"),
+    resolve("./src/components/AIButton/kapaModule.ts"),
+  ],
 };
 
 export default config;

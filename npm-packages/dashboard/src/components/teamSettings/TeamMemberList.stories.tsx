@@ -1,11 +1,16 @@
-import { StoryObj } from "@storybook/react";
-import { InvitationResponse, Team, TeamMemberResponse } from "generatedApi";
+import { Meta, StoryObj } from "@storybook/nextjs";
+import { InvitationResponse, TeamResponse, TeamMember } from "generatedApi";
 
 import { TeamMemberList } from "./TeamMemberList";
 
-export default { component: TeamMemberList };
+const meta = {
+  component: TeamMemberList,
+} satisfies Meta<typeof TeamMemberList>;
 
-const members: TeamMemberResponse[] = [
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+const members: TeamMember[] = [
   {
     id: 1,
     email: "user1@example.org",
@@ -30,7 +35,7 @@ const invites: InvitationResponse[] = [
     role: "admin",
   },
 ];
-const team: Team = {
+const team: TeamResponse = {
   id: 1,
   creator: 1,
   slug: "team",
@@ -40,7 +45,7 @@ const team: Team = {
   referredBy: null,
 };
 
-export const Primary: StoryObj<typeof TeamMemberList> = {
+export const Primary: Story = {
   args: {
     members,
     invites,
@@ -48,7 +53,7 @@ export const Primary: StoryObj<typeof TeamMemberList> = {
   },
 };
 
-export const LoadingState: StoryObj<typeof TeamMemberList> = {
+export const LoadingState: Story = {
   args: {
     members: undefined,
     invites: undefined,

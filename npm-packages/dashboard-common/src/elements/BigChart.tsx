@@ -1,7 +1,6 @@
 import { useContext, useEffect, useState } from "react";
 import {
   CartesianGrid,
-  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -14,6 +13,7 @@ import { ChartData, ChartDataSource } from "@common/lib/charts/types";
 import { Callout } from "@ui/Callout";
 import { ChartTooltip } from "@common/elements/ChartTooltip";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
+import { timeLabelForMinute } from "@common/lib/format";
 
 export function BigChart({
   dataSources,
@@ -88,36 +88,23 @@ export function BigChart({
                     >
                       <XAxis
                         dataKey={chart.xAxisKey}
-                        axisLine={{
-                          stroke: "currentColor",
-                        }}
-                        tickLine={{
-                          stroke: "currentColor",
-                        }}
+                        axisLine={{ className: "stroke-content-tertiary/30" }}
+                        tickLine={false}
                         domain={["auto", "auto"]}
-                        className="text-content-secondary"
                         strokeWidth={1}
                         minTickGap={100}
                         tick={{ fontSize: 12, fill: "currentColor" }}
                       />
                       <YAxis
-                        axisLine={{
-                          stroke: "currentColor",
-                        }}
+                        axisLine={{ className: "stroke-content-tertiary/30" }}
                         tickLine={false}
-                        className="text-content-secondary"
                         tick={{ fontSize: 12, fill: "currentColor" }}
                         width={60}
                       />
                       <CartesianGrid
-                        className="stroke-content-tertiary/40"
+                        className="stroke-content-tertiary/30"
                         horizontal
                         strokeWidth={1}
-                        vertical={false}
-                        verticalFill={[]}
-                        horizontalFill={[
-                          "rgba(var(--background-tertiary), 0.33)",
-                        ]}
                         syncWithTicks
                       />
                       <Tooltip
@@ -125,44 +112,11 @@ export function BigChart({
                           <ChartTooltip
                             active={active}
                             payload={payload}
-                            label={timeLabel(label)}
+                            label={timeLabelForMinute(label)}
                           />
                         )}
                         animationDuration={100}
                       />
-                      {chart.lineKeys.length! > 1 ? (
-                        <Legend
-                          iconType="circle"
-                          iconSize={10}
-                          content={(props) => {
-                            // eslint-disable-next-line react/prop-types
-                            const { payload } = props;
-                            if (!payload) {
-                              return null;
-                            }
-
-                            return (
-                              <ul className="flex w-full justify-center gap-2">
-                                {/* eslint-disable-next-line react/prop-types */}
-                                {payload.map((entry, index) => (
-                                  <li
-                                    key={`item-${index}`}
-                                    className="flex items-center gap-1 text-content-primary"
-                                  >
-                                    <span
-                                      style={{ backgroundColor: entry.color }}
-                                      className="h-2 w-2 rounded-full"
-                                    />
-                                    {entry.value}
-                                  </li>
-                                ))}
-                              </ul>
-                            );
-                          }}
-                        />
-                      ) : (
-                        <div />
-                      )}
                       {chart.lineKeys.map((line) => {
                         const dataKey = line.key;
                         const { name } = line;
@@ -194,33 +148,3 @@ export function BigChart({
     </div>
   );
 }
-
-export const timeLabel = (value: string) => {
-  if (!value) {
-    return "";
-  }
-  // TODO(ari): Consolidate all the time rendering logic - this is a hack
-  // for now
-  if (value.includes("-") || !value.includes(":")) {
-    return value;
-  }
-  const [time, modifier] = value.split(" ");
-  const [hours, minutes] = time.split(":");
-  const date = new Date();
-  date.setHours(parseInt(hours) + (modifier === "PM" ? 12 : 0));
-  date.setMinutes(parseInt(minutes));
-  const oneMinuteLater = new Date(date);
-  oneMinuteLater.setMinutes(date.getMinutes() + 1);
-
-  return `${formatTime(date)} – ${formatTime(oneMinuteLater)}`;
-};
-
-const formatTime = (date: Date) => {
-  let hours = date.getHours();
-  const minutes = date.getMinutes();
-  const ampm = hours >= 12 ? "PM" : "AM";
-  hours %= 12;
-  hours = hours || 12; // the hour '0' should be '12'
-  const strMinutes = minutes < 10 ? `0${minutes}` : minutes;
-  return `${hours}:${strMinutes} ${ampm}`;
-};

@@ -1,10 +1,7 @@
-use std::{
-    collections::{
-        BTreeMap,
-        BTreeSet,
-        HashSet,
-    },
-    ops::Deref,
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+    HashSet,
 };
 
 use anyhow::Context;
@@ -14,6 +11,10 @@ use common::{
         CreationTime,
         PackedDocument,
     },
+    document_index_keys::{
+        SearchIndexKeyValue,
+        SearchValueTokens,
+    },
     index::IndexKeyBytes,
     query::FilterValue,
     types::{
@@ -22,21 +23,14 @@ use common::{
         WriteTimestamp,
     },
 };
+use compact_str::CompactString;
 use itertools::{
     Either,
     Itertools,
 };
 use maplit::btreemap;
-#[cfg(any(test, feature = "testing"))]
-use proptest::arbitrary::{
-    any,
-    Arbitrary,
-};
-#[cfg(any(test, feature = "testing"))]
-use proptest::strategy::Strategy;
 use tantivy::{
     schema::Field,
-    tokenizer::TextAnalyzer,
     Score,
     Term,
 };
@@ -70,6 +64,11 @@ pub struct CompiledQuery {
 }
 
 impl CompiledQuery {
+    /// If true, this query can't match anything
+    pub fn is_empty(&self) -> bool {
+        self.text_query.is_empty()
+    }
+
     pub fn num_terms(&self) -> usize {
         self.text_query.len() + self.filter_conditions.len()
     }
@@ -150,9 +149,9 @@ impl QueryTerm {
                 term: Term::from_field_text(search_field, &exact.token),
                 prefix: false,
             },
-            Some(pb::searchlight::text_query_term::TermType::Fuzzy(fuzzy)) => QueryTerm {
-                term: Term::from_field_text(search_field, &fuzzy.token),
-                prefix: fuzzy.prefix,
+            Some(pb::searchlight::text_query_term::TermType::Prefix(term)) => QueryTerm {
+                term: Term::from_field_text(search_field, &term.token),
+                prefix: true,
             },
         };
         Ok(qterm)
@@ -169,11 +168,7 @@ impl TryFrom<QueryTerm> for TextQueryTerm {
             .context("Term was not a string")?
             .to_string();
         let text_query_term = if value.prefix {
-            TextQueryTerm::Fuzzy {
-                token: term,
-                max_distance: 0.try_into()?,
-                prefix: value.prefix,
-            }
+            TextQueryTerm::Prefix(term)
         } else {
             TextQueryTerm::Exact(term)
         };
@@ -187,9 +182,8 @@ impl From<QueryTerm> for pb::searchlight::TextQueryTerm {
         let term_str = term.as_str().expect("QueryTerm not a string").to_string();
 
         let term_type = if value.prefix {
-            pb::searchlight::text_query_term::TermType::Fuzzy(pb::searchlight::FuzzyTextTerm {
+            pb::searchlight::text_query_term::TermType::Prefix(pb::searchlight::PrefixTextTerm {
                 token: term_str,
-                max_distance: 0,
                 prefix: value.prefix,
             })
         } else {
@@ -285,7 +279,6 @@ impl TermShortlistBuilder {
 /// As an implementation detail that may change in the future, these are
 /// currently just the index of the term in the shortlist.
 #[derive(PartialOrd, Ord, Clone, Debug, Eq, PartialEq, Copy)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct ShortlistId(u16);
 
 impl TryFrom<u32> for ShortlistId {
@@ -343,7 +336,7 @@ impl TermShortlist {
     pub fn get_shortlisted_terms_for_query_term(
         &self,
         query_term: &QueryTerm,
-    ) -> impl Iterator<Item = &(EditDistance, ShortlistId)> {
+    ) -> impl Iterator<Item = &(EditDistance, ShortlistId)> + use<'_> {
         if let Some(vec) = self.query_term_shortlist_items.get(query_term) {
             Either::Left(vec.iter())
         } else {
@@ -483,7 +476,6 @@ pub enum CompiledFilterCondition {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CandidateRevision {
     pub score: f32,
     pub id: InternalId,
@@ -525,7 +517,6 @@ impl TryFrom<pb::searchlight::CandidateRevision> for CandidateRevision {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct CandidateRevisionPositions {
     pub revision: CandidateRevision,
     pub positions: BTreeMap<ShortlistId, Vec<u32>>,
@@ -592,7 +583,6 @@ impl QueryResults {
 /// will be combined with the constant metadata (path, distance prefix etc) into
 /// a term, then we track reads based on individual terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct TextQueryTermRead {
     pub field_path: FieldPath,
     pub term: TextQueryTerm,
@@ -609,98 +599,31 @@ impl TextQueryTermRead {
 // would already have run on these terms prior to this point for production
 // code.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum TextQueryTerm {
     Exact(
-        #[cfg_attr(
-            any(test, feature = "testing"),
-            proptest(
-                regex = "[a-z]+",
-                filter = "|token| token.len() > 1 && token.len() < 32"
-            )
-        )]
         String,
     ),
-    Fuzzy {
-        #[cfg_attr(
-            any(test, feature = "testing"),
-            proptest(
-                regex = "[a-z]+",
-                filter = "|token| token.len() > 1 && token.len() < 32"
-            )
-        )]
-        token: String,
-        max_distance: FuzzyDistance,
-        prefix: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
-pub enum FuzzyDistance {
-    Zero,
-    One,
-    Two,
-}
-
-impl TryFrom<u8> for FuzzyDistance {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Zero),
-            1 => Ok(Self::One),
-            2 => Ok(Self::Two),
-            _ => Err(anyhow::anyhow!("Invalid distance: {value}")),
-        }
-    }
-}
-
-impl From<FuzzyDistance> for u8 {
-    fn from(value: FuzzyDistance) -> Self {
-        *value
-    }
-}
-
-impl Deref for FuzzyDistance {
-    type Target = u8;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            FuzzyDistance::Zero => &0u8,
-            FuzzyDistance::One => &1u8,
-            FuzzyDistance::Two => &2u8,
-        }
-    }
+    Prefix(
+        String,
+    ),
 }
 
 impl TextQueryTerm {
-    /// Convert a term into the parameters necessary to perform a "fuzzy"
-    /// search.
-    ///
-    /// Since exact text search is equivalent to a non-prefixed fuzzy search
-    /// with a distance 0, we can hard code those values.
-    fn fuzzy_params(&self) -> (&String, u8, bool) {
+    fn token(&self) -> &str {
         match self {
-            Self::Fuzzy {
-                token,
-                max_distance,
-                prefix,
-            } => (token, **max_distance, *prefix),
-            Self::Exact(token) => (token, 0u8, false),
+            Self::Exact(token) | Self::Prefix(token) => token,
         }
+    }
+
+    fn is_prefix(&self) -> bool {
+        matches!(self, Self::Prefix(_))
     }
 }
 
 impl HeapSize for TextQueryTerm {
     fn heap_size(&self) -> usize {
         match self {
-            TextQueryTerm::Exact(token) => token.heap_size(),
-            TextQueryTerm::Fuzzy {
-                token,
-                max_distance,
-                prefix,
-            } => token.heap_size() + max_distance.heap_size() + prefix.heap_size(),
+            TextQueryTerm::Exact(token) | TextQueryTerm::Prefix(token) => token.heap_size(),
         }
     }
 }
@@ -712,7 +635,6 @@ impl HeapSize for TextQueryTermRead {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum FilterConditionRead {
     Must(FieldPath, FilterValue),
 }
@@ -751,23 +673,6 @@ impl QueryReads {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for QueryReads {
-    type Parameters = ();
-
-    type Strategy = impl Strategy<Value = QueryReads>;
-
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        any::<(
-            WithHeapSize<Vec<TextQueryTermRead>>,
-            WithHeapSize<Vec<FilterConditionRead>>,
-        )>()
-        .prop_map(|(text_queries, filter_conditions)| {
-            QueryReads::new(text_queries, filter_conditions)
-        })
-    }
-}
-
 impl PartialEq for QueryReads {
     fn eq(&self, other: &Self) -> bool {
         self.text_queries == other.text_queries && self.filter_conditions == other.filter_conditions
@@ -783,7 +688,7 @@ impl HeapSize for QueryReads {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct SearchTermTries<T: Clone + Ord> {
     terms: BTreeMap<FieldPath, Tries<T>>,
 }
@@ -795,45 +700,58 @@ impl<T: Clone + Ord> SearchTermTries<T> {
         }
     }
 
-    #[fastrace::trace]
-    fn overlaps<'a>(&'a self, document: &'a PackedDocument, analyzer: &'a TextAnalyzer) -> bool {
-        let mut tokens = DocumentTokens::new(analyzer, document);
-        !self.matching_values(&mut tokens).is_empty()
+    fn is_empty(&self) -> bool {
+        self.terms.is_empty()
     }
 
-    fn matching_values<'a>(&'a self, tokens: &mut DocumentTokens<'a>) -> BTreeSet<T> {
-        let mut result = BTreeSet::new();
+    #[fastrace::trace]
+    fn overlaps_document<'a>(&'a self, document: &'a PackedDocument) -> bool {
         for (path, tries) in self.terms.iter() {
-            for ((prefix, _max_distance), trie) in tries.tries.iter() {
-                // Prefixing is handled by constructing prefix tokens in DocumentTokens (see the
-                // notes there), so we can get away with a symmetric search where the dfa's
-                // prefix is always set to false.
-                tokens.for_each_token(path, *prefix, |token| {
-                    if let Some(value) = trie.get(token) {
-                        result.extend(value.keys().cloned());
-                    }
-                });
+            let Some(ConvexValue::String(document_text)) = document.value().get_path(path) else {
+                continue;
+            };
+
+            let tokens = tokenize(document_text);
+            let mut overlaps = false;
+            tries.matching_values(&tokens, &mut |_| overlaps = true);
+            if overlaps {
+                return true;
             }
         }
-        result
+
+        false
+    }
+
+    #[fastrace::trace]
+    fn overlaps_index_key_value(&self, index_key_value: &SearchIndexKeyValue) -> bool {
+        let Some(tokens) = &index_key_value.search_field_value else {
+            return false;
+        };
+        let Some(tries) = self.terms.get(&index_key_value.search_field) else {
+            return false;
+        };
+        let mut overlaps = false;
+        tries.matching_values(tokens, &mut |_| overlaps = true);
+        overlaps
     }
 
     fn extend(&mut self, value: T, queries: &WithHeapSize<Vec<TextQueryTermRead>>) {
         for text_query in queries {
             let path = &text_query.field_path;
-            let (token, max_distance, prefix) = text_query.term.fuzzy_params();
+            let token = text_query.term.token();
+            let prefix = text_query.term.is_prefix();
             let art = self
                 .terms
                 .entry(path.clone())
                 .or_insert_with(Tries::new)
                 .tries
-                .entry((prefix, max_distance))
+                .entry(prefix)
                 .or_insert_with(ART::new);
 
             if let Some(value_to_count) = art.get_mut(token) {
                 *value_to_count.entry(value.clone()).or_default() += 1
             } else {
-                art.insert(token.clone(), btreemap! { value.clone() => 1});
+                art.insert(token.to_string(), btreemap! { value.clone() => 1});
             }
         }
     }
@@ -841,19 +759,20 @@ impl<T: Clone + Ord> SearchTermTries<T> {
     fn remove(&mut self, value: T, queries: &WithHeapSize<Vec<TextQueryTermRead>>) {
         for text_query in queries {
             let path = &text_query.field_path;
-            let (token, max_distance, prefix) = text_query.term.fuzzy_params();
+            let token = text_query.term.token();
+            let prefix = text_query.term.is_prefix();
             let value = value.clone();
             let tries = self
                 .terms
                 .get_mut(path)
-                .unwrap_or_else(|| panic!("Missing tries for {}", path));
+                .unwrap_or_else(|| panic!("Missing tries for {path}"));
             let trie = tries
                 .tries
-                .get_mut(&(prefix, max_distance))
-                .unwrap_or_else(|| panic!("Missing trie for ({}, {})", prefix, max_distance));
+                .get_mut(&prefix)
+                .unwrap_or_else(|| panic!("Missing trie for prefix={prefix}"));
             let value_to_count = trie
                 .get_mut(token)
-                .unwrap_or_else(|| panic!("Missing values for a token of length {}", token.len()));
+                .unwrap_or_else(|| panic!("Missing values for token of length {}", token.len()));
             let count = value_to_count
                 .entry(value.clone())
                 .and_modify(|count| {
@@ -877,13 +796,30 @@ impl<T: Clone + Ord> SearchTermTries<T> {
 struct Tries<T: Clone> {
     // TODO: Allow ART to store N values:
     // https://github.com/get-convex/convex/pull/20030/files#r1427222221
-    tries: BTreeMap<(bool, u8), ART<String, BTreeMap<T, usize>>>,
+    tries: BTreeMap<bool, ART<String, BTreeMap<T, usize>>>,
 }
 
 impl<T: Clone> Tries<T> {
     fn new() -> Self {
         Self {
             tries: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Clone + Ord> Tries<T> {
+    fn matching_values(&self, tokens: &SearchValueTokens, result: &mut impl FnMut(T)) {
+        for (prefix, trie) in self.tries.iter() {
+            // Prefixing is handled by constructing prefix tokens in ValueTokens (see the
+            // notes there), so we can get away with a symmetric search where the dfa's
+            // prefix is always set to false.
+            tokens.for_each_token(*prefix, |token| {
+                if let Some(value) = trie.get(token) {
+                    for key in value.keys() {
+                        result(key.clone());
+                    }
+                }
+            });
         }
     }
 }
@@ -905,7 +841,7 @@ impl QueryReads {
     }
 
     #[fastrace::trace]
-    pub fn overlaps(&self, document: &PackedDocument) -> bool {
+    pub fn overlaps_document(&self, document: &PackedDocument) -> bool {
         let _timer = metrics::query_reads_overlaps_timer();
 
         for filter_condition in &self.filter_conditions {
@@ -919,6 +855,7 @@ impl QueryReads {
                 return false;
             }
         }
+
         // If there are no text queries and all filters match, this counts as an
         // overlap.
         if self.text_queries.is_empty() {
@@ -927,82 +864,131 @@ impl QueryReads {
         }
         // If all the filter conditions match and there are text queries, we then check
         // for fuzzy matches.
-        let analyzer = convex_en();
-        let is_fuzzy_match = self.fuzzy_terms.overlaps(document, &analyzer);
+        let is_fuzzy_match = self.fuzzy_terms.overlaps_document(document);
+        metrics::log_query_reads_outcome(is_fuzzy_match);
+        is_fuzzy_match
+    }
+
+    #[fastrace::trace]
+    pub fn overlaps_search_index_key_value(&self, index_key_value: &SearchIndexKeyValue) -> bool {
+        let _timer = metrics::query_reads_overlaps_search_value_timer();
+
+        // Filter out documents that don’t match the filter
+        for filter_condition in &self.filter_conditions {
+            let FilterConditionRead::Must(field_path, filter_value) = filter_condition;
+
+            let Some(document_value) = index_key_value.filter_values.get(field_path) else {
+                // This shouldn’t happen because even if the field doesn’t exist in the
+                // document, there is a special `FilterValue` value for
+                // undefined. This could happen if the write log entry was created concurrently
+                // with index definition changes, but it shouldn’t be a problem.
+                metrics::log_missing_filter_value();
+                return false;
+            };
+
+            if *document_value != *filter_value {
+                return false;
+            }
+        }
+
+        // If there are no text queries and all filters match, this counts as an
+        // overlap.
+        if self.text_queries.is_empty() {
+            metrics::log_query_reads_outcome(true);
+            return true;
+        }
+        // If all the filter conditions match and there are text queries, we then check
+        // for fuzzy matches.
+        let is_fuzzy_match = self.fuzzy_terms.overlaps_index_key_value(index_key_value);
         metrics::log_query_reads_outcome(is_fuzzy_match);
         is_fuzzy_match
     }
 }
 
 pub struct TextSearchSubscriptions {
-    fuzzy_searches: BTreeMap<TabletIndexName, SearchTermTries<SubscriberId>>,
+    subscriptions: BTreeMap<TabletIndexName, TextSearchSubscription>,
+}
+
+#[derive(Default)]
+pub struct TextSearchSubscription {
+    tries: SearchTermTries<SubscriberId>,
     // TODO: Filter conditions are inefficiently searched, especially in conjunction with text
     // searches. We should eventually optimize this simpler implementation as well.
-    filter_conditions: BTreeMap<TabletIndexName, BTreeMap<SubscriberId, Vec<FilterConditionRead>>>,
+    filter_conditions: BTreeMap<SubscriberId, Vec<FilterConditionRead>>,
+}
+
+impl TextSearchSubscription {
+    fn is_empty(&self) -> bool {
+        self.tries.is_empty() && self.filter_conditions.is_empty()
+    }
 }
 
 impl TextSearchSubscriptions {
     pub fn new() -> Self {
         Self {
-            fuzzy_searches: BTreeMap::new(),
-            filter_conditions: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
         }
+    }
+
+    pub fn get(&self, index_name: &TabletIndexName) -> Option<&TextSearchSubscription> {
+        self.subscriptions.get(index_name)
+    }
+
+    pub fn filter_len(&self) -> usize {
+        self.subscriptions
+            .values()
+            .map(|s| s.filter_conditions.len())
+            .sum()
     }
 
     pub fn insert(&mut self, id: SubscriberId, index: &TabletIndexName, reads: &QueryReads) {
-        self.filter_conditions
-            .entry(index.clone())
-            .or_default()
+        let subscription = self.subscriptions.entry(index.clone()).or_default();
+        subscription
+            .filter_conditions
             .entry(id)
             .or_default()
             .extend(reads.filter_conditions.to_vec());
-        self.fuzzy_searches
-            .entry(index.clone())
-            .or_insert_with(SearchTermTries::new)
-            .extend(id, &reads.text_queries)
+        subscription.tries.extend(id, &reads.text_queries);
     }
 
     pub fn remove(&mut self, id: SubscriberId, index: &TabletIndexName, reads: &QueryReads) {
-        let conditions = self
-            .filter_conditions
+        let subscription = self
+            .subscriptions
             .get_mut(index)
-            .unwrap_or_else(|| panic!("Missing condition index entry for {}", index));
-        assert!(conditions.remove(&id).is_some());
-        if conditions.is_empty() {
-            self.filter_conditions.remove(index);
+            .unwrap_or_else(|| panic!("Missing subscription for {index}"));
+        assert!(subscription.filter_conditions.remove(&id).is_some());
+        subscription.tries.remove(id, &reads.text_queries);
+        if subscription.is_empty() {
+            self.subscriptions.remove(index);
         }
-        let terms = self
-            .fuzzy_searches
-            .get_mut(index)
-            .unwrap_or_else(|| panic!("Missing fuzzy search index entry for {}", index));
-        terms.remove(id, &reads.text_queries);
     }
 
-    pub fn add_matches(&self, document: &PackedDocument, to_notify: &mut BTreeSet<SubscriberId>) {
-        self.add_filter_conditions_matches(document, to_notify);
-        self.add_fuzzy_matches(document, to_notify);
+    pub fn add_matches(
+        &self,
+        subscription: &TextSearchSubscription,
+        index_key: &SearchIndexKeyValue,
+        notify: &mut impl FnMut(SubscriberId),
+    ) {
+        self.add_filter_conditions_matches(&subscription.filter_conditions, index_key, notify);
+        self.add_fuzzy_matches(&subscription.tries, index_key, notify);
     }
 
     fn add_filter_conditions_matches(
         &self,
-        document: &PackedDocument,
-        to_notify: &mut BTreeSet<SubscriberId>,
+        filter_conditions_map: &BTreeMap<SubscriberId, Vec<FilterConditionRead>>,
+        index_key: &SearchIndexKeyValue,
+        notify: &mut impl FnMut(SubscriberId),
     ) {
-        for (index, filter_conditions_map) in &self.filter_conditions {
-            if *index.table() != document.id().tablet_id {
-                continue;
-            }
+        for (subscriber_id, filter_conditions) in filter_conditions_map {
+            for FilterConditionRead::Must(field_path, filter_value) in filter_conditions {
+                let Some(document_value) = index_key.filter_values.get(field_path) else {
+                    metrics::log_missing_filter_value();
+                    continue;
+                };
 
-            for (subscriber_id, filter_conditions) in filter_conditions_map {
-                for filter_condition in filter_conditions {
-                    let FilterConditionRead::Must(field_path, filter_value) = filter_condition;
-                    let document_value = document.value().get_path(field_path);
-                    let document_value = FilterValue::from_search_value(document_value.as_ref());
-
-                    if document_value == *filter_value {
-                        metrics::log_query_reads_outcome(true);
-                        to_notify.insert(*subscriber_id);
-                    }
+                if document_value == filter_value {
+                    metrics::log_query_reads_outcome(true);
+                    notify(*subscriber_id);
                 }
             }
         }
@@ -1015,107 +1001,33 @@ impl TextSearchSubscriptions {
     /// This inverse looking search optimizes for cases where the number of
     /// reads/subscriptions is significantly larger than the number of
     /// tokens in the document.
-    fn add_fuzzy_matches(&self, document: &PackedDocument, matches: &mut BTreeSet<SubscriberId>) {
-        let analyzer = convex_en();
-        let mut tokens = DocumentTokens::new(&analyzer, document);
-        for (_, fuzzy_terms) in self
-            .fuzzy_searches
-            .iter()
-            .filter(|(index, _)| *index.table() == document.id().tablet_id)
+    fn add_fuzzy_matches(
+        &self,
+        tries: &SearchTermTries<SubscriberId>,
+        index_key: &SearchIndexKeyValue,
+        matches: &mut impl FnMut(SubscriberId),
+    ) {
+        if let Some(tokens) = &index_key.search_field_value
+            && let Some(tries) = tries.terms.get(&index_key.search_field)
         {
-            matches.extend(fuzzy_terms.matching_values(&mut tokens));
-        }
-    }
-}
-
-struct FieldTokens {
-    tokens: HashSet<String>,
-}
-
-impl FieldTokens {
-    fn calculate_prefixes(&self) -> impl Iterator<Item = String> + '_ {
-        let mut set = HashSet::new();
-
-        for token in self.tokens.iter() {
-            if !set.insert(token.clone()) {
-                continue;
-            }
-            for (i, _) in token.char_indices()
-                // Skip the first index because 0 up to but not including the
-                // first character index is either the empty String or includes
-                // a partial character, neither of which is a valid prefix.
-                .skip(1)
-            {
-                // After that we get all prefixes except for the complete
-                // token (because `..i` always skips the last character
-                // bytes).
-                set.insert(token[..i].to_string());
-            }
-        }
-        set.into_iter()
-    }
-}
-
-struct DocumentTokens<'a> {
-    doc: &'a PackedDocument,
-    analyzer: &'a TextAnalyzer,
-    tokens: BTreeMap<FieldPath, FieldTokens>,
-}
-
-impl<'a> DocumentTokens<'a> {
-    fn new(analyzer: &'a TextAnalyzer, doc: &'a PackedDocument) -> Self {
-        DocumentTokens {
-            doc,
-            analyzer,
-            tokens: BTreeMap::new(),
-        }
-    }
-
-    fn calculate(document_text: &ConvexString, analyzer: &'a TextAnalyzer) -> FieldTokens {
-        // Tokenizing the document is expensive, but so is constructing a prefix for
-        // every token. So we always keep track of the list of tokens, but we
-        // only construct the prefixes for each token if we have at least one search in
-        // the read set that uses prefixes.
-        let mut token_stream = analyzer.token_stream(document_text);
-        let mut tokens = HashSet::new();
-        while token_stream.advance() {
-            let text = &token_stream.token().text;
-            tokens.insert(text.clone());
-        }
-
-        FieldTokens { tokens }
-    }
-
-    fn for_each_token<'b, F>(&'b mut self, path: &'a FieldPath, prefix: bool, mut for_each: F)
-    where
-        F: FnMut(&String),
-    {
-        let Some(ConvexValue::String(document_text)) = self.doc.value().get_path(path) else {
-            return;
+            tries.matching_values(tokens, matches);
         };
-        let document_tokens = self
-            .tokens
-            .entry(path.clone())
-            .or_insert(Self::calculate(&document_text, self.analyzer));
-
-        if prefix {
-            // We're inverting prefix match here by constructing all possible prefixes for
-            // each term in the document if at least one prefix search exists in
-            // the readset (resulting in this method being called with prefix:
-            // true).
-            //
-            // This lets callers search into tries containing the actual search term with
-            // dfa prefixes set to false and still match based on prefix.
-            // Searching a trie with the document tokens is bounded by the size
-            // of the document, which is expected to be significantly smaller
-            // than the total number of subscriptions for busy backends.
-            for token in document_tokens.calculate_prefixes() {
-                for_each(&token);
-            }
-        } else {
-            for token in document_tokens.tokens.iter() {
-                for_each(token);
-            }
-        }
     }
+}
+
+pub fn tokenize(value: ConvexString) -> SearchValueTokens {
+    let analyzer = convex_en();
+
+    // Tokenizing the value is expensive, but so is constructing a prefix for
+    // every token. So we always keep track of the list of tokens, but we
+    // only construct the prefixes for each token if we have at least one search in
+    // the read set that uses prefixes.
+    let mut token_stream = analyzer.token_stream(&value);
+    let mut tokens: HashSet<CompactString> = HashSet::new();
+    while token_stream.advance() {
+        let text = &token_stream.token().text;
+        tokens.insert(text.into());
+    }
+
+    SearchValueTokens::from(tokens)
 }

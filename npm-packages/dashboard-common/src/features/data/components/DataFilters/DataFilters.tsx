@@ -3,17 +3,16 @@ import {
   ArrowRightIcon,
   CheckIcon,
   ExclamationTriangleIcon,
-  InfoCircledIcon,
   PlusIcon,
   QuestionMarkCircledIcon,
 } from "@radix-ui/react-icons";
 import { GenericDocument } from "convex/server";
 import {
+  DatabaseIndexFilterClause,
   Filter,
-  FilterByIndex,
-  FilterByIndexRange,
   FilterExpression,
   FilterValidationError,
+  SearchIndexFilterClause,
 } from "system-udfs/convex/_system/frontend/lib/filters";
 import {
   FilterEditor,
@@ -22,6 +21,7 @@ import {
 import { SchemaJson } from "@common/lib/format";
 import { Button } from "@ui/Button";
 import { Tooltip } from "@ui/Tooltip";
+import { HelpTooltip } from "@ui/HelpTooltip";
 import {
   FilterButton,
   filterMenuId,
@@ -35,12 +35,19 @@ import {
   documentValidatorForTable,
   validatorForColumn,
 } from "@common/features/data/components/Table/utils/validators";
-import { useFilterHistory } from "@common/features/data/lib/useTableFilters";
+import {
+  useFilterHistory,
+  useTableFilters,
+} from "@common/features/data/lib/useTableFilters";
 import { cn } from "@ui/cn";
-import { useTableIndexes } from "@common/features/data/lib/api";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
-import { IndexFilterState } from "./IndexFilterEditor";
+import { useNents } from "@common/lib/useNents";
+import { useQuery } from "convex/react";
+import { api } from "system-udfs/convex/_generated/api";
+import { Index } from "@common/features/data/lib/api";
 import { IndexFilters, getDefaultIndex } from "./IndexFilters";
+import { clearFilters } from "./clearFilters";
+import { FieldSelector } from "./FieldSelector";
 
 export function DataFilters({
   defaultDocument,
@@ -48,7 +55,7 @@ export function DataFilters({
   tableFields,
   componentId,
   filters,
-  onChangeFilters,
+  onFiltersChange,
   dataFetchErrors,
   draftFilters,
   setDraftFilters,
@@ -58,13 +65,18 @@ export function DataFilters({
   hasFilters,
   showFilters,
   setShowFilters,
+  allFields,
+  hiddenColumns,
+  setHiddenColumns,
+  columnOrder,
+  setColumnOrder,
 }: {
   defaultDocument: GenericDocument;
   tableName: string;
   tableFields: string[];
   componentId: string | null;
   filters?: FilterExpression;
-  onChangeFilters(next: FilterExpression): void;
+  onFiltersChange(next: FilterExpression): void;
   dataFetchErrors?: FilterValidationError[];
   draftFilters?: FilterExpression;
   setDraftFilters(next: FilterExpression): void;
@@ -74,8 +86,18 @@ export function DataFilters({
   hasFilters: boolean;
   showFilters: boolean;
   setShowFilters: React.Dispatch<React.SetStateAction<boolean>>;
+  allFields: string[];
+  hiddenColumns: string[];
+  setHiddenColumns: (hiddenColumns: string[]) => void;
+  columnOrder: string[];
+  setColumnOrder: (columnOrder: string[]) => void;
 }) {
-  const { indexes } = useTableIndexes(tableName);
+  const { selectedNent } = useNents();
+  const indexes =
+    (useQuery(api._system.frontend.indexes.default, {
+      tableName,
+      tableNamespace: selectedNent?.id ?? null,
+    }) satisfies undefined | null | Index[]) ?? undefined;
   const {
     isDirty,
     hasInvalidFilters,
@@ -91,11 +113,12 @@ export function DataFilters({
     onChangeOrder,
     getValidatorForField,
     onChangeIndexFilter,
+    applyFiltersWithHistory,
   } = useDataFilters({
     tableName,
     componentId,
     filters,
-    onChangeFilters,
+    onFiltersChange,
     draftFilters,
     setDraftFilters,
     activeSchema,
@@ -103,13 +126,19 @@ export function DataFilters({
 
   const numRowsWeKnowOf = hasFilters ? numRowsLoaded : numRows;
 
-  const { enableIndexFilters } = useContext(DeploymentInfoContext);
   const { useLogDeploymentEvent } = useContext(DeploymentInfoContext);
   const log = useLogDeploymentEvent();
 
+  const onIndexError = useCallback(
+    (idx: number, errors: string[]) => onError("index", idx, errors),
+    [onError],
+  );
+
+  const isSearchIndex = shownFilters.index && "search" in shownFilters.index;
+
   return (
     <form
-      className="flex w-full flex-col gap-2 rounded-t border border-b-0 bg-background-secondary/50 p-2"
+      className="flex w-full flex-col gap-2 rounded-t-lg border border-b-0 bg-background-secondary/50 p-2"
       id={filterMenuId}
       data-testid="filterMenu"
       onSubmit={(e) => {
@@ -124,7 +153,7 @@ export function DataFilters({
           hasOtherFilters:
             shownFilters.clauses.filter((c) => c.enabled !== false).length > 0,
         });
-        onChangeFilters(
+        onFiltersChange(
           draftFilters || {
             clauses: [],
             index: undefined,
@@ -134,11 +163,11 @@ export function DataFilters({
       key={currentIdx}
     >
       <div className="flex flex-col">
-        <div className="flex justify-between gap-2">
-          <div className="flex items-center">
+        <div className="scrollbar flex justify-between gap-4 overflow-x-auto">
+          <div className="flex items-center gap-2">
             <div
               className={cn(
-                "flex w-full rounded-lg bg-background-secondary border",
+                "flex w-full min-w-fit overflow-hidden rounded-lg border bg-background-secondary",
                 showFilters && "rounded-b-none border-b-0",
               )}
             >
@@ -184,6 +213,13 @@ export function DataFilters({
                 open={showFilters}
               />
             </div>
+            <FieldSelector
+              allFields={allFields}
+              hiddenColumns={hiddenColumns}
+              setHiddenColumns={setHiddenColumns}
+              columnOrder={columnOrder}
+              setColumnOrder={setColumnOrder}
+            />
           </div>
           <div className="flex gap-2">
             {numRowsWeKnowOf !== undefined && (
@@ -214,41 +250,36 @@ export function DataFilters({
         </div>
         {indexes && showFilters && (
           <div className="w-full animate-fadeInFromLoading">
-            <div className="flex w-full flex-col gap-2 overflow-x-auto rounded rounded-tl-none border bg-background-secondary p-2 pb-2.5 scrollbar">
-              {enableIndexFilters && (
-                <IndexFilters
-                  shownFilters={shownFilters}
-                  defaultDocument={defaultDocument}
-                  indexes={indexes}
-                  tableName={tableName}
-                  activeSchema={activeSchema}
-                  getValidatorForField={getValidatorForField}
-                  onChangeFilters={onChangeFilters}
-                  setDraftFilters={setDraftFilters}
-                  onChangeOrder={onChangeOrder}
-                  onChangeIndexFilter={onChangeIndexFilter}
-                  invalidFilters={invalidFilters}
-                  onError={(...args) => onError("index", ...args)}
-                  hasInvalidFilters={hasInvalidFilters}
-                />
-              )}
+            <div className="scrollbar flex w-full flex-col gap-2 overflow-x-auto rounded-sm rounded-tl-none border bg-background-secondary p-2 pb-2.5">
+              <IndexFilters
+                shownFilters={shownFilters}
+                defaultDocument={defaultDocument}
+                indexes={indexes}
+                tableName={tableName}
+                activeSchema={activeSchema}
+                getValidatorForField={getValidatorForField}
+                onFiltersChange={onFiltersChange}
+                applyFiltersWithHistory={applyFiltersWithHistory}
+                setDraftFilters={setDraftFilters}
+                onChangeOrder={onChangeOrder}
+                onChangeIndexFilter={onChangeIndexFilter}
+                invalidFilters={invalidFilters}
+                onError={onIndexError}
+                hasInvalidFilters={hasInvalidFilters}
+              />
               {shownFilters.clauses.length > 0 && (
                 <div className="mt-2 flex flex-col gap-2">
-                  {enableIndexFilters && (
-                    <div className="flex items-center gap-1">
-                      <hr className="w-2" />{" "}
-                      <p className="flex items-center gap-1 text-xs text-content-secondary">
-                        Other Filters
-                        <Tooltip
-                          tip="Other filters are not indexed and are applied after the indexed filters. These filters are less efficient."
-                          side="right"
-                        >
-                          <InfoCircledIcon />
-                        </Tooltip>
-                      </p>{" "}
-                      <hr className="grow" />
-                    </div>
-                  )}
+                  <div className="flex items-center gap-1">
+                    <hr className="w-2" />{" "}
+                    <p className="flex items-center gap-1 text-xs text-content-secondary">
+                      Other Filters
+                      <HelpTooltip tipSide="right">
+                        Other filters are not indexed and are applied after the
+                        indexed filters. These filters are less efficient.
+                      </HelpTooltip>
+                    </p>{" "}
+                    <hr className="grow" />
+                  </div>
                   {shownFilters.clauses.map((clause, idx) => (
                     <FilterItem
                       key={clause.id || idx}
@@ -272,7 +303,7 @@ export function DataFilters({
                               (c) => c.enabled !== false,
                             ).length > 0,
                         });
-                        onChangeFilters(shownFilters);
+                        onFiltersChange(shownFilters);
                       }}
                       onError={(...args) => onError("filter", ...args)}
                       error={
@@ -293,18 +324,21 @@ export function DataFilters({
                 </div>
               )}
               <div className="mt-2 flex items-center gap-1">
-                <Button
-                  variant="neutral"
-                  size="xs"
-                  className="text-xs"
-                  icon={<PlusIcon />}
-                  onClick={() => {
-                    onAddFilter(shownFilters.clauses.length);
-                    log("add filter");
-                  }}
-                >
-                  Add filter
-                </Button>
+                {/* TODO(ENG-9733) Support arbitrary filters in search queries */}
+                {!isSearchIndex && (
+                  <Button
+                    variant="neutral"
+                    size="xs"
+                    className="text-xs"
+                    icon={<PlusIcon />}
+                    onClick={() => {
+                      onAddFilter(shownFilters.clauses.length);
+                      log("add filter");
+                    }}
+                  >
+                    Add filter
+                  </Button>
+                )}
                 {isDirty || (dataFetchErrors && dataFetchErrors.length > 0) ? (
                   <Button
                     type="submit"
@@ -332,22 +366,7 @@ export function DataFilters({
                         variant="neutral"
                         className="ml-auto text-xs"
                         onClick={() => {
-                          onChangeFilters({
-                            clauses: [],
-                            index: shownFilters.index
-                              ? {
-                                  name: shownFilters.index.name,
-                                  clauses: shownFilters.index.clauses.map(
-                                    (clause) => ({
-                                      ...clause,
-                                      enabled: false,
-                                    }),
-                                  ) as
-                                    | FilterByIndex[]
-                                    | [...FilterByIndex[], FilterByIndexRange],
-                                }
-                              : undefined,
-                          });
+                          onFiltersChange(clearFilters(shownFilters));
                         }}
                       >
                         Clear filters
@@ -357,7 +376,7 @@ export function DataFilters({
                 )}
                 {dataFetchErrors && dataFetchErrors.length > 0 && (
                   <p
-                    className="h-4 break-words text-xs text-content-errorSecondary"
+                    className="h-4 text-xs break-words text-content-errorSecondary"
                     role="alert"
                   >
                     {dataFetchErrors[0].error}
@@ -416,7 +435,7 @@ function FilterItem({
       />
       {error && (
         <Tooltip tip={error}>
-          <div className="rounded border bg-background-error p-1">
+          <div className="rounded-sm border bg-background-error p-1">
             <ExclamationTriangleIcon className="size-4 text-content-errorSecondary" />
           </div>
         </Tooltip>
@@ -460,7 +479,7 @@ function useDataFilters({
   tableName,
   componentId,
   filters,
-  onChangeFilters,
+  onFiltersChange,
   draftFilters,
   setDraftFilters,
   activeSchema,
@@ -468,7 +487,7 @@ function useDataFilters({
   tableName: string;
   componentId: string | null;
   filters?: FilterExpression;
-  onChangeFilters(next: FilterExpression): void;
+  onFiltersChange(next: FilterExpression): void;
   draftFilters?: FilterExpression;
   setDraftFilters(next: FilterExpression): void;
   activeSchema: SchemaJson | null;
@@ -498,7 +517,7 @@ function useDataFilters({
       ({
         clauses: [],
         index: getDefaultIndex(),
-      } as FilterExpression),
+      } satisfies FilterExpression),
     [draftFilters],
   );
 
@@ -558,7 +577,10 @@ function useDataFilters({
   );
 
   const onChangeIndexFilter = useCallback(
-    (filter: IndexFilterState, idx: number) => {
+    (
+      filter: DatabaseIndexFilterClause | SearchIndexFilterClause,
+      idx: number,
+    ) => {
       const newFilters = cloneDeep(shownFilters);
       if (!newFilters.index) {
         throw new Error("Index not found");
@@ -573,7 +595,11 @@ function useDataFilters({
             filterType: "index",
             filterIndex: idx,
           });
-        } else if (oldFilter.type !== filter.type) {
+        } else if (
+          "type" in oldFilter &&
+          "type" in filter &&
+          oldFilter.type !== filter.type
+        ) {
           log("index filter type change", {
             oldType: oldFilter.type,
             newType: filter.type,
@@ -602,7 +628,7 @@ function useDataFilters({
           ...shownFilters.clauses.slice(idx + 1),
         ],
         index: shownFilters.index || getDefaultIndex(),
-      } as FilterExpression;
+      } satisfies FilterExpression;
       setDraftFilters(newFilters);
     },
     [shownFilters, setDraftFilters, setInvalidFilters, log],
@@ -622,7 +648,7 @@ function useDataFilters({
           ...shownFilters.clauses.slice(idx),
         ],
         index: shownFilters.index || getDefaultIndex(),
-      } as FilterExpression;
+      } satisfies FilterExpression;
       setDraftFilters(newFilters);
     },
     [shownFilters, setDraftFilters, log],
@@ -639,6 +665,7 @@ function useDataFilters({
   );
 
   const { filterHistory } = useFilterHistory(tableName, componentId);
+  const { applyFiltersWithHistory } = useTableFilters(tableName, componentId);
   const [currentIdx, setCurrentIdx] = useState(0);
   useEffect(() => {
     setCurrentIdx(0);
@@ -671,9 +698,9 @@ function useDataFilters({
         order: newOrder,
       };
       setDraftFilters(newFilters);
-      onChangeFilters(newFilters);
+      onFiltersChange(newFilters);
     },
-    [shownFilters, setDraftFilters, onChangeFilters, invalidFilters, log],
+    [shownFilters, setDraftFilters, onFiltersChange, invalidFilters, log],
   );
 
   return {
@@ -691,5 +718,6 @@ function useDataFilters({
     onChangeOrder,
     getValidatorForField,
     onChangeIndexFilter,
+    applyFiltersWithHistory,
   };
 }

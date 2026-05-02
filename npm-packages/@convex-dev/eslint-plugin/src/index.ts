@@ -1,14 +1,20 @@
-import { noImportUseNode } from "./lib/noImportUseNode.js";
-import noOldRegisteredFunctionSyntax from "./lib/noOldRegisteredFunctionSyntax.js";
-import { noMissingArgs, noArgsWithoutValidator } from "./lib/noMissingArgs.js";
-import { RuleModule } from "@typescript-eslint/utils/ts-eslint";
+import { noImportUseNode } from "./lib/no-import-use-node.js";
+import { noOldRegisteredFunctionSyntax } from "./lib/no-old-registered-function-syntax.js";
+import { requireArgsValidator } from "./lib/require-args-validator.js";
+import { noFilterInQuery } from "./lib/no-filter-in-query.js";
+import { explicitTableIds } from "./lib/explicit-table-ids.js";
+import { noCollectInQuery } from "./lib/no-collect-in-query.js";
+import type { RuleModule } from "@typescript-eslint/utils/ts-eslint";
+import { version } from "./version.js";
 
 const rules = {
   "no-old-registered-function-syntax": noOldRegisteredFunctionSyntax,
-  "no-args-without-validator": noArgsWithoutValidator,
-  "no-missing-args-validator": noMissingArgs,
+  "require-args-validator": requireArgsValidator,
   "import-wrong-runtime": noImportUseNode,
-} satisfies Record<string, RuleModule<any>>;
+  "explicit-table-ids": explicitTableIds,
+  "no-filter-in-query": noFilterInQuery,
+  "no-collect-in-query": noCollectInQuery,
+} satisfies Record<string, RuleModule<string, unknown[]>>;
 
 const recommendedRules = {
   // This rule is a good idea but bothersome to convert projects to later:
@@ -16,29 +22,28 @@ const recommendedRules = {
   // file if all Node.js-specific imports are side-effect free.
   "@convex-dev/import-wrong-runtime": "off",
   "@convex-dev/no-old-registered-function-syntax": "error",
-  // This is a reasonable idea in large projects: throw at runtime
-  // when API endpoints that don't expect arguments receive them.
-  // But it lacks the typical benefit of a validator providing
-  // types so it feels more pedantic.
-  "@convex-dev/no-missing-args-validator": "off",
-  "@convex-dev/no-args-without-validator": "error",
+  "@convex-dev/require-args-validator": "error",
+  "@convex-dev/explicit-table-ids": "error",
+  "@convex-dev/no-filter-in-query": "warn",
 } satisfies {
   [key: `@convex-dev/${string}`]: "error" | "warn" | "off";
 };
 
-const isESM = typeof require === "undefined";
+// Bun is hard to feature detect for ESM vs CJS, so only support ESLint 9 with Bun (contributions welcome)
+// @ts-expect-error Bun types are not installed
+const isBun = typeof Bun !== "undefined";
+// Detect ESM to guess at which ESLint version we're using.
+const isESM = typeof require === "undefined" || isBun;
 
 // Base plugin structure, common across ESLint 8 and 9
 const plugin = {
   // loose types so this can work with ESlint 8 and 9
   configs: {} as {
     recommended: any;
-    /** Only available in ESlint 8 */
-    recommendedRulesCustomConvexDirectoryLocation: any;
   },
   meta: {
     name: "@convex-dev/eslint-plugin",
-    version: "0.0.0-alpha.0",
+    version,
   },
   rules,
   processors: {},
@@ -81,10 +86,6 @@ else {
           rules: recommendedRules,
         },
       ],
-    },
-    /** Useful for custom convex directory locations */
-    recommendedRulesCustomConvexDirectoryLocation: {
-      rules: recommendedRules,
     },
   };
 

@@ -1,5 +1,4 @@
 import React, { useEffect } from "react";
-import { useUser } from "@auth0/nextjs-auth0/client";
 import { useRouter } from "next/router";
 import { useAsync } from "react-use";
 import { basicLogger, LDClient, LDFlagSet } from "launchdarkly-js-client-sdk";
@@ -36,7 +35,6 @@ export function LaunchDarklyProvider({
 }: {
   children: React.ReactNode;
 }) {
-  const { user } = useUser();
   const router = useRouter();
 
   const clientSideID = process.env.NEXT_PUBLIC_LAUNCHDARKLY_SDK_CLIENT_SIDE_ID;
@@ -45,9 +43,11 @@ export function LaunchDarklyProvider({
   }
 
   const [, setContext] = useGlobalLDContext();
-  const localContext = useLDContext(user);
+  const localContext = useLDContext();
   useEffect(() => {
-    !router.query.deploymentName && localContext && setContext(localContext);
+    if (!router.query.deploymentName && localContext) {
+      setContext(localContext);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(localContext), router.query.deploymentName]);
 
@@ -109,45 +109,11 @@ export const LaunchDarklyConsumer = withLDConsumer({ clientOnly: true })(
       if (process.env.NEXT_PUBLIC_TEST_MODE) {
         return;
       }
-      context && void ldClient?.identify(context);
+      if (context) {
+        void ldClient?.identify(context);
+      }
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [JSON.stringify(context)]);
     return children;
   },
 );
-
-// Anonymous LaunchDarkly provider that always uses an anonymous user context
-export function AnonymousLaunchDarklyProvider({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
-  const clientSideID = process.env.NEXT_PUBLIC_LAUNCHDARKLY_SDK_CLIENT_SIDE_ID;
-  if (!clientSideID) {
-    throw new Error("LaunchDarkly Client Side ID not set");
-  }
-
-  // Always use a stable anonymous user context
-  const anonymousContext = { key: "anon", anonymous: true, kind: "user" };
-
-  const { value: LDProvider }: any = useAsync<
-    () => ReturnType<typeof asyncWithLDProvider>
-  >(
-    async () =>
-      LDProvider ||
-      asyncWithLDProvider({
-        clientSideID,
-        flags: flagDefaultsKebabCase,
-        context: anonymousContext,
-      }),
-    [],
-  );
-
-  return LDProvider ? (
-    <LDProvider>{children}</LDProvider>
-  ) : (
-    <div className="flex h-screen w-full items-center justify-center">
-      <LoadingLogo />
-    </div>
-  );
-}

@@ -13,13 +13,11 @@ use value::TableNumber;
 
 use crate::{
     array::ArrayShape,
-    map::MapShape,
     object::{
         ObjectField,
         ObjectShape,
         RecordShape,
     },
-    set::SetShape,
     string::StringLiteralShape,
     Shape,
     ShapeConfig,
@@ -49,15 +47,14 @@ impl<C: ShapeConfig, S: ShapeCounter> fmt::Display for ShapeEnum<C, S> {
             ShapeEnum::NaN => write!(f, "NaN"),
             ShapeEnum::NormalFloat64 => write!(f, "normalfloat64"),
             ShapeEnum::Boolean => write!(f, "boolean"),
-            ShapeEnum::StringLiteral(ref s) => write!(f, "{:?}", &s[..]),
-            ShapeEnum::Id(ref table) => write!(f, "id<{table}>"),
+            ShapeEnum::StringLiteral(s) => write!(f, "{:?}", &s[..]),
+            ShapeEnum::Id(table) => write!(f, "id<{table}>"),
             ShapeEnum::FieldName => write!(f, "field_name"),
             ShapeEnum::String => write!(f, "string"),
             ShapeEnum::Bytes => write!(f, "bytes"),
-            ShapeEnum::Array(ref array) => write!(f, "array<{}>", array.element()),
-            ShapeEnum::Set(ref set) => write!(f, "set<{}>", set.element()),
-            ShapeEnum::Map(ref map) => write!(f, "map<{}, {}>", map.key(), map.value()),
-            ShapeEnum::Object(ref object) => {
+            ShapeEnum::Array(array) => write!(f, "array<{}>", array.element()),
+
+            ShapeEnum::Object(object) => {
                 let mut first = true;
                 write!(f, "{{")?;
                 for (field_name, field) in object.iter() {
@@ -77,10 +74,10 @@ impl<C: ShapeConfig, S: ShapeCounter> fmt::Display for ShapeEnum<C, S> {
                 }
                 write!(f, "}}")
             },
-            ShapeEnum::Record(ref record) => {
+            ShapeEnum::Record(record) => {
                 write!(f, "record<{}, {}>", record.field(), record.value())
             },
-            ShapeEnum::Union(ref union) => {
+            ShapeEnum::Union(union) => {
                 let mut first = true;
                 for variant in union.iter() {
                     if first {
@@ -108,7 +105,7 @@ pub(crate) fn format_shapes<'a, C: ShapeConfig, S: ShapeCounter + 'static>(
         } else {
             out.push_str(", ");
         }
-        out.push_str(&format!("{}", t));
+        out.push_str(&format!("{t}"));
     }
     if first {
         out.push_str("<empty>");
@@ -195,7 +192,7 @@ impl<C: ShapeConfig> StructuralShape<C> {
         ];
         for (unit_str, unit_enum) in units {
             if let Some(suffix) = s.strip_prefix(unit_str) {
-                return Ok((Self::new(unit_enum.clone()), suffix));
+                return Ok((Self::new(unit_enum), suffix));
             }
         }
         if let Some(mut suffix) = s.strip_prefix('{') {
@@ -235,13 +232,6 @@ impl<C: ShapeConfig> StructuralShape<C> {
         } else if let Some(mut suffix) = s.strip_prefix("array<") {
             let value = Self::parse_value_with_terminator(&mut suffix, ">")?;
             Ok((Self::new(ShapeEnum::Array(ArrayShape::new(value))), suffix))
-        } else if let Some(mut suffix) = s.strip_prefix("set<") {
-            let value = Self::parse_value_with_terminator(&mut suffix, ">")?;
-            Ok((Self::new(ShapeEnum::Set(SetShape::new(value))), suffix))
-        } else if let Some(mut suffix) = s.strip_prefix("map<") {
-            let key = Self::parse_value_with_terminator(&mut suffix, ", ")?;
-            let value = Self::parse_value_with_terminator(&mut suffix, ">")?;
-            Ok((Self::new(ShapeEnum::Map(MapShape::new(key, value))), suffix))
         } else if let Some(mut suffix) = s.strip_prefix("record<") {
             let key = Self::parse_value_with_terminator(&mut suffix, ", ")?;
             let value = Self::parse_value_with_terminator(&mut suffix, ">")?;
@@ -256,47 +246,6 @@ impl<C: ShapeConfig> StructuralShape<C> {
             Ok((Self::new(StringLiteralShape::shape_of(literal)), suffix))
         } else {
             anyhow::bail!("unexpected token at '{s}'");
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_from_str_structural {
-
-    use std::str::FromStr;
-
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-
-    use crate::{
-        testing::SmallTestConfig,
-        Shape,
-        StructuralShape,
-    };
-
-    #[test]
-    fn test_from_str_structural_union() -> anyhow::Result<()> {
-        // Regression test: used to panic.
-        let input = r#"{"location": {"city": string, "country": string} | {"country": string}} | {"name": string, "location": {"city": string, "country": string} | {"country": string}}"#;
-        let _t = StructuralShape::<SmallTestConfig>::from_str(input)?;
-        Ok(())
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            failure_persistence: None, cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1),  ..ProptestConfig::default()
-        })]
-        #[test]
-        fn shape_to_string_roundtrips_structural(
-            t in any::<StructuralShape<SmallTestConfig>>()
-        ) {
-            let shape_string = t.to_string();
-            let shape_from_strng = Shape::from_str(&shape_string).unwrap();
-
-            prop_assert_eq!(&t, &shape_from_strng);
-
-            let another_round = Shape::from_str(&shape_from_strng.to_string()).unwrap();
-            prop_assert_eq!(&shape_from_strng, &another_round);
         }
     }
 }

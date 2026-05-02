@@ -1,10 +1,9 @@
 import type {
   MemberResponse,
-  ProjectDetails,
   ProjectMemberRoleResponse,
   UpdateProjectRolesArgs,
-  Team,
-  TeamMemberResponse,
+  TeamResponse,
+  TeamMember,
 } from "generatedApi";
 import { useRouter } from "next/router";
 import { useRef, useState } from "react";
@@ -16,7 +15,8 @@ import { CaretSortIcon } from "@radix-ui/react-icons";
 import { useMount } from "react-use";
 import classNames from "classnames";
 import startCase from "lodash/startCase";
-import Link from "next/link";
+import { Link } from "@ui/Link";
+import { Callout } from "@ui/Callout";
 import { MemberProjectRolesModal } from "./MemberProjectRolesModal";
 
 export const roleOptions: Option<"admin" | "developer">[] = [
@@ -25,10 +25,10 @@ export const roleOptions: Option<"admin" | "developer">[] = [
 ];
 
 type TeamMemberListItemProps = {
-  team: Team;
+  team: TeamResponse;
   myProfile: MemberResponse;
-  member: TeamMemberResponse;
-  members: TeamMemberResponse[];
+  member: TeamMember;
+  members: TeamMember[];
   canChangeRole: boolean;
   onChangeRole: (body: {
     memberId: number;
@@ -38,7 +38,6 @@ type TeamMemberListItemProps = {
   onUpdateProjectRoles: (body: UpdateProjectRolesArgs) => Promise<undefined>;
   hasAdminPermissions: boolean;
   projectRoles: ProjectMemberRoleResponse[];
-  projects: ProjectDetails[];
 };
 export function TeamMemberListItem({
   team,
@@ -51,7 +50,6 @@ export function TeamMemberListItem({
   onRemoveMember,
   hasAdminPermissions,
   projectRoles,
-  projects,
 }: TeamMemberListItemProps) {
   const router = useRouter();
   const isMemberTheLastAdmin =
@@ -66,7 +64,9 @@ export function TeamMemberListItem({
 
   const ref = useRef<HTMLDivElement | null>(null);
   useMount(() => {
-    isHighlighted && ref.current?.scrollIntoView();
+    if (isHighlighted) {
+      ref.current?.scrollIntoView();
+    }
   });
 
   let removeMemberMessage = "";
@@ -79,7 +79,9 @@ export function TeamMemberListItem({
   }
 
   let updateRoleMessage = "";
-  if (isMemberTheLastAdmin) {
+  if (team.managedBy === "vercel") {
+    updateRoleMessage = `This team is managed by ${startCase(team.managedBy)}. You may manage team roles in ${startCase(team.managedBy)}.`;
+  } else if (isMemberTheLastAdmin) {
     updateRoleMessage = "You cannot change the role of the last admin.";
   } else if (!hasAdminPermissions) {
     updateRoleMessage = "You do not have permission to change member roles.";
@@ -101,7 +103,7 @@ export function TeamMemberListItem({
       className={classNames(
         "flex flex-wrap justify-between items-center gap-4 py-2",
         isHighlighted
-          ? "bg-highlight px-2 -mx-2 rounded border"
+          ? "bg-highlight px-2 -mx-2 rounded-sm border"
           : "border-b last:border-b-0",
       )}
     >
@@ -125,10 +127,10 @@ export function TeamMemberListItem({
             <div className="text-sm text-content-primary">
               {startCase(member.role)}
             </div>
-          ) : !canManageMember ? (
+          ) : !canManageMember || team.managedBy === "vercel" ? (
             // Combobox is difficult to create a disabled state for, so we're using a div here that looks like a disabled input
             <Tooltip tip={updateRoleMessage}>
-              <div className="flex cursor-not-allowed items-center gap-1 rounded border bg-background-tertiary px-3 py-2 text-content-secondary">
+              <div className="flex cursor-not-allowed items-center gap-1 rounded-sm border bg-background-tertiary p-1.5 text-content-secondary">
                 {startCase(member.role)}
                 <CaretSortIcon className="h-5 w-5" />
               </div>
@@ -145,10 +147,7 @@ export function TeamMemberListItem({
                 tip: (
                   <span>
                     Change this member's{" "}
-                    <Link
-                      href="https://docs.convex.dev/dashboard/teams#roles-and-permissions"
-                      className="underline"
-                    >
+                    <Link href="https://docs.convex.dev/dashboard/teams#roles-and-permissions">
                       team role
                     </Link>
                     .
@@ -195,9 +194,24 @@ export function TeamMemberListItem({
             }}
             dialogTitle={isMemberMe ? "Leave team" : "Remove team member"}
             dialogBody={
-              isMemberMe
-                ? `You are about to leave ${team.name}, are you sure you want to continue?`
-                : `You are about to remove ${confirmationDisplayName} from ${team.name}, are you sure you want to continue?`
+              isMemberMe ? (
+                `You are about to leave ${team.name}, are you sure you want to continue?`
+              ) : (
+                <div className="flex flex-col gap-1">
+                  <p>
+                    You are about to remove {confirmationDisplayName} from{" "}
+                    {team.name}, are you sure you want to continue?{" "}
+                  </p>
+                  {team.managedBy === "vercel" && (
+                    <Callout>
+                      Note that this member may be able to re-join the team
+                      through the {startCase(team.managedBy)} dashboard if they
+                      are still a member of your {startCase(team.managedBy)}{" "}
+                      team.
+                    </Callout>
+                  )}
+                </div>
+              )
             }
             confirmText="Confirm"
           />
@@ -206,7 +220,6 @@ export function TeamMemberListItem({
           <MemberProjectRolesModal
             member={member}
             team={team}
-            projects={projects}
             projectRoles={projectRoles}
             onClose={() => setShowProjectRolesModal(false)}
             onUpdateProjectRoles={onUpdateProjectRoles}

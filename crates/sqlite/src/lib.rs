@@ -1,5 +1,5 @@
 #![feature(try_blocks)]
-#![feature(let_chains)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(coroutines)]
 
 use std::{
@@ -37,14 +37,15 @@ use common::{
         LatestDocument,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceIndexEntry,
         PersistenceReader,
         RetentionValidator,
         TimestampRange,
     },
     query::Order,
+    runtime::CoopStreamExt as _,
+    try_anyhow,
     types::{
-        DatabaseIndexUpdate,
-        DatabaseIndexValue,
         IndexId,
         PersistenceVersion,
         Timestamp,
@@ -83,18 +84,13 @@ struct Inner {
 }
 
 impl SqlitePersistence {
-    pub fn new(path: &str, allow_read_only: bool) -> anyhow::Result<Self> {
+    pub fn new(path: &str) -> anyhow::Result<Self> {
         let newly_created = !Path::new(path).exists();
         let connection = Connection::open(path)?;
         // Execute create tables unconditionally since they are idempotent.
         connection.execute_batch(DOCUMENTS_INIT)?;
         connection.execute_batch(INDEXES_INIT)?;
-        connection.execute_batch(READ_ONLY_INIT)?;
         connection.execute_batch(PERSISTENCE_GLOBALS_INIT)?;
-        if !allow_read_only {
-            let mut stmt = connection.prepare(CHECK_IS_READ_ONLY)?;
-            anyhow::ensure!(stmt.raw_query().next()?.is_none());
-        }
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 newly_created,
@@ -261,10 +257,10 @@ impl Persistence for SqlitePersistence {
         })
     }
 
-    async fn write(
+    async fn write<'a>(
         &self,
-        documents: Vec<DocumentLogEntry>,
-        indexes: BTreeSet<(Timestamp, DatabaseIndexUpdate)>,
+        documents: &'a [DocumentLogEntry],
+        indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
@@ -275,7 +271,7 @@ impl Persistence for SqlitePersistence {
         };
 
         for update in documents {
-            let (json_value, deleted) = if let Some(document) = update.value {
+            let (json_value, deleted) = if let Some(document) = &update.value {
                 assert_eq!(update.id, document.id_with_table_id());
                 let json_value = document.value().json_serialize()?;
                 (Some(json_value), 0)
@@ -298,27 +294,27 @@ impl Persistence for SqlitePersistence {
         } else {
             tx.prepare_cached(INSERT_INDEX)?
         };
-        for (ts, update) in indexes {
+        for update in indexes {
             let index_id = update.index_id;
-            let key: Vec<u8> = update.key.to_bytes().0;
+            let key: &[u8] = &update.key.0;
             match update.value {
-                DatabaseIndexValue::Deleted => {
+                None => {
                     insert_index_query.execute(params![
                         &index_id[..],
-                        &u64::from(ts),
+                        &u64::from(update.ts),
                         key,
                         &1,
                         &Null,
                         &Null,
                     ])?;
                 },
-                DatabaseIndexValue::NonClustered(doc_id) => {
+                Some(doc_id) => {
                     insert_index_query.execute(params![
                         &index_id[..],
-                        &u64::from(ts),
+                        &u64::from(update.ts),
                         key,
                         &0,
-                        &doc_id.tablet_id.0[..],
+                        &doc_id.table().0[..],
                         &doc_id.internal_id()[..],
                     ])?;
                 },
@@ -327,16 +323,6 @@ impl Persistence for SqlitePersistence {
         drop(insert_index_query);
 
         tx.commit()?;
-        Ok(())
-    }
-
-    async fn set_read_only(&self, read_only: bool) -> anyhow::Result<()> {
-        let stmt = if read_only {
-            SET_READ_ONLY
-        } else {
-            UNSET_READ_ONLY
-        };
-        self.inner.lock().connection.execute_batch(stmt)?;
         Ok(())
     }
 
@@ -437,6 +423,24 @@ impl Persistence for SqlitePersistence {
         tx.commit()?;
         Ok(count_deleted)
     }
+
+    async fn delete_tablet_documents(
+        &self,
+        tablet_id: TabletId,
+        chunk_size: usize,
+    ) -> anyhow::Result<usize> {
+        let mut inner = self.inner.lock();
+        let tx = inner.connection.transaction()?;
+        let mut delete_table_documents_query = tx.prepare_cached(DELETE_TABLE_DOCUMENTS)?;
+        let count_deleted = delete_table_documents_query.execute(params![
+            &tablet_id.0[..],
+            &tablet_id.0[..],
+            chunk_size,
+        ])?;
+        drop(delete_table_documents_query);
+        tx.commit()?;
+        Ok(count_deleted)
+    }
 }
 
 #[async_trait]
@@ -448,7 +452,7 @@ impl PersistenceReader for SqlitePersistence {
         _page_size: u32,
         retention_validator: Arc<dyn RetentionValidator>,
     ) -> DocumentStream<'_> {
-        let triples = try {
+        let triples = try_anyhow!({
             let connection = &self.inner.lock().connection;
             let load_docs_query = load_docs(range, order);
             let mut stmt = connection.prepare(load_docs_query.as_str())?;
@@ -464,13 +468,13 @@ impl PersistenceReader for SqlitePersistence {
                 }));
             }
             entries
-        };
+        });
         // load_documents isn't async so we have to validate snapshot as part of the
         // stream.
         let validate =
             self.validate_document_snapshot(range.min_timestamp_inclusive(), retention_validator);
         match triples {
-            Ok(s) => (validate.chain(stream::iter(s))).boxed(),
+            Ok(s) => validate.chain(stream::iter(s).cooperative()).boxed(),
             Err(e) => stream::once(async { Err(e) }).boxed(),
         }
     }
@@ -616,14 +620,6 @@ CREATE TABLE IF NOT EXISTS indexes (
 );
 "#;
 
-const READ_ONLY_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS read_only (
-    id INTEGER NOT NULL,
-
-    PRIMARY KEY (id)
-);
-"#;
-
 const PERSISTENCE_GLOBALS_INIT: &str = r#"
 CREATE TABLE IF NOT EXISTS persistence_globals (
     key TEXT NOT NULL,
@@ -706,9 +702,8 @@ const DELETE_INDEX: &str = "DELETE FROM indexes WHERE index_id = ? AND ts <= ? A
 
 const DELETE_DOCUMENT: &str = "DELETE FROM documents WHERE table_id = ? AND id = ? AND ts <= ?";
 
-const CHECK_IS_READ_ONLY: &str = "SELECT 1 FROM read_only LIMIT 1";
-const SET_READ_ONLY: &str = "INSERT INTO read_only (id) VALUES (1)";
-const UNSET_READ_ONLY: &str = "DELETE FROM read_only WHERE id = 1";
+const DELETE_TABLE_DOCUMENTS: &str = "DELETE FROM documents WHERE table_id = ? AND id IN (SELECT \
+                                      id FROM documents WHERE table_id = ? LIMIT ?)";
 
 const PREV_REV_QUERY: &str = r#"
 SELECT id, ts, table_id, json_value, deleted, prev_ts

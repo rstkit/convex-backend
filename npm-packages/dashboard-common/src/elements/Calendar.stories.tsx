@@ -1,14 +1,14 @@
-import { StoryFn, StoryObj } from "@storybook/react";
+import { Meta, StoryFn, StoryObj } from "@storybook/nextjs";
 import { Calendar } from "@common/elements/Calendar";
 
-export const Single: StoryObj<typeof Calendar> = {
+export const Single: Story = {
   args: {
     mode: "single",
     selected: new Date(Date.now() - 24 * 60 * 60 * 1000), // Yesterday
   },
 };
 
-export const Range: StoryObj<typeof Calendar> = {
+export const Range: Story = {
   args: {
     mode: "range",
     selected: {
@@ -18,16 +18,27 @@ export const Range: StoryObj<typeof Calendar> = {
   },
 };
 
-export const RestrictedRange: StoryObj<typeof Calendar> = {
+const rangeStart = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000); // 3 days ago
+const rangeEnd = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000); // 3 days from now
+export const RestrictedRange: Story = {
   args: {
     mode: "single",
     selected: new Date(Date.now() - 24 * 60 * 60 * 1000), // Yesterday
-    fromDate: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000), // 3 days ago
-    toDate: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000), // 3 days from now
+    startMonth: rangeStart,
+    endMonth: rangeEnd,
+    disabled: {
+      before: rangeStart,
+      after: rangeEnd,
+    },
+    beforeStartTooltip: (
+      <>
+        This is <em>too early</em>!
+      </>
+    ),
   },
 };
 
-export default {
+const meta = {
   component: Calendar,
   decorators: [
     (Story: StoryFn) => (
@@ -38,4 +49,7 @@ export default {
       </div>
     ),
   ],
-};
+} satisfies Meta<typeof Calendar>;
+
+export default meta;
+type Story = StoryObj<typeof meta>;

@@ -1,17 +1,17 @@
-import { Form, Formik, getIn, useFormikContext } from "formik";
+import { Form, Formik, FormikTouched, getIn, useFormikContext } from "formik";
 
 import {
   ClipboardCopyIcon,
-  Cross2Icon,
   EyeNoneIcon,
   EyeOpenIcon,
-  Pencil1Icon,
-  PlusIcon,
-  TrashIcon,
+  MinusCircledIcon,
+  Pencil2Icon,
+  PlusCircledIcon,
+  ResetIcon,
 } from "@radix-ui/react-icons";
 
 import classNames from "classnames";
-import {
+import React, {
   ClipboardEventHandler,
   useEffect,
   useId,
@@ -24,11 +24,12 @@ import { Callout } from "@ui/Callout";
 import { Button } from "@ui/Button";
 import { copyTextToClipboard, toast } from "@common/lib/utils";
 import { TextInput } from "@ui/TextInput";
-
-const MAX_NUMBER_OF_ENV_VARS = 100;
+import { cn } from "@ui/cn";
+import cloneDeep from "lodash/cloneDeep";
+import { formatEnvValueForDotfile } from "./formatEnvValueForDotfile";
 
 export const ENVIRONMENT_VARIABLES_ROW_CLASSES =
-  "grid grid-cols-[minmax(0,1fr)_7.5rem] gap-4 py-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_7.5rem] items-start";
+  "grid grid-cols-[minmax(0,1fr)_6.5rem] gap-x-4 gap-y-2 py-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_6.5rem]";
 export const ENVIRONMENT_VARIABLE_NAME_COLUMN = "col-span-2 md:col-span-1";
 
 const ERROR_ENV_VAR_NOT_UNIQUE = "Environment variable name is not unique";
@@ -38,11 +39,10 @@ export type BaseEnvironmentVariable = { name: string; value: string };
 type FormState<T extends BaseEnvironmentVariable> = {
   editedVars: {
     oldEnvVar: T;
-    newEnvVar: BaseEnvironmentVariable;
+    newEnvVar: T;
   }[];
-  newVars: BaseEnvironmentVariable[];
+  newVars: T[];
   deletedVars: T[];
-  tooManyEnvVars: boolean;
 };
 
 // This is used for showing both deployment environment variables and project level environment variables
@@ -51,62 +51,119 @@ export function EnvironmentVariables<T extends BaseEnvironmentVariable>({
   updateEnvironmentVariables,
   initialFormValues,
   hasAdminPermissions,
+  onEnvironmentVariablesAdded,
+  renderDisplayExtra,
+  renderEditExtra,
+  validateNameUniqueness = defaultValidateNameUniqueness,
+  initEnvVar,
+  envVarKey,
 }: {
   environmentVariables: Array<T> | undefined;
-  initialFormValues?: Array<BaseEnvironmentVariable>;
+  initialFormValues?: Array<T>;
   updateEnvironmentVariables: (
-    creations: BaseEnvironmentVariable[],
-    modifications: { oldEnvVar: T; newEnvVar: BaseEnvironmentVariable }[],
+    creations: T[],
+    modifications: { oldEnvVar: T; newEnvVar: T }[],
     deletions: T[],
   ) => Promise<void>;
   hasAdminPermissions: boolean;
+  onEnvironmentVariablesAdded?: (count: number) => void;
+  /** Render content below the name when displaying (not editing) */
+  renderDisplayExtra?: (props: { envVar: T }) => React.ReactNode;
+  /** Render content below the form fields when editing */
+  renderEditExtra?: (props: {
+    formKey: string; // e.g. "newVars[0]"
+    envVar: T;
+  }) => React.ReactNode;
+  /**
+   * Override uniqueness validation
+   *
+   * By default, duplicate names are always errors.
+   *
+   * DefaultEnvironmentVariables overrides this to allow duplicates
+   * with non-overlapping deployment types.
+   */
+  validateNameUniqueness?: (
+    allVariables: Array<{ name: string; formKey: string; envVar: T }>,
+    environmentVariables: Array<T> | undefined,
+  ) => Record<string, string>;
+  /** Creates a new env var object (useful for adding extra fields) */
+  initEnvVar: (envVar: { name: string; value: string }) => T;
+  /** Key used to uniquely identify a saved row */
+  envVarKey?: (envVar: T) => string;
 }) {
+  const initialValues: FormState<T> = {
+    editedVars: [],
+    newVars: initialFormValues ?? [],
+    deletedVars: [],
+  };
+  const initialTouched = {
+    newVars: initialValues.newVars.map(({ name, value }) =>
+      name !== "" || value !== ""
+        ? ({ name: true, value: true } as FormikTouched<T>)
+        : ({} as FormikTouched<T>),
+    ),
+  } as FormikTouched<FormState<T>>;
+
   return (
     <Formik
       enableReinitialize
-      initialValues={
-        {
-          editedVars: [],
-          newVars: initialFormValues ?? [],
-          deletedVars: [],
-          tooManyEnvVars: false,
-        } as FormState<T>
-      }
+      initialValues={initialValues}
+      initialTouched={initialTouched}
       onSubmit={async (values, helpers) => {
         await updateEnvironmentVariables(
           values.newVars,
           values.editedVars,
           values.deletedVars,
         );
-
+        const createdCount = values.newVars.length;
+        if (createdCount > 0) {
+          onEnvironmentVariablesAdded?.(createdCount);
+        }
         helpers.resetForm({});
       }}
       validate={(values) => {
         const errors: Record<string, string> = {};
 
-        // Names / values validation
-        const uneditedVarNames =
-          environmentVariables
-            ?.filter(
-              (v) =>
-                !values.editedVars.some((edited) => edited.oldEnvVar === v) &&
-                !values.deletedVars.some((deleted) => deleted === v),
-            )
-            .map((sourceVar) => sourceVar.name) ?? [];
-        const editedVarNames = values.editedVars.map(
-          (editedVar) => editedVar.newEnvVar.name,
+        // Collect all variables for uniqueness validation
+        const uneditedVars =
+          environmentVariables?.filter(
+            (v) =>
+              !values.editedVars.some((edited) => edited.oldEnvVar === v) &&
+              !values.deletedVars.some((deleted) => deleted === v),
+          ) ?? [];
+
+        const allVariablesForUniqueness: Array<{
+          name: string;
+          formKey: string;
+          envVar: T;
+        }> = [
+          ...uneditedVars.map((envVar, index) => ({
+            name: envVar.name,
+            formKey: `uneditedVars[${index}]`,
+            envVar,
+          })),
+          ...values.editedVars.map((editedVar, index) => ({
+            name: editedVar.newEnvVar.name,
+            formKey: `editedVars[${index}].newEnvVar`,
+            envVar: editedVar.newEnvVar,
+          })),
+          ...values.newVars.map((envVar, index) => ({
+            name: envVar.name,
+            formKey: `newVars[${index}]`,
+            envVar,
+          })),
+        ];
+
+        // Use pluggable uniqueness validation
+        const uniquenessErrors = validateNameUniqueness(
+          allVariablesForUniqueness,
+          environmentVariables,
         );
-        const newVarNames = values.newVars.map((newVar) => newVar.name);
-        const nameOccurrences = [
-          ...uneditedVarNames,
-          ...editedVarNames,
-          ...newVarNames,
-        ].reduce(
-          (acc, name) => acc.set(name, (acc.get(name) ?? 0) + 1),
-          new Map(),
-        );
+        Object.assign(errors, uniquenessErrors);
+
+        // Validate individual field values
         const variablesToValidate: {
-          value: BaseEnvironmentVariable;
+          value: T;
           key: string;
         }[] = [
           ...values.editedVars.map((editedVar, index) => ({
@@ -134,10 +191,6 @@ export function EnvironmentVariables<T extends BaseEnvironmentVariable>({
               errors[`${key}.value`] = err.issues[0].message;
             }
           }
-
-          if (nameOccurrences.get(value.name) > 1) {
-            errors[`${key}.name`] = ERROR_ENV_VAR_NOT_UNIQUE;
-          }
         });
 
         return errors;
@@ -146,6 +199,10 @@ export function EnvironmentVariables<T extends BaseEnvironmentVariable>({
       <EnvironmentVariablesForm
         environmentVariables={environmentVariables}
         hasAdminPermissions={hasAdminPermissions}
+        renderDisplayExtra={renderDisplayExtra}
+        renderEditExtra={renderEditExtra}
+        initEnvVar={initEnvVar}
+        envVarKey={envVarKey}
       />
     </Formik>
   );
@@ -154,9 +211,17 @@ export function EnvironmentVariables<T extends BaseEnvironmentVariable>({
 function EnvironmentVariablesForm<T extends BaseEnvironmentVariable>({
   environmentVariables,
   hasAdminPermissions,
+  renderDisplayExtra,
+  renderEditExtra,
+  initEnvVar,
+  envVarKey,
 }: {
   environmentVariables: Array<T> | undefined;
   hasAdminPermissions: boolean;
+  renderDisplayExtra?: (props: { envVar: T }) => React.ReactNode;
+  renderEditExtra?: (props: { formKey: string; envVar: T }) => React.ReactNode;
+  initEnvVar: (envVar: { name: string; value: string }) => T;
+  envVarKey: ((envVar: T) => string) | undefined;
 }) {
   const formState = useFormikContext<FormState<T>>();
 
@@ -196,7 +261,7 @@ function EnvironmentVariablesForm<T extends BaseEnvironmentVariable>({
   }, [environmentVariables, formState]);
 
   return (
-    <Form className="flex flex-col">
+    <Form className="flex flex-col [--env-var-contents-height:2.125rem]">
       {environmentVariables === undefined ? (
         <Spinner />
       ) : (
@@ -207,24 +272,26 @@ function EnvironmentVariablesForm<T extends BaseEnvironmentVariable>({
               <div
                 className={classNames(
                   ENVIRONMENT_VARIABLES_ROW_CLASSES,
-                  "hidden md:grid",
+                  "hidden md:grid mb-0.5",
                 )}
               >
                 <div
                   className={`flex flex-col gap-1 ${ENVIRONMENT_VARIABLE_NAME_COLUMN}`}
                 >
-                  <span className="text-xs text-content-secondary">Name</span>
+                  <span className="text-sm text-content-secondary">Name</span>
                 </div>
                 <div className="flex flex-col gap-1">
-                  <span className="text-xs text-content-secondary">Value</span>
+                  <span className="text-sm text-content-secondary">Value</span>
                 </div>
               </div>
             )}
             {environmentVariables?.map((value) => (
               <EnvironmentVariableListItem
-                key={value.name}
+                key={envVarKey ? envVarKey(value) : value.name}
                 environmentVariable={value}
                 hasAdminPermissions={hasAdminPermissions}
+                renderDisplayExtra={renderDisplayExtra}
+                renderEditExtra={renderEditExtra}
               />
             ))}
           </div>
@@ -232,21 +299,39 @@ function EnvironmentVariablesForm<T extends BaseEnvironmentVariable>({
           <NewEnvVars
             existingEnvVars={environmentVariables}
             hasAdminPermissions={hasAdminPermissions}
+            renderEditExtra={renderEditExtra}
+            initEnvVar={initEnvVar}
           />
-
-          {environmentVariables.length >= MAX_NUMBER_OF_ENV_VARS && (
-            <div>
-              <Callout variant="error">
-                You've reached the environment variable limit (
-                {MAX_NUMBER_OF_ENV_VARS}). Contact support@convex.dev if you
-                need more.
-              </Callout>
-            </div>
-          )}
         </>
       )}
     </Form>
   );
+}
+
+// Default uniqueness validator - any duplicate name is an error
+export function defaultValidateNameUniqueness<
+  T extends BaseEnvironmentVariable,
+>(
+  allVariables: Array<{ name: string; formKey: string; envVar: T }>,
+): Record<string, string> {
+  const errors: Record<string, string> = {};
+  const nameOccurrences = new Map<string, string[]>();
+
+  allVariables.forEach(({ name, formKey }) => {
+    const existing = nameOccurrences.get(name) || [];
+    existing.push(formKey);
+    nameOccurrences.set(name, existing);
+  });
+
+  nameOccurrences.forEach((formKeys) => {
+    if (formKeys.length > 1) {
+      formKeys.forEach((key) => {
+        errors[`${key}.name`] = ERROR_ENV_VAR_NOT_UNIQUE;
+      });
+    }
+  });
+
+  return errors;
 }
 
 // Adapted from https://github.com/motdotla/dotenv/blob/cf4c56957974efb7238ecaba6f16e0afa895c194/lib/main.js#L12
@@ -307,66 +392,69 @@ function DisplayEnvVar<T extends BaseEnvironmentVariable>({
   onEdit,
   onDelete,
   hasAdminPermissions,
+  renderDisplayExtra,
 }: {
   environmentVariable: T;
   onEdit: () => void;
   onDelete: () => void;
   hasAdminPermissions: boolean;
+  renderDisplayExtra?: (props: { envVar: T }) => React.ReactNode;
 }) {
   const formState = useFormikContext<FormState<T>>();
   const [showValue, setShowValue] = useState(false);
 
   return (
     <div className={ENVIRONMENT_VARIABLES_ROW_CLASSES}>
-      <div
-        className={`flex flex-col gap-1 ${ENVIRONMENT_VARIABLE_NAME_COLUMN}`}
-      >
-        <div className="flex h-[2.375rem] items-center truncate text-content-primary md:col-span-1">
-          {environmentVariable.name}
-        </div>
+      <div className={ENVIRONMENT_VARIABLE_NAME_COLUMN}>
+        <EnvironmentVariableName
+          environmentVariable={environmentVariable}
+          renderDisplayExtra={renderDisplayExtra}
+        />
       </div>
-      <div className="flex flex-col gap-1">
-        <div className="flex h-[2.375rem] items-center gap-1 font-mono">
-          <Button
-            tip={showValue ? "Hide" : "Show"}
-            type="button"
-            onClick={() => setShowValue(!showValue)}
-            variant="neutral"
-            inline
-            size="sm"
-            icon={showValue ? <EyeNoneIcon /> : <EyeOpenIcon />}
-          />
+      <div className="flex min-h-(--env-var-contents-height) min-w-0 items-center gap-1 font-mono">
+        <Button
+          tip={showValue ? "Hide" : "Show"}
+          aria-label={showValue ? "Hide" : "Show"}
+          type="button"
+          onClick={() => setShowValue(!showValue)}
+          variant="neutral"
+          inline
+          size="sm"
+          className="h-full"
+          icon={showValue ? <EyeNoneIcon /> : <EyeOpenIcon />}
+        />
+        <div className="min-w-0 flex-1">
           {showValue ? (
-            <span className=" truncate text-content-primary">
+            <pre className="animate-fadeInFromLoading cursor-not-allowed rounded-md border bg-background-primary p-1.5 px-2 break-all whitespace-pre-wrap text-content-primary">
               {environmentVariable.value}
-            </span>
+            </pre>
           ) : (
             <span
               title="Hidden environment variable"
-              className="text-content-primary"
+              className="block truncate text-xs text-content-primary"
             >
-              ••••••
+              •••••••••••••••
             </span>
           )}
         </div>
       </div>
-      <div className="flex gap-2">
+      <div className="flex h-(--env-var-contents-height) justify-between gap-2">
         <Button
           tip={
             !hasAdminPermissions
               ? "You do not have permission to edit environment variables."
               : "Edit"
           }
+          aria-label="Edit"
           type="button"
           onClick={() => onEdit()}
           variant="neutral"
-          size="sm"
-          inline
-          icon={<Pencil1Icon />}
+          icon={<Pencil2Icon />}
           disabled={formState.isSubmitting || !hasAdminPermissions}
         />
         <Button
           tip="Copy Value"
+          aria-label="Copy Value"
           type="button"
           onClick={async () => {
             await copyTextToClipboard(environmentVariable.value);
@@ -376,8 +464,6 @@ function DisplayEnvVar<T extends BaseEnvironmentVariable>({
             );
           }}
           variant="neutral"
-          size="sm"
-          inline
           icon={<ClipboardCopyIcon />}
           disabled={formState.isSubmitting}
         />
@@ -387,12 +473,11 @@ function DisplayEnvVar<T extends BaseEnvironmentVariable>({
               ? "You do not have permission to delete environment variables."
               : "Delete"
           }
+          aria-label="Delete"
           type="button"
           onClick={() => onDelete()}
           variant="danger"
-          size="sm"
-          inline
-          icon={<TrashIcon />}
+          icon={<MinusCircledIcon />}
           disabled={formState.isSubmitting || !hasAdminPermissions}
         />
       </div>
@@ -403,9 +488,11 @@ function DisplayEnvVar<T extends BaseEnvironmentVariable>({
 function DeletedEnvVar<T extends BaseEnvironmentVariable>({
   environmentVariable,
   onCancelDelete,
+  renderDisplayExtra,
 }: {
   environmentVariable: T;
   onCancelDelete: () => void;
+  renderDisplayExtra?: (props: { envVar: T }) => React.ReactNode;
 }) {
   const formState = useFormikContext<FormState<T>>();
 
@@ -414,25 +501,41 @@ function DeletedEnvVar<T extends BaseEnvironmentVariable>({
       <div
         className={`flex flex-col gap-1 ${ENVIRONMENT_VARIABLE_NAME_COLUMN}`}
       >
-        <div className="flex h-[2.375rem] items-center truncate text-content-primary md:col-span-1">
-          {environmentVariable.name}
-        </div>
+        <EnvironmentVariableName
+          environmentVariable={environmentVariable}
+          renderDisplayExtra={renderDisplayExtra}
+        />
       </div>
-      <div className="flex flex-col gap-1">
-        <div className="flex h-[2.375rem] items-center justify-center gap-1 bg-background-error">
-          <TrashIcon className="text-content-error" /> Will be deleted
-        </div>
+      <div className="flex h-(--env-var-contents-height) items-center justify-center gap-1 rounded-md border bg-background-error text-content-error">
+        <MinusCircledIcon /> Will be deleted
       </div>
-      <div className="flex items-center justify-center">
-        <Button
-          inline
-          size="sm"
-          onClick={() => onCancelDelete()}
-          disabled={formState.isSubmitting}
-        >
-          Cancel
-        </Button>
+      <Button
+        variant="neutral"
+        className="min-h-(--env-var-contents-height) w-full justify-center"
+        size="sm"
+        onClick={() => onCancelDelete()}
+        disabled={formState.isSubmitting}
+        icon={<ResetIcon />}
+      >
+        Restore
+      </Button>
+    </div>
+  );
+}
+
+function EnvironmentVariableName<T extends BaseEnvironmentVariable>({
+  environmentVariable,
+  renderDisplayExtra,
+}: {
+  environmentVariable: T;
+  renderDisplayExtra?: (props: { envVar: T }) => React.ReactNode;
+}) {
+  return (
+    <div className="flex min-h-(--env-var-contents-height) flex-col justify-center md:col-span-1">
+      <div className="font-mono font-semibold break-all whitespace-pre-wrap text-content-primary">
+        {environmentVariable.name}
       </div>
+      {renderDisplayExtra?.({ envVar: environmentVariable })}
     </div>
   );
 }
@@ -448,52 +551,53 @@ const EnvVarName = z
 
 const EnvVarValue = z
   .string()
-  .min(1, "Environment variable value is required.")
   .max(8192, "Environment variable value cannot be larger than 8KB");
 
 function EditEnvVarForm<T extends BaseEnvironmentVariable>({
   editIndex,
   onCancelEdit,
+  renderEditExtra,
 }: {
   editIndex: number;
   onCancelEdit: () => void;
+  renderEditExtra?: (props: { formKey: string; envVar: T }) => React.ReactNode;
 }) {
   const nameId = useId();
   const valueId = useId();
 
   const formState = useFormikContext<FormState<T>>();
-  const { value } = (formState.values as any).editedVars[editIndex].newEnvVar;
+  const envVar = formState.values.editedVars[editIndex].newEnvVar;
+  const { value } = envVar;
+  const formKey = `editedVars[${editIndex}].newEnvVar`;
 
   return (
-    <div>
+    <div className="animate-fadeInFromLoading">
       <div className={ENVIRONMENT_VARIABLES_ROW_CLASSES}>
         <label
           htmlFor={nameId}
           className={`flex flex-col gap-1 ${ENVIRONMENT_VARIABLE_NAME_COLUMN}`}
         >
-          <ValidatedTextInput
-            formKey={`editedVars[${editIndex}].newEnvVar.name`}
-            id={nameId}
-          />
+          <EnvVarNameInput formKey={`${formKey}.name`} id={nameId} />
         </label>
         <label htmlFor={valueId} className="flex grow flex-col flex-wrap gap-1">
-          <ValidatedTextInput
-            formKey={`editedVars[${editIndex}].newEnvVar.value`}
-            id={valueId}
-            noAutocomplete
-          />
+          <EnvVarValueInput formKey={`${formKey}.value`} id={valueId} />
         </label>
-        <div className="flex items-center justify-center">
-          <Button
-            type="button"
-            inline
-            size="sm"
-            onClick={() => onCancelEdit()}
-            disabled={formState.isSubmitting}
-          >
-            Cancel
-          </Button>
-        </div>
+        <Button
+          type="button"
+          variant="neutral"
+          className="h-fit min-h-(--env-var-contents-height) w-full justify-center"
+          size="sm"
+          onClick={() => onCancelEdit()}
+          disabled={formState.isSubmitting}
+          icon={<ResetIcon />}
+        >
+          Undo Edit
+        </Button>
+        {renderEditExtra && (
+          <div className="col-span-full flex flex-col gap-1 py-1">
+            {renderEditExtra?.({ formKey, envVar })}
+          </div>
+        )}
       </div>
       {value.length > 1 && value.startsWith('"') && value.endsWith('"') && (
         <Callout className="mb-2 w-full">
@@ -511,9 +615,13 @@ function EnvironmentVariableListItem<
 >({
   environmentVariable,
   hasAdminPermissions,
+  renderDisplayExtra,
+  renderEditExtra,
 }: {
   environmentVariable: T;
   hasAdminPermissions: boolean;
+  renderDisplayExtra?: (props: { envVar: T }) => React.ReactNode;
+  renderEditExtra?: (props: { formKey: string; envVar: T }) => React.ReactNode;
 }) {
   const formState = useFormikContext<FormState<T>>();
 
@@ -538,9 +646,10 @@ function EnvironmentVariableListItem<
               editedVars: newEditedVars.map(() => ({
                 newEnvVar: { name: true, value: true },
               })),
-            }),
+            } as any),
           );
         }}
+        renderEditExtra={renderEditExtra}
       />
     );
   }
@@ -560,6 +669,7 @@ function EnvironmentVariableListItem<
           ];
           void formState.setFieldValue("deletedVars", newDeletedVars);
         }}
+        renderDisplayExtra={renderDisplayExtra}
       />
     );
   }
@@ -573,10 +683,7 @@ function EnvironmentVariableListItem<
           ...formState.values.editedVars,
           {
             oldEnvVar: environmentVariable,
-            newEnvVar: {
-              name: environmentVariable.name,
-              value: environmentVariable.value,
-            },
+            newEnvVar: cloneDeep(environmentVariable),
           },
         ]);
       }}
@@ -586,6 +693,7 @@ function EnvironmentVariableListItem<
           environmentVariable,
         ]);
       }}
+      renderDisplayExtra={renderDisplayExtra}
     />
   );
 }
@@ -593,9 +701,13 @@ function EnvironmentVariableListItem<
 function NewEnvVars<T extends BaseEnvironmentVariable>({
   existingEnvVars,
   hasAdminPermissions,
+  renderEditExtra,
+  initEnvVar,
 }: {
   existingEnvVars: Array<T>;
   hasAdminPermissions: boolean;
+  renderEditExtra?: (props: { formKey: string; envVar: T }) => React.ReactNode;
+  initEnvVar: (envVar: { name: string; value: string }) => T;
 }) {
   const formState = useFormikContext<FormState<T>>();
 
@@ -604,25 +716,17 @@ function NewEnvVars<T extends BaseEnvironmentVariable>({
       ({ name, value }) => name !== "" || value !== "",
     );
 
-    let totalEnvVars = existingEnvVars.length;
-    let tooManyEnvVars = false;
-    envVars.forEach((envVar) => {
-      if (totalEnvVars < MAX_NUMBER_OF_ENV_VARS) {
-        newVars.push(envVar);
-        totalEnvVars += 1;
-      } else {
-        tooManyEnvVars = true;
-      }
-    });
+    const transformedEnvVars = envVars.map(({ name, value }) =>
+      initEnvVar({ name, value }),
+    );
 
-    void formState.setFieldValue("newVars", newVars, true);
-    void formState.setFieldValue("tooManyEnvVars", tooManyEnvVars);
+    void formState.setFieldValue("newVars", transformedEnvVars, true);
 
     // https://github.com/jaredpalmer/formik/issues/2059#issuecomment-612733378
     setTimeout(() =>
       formState.setTouched({
         newVars: newVars.map(() => ({ name: true, value: true })),
-      }),
+      } as any),
     );
   };
 
@@ -631,32 +735,33 @@ function NewEnvVars<T extends BaseEnvironmentVariable>({
       {formState.values.newVars.length > 0 && (
         <>
           <div className="divide-y divide-border-transparent border-t">
-            {formState.values.newVars.map((_, index) => (
+            {formState.values.newVars.map((envVar, index) => (
               <NewEnvVar
                 key={index}
                 newVarIndex={index}
+                envVar={envVar}
                 onDelete={() => {
                   const newVars = [
                     ...formState.values.newVars.slice(0, index),
                     ...formState.values.newVars.slice(index + 1),
                   ];
                   void formState.setFieldValue("newVars", newVars);
-                  void formState.setFieldValue("tooManyEnvVars", false);
 
                   // https://github.com/jaredpalmer/formik/issues/2059#issuecomment-612733378
                   setTimeout(() => {
                     void formState.setTouched({
                       newVars: newVars.map(() => ({ name: true, value: true })),
-                    });
+                    } as any);
                   });
                 }}
                 onPasteVariables={(input) => handlePaste(input)}
                 isLastVariable={index === formState.values.newVars.length - 1}
+                renderEditExtra={renderEditExtra}
               />
             ))}
           </div>
 
-          <p className="pb-4 pt-2 text-content-secondary">
+          <p className="pt-2 pb-4 text-content-secondary">
             Tip: Paste your .env file directly into here!
           </p>
         </>
@@ -664,48 +769,70 @@ function NewEnvVars<T extends BaseEnvironmentVariable>({
 
       <div className="my-2 flex place-content-between">
         <div className="flex gap-2">
-          {existingEnvVars.length + formState.values.newVars.length <
-            MAX_NUMBER_OF_ENV_VARS && (
-            <Button
-              type="button"
-              variant="neutral"
-              onClick={() => {
-                void formState.setFieldValue("newVars", [
-                  ...formState.values.newVars,
-                  {
-                    name: "",
-                    value: "",
-                  },
-                ]);
-              }}
-              icon={<PlusIcon />}
-              disabled={!hasAdminPermissions}
-              tip={
-                !hasAdminPermissions
-                  ? "You do not have permission to add new environment variables."
-                  : undefined
-              }
-            >
-              Add
-            </Button>
-          )}
+          <Button
+            type="button"
+            variant="neutral"
+            onClick={() => {
+              void formState.setFieldValue("newVars", [
+                ...formState.values.newVars,
+                initEnvVar({ name: "", value: "" }),
+              ]);
+            }}
+            icon={<PlusCircledIcon />}
+            disabled={!hasAdminPermissions}
+            tip={
+              !hasAdminPermissions
+                ? "You do not have permission to add new environment variables."
+                : undefined
+            }
+          >
+            Add
+          </Button>
 
           {existingEnvVars.length > 0 && (
             <Button
               type="button"
               variant="neutral"
-              inline
               onClick={async () => {
+                const formattedEnvVars = existingEnvVars.map(
+                  ({ name, value }) => {
+                    const { formatted, warning } =
+                      formatEnvValueForDotfile(value);
+                    return { name, formatted, warning };
+                  },
+                );
                 await copyTextToClipboard(
-                  existingEnvVars
-                    .map(({ name, value }) => `${name}=${value}`)
+                  formattedEnvVars
+                    .map(({ name, formatted }) => `${name}=${formatted}`)
                     .join("\n"),
                 );
 
-                toast(
-                  "success",
-                  "Environment variables copied to the clipboard.",
+                const warnings = formattedEnvVars.flatMap(
+                  ({ name, warning }) => (warning ? [{ name, warning }] : []),
                 );
+                if (warnings.length > 0) {
+                  toast(
+                    "warning",
+                    <div className="space-y-1">
+                      <div>
+                        Environment variables copied to the clipboard with the
+                        following warnings:
+                      </div>
+                      <ul className="list-disc pl-4">
+                        {warnings.map(({ name, warning }, index) => (
+                          <li key={index}>
+                            <code>{name}</code>: {warning}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>,
+                  );
+                } else {
+                  toast(
+                    "success",
+                    "Environment variables copied to the clipboard.",
+                  );
+                }
               }}
               icon={<ClipboardCopyIcon />}
             >
@@ -730,33 +857,29 @@ function NewEnvVars<T extends BaseEnvironmentVariable>({
           </Button>
         )}
       </div>
-
-      {formState.values.tooManyEnvVars && (
-        <Callout variant="error">
-          You've reached the environment variable limit (
-          {MAX_NUMBER_OF_ENV_VARS}). Some pasted environment variables have been
-          omitted.
-        </Callout>
-      )}
     </div>
   );
 }
 
-function NewEnvVar({
+function NewEnvVar<T extends BaseEnvironmentVariable>({
   newVarIndex,
+  envVar,
   onDelete,
   onPasteVariables,
   isLastVariable,
+  renderEditExtra,
 }: {
   newVarIndex: number;
+  envVar: T;
   onDelete: () => void;
   onPasteVariables: (variables: Array<BaseEnvironmentVariable>) => void;
   isLastVariable: boolean;
+  renderEditExtra?: (props: { formKey: string; envVar: T }) => React.ReactNode;
 }) {
   const nameId = useId();
   const valueId = useId();
-  const formState = useFormikContext();
-  const { value } = (formState.values as any).newVars[newVarIndex];
+  const { value } = envVar;
+  const formKey = `newVars[${newVarIndex}]`;
 
   return (
     <div className={ENVIRONMENT_VARIABLES_ROW_CLASSES}>
@@ -765,8 +888,8 @@ function NewEnvVar({
         className={`flex flex-col gap-1 ${ENVIRONMENT_VARIABLE_NAME_COLUMN}`}
       >
         <div>
-          <ValidatedTextInput
-            formKey={`newVars[${newVarIndex}].name`}
+          <EnvVarNameInput
+            formKey={`${formKey}.name`}
             id={nameId}
             onPaste={(e) => {
               const variables = parseEnvVars(e.clipboardData.getData("text"));
@@ -782,11 +905,7 @@ function NewEnvVar({
 
       <label htmlFor={valueId} className="flex grow flex-col gap-1">
         <div>
-          <ValidatedTextInput
-            formKey={`newVars[${newVarIndex}].value`}
-            id={valueId}
-            noAutocomplete
-          />
+          <EnvVarValueInput formKey={`${formKey}.value`} id={valueId} />
           {value.length > 1 && value.startsWith('"') && value.endsWith('"') && (
             <Callout>
               Environment variables usually shouldn't be surrounded by quotes.
@@ -797,53 +916,208 @@ function NewEnvVar({
         </div>
       </label>
 
-      <div className="pt-1">
-        <Button
-          tip="Remove"
-          type="button"
-          onClick={() => {
-            onDelete();
-          }}
-          variant="neutral"
-          inline
-          size="sm"
-          icon={<Cross2Icon />}
-        />
-      </div>
+      <Button
+        tip="Remove"
+        aria-label="Remove"
+        type="button"
+        onClick={() => {
+          onDelete();
+        }}
+        className="min-h-(--env-var-contents-height) w-fit self-start"
+        variant="neutral"
+        size="sm"
+        icon={<MinusCircledIcon />}
+      />
+
+      {renderEditExtra && (
+        <div className="col-span-full flex flex-col gap-1 py-1 md:col-start-1 md:row-start-2">
+          {renderEditExtra?.({ formKey, envVar })}
+        </div>
+      )}
     </div>
   );
 }
 
-function ValidatedTextInput({
+function EnvVarNameInput({
   formKey,
   id,
-  noAutocomplete = false,
-  onPaste = undefined,
+  onPaste,
   autoFocus = false,
 }: {
   formKey: string;
   id: string;
-  noAutocomplete?: boolean;
   onPaste?: ClipboardEventHandler;
   autoFocus?: boolean;
 }) {
   const formState = useFormikContext();
   const error = (formState.errors as Record<string, string>)[formKey];
+  const touched = getIn(formState.touched, formKey);
 
   return (
     <TextInput
       id={id}
+      className="font-mono"
+      label="Name"
       labelHidden
       disabled={formState.isSubmitting}
       {...formState.getFieldProps(formKey)}
-      autoComplete={noAutocomplete ? "off" : undefined}
       onPaste={onPaste}
       error={
-        (getIn(formState.touched, formKey) ||
-          error === ERROR_ENV_VAR_NOT_UNIQUE) &&
-        error
+        (touched || error === ERROR_ENV_VAR_NOT_UNIQUE) && error
+          ? error
+          : undefined
       }
       autoFocus={autoFocus}
     />
+  );
+}
+
+function EnvVarValueInput({
+  formKey,
+  id,
+  autoFocus = false,
+}: {
+  formKey: string;
+  id: string;
+  autoFocus?: boolean;
+}) {
+  const formState = useFormikContext();
+  const error = (formState.errors as Record<string, string>)[formKey];
+  const value = getIn(formState.values, formKey) as string;
+  const touched = Boolean(getIn(formState.touched, formKey));
+
+  const hasAnyWhitespace = /\s/.test(value);
+  const hasLeadingOrTrailingWhitespace =
+    value.length > 0 && value !== value.trim();
+  const hasReturnCharacter = value.includes("\n");
+  const emptyStringWarning =
+    touched && value === "" ? "This value is an empty string." : "";
+
+  // Build whitespace warning message
+  let whitespaceWarning = "";
+  if (hasLeadingOrTrailingWhitespace || hasReturnCharacter) {
+    const hasLeading = value !== value.trimStart();
+    const hasTrailing = value !== value.trimEnd();
+    if (hasLeading && hasTrailing) {
+      whitespaceWarning = "This value has leading and trailing whitespace.";
+    } else if (hasLeading) {
+      whitespaceWarning = "This value has leading whitespace.";
+    } else if (hasTrailing) {
+      whitespaceWarning = "This value has trailing whitespace.";
+    } else {
+      whitespaceWarning = "This value contains return characters.";
+    }
+  }
+
+  // Build whitespace indicator overlay parts - one element per character
+  const whitespaceOverlayParts: { text: string; className: string }[] = [];
+  if (hasAnyWhitespace) {
+    const trimmedStart = value.trimStart();
+    const trimmedEnd = value.trimEnd();
+    const leadingCount = value.length - trimmedStart.length;
+    const trailingCount = value.length - trimmedEnd.length;
+
+    for (let i = 0; i < value.length; i++) {
+      const char = value[i];
+      const isSpace = char === " ";
+      const isLineReturn = char === "\n";
+      const isLeading = i < leadingCount;
+      const isTrailing = i >= value.length - trailingCount;
+      const colorClass =
+        (isSpace && (isLeading || isTrailing)) || isLineReturn
+          ? "text-content-warning bg-background-warning/60"
+          : isSpace
+            ? "text-content-tertiary/50"
+            : "text-transparent";
+      const displayChar = isSpace ? "␣" : isLineReturn ? "↵\n" : char;
+
+      whitespaceOverlayParts.push({ text: displayChar, className: colorClass });
+    }
+  }
+
+  const { hint, hintStyle } =
+    touched && error
+      ? {
+          hint: error,
+          hintStyle: "error" as const,
+        }
+      : emptyStringWarning
+        ? {
+            hint: emptyStringWarning,
+            hintStyle: "warning" as const,
+          }
+        : whitespaceWarning
+          ? {
+              hint: whitespaceWarning,
+              hintStyle: "warning" as const,
+            }
+          : { hint: null, hintStyle: null };
+
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-resize textarea based on content
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = "auto";
+      textarea.style.height = `${textarea.scrollHeight}px`;
+    }
+  }, [value]);
+
+  return (
+    <>
+      <div className="relative overflow-hidden">
+        <textarea
+          ref={textareaRef}
+          id={id}
+          aria-label="Value"
+          className={cn(
+            "block min-h-(--env-var-contents-height) w-full",
+            "resize-none",
+            "overflow-hidden rounded-md border bg-background-secondary",
+            "px-2 py-1.5",
+            "font-mono text-sm break-all whitespace-break-spaces placeholder-content-tertiary",
+            "focus:outline-hidden",
+            "disabled:cursor-not-allowed disabled:bg-background-tertiary disabled:text-content-secondary",
+            hintStyle === "error"
+              ? "focus:border-content-error"
+              : hintStyle === "warning"
+                ? "focus:border-content-warning"
+                : "text-content-primary focus:border-border-selected",
+          )}
+          disabled={formState.isSubmitting}
+          {...formState.getFieldProps(formKey)}
+          autoComplete="off"
+          spellCheck={false}
+          autoFocus={autoFocus}
+          rows={1}
+        />
+        {hasAnyWhitespace && (
+          <pre
+            className="pointer-events-none absolute inset-0 mt-0.5 ml-px max-h-full max-w-full animate-fadeInFromLoading overflow-hidden rounded-md p-1.5 px-2 font-mono break-all whitespace-pre-wrap"
+            aria-hidden="true"
+          >
+            {whitespaceOverlayParts.map((part, i) => (
+              <span key={i} className={part.className}>
+                {part.text}
+              </span>
+            ))}
+          </pre>
+        )}
+      </div>
+      {hint && (
+        <p
+          className={cn(
+            "mt-1 flex max-w-full animate-fadeInFromLoading gap-1 text-xs break-words",
+            hintStyle === "error"
+              ? "text-content-errorSecondary"
+              : "text-content-warning",
+          )}
+          role="alert"
+        >
+          {hint}
+        </p>
+      )}
+    </>
   );
 }

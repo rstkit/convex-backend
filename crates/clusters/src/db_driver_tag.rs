@@ -3,16 +3,13 @@ use std::str::FromStr;
 use common::types::PersistenceVersion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(any(test, feature = "testing")), non_exhaustive)]
 pub enum DbDriverTag {
     Sqlite,
     Postgres(PersistenceVersion),
-    PostgresMultiSchema(PersistenceVersion),
-    PostgresAwsIam(PersistenceVersion),
+    PostgresMultitenant(PersistenceVersion),
     MySql(PersistenceVersion),
     MySqlAwsIam(PersistenceVersion),
-    #[cfg(any(test, feature = "testing"))]
-    TestPersistence,
+    MySqlMultitenant(PersistenceVersion),
 }
 
 impl clap::ValueEnum for DbDriverTag {
@@ -21,11 +18,9 @@ impl clap::ValueEnum for DbDriverTag {
             DbDriverTag::Sqlite,
             DbDriverTag::MySql(PersistenceVersion::V5),
             DbDriverTag::MySqlAwsIam(PersistenceVersion::V5),
+            DbDriverTag::MySqlMultitenant(PersistenceVersion::V5),
             DbDriverTag::Postgres(PersistenceVersion::V5),
-            DbDriverTag::PostgresMultiSchema(PersistenceVersion::V5),
-            DbDriverTag::PostgresAwsIam(PersistenceVersion::V5),
-            #[cfg(any(test, feature = "testing"))]
-            DbDriverTag::TestPersistence,
+            DbDriverTag::PostgresMultitenant(PersistenceVersion::V5),
         ]
     }
 
@@ -38,16 +33,12 @@ impl DbDriverTag {
     pub fn persistence_version(&self) -> anyhow::Result<PersistenceVersion> {
         match self {
             Self::Postgres(version)
-            | Self::PostgresMultiSchema(version)
-            | Self::PostgresAwsIam(version)
+            | Self::PostgresMultitenant(version)
             | Self::MySql(version)
-            | Self::MySqlAwsIam(version) => Ok(*version),
+            | Self::MySqlAwsIam(version)
+            | Self::MySqlMultitenant(version) => Ok(*version),
             Self::Sqlite => {
                 anyhow::bail!("sqlite has no persistence version")
-            },
-            #[cfg(any(test, feature = "testing"))]
-            Self::TestPersistence => {
-                anyhow::bail!("test persistence has no persistence version")
             },
         }
     }
@@ -56,12 +47,10 @@ impl DbDriverTag {
         match self {
             DbDriverTag::Sqlite => "sqlite",
             DbDriverTag::Postgres(PersistenceVersion::V5) => "postgres-v5",
-            DbDriverTag::PostgresMultiSchema(PersistenceVersion::V5) => "postgres-v5-multi-schema",
-            DbDriverTag::PostgresAwsIam(PersistenceVersion::V5) => "postgres-v5-aws-iam",
+            DbDriverTag::PostgresMultitenant(PersistenceVersion::V5) => "postgres-v5-multitenant",
             DbDriverTag::MySql(PersistenceVersion::V5) => "mysql-v5",
             DbDriverTag::MySqlAwsIam(PersistenceVersion::V5) => "mysql-v5-aws-iam",
-            #[cfg(any(test, feature = "testing"))]
-            DbDriverTag::TestPersistence => "test-persistence",
+            DbDriverTag::MySqlMultitenant(PersistenceVersion::V5) => "mysql-v5-multitenant",
         }
     }
 }
@@ -73,14 +62,12 @@ impl FromStr for DbDriverTag {
         match s {
             "sqlite" => Ok(Self::Sqlite),
             "postgres-v5" => Ok(DbDriverTag::Postgres(PersistenceVersion::V5)),
-            "postgres-v5-multi-schema" => {
-                Ok(DbDriverTag::PostgresMultiSchema(PersistenceVersion::V5))
+            "postgres-v5-multitenant" => {
+                Ok(DbDriverTag::PostgresMultitenant(PersistenceVersion::V5))
             },
-            "postgres-v5-aws-iam" => Ok(DbDriverTag::PostgresAwsIam(PersistenceVersion::V5)),
             "mysql-v5" => Ok(DbDriverTag::MySql(PersistenceVersion::V5)),
             "mysql-v5-aws-iam" => Ok(DbDriverTag::MySqlAwsIam(PersistenceVersion::V5)),
-            #[cfg(any(test, feature = "testing"))]
-            "test-persistence" => Ok(DbDriverTag::TestPersistence),
+            "mysql-v5-multitenant" => Ok(DbDriverTag::MySqlMultitenant(PersistenceVersion::V5)),
             _ => anyhow::bail!("unrecognized db_driver {s}"),
         }
     }

@@ -9,15 +9,15 @@ use common::{
     bootstrap_model::{
         index::{
             database_index::{
+                DatabaseIndexSpec,
                 DatabaseIndexState,
-                DeveloperDatabaseIndexConfig,
             },
             text_index::{
-                DeveloperTextIndexConfig,
+                TextIndexSpec,
                 TextIndexState,
             },
             vector_index::{
-                DeveloperVectorIndexConfig,
+                VectorIndexSpec,
                 VectorIndexState,
             },
             IndexConfig,
@@ -33,14 +33,15 @@ use common::{
     http::{
         extract::{
             Json,
+            MtState,
             Path,
         },
         HttpResponseError,
     },
+    types::IndexDiff,
 };
 use database::{
     IndexModel,
-    LegacyIndexDiff,
     SchemaModel,
 };
 use errors::ErrorMetadata;
@@ -60,40 +61,10 @@ use value::{
 };
 
 use crate::{
-    admin::{
-        must_be_admin,
-        must_be_admin_from_key_with_write_access,
-    },
+    admin::must_be_admin_from_key,
     authentication::ExtractIdentity,
     LocalAppState,
 };
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildIndexesResponse {
-    added: Vec<IndexMetadataResponse>,
-    dropped: Vec<IndexMetadataResponse>,
-}
-
-impl TryFrom<LegacyIndexDiff> for BuildIndexesResponse {
-    type Error = anyhow::Error;
-
-    fn try_from(diff: LegacyIndexDiff) -> anyhow::Result<Self> {
-        Ok(BuildIndexesResponse {
-            added: diff
-                .added
-                .into_iter()
-                .map(IndexMetadataResponse::try_from)
-                .try_collect()?,
-            dropped: diff
-                .dropped
-                .into_iter()
-                .map(|doc| doc.into_value())
-                .map(IndexMetadataResponse::try_from)
-                .try_collect()?,
-        })
-    }
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,15 +72,20 @@ struct BackfillResponse {
     state: String,
 }
 
+// When updating this, please keep `IndexMetadata`
+// in `npm-packages/convex/src/cli/lib/indexes.ts` in sync
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexMetadataResponse {
     table: String,
     name: String,
-    // Either an array of fields (`string[]`) for a database index or an object of
-    // `{ searchField: string, filterFields: string }` for a search index.
+    // Either:
+    // - an array of fields (`string[]`) for a database index
+    // - `{ searchField: string, filterFields: string[] }` for a search index
+    // - `{ dimensions: number, vectorField: string, filterFields: string[] }` for a vector index
     fields: JsonValue,
     backfill: BackfillResponse,
+    staged: bool,
 }
 
 impl TryFrom<IndexMetadata<TableName>> for IndexMetadataResponse {
@@ -120,7 +96,7 @@ impl TryFrom<IndexMetadata<TableName>> for IndexMetadataResponse {
         let name = meta.name.descriptor().to_string();
         Ok(match meta.config {
             IndexConfig::Database {
-                developer_config: DeveloperDatabaseIndexConfig { fields },
+                spec: DatabaseIndexSpec { fields },
                 on_disk_state,
             } => {
                 let backfill_state = match on_disk_state {
@@ -130,7 +106,7 @@ impl TryFrom<IndexMetadata<TableName>> for IndexMetadataResponse {
                     // might consider a new value that would let us
                     // differentiate between Backfilled and Enabled in the
                     // dashboard. The CLI doesn't currently care.
-                    DatabaseIndexState::Enabled | DatabaseIndexState::Backfilled => {
+                    DatabaseIndexState::Enabled | DatabaseIndexState::Backfilled { .. } => {
                         "done".to_string()
                     },
                 };
@@ -142,12 +118,13 @@ impl TryFrom<IndexMetadata<TableName>> for IndexMetadataResponse {
                     backfill: BackfillResponse {
                         state: backfill_state,
                     },
+                    staged: on_disk_state.is_staged(),
                 }
             },
             IndexConfig::Text {
                 on_disk_state,
-                developer_config:
-                    DeveloperTextIndexConfig {
+                spec:
+                    TextIndexSpec {
                         search_field,
                         filter_fields,
                     },
@@ -158,7 +135,7 @@ impl TryFrom<IndexMetadata<TableName>> for IndexMetadataResponse {
                     // also for display in the dashboard. We might consider a new value that would
                     // let us differentiate between Backfilled and SnapshottedAt in the dashboard.
                     // The CLI doesn't currently care.
-                    TextIndexState::SnapshottedAt(_) | TextIndexState::Backfilled(_) => {
+                    TextIndexState::SnapshottedAt(_) | TextIndexState::Backfilled { .. } => {
                         "done".to_string()
                     },
                 };
@@ -172,11 +149,12 @@ impl TryFrom<IndexMetadata<TableName>> for IndexMetadataResponse {
                     backfill: BackfillResponse {
                         state: backfill_state,
                     },
+                    staged: on_disk_state.is_staged(),
                 }
             },
             IndexConfig::Vector {
-                developer_config:
-                    DeveloperVectorIndexConfig {
+                spec:
+                    VectorIndexSpec {
                         dimensions,
                         vector_field,
                         filter_fields,
@@ -185,7 +163,7 @@ impl TryFrom<IndexMetadata<TableName>> for IndexMetadataResponse {
             } => {
                 let backfill_state = match on_disk_state {
                     VectorIndexState::Backfilling(_) => "in_progress".to_string(),
-                    VectorIndexState::Backfilled(_) | VectorIndexState::SnapshottedAt(_) => {
+                    VectorIndexState::Backfilled { .. } | VectorIndexState::SnapshottedAt(_) => {
                         "done".to_string()
                     },
                 };
@@ -200,6 +178,7 @@ impl TryFrom<IndexMetadata<TableName>> for IndexMetadataResponse {
                     backfill: BackfillResponse {
                         state: backfill_state,
                     },
+                    staged: on_disk_state.is_staged(),
                 }
             },
         })
@@ -219,11 +198,13 @@ pub struct PrepareSchemaArgs {
 pub struct PrepareSchemaResponse {
     added: Vec<IndexMetadataResponse>,
     dropped: Vec<IndexMetadataResponse>,
+    enabled: Vec<IndexMetadataResponse>,
+    disabled: Vec<IndexMetadataResponse>,
     schema_id: String,
 }
 
 impl PrepareSchemaResponse {
-    fn new(diff: LegacyIndexDiff, schema_id: ResolvedDocumentId) -> anyhow::Result<Self> {
+    fn new(diff: IndexDiff, schema_id: ResolvedDocumentId) -> anyhow::Result<Self> {
         Ok(PrepareSchemaResponse {
             added: diff
                 .added
@@ -232,6 +213,18 @@ impl PrepareSchemaResponse {
                 .try_collect()?,
             dropped: diff
                 .dropped
+                .into_iter()
+                .map(|doc| doc.into_value())
+                .map(IndexMetadataResponse::try_from)
+                .try_collect()?,
+            enabled: diff
+                .enabled
+                .into_iter()
+                .map(|doc| doc.into_value())
+                .map(IndexMetadataResponse::try_from)
+                .try_collect()?,
+            disabled: diff
+                .disabled
                 .into_iter()
                 .map(|doc| doc.into_value())
                 .map(IndexMetadataResponse::try_from)
@@ -255,12 +248,13 @@ pub async fn prepare_schema_handler(
     req: PrepareSchemaArgs,
 ) -> Result<(Json<PrepareSchemaResponse>, bool), HttpResponseError> {
     let bundle = req.bundle.try_into()?;
-    let identity = must_be_admin_from_key_with_write_access(
+    let identity = must_be_admin_from_key(
         st.application.app_auth(),
         st.instance_name.clone(),
         req.admin_key,
     )
     .await?;
+    identity.require_operation(keybroker::DeploymentOp::Deploy)?;
     let schema = match st.application.evaluate_schema(bundle).await {
         Ok(m) => m,
         Err(e) => return Err(e.into()),
@@ -275,7 +269,7 @@ pub async fn prepare_schema_handler(
     let table_namespace = TableNamespace::root_component();
     // In dry_run we only commit the schema, to enable CLI to check if the schema is
     // valid.
-    let index_diff: LegacyIndexDiff = if dry_run {
+    let index_diff = if dry_run {
         let mut tx = st.application.begin(identity.clone()).await?;
         IndexModel::new(&mut tx)
             .prepare_new_and_mutated_indexes(table_namespace, &schema)
@@ -284,8 +278,7 @@ pub async fn prepare_schema_handler(
         IndexModel::new(&mut tx)
             .prepare_new_and_mutated_indexes(table_namespace, &schema)
             .await?
-    }
-    .into();
+    };
 
     let (schema_id, schema_state) = SchemaModel::new(&mut tx, table_namespace)
         .submit_pending(schema)
@@ -355,11 +348,11 @@ impl From<SchemaState> for SchemaStateJson {
 
 /// Gets the current state of the indexes and schema.
 pub async fn schema_state(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     Path(schema_id): Path<String>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::Deploy)?;
     let mut tx = st.application.begin(identity.clone()).await?;
     // This endpoint is only used in non-components push.
     let table_namespace = TableNamespace::root_component();
@@ -372,7 +365,7 @@ pub async fn schema_state(
     let doc = tx.get(schema_id).await?.ok_or_else(|| {
         anyhow::anyhow!(ErrorMetadata::not_found(
             "SchemaNotFound",
-            format!("Schema with id {} not found", schema_id),
+            format!("Schema with id {schema_id} not found"),
         ))
     })?;
     let SchemaMetadata { state, .. } = doc.into_value().into_value().try_into()?;

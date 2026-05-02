@@ -3,16 +3,16 @@ import { endOfDay } from "date-fns";
 import { LoadingTransition } from "@ui/Loading";
 import { useDateFilters } from "@common/elements/DateRangePicker";
 import { useTeamAuditLog } from "api/auditLog";
-import { useProjects } from "api/projects";
-import { useTeamMembers } from "api/teams";
-import { AuditLogAction, Team } from "generatedApi";
+import { useTeamEntitlements, useTeamMembers } from "api/teams";
+import { AuditLogAction, TeamResponse } from "generatedApi";
 import { useRouter } from "next/router";
 import { AuditLogContent } from "./AuditLogContent";
 import { AuditLogToolbar } from "./AuditLogToolbar";
 
-export function AuditLog({ team }: { team: Team }) {
-  const projects = useProjects(team.id);
+export function AuditLog({ team }: { team: TeamResponse }) {
   const members = useTeamMembers(team.id);
+  const auditLogRetentionDays =
+    useTeamEntitlements(team?.id)?.auditLogRetentionDays ?? 0;
 
   const router = useRouter();
 
@@ -73,15 +73,15 @@ export function AuditLog({ team }: { team: Team }) {
             selectedEndDay={endDate}
             setDate={setDate}
             members={members}
+            auditLogRetentionDays={auditLogRetentionDays}
           />
         )}
         <LoadingTransition>
-          {projects && members && !isLoading && entries !== undefined ? (
+          {members && !isLoading && entries !== undefined && (
             <div className="flex w-full flex-col gap-4 overflow-y-auto">
               <AuditLogContent
                 {...{
                   team,
-                  projects,
                   members,
                   entries,
                 }}
@@ -97,7 +97,7 @@ export function AuditLog({ team }: { team: Team }) {
                 Load more
               </Button>
             </div>
-          ) : undefined}
+          )}
         </LoadingTransition>
       </div>
     </>

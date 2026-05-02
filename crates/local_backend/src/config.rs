@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    fmt,
+    net::SocketAddr,
+};
 
 use clap::Parser;
 use clusters::DbDriverTag;
@@ -7,7 +10,7 @@ use common::types::{
     ConvexSite,
 };
 use keybroker::{
-    InstanceSecret,
+    DeploymentSecret,
     KeyBroker,
     DEV_INSTANCE_NAME,
     DEV_SECRET,
@@ -103,7 +106,7 @@ pub struct LocalConfig {
     /// self-hosted Convex will periodically communicate with a remote beacon
     /// server. This is to help Convex understand and improve the product.
     /// If set, the self-host beacon will not be sent.
-    #[clap(long)]
+    #[clap(long, env = "DISABLE_BEACON", value_parser = clap::builder::BoolishValueParser::new())]
     pub disable_beacon: bool,
 
     /// A tag to identify the self-hosted instance.
@@ -122,6 +125,11 @@ pub struct LocalConfig {
     /// reach the client for debugging purposes.
     #[clap(long, default_value = "false")]
     pub redact_logs_to_client: bool,
+
+    /// Path of local file for logs to be routed to. For local testing
+    /// of log integrations (eg axiom/datadog).
+    #[clap(long)]
+    pub local_log_sink: Option<String>,
 }
 
 impl fmt::Debug for LocalConfig {
@@ -135,8 +143,8 @@ impl fmt::Debug for LocalConfig {
 }
 
 impl LocalConfig {
-    pub fn http_bind_address(&self) -> ([u8; 4], u16) {
-        (self.interface.octets(), self.port)
+    pub fn http_bind_address(&self) -> SocketAddr {
+        SocketAddr::new(self.interface.into(), self.port)
     }
 
     pub fn site_forward_prefix(&self) -> String {
@@ -183,16 +191,15 @@ impl LocalConfig {
         self.instance_name
             .clone()
             .unwrap_or(DEV_INSTANCE_NAME.to_owned())
-            .clone()
     }
 
     pub fn key_broker(&self) -> anyhow::Result<KeyBroker> {
-        let name = self.name().clone();
+        let name = self.name();
         KeyBroker::new(&name, self.secret()?)
     }
 
-    pub fn secret(&self) -> anyhow::Result<InstanceSecret> {
-        InstanceSecret::try_from(
+    pub fn secret(&self) -> anyhow::Result<DeploymentSecret> {
+        DeploymentSecret::try_from(
             self.instance_secret
                 .clone()
                 .unwrap_or(DEV_SECRET.to_owned())
@@ -210,22 +217,4 @@ impl LocalConfig {
         }
     }
 
-    #[cfg(test)]
-    pub fn new_for_test() -> anyhow::Result<Self> {
-        use anyhow::Context;
-
-        let tempdir_handle = tempfile::tempdir()?;
-        let db_path = tempdir_handle.path().join("convex_local_backend.sqlite3");
-        // Easiest way to get a config object with defaults is to parse from cmd line
-        let config = Self::try_parse_from([
-            "convex-local-backend",
-            db_path.to_str().context("invalid db path")?,
-            "--local-storage",
-            tempdir_handle
-                .path()
-                .to_str()
-                .context("invalid local storage path")?,
-        ])?;
-        Ok(config)
-    }
 }

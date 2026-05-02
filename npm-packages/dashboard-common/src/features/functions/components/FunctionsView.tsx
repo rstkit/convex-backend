@@ -5,7 +5,6 @@ import {
   useModuleFunctions,
 } from "@common/lib/functions/FunctionsProvider";
 import { DirectorySidebar } from "@common/features/functions/components/DirectorySidebar";
-import { FileEditor } from "@common/features/functions/components/FileEditor";
 import { FunctionSummary } from "@common/features/functions/components/FunctionSummary";
 import { PerformanceGraphs } from "@common/features/functions/components/PerformanceGraphs";
 import { SingleGraph } from "@common/features/functions/components/SingleGraph";
@@ -13,23 +12,51 @@ import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import { SidebarDetailLayout } from "@common/layouts/SidebarDetailLayout";
 import { EmptySection } from "@common/elements/EmptySection";
 import { DeploymentPageTitle } from "@common/elements/DeploymentPageTitle";
+import { NoPermissionMessage } from "@common/elements/NoPermissionMessage";
 import { Tab } from "@ui/Tab";
-import { Tab as HeadlessTab } from "@headlessui/react";
+import {
+  TabGroup as HeadlessTabGroup,
+  TabPanel as HeadlessTabPanel,
+  TabPanels as HeadlessTabPanels,
+} from "@headlessui/react";
 import { useNents } from "@common/lib/useNents";
 import { Sheet } from "@ui/Sheet";
 import { FunctionLogs } from "./FunctionLogs";
 
-export function FunctionsView() {
+export function FunctionsView({
+  showSubscriptionInvalidations = false,
+}: {
+  showSubscriptionInvalidations?: boolean;
+} = {}) {
+  const { useIsOperationAllowed } = useContext(DeploymentInfoContext);
+  const canViewData = useIsOperationAllowed("ViewData");
+
+  if (!canViewData) {
+    return (
+      <>
+        <DeploymentPageTitle title="Functions" />
+        <NoPermissionMessage message="You do not have permission to view functions in this deployment." />
+      </>
+    );
+  }
+
   return (
     <>
       <DeploymentPageTitle title="Functions" />
-      <Functions />
+      <Functions
+        showSubscriptionInvalidations={showSubscriptionInvalidations}
+      />
     </>
   );
 }
-function Functions() {
+function Functions({
+  showSubscriptionInvalidations,
+}: {
+  showSubscriptionInvalidations: boolean;
+}) {
   const { useCurrentDeployment } = useContext(DeploymentInfoContext);
-  const deploymentId = useCurrentDeployment()?.id;
+  const deployment = useCurrentDeployment();
+  const deploymentId = deployment && "id" in deployment ? deployment.id : null;
   const currentOpenFunction = useCurrentOpenFunction();
   const modules = useModuleFunctions();
   const [selectedTabIndex, setSelectedTabIndex] = useState(0);
@@ -48,49 +75,45 @@ function Functions() {
             className="size-8 min-w-8 text-content-primary"
             aria-hidden
           />
-          Select a function in the expandable panel to the left to view its
-          statistics, code, and logs.
+          Select a function in the expandable panel to the left to view metrics
+          and logs.
         </Sheet>
       </div>
     );
   } else {
     content = (
-      <div className="flex h-full max-w-[110rem] grow flex-col">
-        <HeadlessTab.Group
+      <div className="flex h-full min-w-0 grow flex-col overflow-hidden">
+        <HeadlessTabGroup
           selectedIndex={selectedTabIndex}
           onChange={setSelectedTabIndex}
-          className="flex grow flex-col"
-          as="div"
+          className="flex min-h-0 grow flex-col"
         >
-          <div className="sticky top-0 z-10 mb-6 overflow-x-auto bg-background-secondary scrollbar">
+          <div className="sticky top-0 z-10 scrollbar min-h-fit overflow-x-auto bg-background-secondary">
             <div className="flex-none px-6 pt-4">
               <FunctionSummary currentOpenFunction={currentOpenFunction} />
             </div>
             <div className="-ml-2 flex gap-2 border-b px-6">
               <Tab>Statistics</Tab>
-              <Tab>Code</Tab>
               <Tab>Logs</Tab>
             </div>
           </div>
 
-          <HeadlessTab.Panels className="flex w-full grow overflow-x-auto px-6 pb-4 scrollbar">
-            <HeadlessTab.Panel className="grow">
-              <PerformanceGraphs />
-            </HeadlessTab.Panel>
+          <HeadlessTabPanels className="scrollbar flex w-full max-w-[110rem] min-w-0 grow flex-col overflow-x-auto p-6">
+            <HeadlessTabPanel className="grow">
+              <PerformanceGraphs
+                showSubscriptionInvalidations={showSubscriptionInvalidations}
+              />
+            </HeadlessTabPanel>
 
-            <HeadlessTab.Panel className="grow">
-              <FileEditor moduleFunction={currentOpenFunction} />
-            </HeadlessTab.Panel>
-
-            <HeadlessTab.Panel className="grow">
+            <HeadlessTabPanel className="flex min-h-0 min-w-0 grow">
               <FunctionLogs
                 key={currentOpenFunction.displayName}
                 currentOpenFunction={currentOpenFunction}
                 selectedNent={selectedNent || undefined}
               />
-            </HeadlessTab.Panel>
-          </HeadlessTab.Panels>
-        </HeadlessTab.Group>
+            </HeadlessTabPanel>
+          </HeadlessTabPanels>
+        </HeadlessTabGroup>
       </div>
     );
   }
@@ -105,7 +128,7 @@ function Functions() {
   );
 }
 
-function EmptyFunctions() {
+export function EmptyFunctions() {
   return (
     <div className="relative h-full w-full animate-fadeIn overflow-hidden">
       {/* Background example */}
@@ -127,7 +150,7 @@ function EmptyFunctions() {
                     <span className="font-mono text-sm font-semibold text-content-secondary">
                       example/function:myFunction
                     </span>
-                    <span className="rounded bg-yellow-500/10 p-1 text-xs font-semibold text-yellow-500">
+                    <span className="rounded-sm bg-yellow-500/10 p-1 text-xs font-semibold text-yellow-500">
                       Query
                     </span>
                   </div>
@@ -137,9 +160,6 @@ function EmptyFunctions() {
             <div className="-ml-2 flex gap-2 border-b px-6">
               <div className="border-b-2 border-content-primary px-3 py-2 text-sm">
                 Statistics
-              </div>
-              <div className="px-3 py-2 text-sm text-content-secondary">
-                Code
               </div>
               <div className="px-3 py-2 text-sm text-content-secondary">
                 Logs
@@ -182,7 +202,7 @@ function EmptyFunctions() {
                     {
                       key: "metric",
                       name: "calls",
-                      color: "rgb(var(--chart-line-1))",
+                      color: "var(--chart-line-1)",
                     },
                   ],
                 }}
@@ -215,7 +235,7 @@ function EmptyFunctions() {
                     {
                       key: "metric",
                       name: "errors",
-                      color: "rgb(var(--chart-line-4))",
+                      color: "var(--chart-line-4)",
                     },
                   ],
                 }}
@@ -247,18 +267,18 @@ function EmptyFunctions() {
                   lineKeys: [
                     {
                       key: "p50",
-                      name: "p50",
-                      color: "rgb(var(--chart-line-1))",
+                      name: "ms p50",
+                      color: "var(--chart-line-1)",
                     },
                     {
                       key: "p90",
-                      name: "p90",
-                      color: "rgb(var(--chart-line-2))",
+                      name: "ms p90",
+                      color: "var(--chart-line-2)",
                     },
                     {
                       key: "p95",
-                      name: "p95",
-                      color: "rgb(var(--chart-line-3))",
+                      name: "ms p95",
+                      color: "var(--chart-line-3)",
                     },
                   ],
                 }}
@@ -291,7 +311,7 @@ function EmptyFunctions() {
                     {
                       key: "metric",
                       name: "%",
-                      color: "rgb(var(--chart-line-1))",
+                      color: "var(--chart-line-1)",
                     },
                   ],
                 }}

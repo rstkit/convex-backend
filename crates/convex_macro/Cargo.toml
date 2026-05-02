@@ -2,15 +2,17 @@
 name = "convex_macro"
 version = "0.1.0"
 authors = ["Convex, Inc. <no-reply@convex.dev>"]
-edition = "2021"
+edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
 
 [lib]
 doctest = false
 proc-macro = true
 
+[features]
+testing = []
+
 [dependencies]
-proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 

@@ -1,19 +1,14 @@
-use std::sync::LazyLock;
+use std::sync::{
+    Arc,
+    LazyLock,
+};
 
 use cmd_util::env::env_config;
 use common::{
-    document::{
-        ParseDocument,
-        ParsedDocument,
-    },
-    query::{
-        Order,
-        Query,
-    },
+    document::ParsedDocument,
     runtime::Runtime,
 };
 use database::{
-    ResolvedQuery,
     SystemMetadataModel,
     Transaction,
 };
@@ -59,12 +54,16 @@ impl<'a, RT: Runtime> BackendInfoModel<'a, RT> {
         Self { tx }
     }
 
-    pub async fn get(&mut self) -> anyhow::Result<Option<ParsedDocument<BackendInfoPersisted>>> {
-        let backend_info_query = Query::full_table_scan(BACKEND_INFO_TABLE.clone(), Order::Asc);
-        let mut query_stream =
-            ResolvedQuery::new(self.tx, TableNamespace::Global, backend_info_query)?;
-        let backend_info_doc = query_stream.expect_at_most_one(self.tx).await?;
-        backend_info_doc.map(|doc| doc.parse()).transpose()
+    pub async fn get(
+        &mut self,
+    ) -> anyhow::Result<Option<Arc<ParsedDocument<BackendInfoPersisted>>>> {
+        self.tx
+            .query_system(
+                TableNamespace::Global,
+                &SystemIndex::<BackendInfoTable>::by_id(),
+            )?
+            .unique()
+            .await
     }
 
     pub async fn set(&mut self, backend_info: BackendInfoPersisted) -> anyhow::Result<()> {
@@ -95,12 +94,13 @@ impl<'a, RT: Runtime> BackendInfoModel<'a, RT> {
 
         let backend_info = self.get().await?;
         anyhow::ensure!(
+            // Streaming export is enabled by default for local-dev and self-hosted.
             backend_info
                 .map(|bi| bi.streaming_export_enabled)
-                .unwrap_or_default(),
+                .unwrap_or(true),
             ErrorMetadata::forbidden(
                 "StreamingExportNotEnabled",
-                "Streaming egress is not available on the Convex Starter plan. See https://www.convex.dev/plans to upgrade.",
+                "Streaming export is not available on your current subscription. See https://www.convex.dev/plans to upgrade.",
             ),
         );
         Ok(())
@@ -108,9 +108,10 @@ impl<'a, RT: Runtime> BackendInfoModel<'a, RT> {
 
     pub async fn is_log_streaming_allowed(&mut self) -> anyhow::Result<bool> {
         let backend_info = self.get().await?;
+        // Log streaming is allowed on local-deployments.
         Ok(backend_info
             .map(|bi| bi.log_streaming_enabled)
-            .unwrap_or_default())
+            .unwrap_or(true))
     }
 
     pub async fn ensure_log_streaming_allowed(&mut self) -> anyhow::Result<()> {
@@ -118,7 +119,7 @@ impl<'a, RT: Runtime> BackendInfoModel<'a, RT> {
             self.is_log_streaming_allowed().await?,
             ErrorMetadata::forbidden(
                 "LogStreamingNotEnabled",
-                "Log streaming is not available on the Convex Starter plan. See https://www.convex.dev/plans to upgrade."
+                "Log streaming is not available on your current subscription. See https://www.convex.dev/plans to upgrade."
             )
         );
         Ok(())

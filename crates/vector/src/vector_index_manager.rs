@@ -18,8 +18,10 @@ use common::{
     },
     knobs::SEARCHLIGHT_CLUSTER_NAME,
     runtime::block_in_place,
+    try_anyhow,
     types::{
         IndexId,
+        SearchIndexMetricLabels,
         Timestamp,
         WriteTimestamp,
     },
@@ -61,7 +63,7 @@ use crate::{
     },
     searcher::VectorSearcher,
     CompiledVectorSearch,
-    DocInVectorIndex,
+    VectorIndexWriteSize,
 };
 
 #[derive(Clone)]
@@ -83,10 +85,10 @@ impl IndexState {
         memory_index: MemoryVectorIndex,
     ) {
         match self {
-            IndexState::Bootstrapping(ref mut indexes) => {
+            IndexState::Bootstrapping(indexes) => {
                 indexes.insert(id, state);
             },
-            IndexState::Ready(ref mut indexes) => {
+            IndexState::Ready(indexes) => {
                 indexes.insert(id, (state, memory_index));
             },
         };
@@ -122,10 +124,10 @@ impl IndexState {
 
     pub fn delete(&mut self, id: &InternalId) {
         match self {
-            IndexState::Bootstrapping(ref mut indexes) => {
+            IndexState::Bootstrapping(indexes) => {
                 indexes.remove(id);
             },
-            IndexState::Ready(ref mut indexes) => {
+            IndexState::Ready(indexes) => {
                 indexes.remove(id);
             },
         }
@@ -139,7 +141,7 @@ fn get_vector_index_states(
 
     for index in registry.all_vector_indexes() {
         let IndexConfig::Vector {
-            developer_config: _,
+            spec: _,
             ref on_disk_state,
         } = index.config
         else {
@@ -183,7 +185,7 @@ impl VectorIndexManager {
         if let IndexState::Ready(ref indexes) = self.indexes {
             Ok(indexes)
         } else {
-            anyhow::bail!(ErrorMetadata::overloaded(
+            anyhow::bail!(ErrorMetadata::feature_temporarily_unavailable(
                 "VectorIndexesUnavailable",
                 "Vector indexes are bootstrapping and not yet available for use",
             ))
@@ -203,25 +205,26 @@ impl VectorIndexManager {
         deletion: Option<&ResolvedDocument>,
         insertion: Option<&ResolvedDocument>,
         ts: WriteTimestamp,
-    ) -> anyhow::Result<DocInVectorIndex> {
+    ) -> anyhow::Result<VectorIndexWriteSize> {
+        let mut write_size = VectorIndexWriteSize(0);
         let timer = metrics::index_manager_update_timer();
         let Some(id) = deletion.as_ref().or(insertion.as_ref()).map(|d| d.id()) else {
             finish_index_manager_update_timer(timer, metrics::IndexUpdateType::None);
-            return Ok(DocInVectorIndex::Absent);
+            return Ok(write_size);
         };
         if self.update_vector_index_metadata(id, index_registry, deletion, insertion, ts)? {
             finish_index_manager_update_timer(timer, metrics::IndexUpdateType::IndexMetadata);
-            return Ok(DocInVectorIndex::Absent);
+            return Ok(write_size);
         }
 
         if let IndexState::Ready(..) = self.indexes {
-            if self.update_vector_index_contents(id, index_registry, deletion, insertion, ts)? {
-                finish_index_manager_update_timer(timer, metrics::IndexUpdateType::Document);
-                return Ok(DocInVectorIndex::Present);
-            }
+            write_size =
+                self.update_vector_index_contents(id, index_registry, deletion, insertion, ts)?;
+            finish_index_manager_update_timer(timer, metrics::IndexUpdateType::Document);
+            return Ok(write_size);
         }
         finish_index_manager_update_timer(timer, metrics::IndexUpdateType::None);
-        Ok(DocInVectorIndex::Absent)
+        Ok(write_size)
     }
 
     fn update_vector_index_contents(
@@ -231,26 +234,24 @@ impl VectorIndexManager {
         deletion: Option<&ResolvedDocument>,
         insertion: Option<&ResolvedDocument>,
         ts: WriteTimestamp,
-    ) -> anyhow::Result<bool> {
-        let mut at_least_one_matching_index = false;
+    ) -> anyhow::Result<VectorIndexWriteSize> {
+        let mut write_size = VectorIndexWriteSize(0);
         for index in index_registry.vector_indexes_by_table(id.tablet_id) {
-            let IndexConfig::Vector {
-                ref developer_config,
-                ..
-            } = index.metadata.config
-            else {
+            let IndexConfig::Vector { ref spec, .. } = index.metadata.config else {
                 continue;
             };
-            let qdrant_schema = QdrantSchema::new(developer_config);
+            let qdrant_schema = QdrantSchema::new(spec);
             let old_value = deletion.as_ref().and_then(|d| qdrant_schema.index(d));
             let new_value = insertion.as_ref().and_then(|d| qdrant_schema.index(d));
-            at_least_one_matching_index =
-                at_least_one_matching_index || old_value.is_some() || new_value.is_some();
-            self.indexes.update(&index.id, None, |memory_index| {
+
+            // We need to add the size of the document id to the write size because it's
+            // also stored in the vector index.
+            write_size.0 += (qdrant_schema.estimate_vector_size() + id.size()) as u64;
+            self.indexes.update(&index.id(), None, |memory_index| {
                 memory_index.update(id.internal_id(), ts, old_value, new_value)
             })?;
         }
-        Ok(at_least_one_matching_index)
+        Ok(write_size)
     }
 
     fn update_vector_index_metadata(
@@ -289,7 +290,7 @@ impl VectorIndexManager {
             (Some(prev_version), Some(next_version)) => {
                 let prev_metadata: ParsedDocument<IndexMetadata<_>> = prev_version.parse()?;
                 let next_metadata: ParsedDocument<IndexMetadata<_>> = next_version.parse()?;
-                let (old_snapshot, new_snapshot) =
+                let (old_snapshot, new_snapshot, staged) =
                     match (&prev_metadata.config, &next_metadata.config) {
                         (
                             IndexConfig::Vector {
@@ -299,40 +300,55 @@ impl VectorIndexManager {
                             },
                             IndexConfig::Vector {
                                 on_disk_state:
-                                    VectorIndexState::Backfilling(VectorIndexBackfillState { .. }),
+                                    VectorIndexState::Backfilling(VectorIndexBackfillState {
+                                        staged,
+                                        ..
+                                    }),
                                 ..
                             },
-                        ) => (None, None),
+                        ) => (None, None, *staged),
                         (
                             IndexConfig::Vector {
                                 on_disk_state: VectorIndexState::Backfilling { .. },
                                 ..
                             },
                             IndexConfig::Vector {
-                                on_disk_state: VectorIndexState::Backfilled(snapshot),
+                                on_disk_state: VectorIndexState::Backfilled { snapshot, staged },
                                 ..
                             },
-                        ) => (None, Some(snapshot)),
+                        ) => (None, Some(snapshot), *staged),
                         (
                             IndexConfig::Vector {
-                                on_disk_state: VectorIndexState::Backfilled(old_snapshot),
+                                on_disk_state:
+                                    VectorIndexState::Backfilled {
+                                        snapshot: old_snapshot,
+                                        ..
+                                    },
                                 ..
                             },
                             IndexConfig::Vector {
                                 on_disk_state: VectorIndexState::SnapshottedAt(new_snapshot),
                                 ..
                             },
-                        ) => (Some(old_snapshot), Some(new_snapshot)),
+                        ) => (Some(old_snapshot), Some(new_snapshot), false),
                         (
                             IndexConfig::Vector {
-                                on_disk_state: VectorIndexState::Backfilled(old_snapshot),
+                                on_disk_state:
+                                    VectorIndexState::Backfilled {
+                                        snapshot: old_snapshot,
+                                        ..
+                                    },
                                 ..
                             },
                             IndexConfig::Vector {
-                                on_disk_state: VectorIndexState::Backfilled(new_snapshot),
+                                on_disk_state:
+                                    VectorIndexState::Backfilled {
+                                        snapshot: new_snapshot,
+                                        staged,
+                                    },
                                 ..
                             },
-                        ) => (Some(old_snapshot), Some(new_snapshot)),
+                        ) => (Some(old_snapshot), Some(new_snapshot), *staged),
                         (
                             IndexConfig::Vector {
                                 on_disk_state: VectorIndexState::SnapshottedAt(old_snapshot),
@@ -342,14 +358,35 @@ impl VectorIndexManager {
                                 on_disk_state: VectorIndexState::SnapshottedAt(new_snapshot),
                                 ..
                             },
-                        ) => (Some(old_snapshot), Some(new_snapshot)),
+                        ) => (Some(old_snapshot), Some(new_snapshot), false),
+                        (
+                            IndexConfig::Vector {
+                                on_disk_state: VectorIndexState::SnapshottedAt(old_snapshot),
+                                ..
+                            },
+                            IndexConfig::Vector {
+                                on_disk_state:
+                                    VectorIndexState::Backfilled {
+                                        snapshot: new_snapshot,
+                                        staged,
+                                    },
+                                ..
+                            },
+                        ) => {
+                            anyhow::ensure!(
+                                old_snapshot == new_snapshot,
+                                "Snapshot mismatch when disabling vector index"
+                            );
+                            anyhow::ensure!(staged, "Disabled vector index must be staged");
+                            (Some(old_snapshot), Some(new_snapshot), *staged)
+                        },
                         (IndexConfig::Vector { .. }, _) | (_, IndexConfig::Vector { .. }) => {
                             anyhow::bail!(
                                 "Invalid index type transition: {prev_metadata:?} to \
                                  {next_metadata:?}"
                             );
                         },
-                        _ => (None, None),
+                        _ => (None, None, false),
                     };
                 if let Some(new_snapshot) = new_snapshot {
                     let is_newly_enabled =
@@ -365,7 +402,10 @@ impl VectorIndexManager {
                         let updated_state = if is_next_index_enabled {
                             VectorIndexState::SnapshottedAt(new_snapshot.clone())
                         } else {
-                            VectorIndexState::Backfilled(new_snapshot.clone())
+                            VectorIndexState::Backfilled {
+                                snapshot: new_snapshot.clone(),
+                                staged,
+                            }
                         };
 
                         self.indexes.update(
@@ -403,12 +443,8 @@ impl VectorIndexManager {
         search_storage: Arc<dyn Storage>,
     ) -> anyhow::Result<Vec<VectorSearchQueryResult>> {
         let timer = metrics::search_timer(&SEARCHLIGHT_CLUSTER_NAME);
-        let result: anyhow::Result<_> = try {
-            let IndexConfig::Vector {
-                ref developer_config,
-                ..
-            } = index.metadata.config
-            else {
+        let result: anyhow::Result<_> = try_anyhow!({
+            let IndexConfig::Vector { ref spec, .. } = index.metadata.config else {
                 anyhow::bail!(ErrorMetadata::bad_request(
                     "IndexNotAVectorIndexError",
                     format!(
@@ -420,10 +456,12 @@ impl VectorIndexManager {
             let Some((vector_index, memory_index)) = self.require_ready_index(&index.id())? else {
                 anyhow::bail!("Vector index {:?} not available", index.id());
             };
-            let qdrant_schema = QdrantSchema::new(developer_config);
-            let VectorIndexState::SnapshottedAt(ref snapshot) = vector_index else {
+            let qdrant_schema = QdrantSchema::new(spec);
+            let VectorIndexState::SnapshottedAt(snapshot) = vector_index else {
                 anyhow::bail!(index_backfilling_error(&query.printable_index_name()?));
             };
+            let metric_labels =
+                SearchIndexMetricLabels::new(Some(index.id()), None::<&str>).to_owned();
             let (disk_revisions, vector_index_type) = match snapshot.data {
                 VectorIndexSnapshotData::Unknown(_) => {
                     anyhow::bail!(index_backfilling_error(&query.printable_index_name()?))
@@ -437,13 +475,14 @@ impl VectorIndexManager {
                         qdrant_schema,
                         memory_index,
                         snapshot.ts,
+                        metric_labels,
                     )
                     .await?,
                     VectorIndexType::MultiSegment,
                 ),
             };
             (disk_revisions, vector_index_type)
-        };
+        });
         match result {
             Ok((disk_revisions, vector_index_type)) => {
                 metrics::finish_search(timer, &disk_revisions, vector_index_type);
@@ -467,19 +506,22 @@ impl VectorIndexManager {
         qdrant_schema: QdrantSchema,
         memory_index: &MemoryVectorIndex,
         ts: Timestamp,
+        metric_labels: SearchIndexMetricLabels<'static>,
     ) -> anyhow::Result<Vec<VectorSearchQueryResult>> {
         self.compile_search_and_truncate(
             query,
             qdrant_schema,
             memory_index,
             ts,
-            |qdrant_schema, compiled_query, overfetch_delta| {
+            metric_labels,
+            |qdrant_schema, compiled_query, overfetch_delta, labels| {
                 async move {
                     let timer = metrics::searchlight_client_execute_timer(
                         VectorIndexType::MultiSegment,
                         &SEARCHLIGHT_CLUSTER_NAME,
                     );
                     let total_segments = segments.len();
+                    let metric_labels = labels;
                     let results = searcher
                         .execute_multi_segment_vector_query(
                             search_storage.clone(),
@@ -491,6 +533,7 @@ impl VectorIndexManager {
                             qdrant_schema,
                             compiled_query.clone(),
                             overfetch_delta as u32,
+                            metric_labels,
                         )
                         .await?;
                     metrics::log_num_segments_searched_total(total_segments);
@@ -509,10 +552,12 @@ impl VectorIndexManager {
         qdrant_schema: QdrantSchema,
         memory_index: &MemoryVectorIndex,
         ts: Timestamp,
+        metric_labels: SearchIndexMetricLabels<'static>,
         call_searchlight: impl FnOnce(
             QdrantSchema,
             CompiledVectorSearch,
             usize,
+            SearchIndexMetricLabels<'static>,
         )
             -> BoxFuture<'a, anyhow::Result<Vec<VectorSearchQueryResult>>>,
     ) -> anyhow::Result<Vec<VectorSearchQueryResult>> {
@@ -520,8 +565,13 @@ impl VectorIndexManager {
         let updated_matches = memory_index.updated_matches(ts, &compiled_query)?;
         let overfetch_delta = updated_matches.len();
         metrics::log_searchlight_overfetch_delta(overfetch_delta);
-        let mut disk_revisions =
-            call_searchlight(qdrant_schema, compiled_query.clone(), overfetch_delta).await?;
+        let mut disk_revisions = call_searchlight(
+            qdrant_schema,
+            compiled_query.clone(),
+            overfetch_delta,
+            metric_labels,
+        )
+        .await?;
 
         block_in_place(|| {
             // Filter out revisions that are no longer latest.

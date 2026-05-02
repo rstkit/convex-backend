@@ -11,6 +11,10 @@ use std::{
         FromStr,
     },
     sync::{
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
         Arc,
         LazyLock,
     },
@@ -33,7 +37,6 @@ use axum::{
         connect_info::IntoMakeServiceWithConnectInfo,
         rejection::ExtensionRejection,
         FromRequestParts,
-        MatchedPath,
         OptionalFromRequestParts,
         State,
     },
@@ -48,6 +51,7 @@ use axum::{
     ServiceExt,
 };
 use axum_extra::extract::Host;
+use bytes::Bytes;
 use errors::{
     ErrorMetadata,
     ErrorMetadataAnyhowExt,
@@ -102,23 +106,34 @@ use utoipa::ToSchema;
 
 use self::metrics::log_http_request;
 use crate::{
+    dyn_event,
     errors::report_error_sync,
+    execution_context::{
+        ClientIp,
+        ClientUserAgent,
+    },
     knobs::{
+        DISABLE_METRICS_ENDPOINT,
         HTTP_SERVER_TCP_BACKLOG,
         PROPAGATE_UPSTREAM_TRACES,
     },
-    metrics::log_client_version_unsupported,
+    metrics::{
+        log_client_version_unsupported,
+        log_http_service_max_concurrent_requests,
+    },
     runtime::TaskManager,
     version::{
         ClientVersion,
         ClientVersionState,
     },
     RequestId,
+    RequestMetadata,
 };
 
 pub mod extract;
 pub mod fetch;
 pub mod fork_of_axum_serve;
+pub mod websocket;
 
 const MAX_HTTP2_STREAMS: u32 = 1024;
 
@@ -176,7 +191,7 @@ pub struct HttpRequest {
     pub headers: HeaderMap,
     pub url: Url,
     pub method: Method,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<Bytes>,
 }
 
 impl From<HttpRequest> for HttpRequestStream {
@@ -184,9 +199,9 @@ impl From<HttpRequest> for HttpRequestStream {
         let body: Pin<
             Box<dyn Stream<Item = anyhow::Result<bytes::Bytes>> + Sync + Send + 'static>,
         > = if let Some(b) = value.body {
-            Box::pin(futures::stream::once(async move {
-                Ok::<_, anyhow::Error>(bytes::Bytes::from(b))
-            }))
+            Box::pin(futures::stream::once(
+                async move { Ok::<_, anyhow::Error>(b) },
+            ))
         } else {
             Box::pin(futures::stream::empty())
         };
@@ -203,22 +218,6 @@ impl From<HttpRequest> for HttpRequestStream {
 }
 
 impl HttpRequestStream {
-    #[cfg(any(test, feature = "testing"))]
-    pub async fn into_http_request(mut self) -> anyhow::Result<HttpRequest> {
-        use futures::TryStreamExt;
-
-        let mut body = vec![];
-        while let Some(chunk) = self.body.try_next().await? {
-            body.append(&mut chunk.to_vec());
-        }
-
-        Ok(HttpRequest {
-            headers: self.headers,
-            url: self.url,
-            method: self.method,
-            body: Some(body),
-        })
-    }
 }
 
 impl HeapSize for HttpRequest {
@@ -226,40 +225,6 @@ impl HeapSize for HttpRequest {
         // Assume heap size is dominated by body (because the rest is annoying
         // to calculate).
         self.body.as_ref().map_or(0, |body| body.len())
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for HttpRequest {
-    type Parameters = ();
-
-    type Strategy = impl Strategy<Value = HttpRequest>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        use proptest_http::{
-            ArbitraryHeaderMap,
-            ArbitraryMethod,
-            ArbitraryUri,
-        };
-        prop_compose! {
-            fn inner()(
-                ArbitraryHeaderMap(headers) in any::<ArbitraryHeaderMap>(),
-                ArbitraryMethod(method) in any::<ArbitraryMethod>(),
-                ArbitraryUri(uri) in any::<ArbitraryUri>(),
-                body in any::<Option<Vec<u8>>>()) -> anyhow::Result<HttpRequest> {
-                    let origin: String = "http://example-deployment.convex.site/".to_string();
-                    let path_and_query: String =  uri.path_and_query().ok_or_else(|| anyhow::anyhow!("No path and query"))?.to_string();
-                    let url: Url = Url::parse(&(origin + &path_and_query))?;
-                Ok(HttpRequest {
-                    headers,
-                    method,
-                    url,
-                    body
-                })
-            }
-        };
-        inner().prop_filter_map("Invalid HttpRequest", |r| r.ok())
     }
 }
 
@@ -304,6 +269,7 @@ pub struct HttpResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub url: Option<Url>,
+    pub request_size: u64,
 }
 
 impl HttpResponse {
@@ -312,12 +278,14 @@ impl HttpResponse {
         headers: HeaderMap,
         body: Option<Vec<u8>>,
         url: Option<Url>,
+        request_size: u64,
     ) -> Self {
         Self {
             body,
             status,
             headers,
             url,
+            request_size,
         }
     }
 }
@@ -331,41 +299,8 @@ impl From<HttpResponse> for HttpResponseStream {
             status: value.status,
             headers: value.headers,
             url: value.url,
+            request_size: Arc::new(AtomicU64::new(value.request_size)),
         }
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for HttpResponse {
-    type Parameters = ();
-
-    type Strategy = impl Strategy<Value = HttpResponse>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        use proptest_http::{
-            ArbitraryHeaderMap,
-            ArbitraryStatusCode,
-            ArbitraryUri,
-        };
-        prop_compose! {
-            fn inner()(
-                ArbitraryHeaderMap(headers) in any::<ArbitraryHeaderMap>(),
-                ArbitraryStatusCode(status) in any::<ArbitraryStatusCode>(),
-                ArbitraryUri(uri) in any::<ArbitraryUri>(),
-                body in any::<Option<Vec<u8>>>()) -> anyhow::Result<HttpResponse> {
-                    let origin: String = "http://example-deployment.convex.site/".to_string();
-                    let path_and_query: String =  uri.path_and_query().ok_or_else(|| anyhow::anyhow!("No path and query"))?.to_string();
-                    let url: Url = Url::parse(&(origin + &path_and_query))?;
-                Ok(HttpResponse {
-                    status,
-                    headers,
-                    body,
-                    url: Some(url),
-                })
-            }
-        };
-        inner().prop_filter_map("Invalid HttpEndpoitnRequest", |r| r.ok())
     }
 }
 
@@ -374,6 +309,7 @@ pub struct HttpResponseStream {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub url: Option<Url>,
+    pub request_size: Arc<AtomicU64>,
 }
 
 impl HttpResponseStream {
@@ -393,6 +329,7 @@ impl HttpResponseStream {
             status: self.status,
             headers: self.headers,
             url: self.url,
+            request_size: self.request_size.load(Ordering::Relaxed),
         })
     }
 }
@@ -423,25 +360,12 @@ pub fn categorize_http_response_stream(
     Err(em.into())
 }
 
-#[cfg(any(test, feature = "testing"))]
-use proptest::prelude::*;
-
-#[cfg(any(test, feature = "testing"))]
-fn status_code_strategy() -> impl Strategy<Value = StatusCode> {
-    proptest_http::ArbitraryStatusCode::arbitrary().prop_map(|v| v.0)
-}
-
 /// `HttpError` is used as a vehicle for getting client facing error messages
 /// to clients on the HTTP protocol. Errors that are tagged with ErrorMetadata
 /// can be used to build these.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct HttpError {
     /// HTTP Status Code
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "status_code_strategy()")
-    )]
     status_code: StatusCode,
     /// Human-readable error code sent in HTTP response
     error_code: Cow<'static, str>,
@@ -607,6 +531,7 @@ impl ConvexHttpService {
         let sentry_layer = ServiceBuilder::new()
             .layer(sentry_tower::NewSentryLayer::<_>::new_from_top())
             .layer(sentry_tower::SentryHttpLayer::new());
+        log_http_service_max_concurrent_requests(service_name, max_concurrency);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
         let semaphore_ = semaphore.clone();
         let concurrency_gauge = PullingGauge::new(
@@ -629,7 +554,7 @@ impl ConvexHttpService {
                     .layer(axum::middleware::from_fn(tokio_instrumentation_middleware))
                     .layer(axum::middleware::from_fn(log_middleware))
                     .layer(axum::middleware::from_fn_with_state(
-                        route_metric_mapper.clone(),
+                        route_metric_mapper,
                         stats_middleware::<RM>,
                     ))
                     .layer(axum::middleware::from_fn(client_version_state_middleware))
@@ -665,7 +590,7 @@ impl ConvexHttpService {
 
     pub async fn serve<F: Future<Output = ()> + Send + 'static>(
         self,
-        addr: SocketAddr,
+        addr: impl MakeSocket,
         shutdown: F,
     ) -> anyhow::Result<()> {
         let extra = self.meta_routes();
@@ -674,8 +599,12 @@ impl ConvexHttpService {
             router = router.merge(extra);
         }
         let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
-        tracing::info!("{} listening on {addr}", self.service_name);
-        serve_http(make_svc, addr, shutdown).await
+        let socket = addr.make_socket()?;
+        let local_addr = socket.local_addr()?;
+        tracing::info!("{} listening on {local_addr}", self.service_name);
+        serve_http(make_svc, socket, shutdown)
+            .await
+            .with_context(|| format!("Could not start {} on {local_addr}", self.service_name))
     }
 
     /// Apply `middleware_fn` to incoming requests *before* passing them to
@@ -684,7 +613,7 @@ impl ConvexHttpService {
     /// matched.
     pub async fn serve_with_middleware<F, Fut, Rejection>(
         self,
-        addr: SocketAddr,
+        addr: impl MakeSocket,
         shutdown: F,
         middleware_fn: impl FnMut(http::Request<Body>) -> Fut + Clone + Send + Sync + 'static,
     ) -> anyhow::Result<()>
@@ -697,7 +626,9 @@ impl ConvexHttpService {
         let meta_router = self.meta_routes();
         let wrapped_svc = middleware.layer(self.router);
 
-        tracing::info!("{} listening on {addr}", self.service_name);
+        let socket = addr.make_socket()?;
+        let local_addr = socket.local_addr()?;
+        tracing::info!("{} listening on {local_addr}", self.service_name);
         if self.meta_routes_enabled {
             // Fall back to the middleware-wrapped service if the request doesn't match the
             // meta router.
@@ -705,7 +636,7 @@ impl ConvexHttpService {
                 meta_router
                     .fallback_service(wrapped_svc)
                     .into_make_service_with_connect_info::<SocketAddr>(),
-                addr,
+                socket,
                 shutdown,
             )
             .await
@@ -713,34 +644,19 @@ impl ConvexHttpService {
             // If we're not serving meta routes, simply serve the middleware-wrapped service
             serve_http(
                 wrapped_svc.into_make_service_with_connect_info::<SocketAddr>(),
-                addr,
+                socket,
                 shutdown,
             )
             .await
         }
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    pub fn new_for_test(router: Router) -> Self {
-        Self {
-            router,
-            version: String::new(),
-            meta_routes_enabled: true,
-            service_name: "test-service",
-            _concurrency_gauge: None,
-        }
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    pub fn router(&self) -> Router {
-        self.router.clone()
-    }
 }
 
 /// Serves an HTTP server using the given service.
 pub async fn serve_http<F, R>(
     make_service: IntoMakeServiceWithConnectInfo<R, SocketAddr>,
-    addr: SocketAddr,
+    addr: impl MakeSocket,
     shutdown: F,
 ) -> anyhow::Result<()>
 where
@@ -751,6 +667,14 @@ where
     <R as Service<http::Request<Body>>>::Future: Send,
     F: Future<Output = ()> + Send + 'static,
 {
+    let listener = addr.make_socket()?.listen(*HTTP_SERVER_TCP_BACKLOG)?;
+    fork_of_axum_serve::serve(listener, make_service)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
+pub fn server_socket(addr: SocketAddr) -> anyhow::Result<TcpSocket> {
     // Set SO_REUSEADDR and a bounded TCP accept backlog for our server's listening
     // socket.
     let socket = TcpSocket::new_v4()?;
@@ -758,12 +682,23 @@ where
     // Set TCP_NODELAY on accepted connections.
     socket.set_nodelay(true)?;
     socket.bind(addr)?;
-    let listener = socket.listen(*HTTP_SERVER_TCP_BACKLOG)?;
+    Ok(socket)
+}
 
-    fork_of_axum_serve::serve(listener, make_service)
-        .with_graceful_shutdown(shutdown)
-        .await?;
-    Ok(())
+pub trait MakeSocket {
+    fn make_socket(self) -> anyhow::Result<TcpSocket>;
+}
+
+impl MakeSocket for SocketAddr {
+    fn make_socket(self) -> anyhow::Result<TcpSocket> {
+        server_socket(self)
+    }
+}
+
+impl MakeSocket for TcpSocket {
+    fn make_socket(self) -> anyhow::Result<TcpSocket> {
+        Ok(self)
+    }
 }
 
 async fn client_version_state_middleware(
@@ -810,6 +745,30 @@ async fn client_version_state_middleware(
     Ok(resp)
 }
 
+/// Guard that records request metrics on drop. Always reports — uses
+/// the stored status (defaulting to "499" for cancelled/timed-out requests).
+struct RequestStatsGuard {
+    start: Instant,
+    route: String,
+    method: Method,
+    client_version: String,
+    is_test: bool,
+    status: String,
+}
+
+impl Drop for RequestStatsGuard {
+    fn drop(&mut self) {
+        log_http_request(
+            &self.client_version,
+            &self.route,
+            self.method.as_str(),
+            &self.status,
+            self.start.elapsed(),
+            self.is_test,
+        );
+    }
+}
+
 pub async fn stats_middleware<RM: RouteMapper>(
     State(route_metric_mapper): State<RM>,
     matched_path: Option<axum::extract::MatchedPath>,
@@ -824,16 +783,33 @@ pub async fn stats_middleware<RM: RouteMapper>(
     let method = req.method().clone();
     // tag with the route. 404s lack matched query path - and the
     // uri is generally unhelpful for metrics aggregation, so leave it out there.
-    let mut route = matched_path
+    let route = matched_path
         .map(|r| r.as_str().to_owned())
         .unwrap_or("unknown".to_owned());
 
     // Capture URI before req is moved
     let uri = req.uri().to_string();
 
+    let client_version_s = client_version.to_string();
+    let is_test = resolved_host.instance_name.starts_with("test-");
+    let mapped_route = route_metric_mapper.map_route(route.clone());
+
+    let mut stats_guard = RequestStatsGuard {
+        start,
+        route: mapped_route.clone(),
+        method: method.clone(),
+        client_version: client_version_s,
+        is_test,
+        status: "499".to_string(),
+    };
+
     // Sampling isn't done here, and should be done upstream
+    // Use the raw route (not mapped) for the tracing span so specific
+    // endpoint paths are preserved in distributed traces.
     let root = match traceparent {
-        Some(span_ctx) if *PROPAGATE_UPSTREAM_TRACES => Span::root(route.to_owned(), span_ctx),
+        Some(span_ctx) if *PROPAGATE_UPSTREAM_TRACES => {
+            Span::root(route.to_owned(), span_ctx).with_property(|| ("span.kind", "server"))
+        },
         _ => Span::noop(),
     };
 
@@ -842,36 +818,12 @@ pub async fn stats_middleware<RM: RouteMapper>(
 
     let resp = next.run(req).in_span(root).await;
 
-    let client_version_s = client_version.to_string();
-
-    // Since conductor is using a fallback handler which creates a new sub-router
-    // within the handler, we can't extract the matched path from the request
-    // extension. So we extract it from the response extension.
-    // This allows it to participate in log_http_request, though it sadly won't
-    // participate in the root span.
-    //
-    // We can probably work around this with some effort by switching from State
-    // to Extension in axum and using a layer instead of a multiplex handler.
-    let matched_path = resp.extensions().get::<Option<MatchedPath>>();
-    if let Some(Some(matched_path)) = matched_path {
-        route = matched_path.as_str().to_owned();
-    }
-
-    if route == "unknown" {
+    if mapped_route == "unknown" {
         tracing::info!("stats_middleware: matched_path is None, uri: {}", uri);
     }
 
-    let route = route_metric_mapper.map_route(route);
-    let is_test = resolved_host.instance_name.starts_with("test-");
-
-    log_http_request(
-        &client_version_s,
-        &route,
-        method.as_str(),
-        resp.status().as_str(),
-        start.elapsed(),
-        is_test,
-    );
+    // Set the real status — drop will report metrics.
+    stats_guard.status = resp.status().as_str().to_string();
 
     Ok::<_, _>(resp)
 }
@@ -879,7 +831,6 @@ pub async fn stats_middleware<RM: RouteMapper>(
 pub struct InstanceNameExt(pub String);
 
 #[derive(ToSchema, Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub enum RequestDestination {
     ConvexCloud,
@@ -1052,6 +1003,7 @@ where
                 e.to_string(),
             ))
         })?;
+        sentry::configure_scope(|scope| scope.set_tag("convex_client_version", &client_version));
         Ok(Self(client_version))
     }
 }
@@ -1100,6 +1052,75 @@ where
     }
 }
 
+pub struct ExtractRequestMetadata(pub RequestMetadata);
+
+impl<S> FromRequestParts<S> for ExtractRequestMetadata
+where
+    S: Send + Sync,
+{
+    type Rejection = HttpResponseError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_owned())
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|ci| ci.0.ip().to_string())
+            });
+        let ip = ip.and_then(|s| ClientIp::try_from(s).ok());
+        let user_agent = parts
+            .headers
+            .get(http::header::USER_AGENT)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_owned());
+        let user_agent = user_agent.and_then(|s| ClientUserAgent::try_from(s).ok());
+        Ok(ExtractRequestMetadata(RequestMetadata { ip, user_agent }))
+    }
+}
+
+#[allow(clippy::declare_interior_mutable_const)]
+pub const CONVEX_CHEF_DEPLOY_SECRET_HEADER: HeaderName =
+    HeaderName::from_static("convex-chef-deploy-secret");
+
+pub struct ExtractChefDeploySecret(pub String);
+
+fn chef_deploy_secret_from_req_parts(
+    parts: &mut axum::http::request::Parts,
+) -> anyhow::Result<String> {
+    parts
+        .headers
+        .get(CONVEX_CHEF_DEPLOY_SECRET_HEADER)
+        .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
+        .context(ErrorMetadata::bad_request(
+            "InvalidChefDeploySecret",
+            "convex-chef-deploy-secret header is not set",
+        ))
+}
+
+impl<S> FromRequestParts<S> for ExtractChefDeploySecret
+where
+    S: Send + Sync,
+{
+    type Rejection = HttpResponseError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let shared_secret = chef_deploy_secret_from_req_parts(parts)?;
+        Ok(Self(shared_secret))
+    }
+}
+
 pub const TRACEPARENT_HEADER_STR: &str = "traceparent";
 pub const TRACEPARENT_HEADER: HeaderName = HeaderName::from_static(TRACEPARENT_HEADER_STR);
 
@@ -1132,6 +1153,120 @@ async fn tokio_instrumentation_middleware(
     Ok(resp)
 }
 
+fn sanitize_uri_for_logging(uri: &Uri) -> Cow<'_, str> {
+    let path = uri.path();
+    let path_and_query_str = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path);
+
+    let uri_for_logging: Cow<str> = if let Some(query) = uri.query() {
+        if query.contains("adminKey=") {
+            // Remove the entire query string to avoid logging the admin key
+            Cow::Borrowed(path)
+        } else {
+            Cow::Borrowed(path_and_query_str)
+        }
+    } else {
+        Cow::Borrowed(path_and_query_str)
+    };
+
+    // Then handle PII in path if present
+    if path.contains("deployment/local-") {
+        Cow::Owned(
+            LOCAL_DEPLOYMENT_NAME_PII_REGEX
+                .replace(&uri_for_logging, r"deployment/local-*/")
+                .into_owned(),
+        )
+    } else {
+        uri_for_logging
+    }
+}
+
+fn is_high_volume_path(path: &str) -> bool {
+    path == "/instance_version"
+        || path == "/instance_name"
+        || path == "/get_backend_info"
+        || path == "/get_deployment_state"
+        || path == "/api/shapes2"
+        || path == "/api/actions/query"
+        || path == "/api/actions/mutation"
+        || path == "/api/actions/action"
+        || path == "/api/stream_function_logs"
+        || path == "/api/app_metrics/stream_function_logs"
+        || path == "/"
+}
+
+/// Emit an HTTP access log line. Used by both the normal completion path
+/// and the drop guard (cancelled/timed-out requests).
+fn log_http_access(
+    site_id: &str,
+    remote_addr: Option<SocketAddr>,
+    method: &Method,
+    uri: &Uri,
+    version: http::Version,
+    status: impl fmt::Display,
+    referer: Option<&str>,
+    user_agent: Option<&str>,
+    content_type: Option<&str>,
+    content_length: Option<&str>,
+    elapsed: Duration,
+) {
+    let uri_for_logging = sanitize_uri_for_logging(uri);
+    let level = if is_high_volume_path(uri.path()) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+    dyn_event!(
+        level,
+        target: "convex-cloud-http",
+        "[{}] {} \"{} {} {:?}\" {} \"{}\" \"{}\" {} {} {:.3}ms",
+        site_id,
+        LogOptFmt(remote_addr),
+        method,
+        uri_for_logging,
+        version,
+        status,
+        LogOptFmt(referer),
+        LogOptFmt(user_agent),
+        LogOptFmt(content_type.as_ref()),
+        LogOptFmt(content_length.as_ref()),
+        elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+/// Guard that logs the HTTP access line on drop. Always reports — defaults
+/// to status 499 (client closed request) for cancelled/timed-out requests.
+struct RequestLogGuard {
+    site_id: String,
+    remote_addr: Option<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    version: http::Version,
+    referer: Option<String>,
+    user_agent: Option<String>,
+    start: Instant,
+    status: u16,
+    content_type: Option<String>,
+    content_length: Option<String>,
+}
+
+impl Drop for RequestLogGuard {
+    fn drop(&mut self) {
+        log_http_access(
+            &self.site_id,
+            self.remote_addr,
+            &self.method,
+            &self.uri,
+            self.version,
+            self.status,
+            self.referer.as_deref(),
+            self.user_agent.as_deref(),
+            self.content_type.as_deref(),
+            self.content_length.as_deref(),
+            self.start.elapsed(),
+        );
+    }
+}
+
 async fn log_middleware(
     remote_addr: Result<axum::extract::ConnectInfo<SocketAddr>, ExtensionRejection>,
     ExtractResolvedHostname(resolved_host): ExtractResolvedHostname,
@@ -1153,56 +1288,27 @@ async fn log_middleware(
     let referer = get_header(req.headers(), http::header::REFERER);
     let user_agent = get_header(req.headers(), http::header::USER_AGENT);
 
+    let mut guard = RequestLogGuard {
+        site_id,
+        remote_addr,
+        method,
+        uri,
+        version,
+        referer,
+        user_agent,
+        start,
+        status: 499,
+        content_type: None,
+        content_length: None,
+    };
+
     let resp = next.run(req).await;
 
-    let content_length = get_header(resp.headers(), http::header::CONTENT_LENGTH);
-    let content_type = get_header(resp.headers(), http::header::CONTENT_TYPE);
+    // Set the real values — drop will log.
+    guard.status = resp.status().as_u16();
+    guard.content_length = get_header(resp.headers(), http::header::CONTENT_LENGTH);
+    guard.content_type = get_header(resp.headers(), http::header::CONTENT_TYPE);
 
-    let path = uri.path();
-    if path == "/instance_version"
-        || path == "/instance_name"
-        || path == "/get_backend_info"
-        || path == "/get_deployment_state"
-        || path == "/"
-    {
-        // Skip logging for these high volume, less useful endpoints
-        return Ok(resp);
-    }
-
-    let path_and_query_str = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path);
-
-    let uri_for_logging: Cow<str> = if let Some(query) = uri.query() {
-        if query.contains("adminKey=") {
-            // Remove the entire query string to avoid logging the admin key
-            Cow::Borrowed(path)
-        } else {
-            Cow::Borrowed(path_and_query_str)
-        }
-    } else {
-        Cow::Borrowed(path_and_query_str)
-    };
-
-    // Then handle PII in path if present
-    let uri_for_logging = if path.contains("deployment/local-") {
-        LOCAL_DEPLOYMENT_NAME_PII_REGEX.replace(&uri_for_logging, r"deployment/local-*/")
-    } else {
-        uri_for_logging
-    };
-    tracing::info!(
-        target: "convex-cloud-http",
-        "[{}] {} \"{} {} {:?}\" {} \"{}\" \"{}\" {} {} {:.3}ms",
-        site_id,
-        LogOptFmt(remote_addr),
-        method,
-        uri_for_logging,
-        version,
-        resp.status().as_u16(),
-        LogOptFmt(referer),
-        LogOptFmt(user_agent),
-        LogOptFmt(content_type),
-        LogOptFmt(content_length),
-        start.elapsed().as_secs_f64() * 1000.0,
-    );
     Ok(resp)
 }
 
@@ -1218,8 +1324,8 @@ impl<T: fmt::Display> fmt::Display for LogOptFmt<T> {
     }
 }
 
-// CLI endpoints can be used from browser IDEs (e.g. StackBlitz), which send
-// different headers.
+/// CLI endpoints can be used from browser IDEs (e.g. StackBlitz), which send
+/// different headers.
 pub fn cli_cors() -> CorsLayer {
     CorsLayer::new()
         .allow_headers(AllowHeaders::mirror_request())
@@ -1235,11 +1341,34 @@ pub fn cli_cors() -> CorsLayer {
         .max_age(Duration::from_secs(86400))
 }
 
+/// Platform APIs dont' accept cookies so there's minimal risk (and plenty of
+/// convenience) from allowing browsers to make these requests.
+pub fn platform_api_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_headers(AllowHeaders::mirror_request())
+        .allow_credentials(true)
+        .allow_methods(vec![
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::OPTIONS,
+        ])
+        .allow_origin(AllowOrigin::mirror_request())
+        .max_age(Duration::from_secs(86400))
+}
+
 /// Collects metrics and returns them in the Prometheus exposition format.
 /// Returns an empty response if no metrics have been recorded yet.
 /// Note that registered metrics will not show here until recorded at least
 /// once.
 pub async fn metrics() -> Result<impl IntoResponse, HttpResponseError> {
+    if *DISABLE_METRICS_ENDPOINT {
+        return Err(anyhow::anyhow!(ErrorMetadata::not_found(
+            "MetricsDisabled",
+            "/metrics endpoint disabled"
+        ))
+        .into());
+    }
     let encoder = TextEncoder::new();
     let metrics = CONVEX_METRICS_REGISTRY.gather();
     let output = encoder
@@ -1269,83 +1398,4 @@ where
             .expect("HeaderMap should not have a None key without a previous Some key");
         (key, value)
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::response::IntoResponse;
-    use errors::{
-        ErrorMetadata,
-        INTERNAL_SERVER_ERROR,
-        INTERNAL_SERVER_ERROR_MSG,
-    };
-    use http::StatusCode;
-
-    use super::HttpResponseError;
-    use crate::http::HttpError;
-
-    #[tokio::test]
-    async fn test_http_response_error_internal_server_error() -> anyhow::Result<()> {
-        let err_text = "some random error";
-        let err = anyhow::anyhow!(err_text);
-        let err_clone = anyhow::anyhow!(err_text);
-        let http_response_err: HttpResponseError = err.into();
-        // Check the backtraces are the same
-        assert_eq!(http_response_err.trace.to_string(), err_clone.to_string());
-        // Check the HttpError is an internal server error
-        assert_eq!(
-            HttpError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                INTERNAL_SERVER_ERROR,
-                INTERNAL_SERVER_ERROR_MSG,
-            ),
-            http_response_err.http_error
-        );
-
-        // Check the Response contains the ResponseErrorMessage
-        let http_response_err: HttpResponseError = err_clone.into();
-        let response = http_response_err.into_response();
-        let error = HttpError::from_response(response).await?;
-        assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(error.error_code(), "InternalServerError");
-        assert_eq!(error.msg, INTERNAL_SERVER_ERROR_MSG);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_http_error_400() -> anyhow::Result<()> {
-        let status_code = StatusCode::BAD_REQUEST;
-        let error_code = "ErrorCode";
-        let msg = "Nice error message!";
-        let first_error = "some random error";
-        let middle_error = ErrorMetadata::bad_request(error_code, msg);
-        let last_error = "another random error";
-        let err = anyhow::anyhow!(first_error)
-            .context(middle_error.clone())
-            .context(last_error);
-        let err_clone = anyhow::anyhow!(first_error)
-            .context(middle_error)
-            .context(last_error);
-
-        let http_response_err: HttpResponseError = err.into();
-        // Check the HttpError in the middle of the stack matches the http_error that
-        // the anyhow::Error is downcast to
-        assert_eq!(
-            HttpError::new(status_code, error_code, msg,),
-            http_response_err.http_error
-        );
-
-        // Check the backtraces are the same - note that the full stack trace including
-        // first_error, HttpError, and last_error, is preserved
-        assert_eq!(http_response_err.trace.to_string(), err_clone.to_string());
-
-        // Check the Response contains the ResponseErrorMessage
-        let http_response_err: HttpResponseError = err_clone.into();
-        let response = http_response_err.into_response();
-        let error = HttpError::from_response(response).await?;
-        assert_eq!(error.status_code(), status_code);
-        assert_eq!(error.error_code(), error_code);
-        assert_eq!(error.message(), msg);
-        Ok(())
-    }
 }

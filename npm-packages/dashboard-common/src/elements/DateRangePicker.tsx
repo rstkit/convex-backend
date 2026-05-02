@@ -4,7 +4,7 @@ import { CalendarIcon, CheckIcon } from "@radix-ui/react-icons";
 import { endOfToday, parse, startOfDay, format } from "date-fns";
 import { NextRouter } from "next/router";
 import * as React from "react";
-import { DateRange } from "react-day-picker";
+import { DateRange, Matcher } from "react-day-picker";
 import { Popover } from "@ui/Popover";
 import { Button } from "@ui/Button";
 import { Calendar } from "@common/elements/Calendar";
@@ -20,6 +20,7 @@ export type DateRangeShortcut = {
 export function DateRangePicker({
   minDate,
   maxDate,
+  beforeMinDateTooltip,
   date,
   setDate,
   shortcuts,
@@ -30,6 +31,7 @@ export function DateRangePicker({
 }: {
   minDate?: Date;
   maxDate?: Date;
+  beforeMinDateTooltip?: React.ReactNode;
   date: {
     from?: Date;
     to?: Date;
@@ -108,7 +110,7 @@ export function DateRangePicker({
       {({ close }) => (
         <div className="flex flex-col gap-4 md:flex-row">
           {shortcuts && (
-            <div className="flex w-[13rem] flex-col gap-2 border-b pb-4 md:border-b-0 md:border-r md:pb-0">
+            <div className="flex w-[13rem] flex-col gap-2 border-b pb-4 md:border-r md:border-b-0 md:pb-0">
               {shortcuts.map((s) => (
                 <Button
                   key={s.label}
@@ -124,7 +126,7 @@ export function DateRangePicker({
                     close();
                     setDate(s, s);
                   }}
-                  className="-ml-4 flex w-full items-start gap-1 rounded p-1 text-xs hover:bg-background-tertiary"
+                  className="-ml-4 flex w-full items-start gap-1 rounded-sm p-1 text-xs hover:bg-background-tertiary"
                   icon={
                     activeShortcut === s.value ? (
                       <CheckIcon className="mt-1" />
@@ -150,10 +152,12 @@ export function DateRangePicker({
             </div>
           )}
           <Calendar
-            initialFocus
+            autoFocus
             mode="range"
-            fromDate={minDate}
-            toDate={maxDate}
+            startMonth={minDate}
+            endMonth={maxDate}
+            disabled={disabledFromRange({ minDate, maxDate })}
+            beforeStartTooltip={beforeMinDateTooltip}
             defaultMonth={from || new Date()}
             selected={selectedRange}
             onSelect={(d) => {
@@ -220,8 +224,31 @@ export function useDateFilters(router: NextRouter) {
     startDate,
     endDate,
     setDate: async (date: DateRange) => {
-      date.from && (await checkAndSetStartDate(date.from));
-      date.to && (await checkAndSetEndDate(date.to));
+      if (date.from) {
+        await checkAndSetStartDate(date.from);
+      }
+      if (date.to) {
+        await checkAndSetEndDate(date.to);
+      }
     },
   };
+}
+
+function disabledFromRange({
+  minDate,
+  maxDate,
+}: {
+  minDate: Date | undefined;
+  maxDate: Date | undefined;
+}): Matcher | undefined {
+  if (minDate && maxDate) {
+    return { before: minDate, after: maxDate };
+  }
+  if (minDate) {
+    return { before: minDate };
+  }
+  if (maxDate) {
+    return { after: maxDate };
+  }
+  return undefined;
 }

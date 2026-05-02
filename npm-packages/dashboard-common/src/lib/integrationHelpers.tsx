@@ -10,22 +10,32 @@ import {
 import {
   axiomConfig,
   datadogConfig,
+  postHogErrorTrackingConfig,
+  postHogLogsConfig,
   sentryConfig,
   webhookConfig,
 } from "system-udfs/convex/schema";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import classNames from "classnames";
 import { WebhookIcon } from "@common/elements/icons";
 import { DatadogLogo } from "@common/lib/logos/DatadogLogo";
 import { AxiomLogo } from "@common/lib/logos/AxiomLogo";
 import { SentryLogo } from "@common/lib/logos/SentryLogo";
+import { PostHogLogo } from "@common/lib/logos/PostHogLogo";
 import { AirbyteLogo } from "@common/lib/logos/AirbyteLogo";
 import { FivetranLogo } from "@common/lib/logos/FivetranLogo";
+import { WorkosLogo } from "./logos/WorkosLogo";
 
 export type SinkStatus = Doc<"_log_sinks">["status"];
 
-export const LOG_INTEGRATIONS = ["axiom", "datadog", "webhook"] as const;
-export const EXC_INTEGRATIONS = ["sentry"] as const;
+export const LOG_INTEGRATIONS = [
+  "axiom",
+  "datadog",
+  "webhook",
+  "postHogLogs",
+] as const;
+export const EXC_INTEGRATIONS = ["sentry", "postHogErrorTracking"] as const;
+export const AUTH_INTEGRATIONS = ["workos"] as const;
 export const EXPORT_INTEGRATIONS: ExportIntegrationType[] = [
   "fivetran",
   "airbyte",
@@ -34,7 +44,8 @@ export const EXPORT_INTEGRATIONS: ExportIntegrationType[] = [
 export type LogIntegrationConfig =
   | Infer<typeof axiomConfig>
   | Infer<typeof datadogConfig>
-  | Infer<typeof webhookConfig>;
+  | Infer<typeof webhookConfig>
+  | Infer<typeof postHogLogsConfig>;
 
 export type LogIntegration =
   | {
@@ -63,19 +74,49 @@ export type LogIntegration =
         status: SinkStatus;
         config: Infer<typeof webhookConfig>;
       } | null;
+    }
+  | {
+      kind: "postHogLogs";
+      existing: {
+        _id: Id<"_log_sinks">;
+        _creationTime: number;
+        status: SinkStatus;
+        config: Infer<typeof postHogLogsConfig>;
+      } | null;
     };
 
-export type ExceptionReportingIntegration = {
-  kind: "sentry";
+export type ExceptionReportingIntegration =
+  | {
+      kind: "sentry";
+      existing: {
+        _id: Id<"_log_sinks">;
+        _creationTime: number;
+        status: SinkStatus;
+        config: Infer<typeof sentryConfig>;
+      } | null;
+    }
+  | {
+      kind: "postHogErrorTracking";
+      existing: {
+        _id: Id<"_log_sinks">;
+        _creationTime: number;
+        status: SinkStatus;
+        config: Infer<typeof postHogErrorTrackingConfig>;
+      } | null;
+    };
+
+export type ExceptionReportingIntegrationConfig =
+  | Infer<typeof sentryConfig>
+  | Infer<typeof postHogErrorTrackingConfig>;
+
+export type AuthIntegration = {
+  kind: "workos";
   existing: {
-    _id: Id<"_log_sinks">;
-    _creationTime: number;
-    status: SinkStatus;
-    config: Infer<typeof sentryConfig>;
+    workosEnvironmentId: string;
+    workosEnvironmentName: string;
+    workosClientId: string;
   } | null;
 };
-
-export type ExceptionReportingIntegrationConfig = Infer<typeof sentryConfig>;
 
 export function integrationToLogo(
   kind: IntegrationType,
@@ -91,7 +132,7 @@ export function integrationToLogo(
       return {
         logo: (
           <DatadogLogo
-            className={classNames("rounded border", sizeClass)}
+            className={classNames("rounded-sm border", sizeClass)}
             size={size}
           />
         ),
@@ -101,7 +142,7 @@ export function integrationToLogo(
         logo: (
           <div
             className={classNames(
-              "flex items-center justify-center rounded border",
+              "flex items-center justify-center rounded-sm border",
               sizeClass,
             )}
           >
@@ -113,7 +154,7 @@ export function integrationToLogo(
       return {
         logo: (
           <AxiomLogo
-            className={classNames("rounded border", sizeClass)}
+            className={classNames("rounded-sm border", sizeClass)}
             size={size}
           />
         ),
@@ -122,7 +163,17 @@ export function integrationToLogo(
       return {
         logo: (
           <SentryLogo
-            className={classNames("rounded border", sizeClass)}
+            className={classNames("rounded-sm border", sizeClass)}
+            size={size}
+          />
+        ),
+      };
+    case "postHogLogs":
+    case "postHogErrorTracking":
+      return {
+        logo: (
+          <PostHogLogo
+            className={classNames("rounded-sm border", sizeClass)}
             size={size}
           />
         ),
@@ -131,7 +182,7 @@ export function integrationToLogo(
       return {
         logo: (
           <AirbyteLogo
-            className={classNames("rounded border", sizeClass)}
+            className={classNames("rounded-sm border", sizeClass)}
             size={size}
           />
         ),
@@ -141,15 +192,28 @@ export function integrationToLogo(
         logo: (
           <FivetranLogo
             className={classNames(
-              "rounded border bg-white dark:bg-black",
+              "rounded-sm border bg-white dark:bg-black",
               sizeClass,
             )}
             size={size}
           />
         ),
       };
+    case "workos": {
+      return {
+        logo: (
+          <WorkosLogo
+            className={classNames(
+              "rounded-sm border bg-white dark:bg-black",
+              sizeClass,
+            )}
+            size={size}
+          />
+        ),
+      };
+    }
     default: {
-      const _: never = kind;
+      kind satisfies never;
       throw new Error(`Unrecognized integration type ${kind}`);
     }
   }
@@ -170,9 +234,12 @@ export function integrationUsingLegacyFormat(
       return false;
     case "sentry":
       return config.version !== "2";
+    case "postHogLogs":
+    case "postHogErrorTracking":
+      return false;
     default: {
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const _typeCheck: never = config;
+      config satisfies never;
       return false;
     }
   }
@@ -216,12 +283,20 @@ export const STREAMING_EXPORT_DESCRIPTION = (
     <Link
       passHref
       href="https://docs.convex.dev/database/import-export/streaming"
-      className="text-content-link"
       target="_blank"
     >
       Learn more
     </Link>
     .
+  </div>
+);
+
+export const AUTHENTICATION_DESCRIPTION = (
+  <div>
+    <p>
+      An automatically provisioned WorkOS AuthKit environments for this
+      deployment.
+    </p>
   </div>
 );
 
@@ -231,7 +306,7 @@ export type IntegrationUnavailableReason =
   | "LocalDeployment";
 
 export const UNAVAILABLE_TOOLTIP_TEXT = {
-  MissingEntitlement: "This integration requires a paid plan.",
+  MissingEntitlement: "This integration requires the Pro plan.",
   CannotManageProd:
     "You cannot manage integrations in a production deployment.",
   LocalDeployment: "You cannot manage integrations in a local deployment.",
@@ -248,9 +323,23 @@ export function configToUrl(config: IntegrationConfig): string {
       return `https://app.axiom.co`;
     case "webhook":
       return config.url;
+    case "postHogLogs": {
+      const logsHost = (config.host ?? "https://us.i.posthog.com").replace(
+        ".i.",
+        ".",
+      );
+      return `${logsHost}/logs`;
+    }
+    case "postHogErrorTracking": {
+      const etHost = (config.host ?? "https://us.i.posthog.com").replace(
+        ".i.",
+        ".",
+      );
+      return `${etHost}/error_tracking`;
+    }
     default:
       // eslint-disable-next-line no-case-declarations
-      const _: never = kind;
+      kind satisfies never;
       throw new Error(`Unrecognized integration type ${kind}`);
   }
 }
@@ -270,11 +359,21 @@ function datadogSiteLocationToUrl(siteLocation: DatadogSiteLocation): string {
     case "AP1":
       return "https://ap1.datadoghq.com";
     default: {
-      const _: never = siteLocation;
+      siteLocation satisfies never;
       throw new Error(`Unrecognized site location ${siteLocation}`);
     }
   }
 }
 
-export const integrationName = (kind: IntegrationType) =>
-  kind.charAt(0).toUpperCase() + kind.slice(1);
+export const integrationName = (kind: IntegrationType) => {
+  switch (kind) {
+    case "workos":
+      return "WorkOS";
+    case "postHogLogs":
+      return "PostHog Logs";
+    case "postHogErrorTracking":
+      return "PostHog Error Tracking";
+    default:
+      return kind.charAt(0).toUpperCase() + kind.slice(1);
+  }
+};

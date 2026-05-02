@@ -4,6 +4,7 @@ import React, {
   useMemo,
   useContext,
   createContext,
+  PropsWithChildren,
 } from "react";
 import { cn } from "@ui/cn";
 import { ChevronLeftIcon } from "@radix-ui/react-icons";
@@ -18,8 +19,12 @@ import {
   useInsightsPeriod,
   getInsightPageIdentifier,
 } from "api/insights";
+import { useCurrentDeployment, useDeploymentRegions } from "api/deployments";
+import { useCurrentTeam, useTeamMembers } from "api/teams";
+import { useCurrentProject } from "api/projects";
+import { useListCloudBackupsIfAvailable } from "api/backups";
 import { useRouter } from "next/router";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import {
   itemIdentifier,
   useModuleFunctions,
@@ -28,9 +33,11 @@ import {
   functionIdentifierValue,
   functionIdentifierFromValue,
 } from "@common/lib/functions/generateFileTree";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { SmallInsightsSummary } from "./SmallInsightsSummary";
 import { InsightsSummary } from "./InsightsSummary";
 import { InsightSummaryBreakdown } from "./InsightsSummaryBreakdown";
+import { UrlObject } from "url";
 
 // We need a context here so the insights components can have data provided to them without rerendering the Health page.
 const InsightsContext = createContext<
@@ -61,8 +68,28 @@ export function HealthWithInsights() {
   const [selectedFunctions, setSelectedFunctions] =
     useState<MultiSelectValue>("all");
 
+  const { subscriptionInvalidationsChart, healthHeatmaps } = useLaunchDarkly();
   const insights = useInsights();
   const { from } = useInsightsPeriod();
+
+  // Get deployment info for summary
+  const deployment = useCurrentDeployment();
+  const team = useCurrentTeam();
+  const project = useCurrentProject();
+  const backups = useListCloudBackupsIfAvailable(deployment);
+  const teamMembers = useTeamMembers(team?.id);
+  const { regions } = useDeploymentRegions(team?.id);
+
+  // Get the most recent backup for this deployment
+  // backups is null when not available (d1024, non-cloud), undefined when loading
+  const lastBackupTime = useMemo(() => {
+    if (backups === null) return null;
+    if (backups === undefined) return undefined;
+    const deploymentsBackups = backups.filter((b) => b.state === "complete");
+    return deploymentsBackups.length > 0
+      ? deploymentsBackups[0].requestedTime
+      : null;
+  }, [backups]);
 
   const selectedInsight = insights?.find(
     (insight) => getInsightPageIdentifier(insight) === page,
@@ -71,7 +98,7 @@ export function HealthWithInsights() {
   const header = (
     <div
       className={cn(
-        "flex items-center justify-between gap-4 sticky top-0 flex-wrap mx-6 pt-2",
+        "sticky top-0 mx-6 flex flex-wrap items-center justify-between gap-4 pt-2",
         page === "insights" ? "max-w-[70rem]" : "",
       )}
     >
@@ -104,42 +131,53 @@ export function HealthWithInsights() {
           />
         )}
         <h3 className="flex items-center gap-2 py-2">
-          <Link
-            href={{
-              pathname: "/t/[team]/[project]/[deploymentName]",
-              query: {
-                team: query.team,
-                project: query.project,
-                deploymentName: query.deploymentName,
-                ...(query.lowInsightsThreshold
-                  ? { lowInsightsThreshold: query.lowInsightsThreshold }
-                  : {}),
-              },
-            }}
-            className={page !== "home" ? "text-content-link" : ""}
+          <MaybeLink
+            href={
+              page === "home"
+                ? null
+                : {
+                    pathname: "/t/[team]/[project]/[deploymentName]",
+                    query: {
+                      team: query.team,
+                      project: query.project,
+                      deploymentName: query.deploymentName,
+                      ...(query.lowInsightsThreshold
+                        ? { lowInsightsThreshold: query.lowInsightsThreshold }
+                        : {}),
+                    },
+                  }
+            }
           >
             Health
-          </Link>{" "}
+          </MaybeLink>{" "}
           {page.startsWith("insight") && (
             <>
               <span className="animate-fadeInFromLoading">/</span>
-              <Link
-                href={{
-                  pathname: "/t/[team]/[project]/[deploymentName]",
-                  query: {
-                    team: query.team,
-                    project: query.project,
-                    deploymentName: query.deploymentName,
-                    view: "insights",
-                    ...(query.lowInsightsThreshold
-                      ? { lowInsightsThreshold: query.lowInsightsThreshold }
-                      : {}),
-                  },
-                }}
-                className="text-content-link"
-              >
-                <span className="animate-fadeInFromLoading">Insights</span>
-              </Link>
+              <span className="animate-fadeInFromLoading">
+                <MaybeLink
+                  href={
+                    page === "insights"
+                      ? null
+                      : {
+                          pathname: "/t/[team]/[project]/[deploymentName]",
+                          query: {
+                            team: query.team,
+                            project: query.project,
+                            deploymentName: query.deploymentName,
+                            view: "insights",
+                            ...(query.lowInsightsThreshold
+                              ? {
+                                  lowInsightsThreshold:
+                                    query.lowInsightsThreshold,
+                                }
+                              : {}),
+                          },
+                        }
+                  }
+                >
+                  Insights
+                </MaybeLink>
+              </span>
             </>
           )}
           {selectedInsight && (
@@ -203,6 +241,14 @@ export function HealthWithInsights() {
         header={header}
         PagesWrapper={InsightsWrapper}
         PageWrapper={PageWrapper}
+        deployment={deployment}
+        teamSlug={team?.slug}
+        projectSlug={project?.slug}
+        lastBackupTime={lastBackupTime}
+        teamMembers={teamMembers}
+        regions={regions}
+        showSubscriptionInvalidations={subscriptionInvalidationsChart}
+        showHeatmaps={healthHeatmaps}
       />
     </InsightsContext.Provider>
   );
@@ -214,7 +260,7 @@ function InsightsWrapper({ children }: { children: React.ReactNode }) {
   return (
     <div
       className={cn(
-        "flex transition-transform duration-500 motion-reduce:transition-none grow gap-6 min-h-0",
+        "flex min-h-0 grow gap-6 transition-transform duration-500 motion-reduce:transition-none",
         page === "home" && "translate-x-0",
         page === "insights" && "-translate-x-[calc(100%+1.5rem)]",
         page?.startsWith("insight:") && "-translate-x-[calc(200%+3rem)]",
@@ -228,7 +274,7 @@ function InsightsWrapper({ children }: { children: React.ReactNode }) {
       >
         <Sheet
           padding={false}
-          className="h-fit max-h-full w-full min-w-0 max-w-[70rem] overflow-auto scrollbar"
+          className="scrollbar h-fit max-h-full w-full max-w-[70rem] min-w-0 overflow-auto"
         >
           <InsightsSummary
             insights={insights?.filter((insight) => {
@@ -250,7 +296,7 @@ function InsightsWrapper({ children }: { children: React.ReactNode }) {
       <div
         // @ts-expect-error https://github.com/facebook/react/issues/17157
         inert={!page.startsWith("insight:") ? "inert" : undefined}
-        className="flex w-full shrink-0 overflow-y-auto px-6 scrollbar"
+        className="scrollbar flex w-full shrink-0 overflow-y-auto px-6"
       >
         <InsightSummaryBreakdown
           insight={
@@ -289,14 +335,25 @@ function PageWrapper({ children }: { children: React.ReactNode }) {
   const { page } = useContext(InsightsContext) || {};
   return (
     <div
-      className="flex w-full shrink-0 grow flex-col gap-4 overflow-y-auto px-6 pb-4 scrollbar"
+      className="scrollbar flex w-full shrink-0 grow flex-col overflow-y-auto px-6 pb-4"
       // @ts-expect-error https://github.com/facebook/react/issues/17157
       inert={page !== "home" ? "inert" : undefined}
     >
       {children}
-      <div className="max-w-[88rem]">
-        <SmallInsightsSummary onViewAll={onViewAll || (() => {})} />
-      </div>
+      <SmallInsightsSummary onViewAll={onViewAll || (() => {})} />
     </div>
+  );
+}
+
+function MaybeLink({
+  href,
+  children,
+}: PropsWithChildren<{
+  href: UrlObject | null;
+}>) {
+  return href === null ? (
+    <span>{children}</span>
+  ) : (
+    <Link href={href}>{children}</Link>
   );
 }

@@ -19,6 +19,7 @@ use metrics::{
     log_counter,
     log_counter_with_labels,
     log_distribution,
+    log_distribution_with_labels,
     log_gauge,
     log_gauge_with_labels,
     register_convex_counter,
@@ -35,13 +36,6 @@ use metrics::{
 use prometheus::{
     VMHistogram,
     VMHistogramVec,
-};
-use sync_types::CanonicalizedUdfPath;
-use udf::{
-    ActionOutcome,
-    FunctionOutcome,
-    HttpActionOutcome,
-    UdfOutcome,
 };
 
 use crate::IsolateHeapStats;
@@ -103,34 +97,13 @@ pub fn log_pool_allocated_count(name: &'static str, count: usize) {
     );
 }
 
-pub fn is_developer_ok(outcome: &FunctionOutcome) -> bool {
-    match &outcome {
-        FunctionOutcome::Query(UdfOutcome { result, .. }) => result.is_ok(),
-        FunctionOutcome::Mutation(UdfOutcome { result, .. }) => result.is_ok(),
-        FunctionOutcome::Action(ActionOutcome { result, .. }) => result.is_ok(),
-        FunctionOutcome::HttpAction(HttpActionOutcome { result, .. }) => match result {
-            // The developer might hit errors after beginning to stream the response that wouldn't
-            // be captured here
-            udf::HttpActionResult::Streamed => true,
-            udf::HttpActionResult::Error(_) => false,
-        },
-    }
-}
-
-pub fn finish_execute_timer(timer: StatusTimer, outcome: &FunctionOutcome) {
-    if is_developer_ok(outcome) {
-        timer.finish();
-    } else {
-        timer.finish_developer_error();
-    }
-}
-
 register_convex_counter!(UDF_EXECUTE_FULL_TOTAL, "UDF execution queue full count");
 pub fn execute_full_error() -> ErrorMetadata {
     log_counter(&UDF_EXECUTE_FULL_TOTAL, 1);
     ErrorMetadata::overloaded(
         "ExecuteFullError",
-        "Too many concurrent requests, backoff and try again.",
+        "Too many concurrent requests in a short period of time. Spread out your requests out \
+         over time or throttle them to avoid errors.",
     )
 }
 
@@ -316,28 +289,6 @@ pub fn log_unawaited_pending_op(count: usize, environment: &'static str) {
 }
 
 register_convex_counter!(
-    FUNCTION_LIMIT_WARNING_TOTAL,
-    "Count of functions that exceeded some limit warning level",
-    &["limit", "system_udf_path"]
-);
-pub fn log_function_limit_warning(
-    limit_name: &'static str,
-    system_udf_path: Option<&CanonicalizedUdfPath>,
-) {
-    let labels = match system_udf_path {
-        Some(udf_path) => vec![
-            StaticMetricLabel::new("limit", limit_name),
-            StaticMetricLabel::new("system_udf_path", udf_path.to_string()),
-        ],
-        None => vec![
-            StaticMetricLabel::new("limit", limit_name),
-            StaticMetricLabel::new("system_udf_path", "none"),
-        ],
-    };
-    log_counter_with_labels(&FUNCTION_LIMIT_WARNING_TOTAL, 1, labels);
-}
-
-register_convex_counter!(
     UDF_SOURCE_MAP_FAILURE_TOTAL,
     "Number of source map failures"
 );
@@ -354,6 +305,14 @@ pub fn log_user_timeout() {
 register_convex_counter!(UDF_SYSTEM_TIMEOUT_TOTAL, "Number of UDF system timeouts");
 pub fn log_system_timeout() {
     log_counter(&UDF_SYSTEM_TIMEOUT_TOTAL, 1);
+}
+
+register_convex_counter!(
+    ARRAY_BUFFER_OOM_TOTAL,
+    "Number of times that isolates hit the ArrayBuffer memory limit"
+);
+pub fn log_array_buffer_oom() {
+    log_counter(&ARRAY_BUFFER_OOM_TOTAL, 1);
 }
 
 register_convex_counter!(
@@ -500,6 +459,10 @@ register_convex_gauge!(
     ISOLATE_TOTAL_MALLOCED_MEMORY_BYTES,
     "Total isolate malloc'd memory across all isolates"
 );
+register_convex_gauge!(
+    ISOLATE_TOTAL_ARRAY_BUFFER_MEMORY_BYTES,
+    "Total isolate ArrayBuffer-allocated memory across all isolates"
+);
 
 pub fn log_aggregated_heap_stats(stats: &IsolateHeapStats) {
     log_gauge(
@@ -525,6 +488,10 @@ pub fn log_aggregated_heap_stats(stats: &IsolateHeapStats) {
     log_gauge(
         &ISOLATE_TOTAL_MALLOCED_MEMORY_BYTES,
         stats.v8_malloced_memory as f64,
+    );
+    log_gauge(
+        &ISOLATE_TOTAL_ARRAY_BUFFER_MEMORY_BYTES,
+        stats.array_buffer_size as f64,
     );
 }
 
@@ -643,10 +610,10 @@ pub fn record_component_function_path(component_function_path: &ResolvedComponen
             Cow::Borrowed("udf_path"),
             Cow::Owned(component_function_path.udf_path.to_string()),
         )];
-        if let Some(component_path) = &component_function_path.component_path {
+        if !component_function_path.component_path.is_root() {
             labels.push((
                 Cow::Borrowed("component"),
-                Cow::Owned(component_path.to_string()),
+                Cow::Owned(component_function_path.component_path.to_string()),
             ));
         }
         labels
@@ -710,6 +677,31 @@ pub fn log_component_get_user_identity(has_user_identity: bool) {
         vec![StaticMetricLabel::new(
             "has_user_identity",
             has_user_identity.as_label(),
+        )],
+    );
+}
+
+register_convex_counter!(
+    LEGACY_POSITIONAL_ARGS_TOTAL,
+    "Number of times that legacy positional arguments are used",
+);
+
+pub fn log_legacy_positional_args() {
+    log_counter(&LEGACY_POSITIONAL_ARGS_TOTAL, 1);
+}
+
+register_convex_histogram!(
+    USER_FUNCTION_EXECUTION_SECONDS,
+    "Time running user code for a function in the isolate",
+    &["udf_type"]
+);
+pub fn log_user_function_execution_time(udf_type: UdfType, execution_time: Duration) {
+    log_distribution_with_labels(
+        &USER_FUNCTION_EXECUTION_SECONDS,
+        execution_time.as_millis() as f64,
+        vec![StaticMetricLabel::new(
+            "udf_type",
+            udf_type.to_lowercase_string(),
         )],
     );
 }

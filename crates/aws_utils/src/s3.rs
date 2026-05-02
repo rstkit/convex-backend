@@ -1,7 +1,14 @@
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    sync::LazyLock,
+    time::Duration,
+};
 
 use anyhow::Context;
-use aws_config::retry::RetryConfig;
+use aws_config::{
+    retry::RetryConfig,
+    timeout::TimeoutConfig,
+};
 use aws_sdk_s3::{
     types::{
         Delete,
@@ -12,6 +19,7 @@ use aws_sdk_s3::{
     Client,
 };
 use aws_smithy_types_convert::stream::PaginationStreamExt;
+use cmd_util::env::env_config;
 use futures::{
     stream::TryStreamExt,
     Stream,
@@ -25,21 +33,35 @@ pub struct S3Client(pub Client);
 
 static S3_TRASH_FOLDER: &str = ".trash/";
 
+static S3_OPERATION_ATTEMPT_TIMEOUT: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("S3_OPERATION_ATTEMPT_TIMEOUT_SECONDS", 30)));
+
 impl S3Client {
     pub async fn new(enable_retries: bool) -> anyhow::Result<Self> {
         let retry_config = match enable_retries {
-            true => RetryConfig::standard(),
+            true => RetryConfig::standard().with_max_attempts(6),
             false => RetryConfig::disabled(),
         };
         let config = must_s3_config_from_env()
-            .context("AWS env variables are required when using AWS Lambda")?
+            .await
+            .context(
+                "Failed to create S3 configuration. Check AWS env variables or IAM permissions.",
+            )?
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_attempt_timeout(*S3_OPERATION_ATTEMPT_TIMEOUT)
+                    .build(),
+            )
             .retry_config(retry_config)
-            .load()
-            .await;
+            .build();
 
-        let s3_client = Client::new(&config);
-
+        let s3_client = Client::from_conf(config);
         Ok(Self(s3_client))
+    }
+
+    /// Create an S3 client from a pre-configured SDK config.
+    pub fn new_with_config(config: aws_config::SdkConfig) -> Self {
+        Self(Client::new(&config))
     }
 
     /// Lists all keys in a bucket, grouped by the substring from the start of
@@ -56,7 +78,7 @@ impl S3Client {
         &self,
         bucket: String,
         delimiter: String,
-    ) -> impl Stream<Item = anyhow::Result<String>> + Send + Unpin {
+    ) -> impl Stream<Item = anyhow::Result<String>> + Send + Unpin + use<> {
         let stream = self
             .0
             .list_objects_v2()
@@ -81,7 +103,7 @@ impl S3Client {
         &self,
         bucket: String,
         prefix: Option<String>,
-    ) -> impl Stream<Item = anyhow::Result<Object>> + Send + Unpin {
+    ) -> impl Stream<Item = anyhow::Result<Object>> + Send + Unpin + use<> {
         let stream = self
             .0
             .list_objects_v2()
@@ -132,7 +154,7 @@ impl S3Client {
         };
         let result = builder.send().await;
 
-        result.with_context(|| format!("Failed to delete S3 file with key {}", key))?;
+        result.with_context(|| format!("Failed to delete S3 file with key {key}"))?;
 
         tracing::info!("Delete of S3 file with key {} was successful", key);
 
@@ -201,10 +223,7 @@ impl S3Client {
                     .version_id
                     .as_deref()
                     .unwrap_or("[missing version_id]");
-                println!(
-                    "DRY RUN: Would delete marker for key {} version {}",
-                    key_str, version_str
-                );
+                println!("DRY RUN: Would delete marker for key {key_str} version {version_str}");
             }
             tracing::info!(
                 "DRY RUN: Would have recovered {num_markers_found} deleted files for instance \

@@ -59,18 +59,25 @@ export async function writeDeploymentEnvVar(
   );
   const deploymentEnvVarValue =
     deploymentType + ":" + deployment.deploymentName;
+  // The `existingValue` that reaches this function is at least sometimes is missing its prefix.
+  // Until this is cleaned up consider either of these values not a change.
+  // Otherwise we spam the init instructions (Welcome to Convex etc.) on every run of `npx convex dev`.
+  const changedDeploymentEnvVar =
+    !!changedFile &&
+    existingValue !== deployment.deploymentName &&
+    existingValue !== deploymentEnvVarValue;
 
   if (changedFile !== null) {
     ctx.fs.writeUtf8File(ENV_VAR_FILE_PATH, changedFile);
     // Only do this if we're not reinitializing an existing setup
     return {
       wroteToGitIgnore: await gitIgnoreEnvVarFile(ctx),
-      changedDeploymentEnvVar: existingValue !== deploymentEnvVarValue,
+      changedDeploymentEnvVar,
     };
   }
   return {
     wroteToGitIgnore: false,
-    changedDeploymentEnvVar: existingValue !== deploymentEnvVarValue,
+    changedDeploymentEnvVar,
   };
 }
 
@@ -209,12 +216,19 @@ export function isProjectKey(adminKey: string) {
   return /^project:.*\|/.test(adminKey);
 }
 
+// "dev deploy keys" and "prod deploy keys" are deployment keys.
+// On the client these are also known as admin keys.
+export function isDeploymentKey(adminKey: string) {
+  return /^(dev|prod):.*\|/.test(adminKey);
+}
+
 // For current keys returns prod|dev|preview,
 // for legacy keys returns "prod".
 // Examples:
 //  "prod:deploymentName|key" -> "prod"
 //  "preview:deploymentName|key" -> "preview"
 //  "dev:deploymentName|key" -> "dev"
+//  "custom:deploymentName|key" -> "custom"
 //  "key" -> "prod"
 export function deploymentTypeFromAdminKey(adminKey: string) {
   const parts = adminKey.split(":");

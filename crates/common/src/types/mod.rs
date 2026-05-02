@@ -18,13 +18,15 @@ mod actions;
 mod admin_key;
 mod backend_info;
 mod backend_state;
-mod deployment_type;
+mod deployments;
 mod environment_variables;
 mod file_storage;
 mod functions;
 mod index;
 mod maybe_value;
 mod object_key;
+mod region;
+mod search_index_metric_labels;
 mod snapshot_export;
 mod table;
 mod timestamp;
@@ -43,15 +45,23 @@ pub use admin_key::{
     split_admin_key,
     AdminKey,
     AdminKeyParts,
-    PreviewDeploymentAdminKeyParts,
     SystemKey,
 };
 pub use backend_info::{
     BackendInfo,
     DEFAULT_PROVISION_CONCURRENCY,
 };
-pub use backend_state::BackendState;
-pub use deployment_type::DeploymentType;
+pub use backend_state::{
+    BackendState,
+    OldBackendState,
+    SystemStopState,
+    UserStopState,
+};
+pub use deployments::{
+    DeploymentClass,
+    DeploymentMetadata,
+    DeploymentType,
+};
 pub use environment_variables::{
     env_var_limit_met,
     env_var_name_forbidden,
@@ -59,7 +69,6 @@ pub use environment_variables::{
     EnvVarName,
     EnvVarValue,
     EnvironmentVariable,
-    ENV_VAR_LIMIT,
 };
 pub use file_storage::StorageUuid;
 pub use functions::{
@@ -68,6 +77,7 @@ pub use functions::{
     ModuleEnvironment,
     UdfIdentifier,
     UdfType,
+    UdfTypeJson,
 };
 pub use index::{
     DatabaseIndexUpdate,
@@ -88,10 +98,15 @@ pub use object_key::{
     FullyQualifiedObjectKey,
     ObjectKey,
 };
+pub use region::{
+    default_region,
+    set_test_region_as_default,
+    RegionName,
+    TEST_REGION_NAME,
+};
+pub use search_index_metric_labels::SearchIndexMetricLabels;
 pub use snapshot_export::SetExportExpirationRequest;
 pub use table::TableStats;
-#[cfg(any(test, feature = "testing"))]
-pub use timestamp::unchecked_repeatable_ts;
 pub use timestamp::{
     RepeatableReason,
     RepeatableTimestamp,
@@ -115,13 +130,6 @@ pub type CursorMs = f64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistenceVersion {
     V5,
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Default for PersistenceVersion {
-    fn default() -> Self {
-        Self::V5
-    }
 }
 
 impl PersistenceVersion {

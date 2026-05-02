@@ -1,7 +1,7 @@
 // eslint-disable-next-line import/no-relative-packages
-import "../../../dashboard-common/src/styles/globals.css";
-// eslint-disable-next-line import/no-relative-packages
 import "../../../@convex-dev/design-system/src/styles/shared.css";
+// eslint-disable-next-line import/no-relative-packages
+import "../../../dashboard-common/src/styles/globals.css";
 import { AppProps } from "next/app";
 import Head from "next/head";
 import { useQuery } from "convex/react";
@@ -13,9 +13,17 @@ import { ToastContainer } from "@common/elements/ToastContainer";
 import { ThemeConsumer } from "@common/elements/ThemeConsumer";
 import { Favicon } from "@common/elements/Favicon";
 import { ToggleTheme } from "@common/elements/ToggleTheme";
+import { SelfHostedDisconnectOverlay } from "@common/features/disconnectOverlay/SelfHostedDisconnectOverlay";
 import { Menu, MenuItem } from "@ui/Menu";
 import { ThemeProvider } from "next-themes";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  createContext,
+} from "react";
 import { ErrorBoundary } from "components/ErrorBoundary";
 import { DeploymentDashboardLayout } from "@common/layouts/DeploymentDashboardLayout";
 import {
@@ -32,6 +40,35 @@ import { ConvexCloudReminderToast } from "components/ConvexCloudReminderToast";
 import { z } from "zod";
 import { UIProvider } from "@ui/UIContext";
 import Link from "next/link";
+
+if (process.env.NEXT_PUBLIC_LOAD_MONACO_INTERNALLY === "true") {
+  import("../lib/monacoInternalLoader").then((a) => a).catch(console.error);
+}
+
+// Context for self-hosted dashboard sidebar settings
+const SelfHostedSettingsContext = createContext<{
+  visiblePages?: string[];
+}>({
+  visiblePages: undefined,
+});
+
+/**
+ * Wrapper component that consumes SelfHostedSettingsContext and passes
+ * the settings to DeploymentDashboardLayout
+ */
+function DeploymentDashboardLayoutWrapper({
+  children,
+}: {
+  children: JSX.Element;
+}) {
+  const { visiblePages } = useContext(SelfHostedSettingsContext);
+
+  return (
+    <DeploymentDashboardLayout visiblePages={visiblePages}>
+      {children}
+    </DeploymentDashboardLayout>
+  );
+}
 
 function App({
   Component,
@@ -67,12 +104,12 @@ function App({
             >
               <DeploymentApiProvider deploymentOverride="local">
                 <WaitForDeploymentApi>
-                  <DeploymentDashboardLayout>
+                  <DeploymentDashboardLayoutWrapper>
                     <>
                       <Component {...pageProps} />
                       <ConvexCloudReminderToast />
                     </>
-                  </DeploymentDashboardLayout>
+                  </DeploymentDashboardLayoutWrapper>
                 </WaitForDeploymentApi>
               </DeploymentApiProvider>
             </DeploymentInfoProvider>
@@ -92,7 +129,7 @@ function normalizeUrl(url: string) {
     const parsedUrl = new URL(url);
     // remove trailing slash
     return parsedUrl.href.replace(/\/$/, "");
-  } catch (e) {
+  } catch {
     return null;
   }
 }
@@ -106,6 +143,10 @@ App.getInitialProps = async ({ ctx }: { ctx: { req?: any } }) => {
     let deploymentUrl: string | null = null;
     if (process.env.NEXT_PUBLIC_DEPLOYMENT_URL) {
       deploymentUrl = normalizeUrl(process.env.NEXT_PUBLIC_DEPLOYMENT_URL);
+    }
+    let adminKey: string | null = null;
+    if (process.env.NEXT_PUBLIC_ADMIN_KEY) {
+      adminKey = process.env.NEXT_PUBLIC_ADMIN_KEY;
     }
 
     const listDeploymentsApiPort =
@@ -121,7 +162,7 @@ App.getInitialProps = async ({ ctx }: { ctx: { req?: any } }) => {
     return {
       pageProps: {
         deploymentUrl,
-        adminKey: null,
+        adminKey,
         defaultListDeploymentsApiUrl: listDeploymentsApiUrl,
       },
     };
@@ -169,7 +210,9 @@ const deploymentInfo: Omit<DeploymentInfo, "deploymentUrl" | "adminKey"> = {
   }),
   useTeamMembers: () => [],
   useTeamEntitlements: () => ({
-    auditLogsEnabled: true,
+    auditLogRetentionDays: -1,
+    logStreamingEnabled: true,
+    streamingExportEnabled: true,
   }),
   useCurrentUsageBanner: () => null,
   useCurrentProject: () => ({
@@ -190,9 +233,16 @@ const deploymentInfo: Omit<DeploymentInfo, "deploymentUrl" | "adminKey"> = {
       projectId: 0,
       kind: "local",
       previewIdentifier: null,
+      creator: 0,
+      createTime: 0,
+      port: 0,
+      deviceName: "local",
+      isActive: true,
     };
   },
+  useIsProtectedDeployment: () => false,
   useHasProjectAdminPermissions: () => true,
+  useIsOperationAllowed: () => true,
   useIsDeploymentPaused: () => {
     const deploymentState = useQuery(udfs.deploymentState.deploymentState);
     return deploymentState?.state === "paused";
@@ -200,6 +250,42 @@ const deploymentInfo: Omit<DeploymentInfo, "deploymentUrl" | "adminKey"> = {
   useProjectEnvironmentVariables: () => ({ configs: [] }),
   // no-op. don't send analytics in the self-hosted dashboard.
   useLogDeploymentEvent: () => () => {},
+  workOSOperations: {
+    useDeploymentWorkOSEnvironment: () => undefined,
+    useTeamWorkOSIntegration: () => undefined,
+    useWorkOSTeamHealth: () => undefined,
+    useWorkOSEnvironmentHealth: () => ({ data: undefined, error: undefined }),
+    useDisconnectWorkOSTeam: (_teamId?: string) => async () => undefined,
+    useInviteWorkOSTeamMember: () => async () => undefined,
+    useWorkOSInvitationEligibleEmails: () => undefined,
+    useAvailableWorkOSTeamEmails: () => undefined,
+    useProvisionWorkOSTeam: (_teamId?: string) => async () => undefined,
+    useProvisionWorkOSEnvironment: (_deploymentName?: string) => async () =>
+      undefined,
+    useDeleteWorkOSEnvironment: (_deploymentName?: string) => async () =>
+      undefined,
+    useProjectWorkOSEnvironments: (_projectId?: number) => undefined,
+    useGetProjectWorkOSEnvironment: (_projectId?: number, _clientId?: string) =>
+      undefined,
+    useCheckProjectEnvironmentHealth:
+      (_projectId?: number, _clientId?: string) => async () =>
+        null,
+    useProvisionProjectWorkOSEnvironment:
+      (_projectId?: number) => async (_body: { environmentName: string }) => ({
+        workosEnvironmentId: "",
+        workosEnvironmentName: "",
+        workosClientId: "",
+        workosApiKey: "",
+        newlyProvisioned: false,
+        userEnvironmentName: "",
+      }),
+    useDeleteProjectWorkOSEnvironment:
+      (_projectId?: number) => async (_clientId: string) => ({
+        workosEnvironmentId: "",
+        workosEnvironmentName: "",
+        workosTeamId: "",
+      }),
+  },
   CloudImport: ({ sourceCloudBackupId }: { sourceCloudBackupId: number }) => (
     <div>{sourceCloudBackupId}</div>
   ),
@@ -210,15 +296,19 @@ const deploymentInfo: Omit<DeploymentInfo, "deploymentUrl" | "adminKey"> = {
       </div>
     </Tooltip>
   ),
+  Link,
   ErrorBoundary: ({ children }: { children: React.ReactNode }) => (
     <ErrorBoundary>{children}</ErrorBoundary>
   ),
+  DisconnectOverlay: () => <SelfHostedDisconnectOverlay />,
   useTeamUsageState: () => "Default",
   teamsURI: "",
   projectsURI: "",
   deploymentsURI: "",
   isSelfHosted: true,
-  enableIndexFilters: true,
+  workosIntegrationEnabled: false,
+  connectionStateCheckIntervalMs: 2500,
+  showScheduledJobArgsInComponents: false,
 };
 
 function DeploymentInfoProvider({
@@ -250,31 +340,43 @@ function DeploymentInfoProvider({
     SESSION_STORAGE_DEPLOYMENT_NAME_KEY,
     "",
   );
+  const [visiblePages, setVisiblePages] = useState<string[] | undefined>(
+    undefined,
+  );
+  const [allowedOps, setAllowedOps] = useState<string[]>([]);
+
+  // Memoize this so it can safely be passed into the context
+  const settingsContextValue = useMemo(
+    () => ({ visiblePages }),
+    [visiblePages],
+  );
+
   const onSubmit = useCallback(
     async ({
       submittedAdminKey,
       submittedDeploymentUrl,
       submittedDeploymentName,
+      submittedVisiblePages,
     }: {
       submittedAdminKey: string;
       submittedDeploymentUrl: string;
       submittedDeploymentName: string;
+      submittedVisiblePages?: string[];
     }) => {
-      const isValid = await checkDeploymentInfo(
+      const result = await checkDeploymentInfo(
         submittedAdminKey,
         submittedDeploymentUrl,
       );
-      if (isValid === false) {
+      if (result === null) {
         setIsValidDeploymentInfo(false);
         return;
       }
-      // For deployments that don't have the `/check_admin_key` endpoint,
-      // we set isValidDeploymentInfo to true so we can move on. The dashboard
-      // will just hit a less graceful error later if the credentials are invalid.
       setIsValidDeploymentInfo(true);
+      setAllowedOps(result.allowedOps);
       setStoredAdminKey(submittedAdminKey);
       setStoredDeploymentUrl(submittedDeploymentUrl);
       setStoredDeploymentName(submittedDeploymentName);
+      setVisiblePages(submittedVisiblePages);
     },
     [setStoredAdminKey, setStoredDeploymentUrl, setStoredDeploymentName],
   );
@@ -288,8 +390,13 @@ function DeploymentInfoProvider({
         ok: true,
         adminKey: storedAdminKey,
         deploymentUrl: storedDeploymentUrl,
+        useIsOperationAllowed: (operation: string) => {
+          // Empty allowedOps means all operations are allowed (full admin key).
+          if (allowedOps.length === 0) return true;
+          return allowedOps.includes(operation);
+        },
       }) as DeploymentInfo,
-    [storedAdminKey, storedDeploymentUrl],
+    [storedAdminKey, storedDeploymentUrl, allowedOps],
   );
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
@@ -360,7 +467,9 @@ function DeploymentInfoProvider({
         }}
       />
       <DeploymentInfoContext.Provider value={finalValue}>
-        <ErrorBoundary>{children}</ErrorBoundary>
+        <SelfHostedSettingsContext.Provider value={settingsContextValue}>
+          <ErrorBoundary>{children}</ErrorBoundary>
+        </SelfHostedSettingsContext.Provider>
       </DeploymentInfoContext.Provider>
     </>
   );
@@ -372,12 +481,12 @@ function Header({ onLogout }: { onLogout: () => void }) {
   }
 
   return (
-    <header className="-ml-1 flex min-h-[56px] items-center justify-between gap-1 overflow-x-auto border-b bg-background-secondary pr-4 scrollbar-none sm:gap-6">
+    <header className="-ml-1 scrollbar-none flex min-h-[56px] items-center justify-between gap-1 overflow-x-auto border-b bg-background-secondary pr-4 sm:gap-6">
       <ConvexLogo height={64} width={192} />
       <Menu
         buttonProps={{
           icon: (
-            <GearIcon className="h-7 w-7 rounded p-1 text-content-primary hover:bg-background-tertiary" />
+            <GearIcon className="h-7 w-7 rounded-sm p-1 text-content-primary hover:bg-background-tertiary" />
           ),
           variant: "unstyled",
           "aria-label": "Dashboard Settings",
@@ -405,10 +514,12 @@ function useEmbeddedDashboardCredentials(
     submittedAdminKey,
     submittedDeploymentUrl,
     submittedDeploymentName,
+    submittedVisiblePages,
   }: {
     submittedAdminKey: string;
     submittedDeploymentUrl: string;
     submittedDeploymentName: string;
+    submittedVisiblePages?: string[];
   }) => void,
 ) {
   // Send a message to the parent iframe to request the credentials.
@@ -430,11 +541,12 @@ function useEmbeddedDashboardCredentials(
         adminKey: z.string(),
         deploymentUrl: z.string().url(),
         deploymentName: z.string(),
+        visiblePages: z.array(z.string()).optional(),
       });
 
       try {
         credentialsSchema.parse(event.data);
-      } catch (err) {
+      } catch {
         return;
       }
 
@@ -443,6 +555,7 @@ function useEmbeddedDashboardCredentials(
           submittedAdminKey: event.data.adminKey,
           submittedDeploymentUrl: event.data.deploymentUrl,
           submittedDeploymentName: event.data.deploymentName,
+          submittedVisiblePages: event.data.visiblePages,
         });
       }
     };

@@ -1,10 +1,10 @@
-import { BackspaceIcon } from "@heroicons/react/24/outline";
+import { BackspaceIcon, FingerPrintIcon } from "@heroicons/react/24/outline";
 import {
   BarChartIcon,
   TrashIcon,
   DotsVerticalIcon,
   CodeIcon,
-  CardStackIcon,
+  CubeIcon,
 } from "@radix-ui/react-icons";
 import { useContext } from "react";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
@@ -17,7 +17,8 @@ export function DataOverflowMenu({
   numRows,
   onClickCustomQuery,
   onClickClearTable,
-  onClickSchemaIndexes,
+  onClickSchema,
+  onClickIndexes,
   onClickMetrics,
   onClickDeleteTable,
 }: {
@@ -25,7 +26,8 @@ export function DataOverflowMenu({
   numRows: number;
   onClickCustomQuery: () => void;
   onClickClearTable: () => void;
-  onClickSchemaIndexes: () => void;
+  onClickSchema: () => void;
+  onClickIndexes: () => void;
   onClickMetrics: () => void;
   onClickDeleteTable: () => void;
 }) {
@@ -38,16 +40,24 @@ export function DataOverflowMenu({
     tableSchemaStatus?.isDefined ||
     tableSchemaStatus?.referencedByTable !== undefined;
 
-  const { useCurrentDeployment, useHasProjectAdminPermissions } = useContext(
-    DeploymentInfoContext,
-  );
+  const isInInProgressSchema =
+    tableSchemaStatus?.isValidationRunning &&
+    tableSchemaStatus?.isDefinedInInProgressSchema;
+
+  const {
+    useCurrentDeployment,
+    useHasProjectAdminPermissions,
+    useIsOperationAllowed,
+  } = useContext(DeploymentInfoContext);
 
   const deployment = useCurrentDeployment();
   const hasAdminPermissions = useHasProjectAdminPermissions(
     deployment?.projectId,
   );
+  const canWriteData = useIsOperationAllowed("WriteData");
   const canManageTable =
-    deployment?.deploymentType !== "prod" || hasAdminPermissions;
+    (deployment?.deploymentType !== "prod" || hasAdminPermissions) &&
+    canWriteData;
   return (
     <Menu
       placement="bottom-start"
@@ -62,9 +72,13 @@ export function DataOverflowMenu({
         <CodeIcon />
         Custom query
       </MenuItem>
-      <MenuItem action={onClickSchemaIndexes}>
-        <CardStackIcon />
-        Schema and Indexes
+      <MenuItem action={onClickSchema}>
+        <CubeIcon />
+        Schema
+      </MenuItem>
+      <MenuItem action={onClickIndexes}>
+        <FingerPrintIcon className="size-4" />
+        Indexes
       </MenuItem>
       <MenuItem action={onClickMetrics}>
         <BarChartIcon />
@@ -77,7 +91,7 @@ export function DataOverflowMenu({
             : numRows === 0
               ? "There are no documents to delete."
               : !canManageTable
-                ? "You do not have permission to clear tables in production."
+                ? "You do not have permission to clear tables in this deployment."
                 : undefined
         }
         tipSide="left"
@@ -94,8 +108,10 @@ export function DataOverflowMenu({
             "Cannot delete tables in an unmounted component."
           ) : isInSchema ? (
             <RemoveTableFromSchemaTip tableSchemaStatus={tableSchemaStatus} />
+          ) : isInInProgressSchema ? (
+            "Cannot delete table while schema validation is in progress."
           ) : !canManageTable ? (
-            "You do not have permission to delete tables in production."
+            "You do not have permission to delete tables in this deployment."
           ) : undefined
         }
         tipSide="left"
@@ -105,7 +121,7 @@ export function DataOverflowMenu({
           isInSchema ||
           !canManageTable ||
           isInUnmountedComponent ||
-          tableSchemaStatus?.isValidationRunning
+          isInInProgressSchema
         }
       >
         <TrashIcon />

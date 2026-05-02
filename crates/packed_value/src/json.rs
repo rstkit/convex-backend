@@ -15,12 +15,9 @@ use serde::{
 };
 use value::numeric::is_negative_zero;
 
-use crate::{
-    OpenedMap,
-    OpenedSet,
-    OpenedValue,
-};
+use crate::OpenedValue;
 
+#[allow(dead_code)] // TODO: remove
 struct JsonOpenedValue<'a, B: Buffer>(&'a OpenedValue<B>)
 where
     B::BufferString: Clone;
@@ -71,7 +68,7 @@ where
                 map.serialize_entry("$bytes", &out[..])?;
                 map.end()?
             },
-            OpenedValue::Array(ref values) => {
+            OpenedValue::Array(values) => {
                 let mut seq = serializer.serialize_seq(Some(values.len()))?;
                 for value_r in values.iter() {
                     let value = value_r.map_err(SerdeError::custom)?;
@@ -79,17 +76,7 @@ where
                 }
                 seq.end()?
             },
-            OpenedValue::Set(ref values) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("$set", &JsonOpenedSet(values))?;
-                map.end()?
-            },
-            OpenedValue::Map(ref values) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("$map", &JsonOpenedMap(values))?;
-                map.end()?
-            },
-            OpenedValue::Object(ref fields) => {
+            OpenedValue::Object(fields) => {
                 let mut map = serializer.serialize_map(Some(fields.len()))?;
                 for r in fields.iter() {
                     let (field, value) = r.map_err(SerdeError::custom)?;
@@ -99,64 +86,5 @@ where
             },
         };
         Ok(result)
-    }
-}
-
-pub struct JsonOpenedSet<'a, B: Buffer>(&'a OpenedSet<B>)
-where
-    B::BufferString: Clone;
-
-impl<B: Buffer> Serialize for JsonOpenedSet<'_, B>
-where
-    B::BufferString: Clone,
-{
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for value_r in self.0.iter() {
-            let value = value_r.map_err(SerdeError::custom)?;
-            seq.serialize_element(&JsonOpenedValue(&value))?;
-        }
-        seq.end()
-    }
-}
-
-pub struct JsonOpenedMap<'a, B: Buffer>(&'a OpenedMap<B>)
-where
-    B::BufferString: Clone;
-
-impl<B: Buffer> Serialize for JsonOpenedMap<'_, B>
-where
-    B::BufferString: Clone,
-{
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for r in self.0.iter() {
-            let (key, value) = r.map_err(SerdeError::custom)?;
-            seq.serialize_element(&JsonOpenedMapPair {
-                key: &key,
-                value: &value,
-            })?;
-        }
-        seq.end()
-    }
-}
-
-pub struct JsonOpenedMapPair<'a, B: Buffer>
-where
-    B::BufferString: Clone,
-{
-    key: &'a OpenedValue<B>,
-    value: &'a OpenedValue<B>,
-}
-
-impl<B: Buffer> Serialize for JsonOpenedMapPair<'_, B>
-where
-    B::BufferString: Clone,
-{
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(2))?;
-        seq.serialize_element(&JsonOpenedValue(self.key))?;
-        seq.serialize_element(&JsonOpenedValue(self.value))?;
-        seq.end()
     }
 }

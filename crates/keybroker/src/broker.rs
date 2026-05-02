@@ -39,7 +39,6 @@ use common::{
         MemberId,
         PersistenceVersion,
         TeamId,
-        UdfType,
     },
 };
 use errors::ErrorMetadata;
@@ -65,6 +64,7 @@ use pb::{
     convex_identity::{
         unchecked_identity::Identity as UncheckedIdentityProto,
         ActingUser,
+        DeploymentOperation as ProtoDeploymentOperation,
         UnknownIdentity,
     },
     convex_keys::{
@@ -78,11 +78,6 @@ use pb::{
     },
     convex_query_journal::InstanceQueryJournal as InstanceQueryJournalProto,
 };
-#[cfg(any(test, feature = "testing"))]
-use proptest::prelude::{
-    Arbitrary,
-    Strategy,
-};
 use serde::{
     Deserialize,
     Serialize,
@@ -94,8 +89,6 @@ use sync_types::{
     UserIdentityAttributes,
 };
 
-#[cfg(any(test, feature = "testing"))]
-use crate::testing::TestUserIdentity;
 use crate::{
     encryptor::{
         DeterministicEncryptor,
@@ -105,9 +98,14 @@ use crate::{
     legacy_encryptor::LegacyEncryptor,
     metrics::{
         log_actions_token_expired,
+        log_legacy_admin_key,
         log_store_file_auth_expired,
     },
-    secret::InstanceSecret,
+    operations::{
+        bad_admin_key_error,
+        DeploymentOp,
+    },
+    secret::DeploymentSecret,
 };
 
 const ACTION_KEY_VERSION: u8 = 2;
@@ -136,7 +134,6 @@ pub struct KeyBroker {
 // [`common::identity::InertIdentity`] to store an "inert" version that records
 // the variant without representation authentication.
 #[derive(Clone, Debug)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum Identity {
     InstanceAdmin(AdminIdentity),
     System(SystemIdentity),
@@ -154,9 +151,7 @@ pub enum Identity {
 impl From<Identity> for AuthenticationToken {
     fn from(i: Identity) -> Self {
         match i {
-            Identity::User(identity) => {
-                AuthenticationToken::User(identity.original_token.to_string())
-            },
+            Identity::User(identity) => AuthenticationToken::User(identity.original_token),
             Identity::ActingUser(identity, user) => {
                 AuthenticationToken::Admin(identity.key, Some(user))
             },
@@ -222,25 +217,6 @@ impl Identity {
                 Identity::Unknown(error_message.map(|e| e.try_into()).transpose()?),
             ),
         }
-    }
-
-    pub fn ensure_can_run_function(&self, udf_type: UdfType) -> anyhow::Result<()> {
-        // Everyone can run queries.
-        if udf_type == UdfType::Query {
-            return Ok(());
-        }
-        match self {
-            Identity::InstanceAdmin(admin_identity) | Identity::ActingUser(admin_identity, _) => {
-                if admin_identity.is_read_only() {
-                    anyhow::bail!(ErrorMetadata::forbidden(
-                        "Unauthorized",
-                        format!("You do not have permission to run {udf_type} functions.")
-                    ));
-                }
-            },
-            _ => {},
-        }
-        Ok(())
     }
 
     pub fn tag(&self) -> StaticMetricLabel {
@@ -324,6 +300,10 @@ impl Identity {
         matches!(self, Identity::InstanceAdmin(..))
     }
 
+    pub fn is_acting_as_user(&self) -> bool {
+        matches!(self, Identity::ActingUser(..))
+    }
+
     pub fn is_user(&self) -> bool {
         matches!(self, Identity::User(..))
     }
@@ -362,11 +342,23 @@ impl Identity {
         None
     }
 
-    pub fn assert_present(&self) -> anyhow::Result<()> {
-        if matches!(self, Identity::Unknown(_)) {
-            anyhow::bail!(ErrorMetadata::unauthenticated(
-                "AuthorizationMissing",
-                "This request requires the HTTP `Authorization` header.",
+    /// Check that this identity is an admin allowed to perform `operation`.
+    /// System identities are always allowed. Admin identities are checked
+    /// against their allowed operations. All other identities are rejected.
+    pub fn require_operation(&self, operation: DeploymentOp) -> anyhow::Result<()> {
+        let admin_identity = match self {
+            Identity::System(_) => return Ok(()),
+            Identity::InstanceAdmin(admin_identity) | Identity::ActingUser(admin_identity, _) => {
+                admin_identity
+            },
+            Identity::User(_) | Identity::Unknown(_) => {
+                return Err(bad_admin_key_error(self.instance_name()).into());
+            },
+        };
+        if !admin_identity.is_operation_allowed(operation) {
+            anyhow::bail!(ErrorMetadata::forbidden(
+                "Unauthorized",
+                format!("You do not have permission to perform this operation ({operation:?})."),
             ));
         }
         Ok(())
@@ -384,21 +376,6 @@ pub struct UserIdentity {
     // The original token this user identity was created from. This may either by an
     // OIDC JWT or a custom JWT.
     pub original_token: String,
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for UserIdentity {
-    type Parameters = ();
-
-    type Strategy = impl Strategy<Value = UserIdentity>;
-
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-
-        // This is not randomized right now because there are many constraints on
-        // string fields in UserIdentity.
-        any::<()>().prop_map(|()| UserIdentity::test())
-    }
 }
 
 impl From<UserIdentity> for pb::convex_identity::UserIdentity {
@@ -551,7 +528,7 @@ impl UserIdentity {
                 email: get_string!(claims, email),
                 email_verified: claims.email_verified(),
                 gender: get_string!(claims, gender),
-                birthday: get_string!(claims, birthday),
+                birthday: get_string!(claims, birthdate),
                 timezone: get_string!(claims, zoneinfo),
                 language: get_string!(claims, locale),
                 phone_number: get_string!(claims, phone_number),
@@ -618,8 +595,9 @@ fn extract_custom_jwt_claims(
     result
 }
 
+use crate::operations::operations_for_deploy_key;
+
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum AdminIdentityPrincipal {
     Member(MemberId),
     Team(TeamId),
@@ -637,6 +615,8 @@ pub struct AdminIdentity {
     // actions. At the database level, they are allowed to read data from user and system tables
     // but not write to them.
     is_read_only: bool,
+    // Operations this identity is allowed to perform. Empty means all operations allowed.
+    allowed_ops: Vec<DeploymentOp>,
 }
 
 impl From<AdminIdentity> for pb::convex_identity::AdminIdentity {
@@ -646,6 +626,7 @@ impl From<AdminIdentity> for pb::convex_identity::AdminIdentity {
             principal,
             key,
             is_read_only,
+            allowed_ops,
         }: AdminIdentity,
     ) -> Self {
         Self {
@@ -660,6 +641,10 @@ impl From<AdminIdentity> for pb::convex_identity::AdminIdentity {
             },
             key: Some(key),
             is_read_only,
+            allowed_operations: allowed_ops
+                .into_iter()
+                .map(|op| ProtoDeploymentOperation::from(op) as i32)
+                .collect(),
         }
     }
 }
@@ -680,11 +665,20 @@ impl AdminIdentity {
         };
         let key = msg.key.ok_or_else(|| anyhow::anyhow!("Missing key"))?;
         let is_read_only: bool = msg.is_read_only;
+        let allowed_ops: Vec<DeploymentOp> = msg
+            .allowed_operations
+            .into_iter()
+            .map(|i| match ProtoDeploymentOperation::try_from(i) {
+                Ok(proto) => DeploymentOp::from(proto),
+                Err(_) => DeploymentOp::Unknown,
+            })
+            .collect();
         Ok(Self {
             instance_name,
             principal,
             key,
             is_read_only,
+            allowed_ops,
         })
     }
 
@@ -693,12 +687,14 @@ impl AdminIdentity {
         principal: AdminIdentityPrincipal,
         access_token: String,
         is_read_only: bool,
+        allowed_ops: Vec<DeploymentOp>,
     ) -> Self {
         Self {
             instance_name,
             principal,
             key: access_token,
             is_read_only,
+            allowed_ops,
         }
     }
 
@@ -713,38 +709,15 @@ impl AdminIdentity {
     pub fn is_read_only(&self) -> bool {
         self.is_read_only
     }
-}
 
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for AdminIdentity {
-    type Parameters = ();
-
-    type Strategy = impl proptest::strategy::Strategy<Value = AdminIdentity>;
-
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        any::<(AdminIdentityPrincipal, String)>().prop_map(|(principal, key)| AdminIdentity {
-            instance_name: "fake-instance-name".to_string(),
-            principal,
-            key,
-            is_read_only: false,
-        })
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl AdminIdentity {
-    pub fn new_for_test_only(instance_name: String, member_id: MemberId) -> AdminIdentity {
-        AdminIdentity {
-            instance_name,
-            principal: AdminIdentityPrincipal::Member(member_id),
-            key: "chocolate-charlies-cupcake".to_string(),
-            is_read_only: false,
-        }
+    pub fn allowed_ops(&self) -> &[DeploymentOp] {
+        &self.allowed_ops
     }
 
-    pub fn instance_name(&self) -> &str {
-        &self.instance_name
+    /// Check whether this identity is allowed to perform a specific operation.
+    /// Empty `allowed_ops` means all operations are allowed.
+    pub fn is_operation_allowed(&self, operation: DeploymentOp) -> bool {
+        self.allowed_ops.is_empty() || self.allowed_ops.contains(&operation)
     }
 }
 
@@ -759,7 +732,6 @@ impl fmt::Debug for AdminIdentity {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct SystemIdentity;
 impl fmt::Debug for SystemIdentity {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -779,28 +751,28 @@ pub fn cursor_parse_error() -> ErrorMetadata {
 }
 
 impl KeyBroker {
-    pub fn new(instance_name: &str, instance_secret: InstanceSecret) -> anyhow::Result<Self> {
+    pub fn new(instance_name: &str, deployment_secret: DeploymentSecret) -> anyhow::Result<Self> {
         Ok(Self {
             instance_name: instance_name.to_owned(),
-            encryptor: LegacyEncryptor::new(instance_secret)?,
+            encryptor: LegacyEncryptor::new(deployment_secret)?,
             admin_key_encryptor: RandomEncryptor::derive_from_secret(
-                &instance_secret,
+                &deployment_secret,
                 Purpose::ADMIN_KEY,
             )?,
             action_callback_encryptor: RandomEncryptor::derive_from_secret(
-                &instance_secret,
+                &deployment_secret,
                 Purpose::ACTION_CALLBACK_TOKEN,
             )?,
             cursor_encryptor: DeterministicEncryptor::derive_from_secret(
-                &instance_secret,
+                &deployment_secret,
                 Purpose::CURSOR,
             )?,
             journal_encryptor: RandomEncryptor::derive_from_secret(
-                &instance_secret,
+                &deployment_secret,
                 Purpose::QUERY_JOURNAL,
             )?,
             store_file_encryptor: RandomEncryptor::derive_from_secret(
-                &instance_secret,
+                &deployment_secret,
                 Purpose::STORE_FILE_AUTHORIZATION,
             )?,
         })
@@ -809,7 +781,7 @@ impl KeyBroker {
     pub fn dev() -> Self {
         Self::new(
             crate::DEV_INSTANCE_NAME,
-            InstanceSecret::try_from(crate::DEV_SECRET).unwrap(),
+            DeploymentSecret::try_from(crate::DEV_SECRET).unwrap(),
         )
         .unwrap()
     }
@@ -817,9 +789,17 @@ impl KeyBroker {
     pub fn local_dev(instance_name: &str) -> Self {
         Self::new(
             instance_name,
-            InstanceSecret::try_from(crate::DEV_SECRET).unwrap(),
+            DeploymentSecret::try_from(crate::DEV_SECRET).unwrap(),
         )
         .unwrap()
+    }
+
+    pub fn function_runner_keybroker(&self) -> FunctionRunnerKeyBroker {
+        FunctionRunnerKeyBroker {
+            instance_name: self.instance_name.clone(),
+            cursor_encryptor: self.cursor_encryptor.clone(),
+            store_file_encryptor: self.store_file_encryptor.clone(),
+        }
     }
 
     pub fn issue_admin_key(&self, member_id: MemberId) -> AdminKey {
@@ -840,22 +820,8 @@ impl KeyBroker {
         issued: UnixTimestamp,
         component: ComponentId,
     ) -> anyhow::Result<StoreFileAuthorization> {
-        let now = rt.unix_timestamp();
-        if (now - issued) > MAX_TS_DELAY {
-            anyhow::bail!("Could not issue authorization. Issued TS too far in past.");
-        }
-        let component_str = component.serialize_to_string();
-        Ok(StoreFileAuthorization(
-            self.store_file_encryptor.encrypt_proto(
-                STORE_FILE_AUTHZ_VERSION,
-                &StorageTokenProto {
-                    instance_name: self.instance_name.clone(),
-                    issued_s: issued.as_secs(),
-                    authorization_type: Some(AuthorizationTypeProto::StoreFile(StoreFileProto {})),
-                    component_id: component_str,
-                },
-            ),
-        ))
+        self.function_runner_keybroker()
+            .issue_store_file_authorization(rt, issued, component)
     }
 
     /// Private helper method to generate an admin key.
@@ -888,11 +854,12 @@ impl KeyBroker {
     pub fn is_encrypted_admin_key(&self, key: &str) -> bool {
         let encrypted_part = split_admin_key(key).map(|(_, key)| key).unwrap_or(key);
         let admin_key: Result<AdminKeyProto, _> = self
-            .encryptor
-            .decode_proto(ADMIN_KEY_VERSION, encrypted_part)
+            .admin_key_encryptor
+            .decrypt_proto(ADMIN_KEY_VERSION, encrypted_part)
             .or_else(|_| {
-                self.admin_key_encryptor
-                    .decrypt_proto(ADMIN_KEY_VERSION, encrypted_part)
+                self.encryptor
+                    .decode_proto(ADMIN_KEY_VERSION, encrypted_part)
+                    .inspect(|_| log_legacy_admin_key())
             });
         admin_key.is_ok()
     }
@@ -907,13 +874,14 @@ impl KeyBroker {
             identity,
             is_read_only,
         } = self
-            .encryptor
-            .decode_proto(ADMIN_KEY_VERSION, encrypted_part)
+            .admin_key_encryptor
+            .decrypt_proto(ADMIN_KEY_VERSION, encrypted_part)
             .or_else(|_| {
-                self.admin_key_encryptor
-                    .decrypt_proto(ADMIN_KEY_VERSION, encrypted_part)
+                self.encryptor
+                    .decode_proto(ADMIN_KEY_VERSION, encrypted_part)
+                    .inspect(|_| log_legacy_admin_key())
             })
-            .with_context(|| format!("Couldn't decode the AdminKeyProto {}", key))?;
+            .with_context(|| format!("Couldn't decode the AdminKeyProto {key}"))?;
         let instance_name = instance_name
             .or(instance_name_from_encrypted_part.as_deref())
             .context("Invalid admin key format")?;
@@ -932,6 +900,7 @@ impl KeyBroker {
                 principal: AdminIdentityPrincipal::Member(MemberId(member_id)),
                 key: key.to_string(),
                 is_read_only,
+                allowed_ops: operations_for_deploy_key(is_read_only),
             }),
             AdminIdentityProto::System(()) => Identity::system(),
         })
@@ -949,12 +918,8 @@ impl KeyBroker {
             authorization_type,
             component_id,
         } = self
-            .encryptor
-            .decode_proto(STORE_FILE_AUTHZ_VERSION, store_file_authorization)
-            .or_else(|_| {
-                self.store_file_encryptor
-                    .decrypt_proto(STORE_FILE_AUTHZ_VERSION, store_file_authorization)
-            })
+            .store_file_encryptor
+            .decrypt_proto(STORE_FILE_AUTHZ_VERSION, store_file_authorization)
             .context(ErrorMetadata::unauthenticated(
                 "StorageTokenInvalid",
                 "Couldn't decode the StoreFileAuthorization token",
@@ -991,69 +956,13 @@ impl KeyBroker {
         Ok(component)
     }
 
-    fn cursor_to_proto(&self, cursor: &Cursor) -> InstanceCursorProto {
-        let position = match cursor.position {
-            CursorPosition::End => PositionProto::End(()),
-            CursorPosition::After(ref key) => PositionProto::After(IndexKeyProto {
-                values: key.clone().0,
-            }),
-        };
-        InstanceCursorProto {
-            instance_name: self.instance_name.clone(),
-            position: Some(position),
-            query_fingerprint: cursor.query_fingerprint.clone(),
-        }
-    }
-
-    fn proto_to_cursor(&self, proto: InstanceCursorProto) -> anyhow::Result<Cursor> {
-        if proto.instance_name != self.instance_name {
-            anyhow::bail!(ErrorMetadata::bad_request(
-                "InvalidCursor",
-                format!("Key is invalid for instance {:?}", proto.instance_name)
-            ));
-        }
-
-        let cursor_position = match proto.position {
-            Some(PositionProto::End(())) => CursorPosition::End,
-            Some(PositionProto::After(IndexKeyProto {
-                values: proto_values,
-            })) => CursorPosition::After(IndexKeyBytes(proto_values)),
-            None => anyhow::bail!(ErrorMetadata::bad_request(
-                "InvalidCursor",
-                "Missing position field"
-            )),
-        };
-        Ok(Cursor {
-            position: cursor_position,
-            query_fingerprint: proto.query_fingerprint,
-        })
-    }
-
     /// Serializes and encrypts the provided Cursor for sending to clients.
-    pub fn encrypt_cursor(
-        &self,
-        cursor: &Cursor,
-        persistence_version: PersistenceVersion,
-    ) -> SerializedCursor {
-        let proto = self.cursor_to_proto(cursor);
-        let cursor_version = persistence_version.index_key_version(CURSOR_VERSION);
-        self.cursor_encryptor.encrypt_proto(cursor_version, &proto)
+    pub fn encrypt_cursor(&self, cursor: &Cursor) -> SerializedCursor {
+        self.function_runner_keybroker().encrypt_cursor(cursor)
     }
 
-    /// Attempts to decrypt and deserialize the EncryptedCursor. May fail if the
-    /// client is sending up an old version.
-    pub fn decrypt_cursor(
-        &self,
-        cursor: SerializedCursor,
-        persistence_version: PersistenceVersion,
-    ) -> anyhow::Result<Cursor> {
-        let cursor_version = persistence_version.index_key_version(CURSOR_VERSION);
-        let proto: InstanceCursorProto = self
-            .encryptor
-            .decode_proto(cursor_version, &cursor)
-            .or_else(|_| self.cursor_encryptor.decrypt_proto(cursor_version, &cursor))
-            .with_context(cursor_parse_error)?;
-        self.proto_to_cursor(proto)
+    pub fn decrypt_cursor(&self, cursor: SerializedCursor) -> anyhow::Result<Cursor> {
+        self.function_runner_keybroker().decrypt_cursor(cursor)
     }
 
     pub fn encrypt_query_journal(
@@ -1063,7 +972,7 @@ impl KeyBroker {
     ) -> SerializedQueryJournal {
         let query_journal_version = persistence_version.index_key_version(QUERY_JOURNAL_VERSION);
         let cursor = match &journal.end_cursor {
-            Some(cursor) => Some(self.cursor_to_proto(cursor)),
+            Some(cursor) => Some(cursor_to_proto(&self.instance_name, cursor)),
             None => return None,
         };
         let proto = InstanceQueryJournalProto { end_cursor: cursor };
@@ -1083,15 +992,11 @@ impl KeyBroker {
             None => Ok(QueryJournal::new()),
             Some(journal) => {
                 let proto: InstanceQueryJournalProto = self
-                    .encryptor
-                    .decode_proto(query_journal_version, &journal)
-                    .or_else(|_| {
-                        self.journal_encryptor
-                            .decrypt_proto(query_journal_version, &journal)
-                    })
+                    .journal_encryptor
+                    .decrypt_proto(query_journal_version, &journal)
                     .with_context(cursor_parse_error)?;
                 let end_cursor = match proto.end_cursor {
-                    Some(cursor) => Some(self.proto_to_cursor(cursor)?),
+                    Some(cursor) => Some(proto_to_cursor(&self.instance_name, cursor)?),
                     None => None,
                 };
                 Ok(QueryJournal { end_cursor })
@@ -1124,12 +1029,8 @@ impl KeyBroker {
             issued_s,
             component_id,
         } = self
-            .encryptor
-            .decode_proto(ACTION_KEY_VERSION, token)
-            .or_else(|_| {
-                self.action_callback_encryptor
-                    .decrypt_proto(ACTION_KEY_VERSION, token)
-            })
+            .action_callback_encryptor
+            .decrypt_proto(ACTION_KEY_VERSION, token)
             .with_context(|| format!("Couldn't decode ActionCallbackTokenProto {token}"))?;
 
         anyhow::ensure!(issued_s != 0, "ActionCallbackTokenProto missing issued_s");
@@ -1152,250 +1053,90 @@ impl KeyBroker {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        str::FromStr,
-        time::{
-            Duration,
-            SystemTime,
-        },
+fn proto_to_cursor(instance_name: &str, proto: InstanceCursorProto) -> anyhow::Result<Cursor> {
+    if proto.instance_name != instance_name {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "InvalidCursor",
+            format!("Key is invalid for instance {:?}", proto.instance_name)
+        ));
+    }
+
+    let cursor_position = match proto.position {
+        Some(PositionProto::End(())) => CursorPosition::End,
+        Some(PositionProto::After(IndexKeyProto {
+            values: proto_values,
+        })) => CursorPosition::After(IndexKeyBytes(proto_values)),
+        None => anyhow::bail!(ErrorMetadata::bad_request(
+            "InvalidCursor",
+            "Missing position field"
+        )),
     };
+    Ok(Cursor {
+        position: cursor_position,
+        query_fingerprint: proto.query_fingerprint,
+    })
+}
 
-    use cmd_util::env::env_config;
-    use common::{
-        bootstrap_model::index::database_index::IndexedFields,
-        components::ComponentId,
-        index::IndexKey,
-        query::{
-            Cursor,
-            CursorPosition,
-            Order,
-            Query,
-        },
-        query_journal::QueryJournal,
-        runtime::Runtime,
-        types::{
-            MemberId,
-            PersistenceVersion,
-            TableName,
-        },
-        value::DeveloperDocumentId,
+fn cursor_to_proto(instance_name: &str, cursor: &Cursor) -> InstanceCursorProto {
+    let position = match cursor.position {
+        CursorPosition::End => PositionProto::End(()),
+        CursorPosition::After(ref key) => PositionProto::After(IndexKeyProto {
+            values: key.clone().0,
+        }),
     };
-    use pb::convex_keys::{
-        admin_key::Identity as AdminIdentityProto,
-        AdminKey as AdminKeyProto,
-    };
-    use pretty_assertions::assert_eq;
-    use proptest::prelude::*;
-    use runtime::testing::TestDriver;
-
-    use super::{
-        AdminKey,
-        KeyBroker,
-        ADMIN_KEY_VERSION,
-    };
-    use crate::{
-        AdminIdentity,
-        Identity,
-    };
-
-    #[test]
-    fn test_admin_keys() -> anyhow::Result<()> {
-        let kb = KeyBroker::dev();
-        let key = kb.issue_admin_key(MemberId(0));
-        let admin = kb.check_admin_key(key.as_str()).unwrap();
-        assert!(admin.is_admin());
-        assert!(!admin.is_system());
-        Ok(())
+    InstanceCursorProto {
+        instance_name: instance_name.to_owned(),
+        position: Some(position),
+        query_fingerprint: cursor.query_fingerprint.clone(),
     }
+}
 
-    #[test]
-    fn test_system_keys() -> anyhow::Result<()> {
-        let kb = KeyBroker::dev();
-        let key = kb.issue_system_key();
-        let system = kb.check_admin_key(key.as_str())?;
-        assert!(!system.is_admin());
-        assert!(system.is_system());
-        Ok(())
-    }
+/// More restricted KeyBroker that only has access to some secrets
+#[derive(Clone)]
+pub struct FunctionRunnerKeyBroker {
+    pub instance_name: String,
+    pub cursor_encryptor: DeterministicEncryptor,
+    pub store_file_encryptor: RandomEncryptor,
+}
 
-    #[test]
-    fn test_admin_keys_with_prefix() -> anyhow::Result<()> {
-        let kb = KeyBroker::dev();
-        let key = kb.issue_admin_key(MemberId(0));
-        let prefixed_key = format!("prod:{}", key.as_str());
-        let admin = kb.check_admin_key(&prefixed_key).unwrap();
-        assert!(admin.is_admin());
-        assert!(!admin.is_system());
-        Ok(())
-    }
-
-    fn old_issue_key(kb: &KeyBroker, member_id: Option<MemberId>) -> String {
-        let now = SystemTime::now();
-        let since_epoch = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Failed to compute seconds since epoch?");
-
-        let identity = match member_id {
-            Some(member_id) => AdminIdentityProto::MemberId(member_id.0),
-            None => AdminIdentityProto::System(()),
-        };
-        let proto = AdminKeyProto {
-            instance_name: Some(kb.instance_name.clone()),
-            issued_s: since_epoch.as_secs(),
-            identity: Some(identity),
-            is_read_only: false,
-        };
-        kb.encryptor.encode_proto(ADMIN_KEY_VERSION, proto)
-    }
-
-    #[test]
-    fn test_old_admin_keys() -> anyhow::Result<()> {
-        let kb = KeyBroker::dev();
-        let key = AdminKey::new(old_issue_key(&kb, Some(MemberId(0))));
-        kb.check_admin_key(key.as_str()).unwrap();
-        Ok(())
-    }
-
-    #[test]
-    fn test_store_file_authorization() -> anyhow::Result<()> {
-        let kb = KeyBroker::dev();
-        let td = TestDriver::new();
-        let now = td.rt().unix_timestamp();
-        let key = kb.issue_store_file_authorization(&td.rt(), now, ComponentId::test_user())?;
-        let component =
-            kb.check_store_file_authorization(&td.rt(), &key.to_string(), Duration::from_secs(60))?;
-        assert_eq!(component, ComponentId::test_user());
-        Ok(())
-    }
-
-    #[test]
-    fn test_cant_issue_backwards_timestamps() -> anyhow::Result<()> {
-        let kb = KeyBroker::dev();
-        let td = TestDriver::new();
-        let hour_ago = td.rt().unix_timestamp() - Duration::from_secs(3600);
-        kb.issue_store_file_authorization(&td.rt(), hour_ago, ComponentId::test_user())
-            .unwrap_err();
-        Ok(())
-    }
-
-    #[test]
-    fn test_cursors() -> anyhow::Result<()> {
-        let kb = KeyBroker::dev();
-        let cursor = Cursor {
-            position: CursorPosition::End,
-            query_fingerprint: vec![],
-        };
-        let encrypted = kb.encrypt_cursor(&cursor, PersistenceVersion::default());
-        let echoed = kb.decrypt_cursor(encrypted, PersistenceVersion::default())?;
-        assert_eq!(cursor, echoed);
-
-        // Add this back if there's a PersistenceVersion that changes cursors
-        // let encrypted_old_version = kb.encrypt_cursor(&cursor,
-        // PersistenceVersion::V5); let result = kb
-        //     .decrypt_cursor(encrypted_old_version, PersistenceVersion::V5)
-        //     .unwrap_err();
-        // assert!(result.is::<InvalidCursor>());
-        Ok(())
-    }
-
-    #[test]
-    fn test_query_journal_size() -> anyhow::Result<()> {
-        // Query journals are synced to the client along with every query
-        // result. This test ensures they stay reasonably small.
-
-        // Feel free to bump this values by a little bit, but rethink changes
-        // that would increase them by a lot.
-
-        let kb = KeyBroker::dev();
-
-        // Empty journal with no data. Serializes as None/null.
-        let empty_journal = QueryJournal::new();
-        let serialized_empty_journal =
-            kb.encrypt_query_journal(&empty_journal, PersistenceVersion::default());
-        assert_eq!(serialized_empty_journal, None);
-
-        // Realistic journal with the end cursor from a paginated query.
-        let query = Query::full_table_scan(TableName::from_str("documents")?, Order::Asc);
-        let mut journal_with_cursor = QueryJournal::new();
-        journal_with_cursor.end_cursor = Some(Cursor {
-            position: CursorPosition::After(
-                IndexKey::new(vec![100.into()], DeveloperDocumentId::MIN).to_bytes(),
+impl FunctionRunnerKeyBroker {
+    pub fn issue_store_file_authorization<RT: Runtime>(
+        &self,
+        rt: &RT,
+        issued: UnixTimestamp,
+        component: ComponentId,
+    ) -> anyhow::Result<StoreFileAuthorization> {
+        let now = rt.unix_timestamp();
+        if (now - issued) > MAX_TS_DELAY {
+            anyhow::bail!("Could not issue authorization. Issued TS too far in past.");
+        }
+        let component_str = component.serialize_to_string();
+        Ok(StoreFileAuthorization(
+            self.store_file_encryptor.encrypt_proto(
+                STORE_FILE_AUTHZ_VERSION,
+                &StorageTokenProto {
+                    instance_name: self.instance_name.clone(),
+                    issued_s: issued.as_secs(),
+                    authorization_type: Some(AuthorizationTypeProto::StoreFile(StoreFileProto {})),
+                    component_id: component_str,
+                },
             ),
-            query_fingerprint: query.fingerprint(&IndexedFields::creation_time())?,
-        });
-        let serialized_journal_with_cursor =
-            kb.encrypt_query_journal(&journal_with_cursor, PersistenceVersion::default());
-        assert_eq!(serialized_journal_with_cursor.unwrap().len(), 228);
-        Ok(())
+        ))
     }
 
-    #[test]
-    fn test_action_token() -> anyhow::Result<()> {
-        let kb = KeyBroker::dev();
-        let before_issue = SystemTime::now();
-        let token = kb.issue_action_token(ComponentId::test_user());
-        let after_issue = SystemTime::now();
-
-        // Should be valid if checked with validity of 1 minute.
-        let (issue_time, component_id) = kb.check_action_token(&token, Duration::from_secs(60))?;
-        // Note we round down the issue time to nearest second.
-        assert!(issue_time > before_issue - Duration::from_secs(1));
-        assert!(issue_time < after_issue);
-        assert_eq!(component_id, ComponentId::test_user());
-
-        // Should be invalid if checked with validity of 0.
-        let err = kb
-            .check_action_token(&token, Duration::from_secs(0))
-            .unwrap_err();
-        assert!(format!("{err}").contains("Action callback token expired"));
-
-        // Try with completely invalid token.
-        let err = kb
-            .check_action_token(&"invalid-token".to_owned(), Duration::from_secs(60))
-            .unwrap_err();
-        assert!(format!("{err}").contains("Couldn't decode ActionCallbackTokenProto"));
-
-        Ok(())
+    /// Serializes and encrypts the provided Cursor for sending to clients.
+    pub fn encrypt_cursor(&self, cursor: &Cursor) -> SerializedCursor {
+        let proto = cursor_to_proto(&self.instance_name, cursor);
+        self.cursor_encryptor.encrypt_proto(CURSOR_VERSION, &proto)
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig { cases: 64 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, .. ProptestConfig::default() })]
-
-        #[test]
-        fn test_cursor_roundtrips(cursor in any::<Cursor>()) {
-            let kb = KeyBroker::dev();
-            let encrypted = kb.encrypt_cursor(&cursor, PersistenceVersion::default());
-            let decrypted = kb.decrypt_cursor(encrypted, PersistenceVersion::default()).unwrap();
-            assert_eq!(cursor, decrypted);
-        }
-
-        #[test]
-        fn test_query_journal_roundtrips(journal in any::<QueryJournal>()) {
-            let kb = KeyBroker::dev();
-            let encrypted = kb.encrypt_query_journal(&journal, PersistenceVersion::default());
-            let decrypted = kb.decrypt_query_journal(
-                encrypted,
-                PersistenceVersion::default(),
-            ).unwrap();
-            assert_eq!(journal, decrypted);
-        }
-
-        #[test]
-        fn test_identity_proto_roundtrips(identity in any::<Identity>()) {
-            let proto: pb::convex_identity::UncheckedIdentity = identity.clone().into();
-            let roundtripped = Identity::from_proto_unchecked(proto).unwrap();
-            assert_eq!(identity, roundtripped);
-        }
-
-        #[test]
-        fn test_admin_identity_proto_roundtrips(admin_identity in any::<AdminIdentity>()) {
-            let proto: pb::convex_identity::AdminIdentity = admin_identity
-                .clone()
-                .into();
-            let roundtripped = AdminIdentity::from_proto_unchecked(proto).unwrap();
-            assert_eq!(admin_identity, roundtripped);
-        }
+    /// Attempts to decrypt and deserialize the EncryptedCursor. May fail if the
+    /// client is sending up an old version.
+    pub fn decrypt_cursor(&self, cursor: SerializedCursor) -> anyhow::Result<Cursor> {
+        let proto: InstanceCursorProto = self
+            .cursor_encryptor
+            .decrypt_proto(CURSOR_VERSION, &cursor)
+            .with_context(cursor_parse_error)?;
+        proto_to_cursor(&self.instance_name, proto)
     }
 }

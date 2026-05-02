@@ -1,13 +1,36 @@
 import { captureMessage } from "@sentry/nextjs";
 import { Callout } from "@ui/Callout";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 
 export default function Custom500() {
-  return <Fallback eventId={null} />;
+  return <Fallback eventId={null} error={new Error("Internal Server Error")} />;
 }
 
-export function Fallback({ eventId }: { eventId: string | null }) {
-  captureMessage("ErrorBoundary triggered");
+export function Fallback({
+  eventId,
+  error,
+}: {
+  eventId: string | null;
+  error: Error;
+}) {
+  captureMessage("ErrorBoundary triggered", "info");
+  if (
+    error.message.includes("Couldn't find system module") ||
+    /Couldn't find ".+" in module/.test(error.message)
+  ) {
+    return (
+      <div className="h-full grow">
+        <div className="flex h-full flex-col items-center justify-center">
+          <Callout variant="error" className="max-w-prose">
+            <span>
+              Your local deployment is out of date. Please restart it with{" "}
+              <code>npx convex dev</code> and upgrade.
+            </span>
+          </Callout>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="h-full grow">
       <div className="flex h-full flex-col items-center justify-center">
@@ -20,19 +43,14 @@ export function Fallback({ eventId }: { eventId: string | null }) {
               <Link
                 href="mailto:support@convex.dev"
                 passHref
-                className="items-center text-content-link"
+                className="items-center"
               >
                 support@convex.dev
               </Link>{" "}
               for support with this issue.
             </p>
             {eventId !== null && <div>Event ID: {eventId}</div>}{" "}
-            <Link
-              href="https://status.convex.dev"
-              className="text-content-link hover:underline"
-            >
-              Convex Status page
-            </Link>
+            <Link href="https://status.convex.dev">Convex Status page</Link>
           </div>
         </Callout>
       </div>

@@ -13,6 +13,7 @@ use common::{
     },
     document::{
         DeveloperDocument,
+        PackedDocument,
         ResolvedDocument,
     },
     errors::JsError,
@@ -27,6 +28,7 @@ use common::{
         QuerySource,
     },
     runtime::Runtime,
+    try_anyhow,
     types::{
         IndexName,
         TabletIndexName,
@@ -73,9 +75,6 @@ pub use index_range::soft_data_limit;
 // data at once.
 const MAX_QUERY_FETCH: usize = 1024;
 
-// Default number of records to fetch if prefetch hint is not provided.
-const DEFAULT_QUERY_PREFETCH: usize = 100;
-
 /// The implementation of `interface Query` from the npm package.
 #[async_trait]
 trait QueryStream: Send {
@@ -116,7 +115,7 @@ trait QueryStream: Send {
         tx: &mut Transaction<RT>,
         prefetch_hint: Option<usize>,
     ) -> anyhow::Result<QueryStreamNext>;
-    fn feed(&mut self, index_range_response: DeveloperIndexRangeResponse) -> anyhow::Result<()>;
+    fn feed(&mut self, index_range_response: IndexRangeResponse) -> anyhow::Result<()>;
 
     /// All queries walk an index of some kind, as long as the table exists.
     /// This is that index name, tied to a tablet.
@@ -126,13 +125,8 @@ trait QueryStream: Send {
     fn printable_index_name(&self) -> &IndexName;
 }
 
-pub struct DeveloperIndexRangeResponse {
-    pub page: Vec<(IndexKeyBytes, DeveloperDocument, WriteTimestamp)>,
-    pub cursor: CursorPosition,
-}
-
 pub struct IndexRangeResponse {
-    pub page: Vec<(IndexKeyBytes, ResolvedDocument, WriteTimestamp)>,
+    pub page: Vec<(IndexKeyBytes, PackedDocument, WriteTimestamp)>,
     pub cursor: CursorPosition,
 }
 
@@ -629,12 +623,12 @@ pub async fn query_batch_next_<RT: Runtime>(
         };
         let mut next_batch = BTreeMap::new();
         for (batch_key, (query, prefetch_hint)) in batch_to_feed {
-            let result: anyhow::Result<_> = try {
+            let result: anyhow::Result<_> = try_anyhow!({
                 let index_range_responses = responses
                     .remove(&batch_key)
                     .context("batch_key missing")??;
                 query.root.feed(index_range_responses)?;
-            };
+            });
             match result {
                 Err(e) => {
                     results.insert(batch_key, Err(e));
@@ -678,7 +672,7 @@ pub async fn resolved_query_batch_next<RT: Runtime>(
     results
         .into_iter()
         .map(|(batch_key, result)| {
-            let resolved_result: anyhow::Result<_> = try {
+            let resolved_result: anyhow::Result<_> = try_anyhow!({
                 match result? {
                     Some((document, ts)) => {
                         let tablet_id = tablet_ids
@@ -690,7 +684,7 @@ pub async fn resolved_query_batch_next<RT: Runtime>(
                     },
                     None => None,
                 }
-            };
+            });
             (batch_key, resolved_result)
         })
         .collect()
@@ -745,7 +739,7 @@ impl QueryStream for QueryNode {
         }
     }
 
-    fn feed(&mut self, index_range_response: DeveloperIndexRangeResponse) -> anyhow::Result<()> {
+    fn feed(&mut self, index_range_response: IndexRangeResponse) -> anyhow::Result<()> {
         match self {
             QueryNode::IndexRange(r) => r.feed(index_range_response),
             QueryNode::Search(r) => r.feed(index_range_response),

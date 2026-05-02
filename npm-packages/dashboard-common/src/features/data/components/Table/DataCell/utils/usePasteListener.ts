@@ -19,6 +19,10 @@ export function usePasteListener(
         return;
       }
 
+      // Stop the event from double-pasting to any text editors that get opened.
+      e.stopPropagation();
+      e.preventDefault();
+
       const clipboardValue = e.clipboardData?.getData("text");
       if (clipboardValue === undefined) {
         return;
@@ -31,7 +35,7 @@ export function usePasteListener(
           allowTopLevelUndefined,
         });
         edit(errors.length > 0 ? clipboardValue : parsedValue);
-      } catch (err) {
+      } catch {
         // The error is likely a SyntaxError, which is thrown when the clipboard value is not valid JavaScript,
         // So paste the string value instead.
         edit(clipboardValue);

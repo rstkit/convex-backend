@@ -1,6 +1,6 @@
-import { Id } from "./_generated/dataModel";
 import { mutation } from "./_generated/server";
 import { api } from "./_generated/api";
+import { v } from "convex/values";
 
 // @snippet start self-destructing-message
 function formatMessage(body: string, secondsLeft: number) {
@@ -24,15 +24,13 @@ export default mutation(
   },
 );
 
-export const update = mutation(
-  async (
-    { db, scheduler },
-    {
-      messageId,
-      body,
-      secondsLeft,
-    }: { messageId: Id<"messages">; body: string; secondsLeft: number },
-  ) => {
+export const update = mutation({
+  args: {
+    messageId: v.id("messages"),
+    body: v.string(),
+    secondsLeft: v.number(),
+  },
+  handler: async ({ db, scheduler }, { messageId, body, secondsLeft }) => {
     if (secondsLeft > 0) {
       await db.patch(messageId, { body: formatMessage(body, secondsLeft) });
       await scheduler.runAfter(1000, api.sendExpiringMessage.update, {
@@ -44,5 +42,5 @@ export const update = mutation(
       await db.delete(messageId);
     }
   },
-);
+});
 // @snippet end self-destructing-message

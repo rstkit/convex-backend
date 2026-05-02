@@ -38,26 +38,31 @@ use model::{
     source_packages::SourcePackageModel,
     udf_config::UdfConfigModel,
 };
-use rand::SeedableRng;
+use rand::{
+    Rng as _,
+    SeedableRng,
+};
 use rand_chacha::ChaCha12Rng;
 use sync_types::ModulePath;
-use udf::environment::system_env_vars;
+use udf::environment::{
+    system_env_vars,
+    CONVEX_SITE,
+};
 use value::{
     identifier::Identifier,
     ConvexValue,
 };
 
 use crate::{
-    concurrency_limiter::ConcurrencyPermit,
     environment::{
-        helpers::{
-            permit::with_release_permit,
-            Phase,
-        },
+        helpers::Phase,
         ModuleCodeCacheResult,
     },
     module_cache::ModuleCache,
-    timeout::Timeout,
+    timeout::{
+        PauseReason,
+        Timeout,
+    },
 };
 
 /// UDF execution has two phases:
@@ -122,11 +127,7 @@ impl<RT: Runtime> UdfPhase<RT> {
     }
 
     #[fastrace::trace]
-    pub async fn initialize(
-        &mut self,
-        timeout: &mut Timeout<RT>,
-        permit_slot: &mut Option<ConcurrencyPermit>,
-    ) -> anyhow::Result<()> {
+    pub async fn initialize(&mut self, timeout: &mut Timeout<RT>) -> anyhow::Result<()> {
         anyhow::ensure!(self.phase == Phase::Importing);
         let UdfPreloaded::Created {
             default_system_env_vars,
@@ -140,24 +141,25 @@ impl<RT: Runtime> UdfPhase<RT> {
 
         let component_args = if !component.is_root() {
             Some(
-                with_release_permit(
-                    timeout,
-                    permit_slot,
-                    BootstrapComponentsModel::new(self.tx_mut()?).load_component_args(component),
-                )
-                .await?,
+                timeout
+                    .with_release_permit(
+                        PauseReason::LoadComponentArgs,
+                        BootstrapComponentsModel::new(self.tx_mut()?)
+                            .load_component_args(component),
+                    )
+                    .await?,
             )
         } else {
             None
         };
 
         // UdfConfig might not be defined for super old modules or system modules.
-        let udf_config = with_release_permit(
-            timeout,
-            permit_slot,
-            UdfConfigModel::new(self.tx_mut()?, component.into()).get(),
-        )
-        .await?;
+        let udf_config = timeout
+            .with_release_permit(
+                PauseReason::LoadUdfConfig,
+                UdfConfigModel::new(self.tx_mut()?, component.into()).get(),
+            )
+            .await?;
         let rng = udf_config
             .as_ref()
             .map(|c| ChaCha12Rng::from_seed(c.import_phase_rng_seed));
@@ -165,23 +167,46 @@ impl<RT: Runtime> UdfPhase<RT> {
 
         let env_vars = if component.is_root() {
             Some(
-                with_release_permit(
-                    timeout,
-                    permit_slot,
-                    EnvironmentVariablesModel::new(self.tx_mut()?).preload(),
-                )
-                .await?,
+                timeout
+                    .with_release_permit(
+                        PauseReason::LoadEnvironmentVariables,
+                        EnvironmentVariablesModel::new(self.tx_mut()?).preload(),
+                    )
+                    .await?,
             )
         } else {
             None
         };
 
-        let system_env_vars = with_release_permit(
-            timeout,
-            permit_slot,
-            system_env_vars(self.tx_mut()?, default_system_env_vars.clone()),
-        )
-        .await?;
+        let mut system_env_vars = timeout
+            .with_release_permit(
+                PauseReason::LoadSystemEnvironmentVariables,
+                system_env_vars(self.tx_mut()?, default_system_env_vars.clone()),
+            )
+            .await?;
+
+        // For non-root components with an HTTP prefix, override CONVEX_SITE_URL
+        // with the prefixed URL so components can construct correct absolute URLs.
+        if !component.is_root() {
+            let component_metadata = timeout
+                .with_release_permit(
+                    PauseReason::LoadComponentArgs,
+                    BootstrapComponentsModel::new(self.tx_mut()?).load_component(component),
+                )
+                .await?;
+            if let Some(http_prefix) = component_metadata
+                .as_ref()
+                .and_then(|m| m.http_prefix.as_deref())
+                && let Some(base_url) = system_env_vars.get(&*CONVEX_SITE).cloned()
+            {
+                let prefixed_url = format!(
+                    "{}{}",
+                    base_url.as_ref().trim_end_matches('/'),
+                    http_prefix.trim_end_matches('/')
+                );
+                system_env_vars.insert(CONVEX_SITE.clone(), prefixed_url.parse()?);
+            }
+        }
 
         self.preloaded = UdfPreloaded::Ready {
             rng,
@@ -232,8 +257,7 @@ impl<RT: Runtime> UdfPhase<RT> {
         &mut self,
         module_path: &ModulePath,
         timeout: &mut Timeout<RT>,
-        permit_slot: &mut Option<ConcurrencyPermit>,
-    ) -> anyhow::Result<Option<(FullModuleSource, ModuleCodeCacheResult)>> {
+    ) -> anyhow::Result<Option<(Arc<FullModuleSource>, ModuleCodeCacheResult)>> {
         if self.phase != Phase::Importing {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "NoDynamicImport",
@@ -248,8 +272,8 @@ impl<RT: Runtime> UdfPhase<RT> {
             component,
             module_path: module_path.clone().canonicalize(),
         };
-        let Some((module_metadata, source_package)) =
-            with_release_permit(timeout, permit_slot, async {
+        let Some((module_metadata, source_package)) = timeout
+            .with_release_permit(PauseReason::LoadModuleMetadata, async {
                 match ModuleModel::new(self.tx_mut()?)
                     .get_metadata(path.clone())
                     .await?
@@ -277,14 +301,14 @@ impl<RT: Runtime> UdfPhase<RT> {
         );
 
         let module_loader = self.module_loader.clone();
-        let module_source = with_release_permit(
-            timeout,
-            permit_slot,
-            module_loader.get_module_with_metadata(module_metadata.clone(), source_package),
-        )
-        .await?;
-        let code_cache_result = module_loader.code_cache_result(module_metadata.into_value());
-        Ok(Some(((*module_source).clone(), code_cache_result)))
+        let module_source = timeout
+            .with_release_permit(
+                PauseReason::LoadModuleSource,
+                module_loader.get_module_with_metadata(&module_metadata, &source_package),
+            )
+            .await?;
+        let code_cache_result = module_loader.code_cache_result(&module_metadata);
+        Ok(Some((module_source, code_cache_result)))
     }
 
     pub fn tx(&mut self) -> anyhow::Result<&mut Transaction<RT>> {
@@ -297,10 +321,30 @@ impl<RT: Runtime> UdfPhase<RT> {
         self.tx_mut()
     }
 
-    pub fn take_tx(&mut self) -> anyhow::Result<Transaction<RT>> {
-        self.tx
+    pub fn start_nested_udf(
+        &mut self,
+    ) -> anyhow::Result<(Transaction<RT>, [u8; 32], UnixTimestamp)> {
+        let tx = self
+            .tx
             .take()
-            .context("Transaction missing due to concurrent component call")
+            .context("Transaction missing due to concurrent component call")?;
+        let UdfPreloaded::Ready {
+            ref mut rng,
+            unix_timestamp,
+            ..
+        } = self.preloaded
+        else {
+            anyhow::bail!("Phase not initialized");
+        };
+        let (rng, unix_timestamp) =
+            (rng.as_mut().zip(unix_timestamp)).context(ErrorMetadata::bad_request(
+                "NoCallsDuringImport",
+                "Cannot call another function at import time",
+            ))?;
+        // Note: it's up to the caller to update observed_rng / observed_time after the
+        // nested UDF returns
+        let rng_seed = rng.random();
+        Ok((tx, rng_seed, unix_timestamp))
     }
 
     pub fn put_tx(&mut self, tx: Transaction<RT>) -> anyhow::Result<()> {
@@ -373,10 +417,12 @@ impl<RT: Runtime> UdfPhase<RT> {
             .as_mut()
             .context("Transaction missing due to concurrent component call")?;
         let Some(env_vars) = env_vars else {
-            return Ok(None);
+            // Non-root components don't have user env vars, but system env vars
+            // (such as the prefixed CONVEX_SITE_URL) are still accessible.
+            return Ok(system_env_vars.get(&name).cloned());
         };
         if let Some(var) = env_vars.get(tx, &name)? {
-            return Ok(Some(var.clone()));
+            return Ok(Some(var));
         }
         Ok(system_env_vars.get(&name).cloned())
     }
@@ -393,7 +439,7 @@ impl<RT: Runtime> UdfPhase<RT> {
         if self.phase == Phase::Executing {
             *observed_rng_during_execution = true;
         }
-        let Some(ref mut rng) = rng else {
+        let Some(rng) = rng else {
             // Fail for old module without import time rng populated.
             anyhow::bail!(ErrorMetadata::bad_request(
                 "NoRandomDuringImport",
@@ -423,6 +469,16 @@ impl<RT: Runtime> UdfPhase<RT> {
             ));
         };
         Ok(unix_timestamp)
+    }
+
+    pub fn observe_rng(&mut self) {
+        if let UdfPreloaded::Ready {
+            observed_rng_during_execution,
+            ..
+        } = &mut self.preloaded
+        {
+            *observed_rng_during_execution = true;
+        }
     }
 
     pub fn observe_identity(&mut self) -> anyhow::Result<()> {

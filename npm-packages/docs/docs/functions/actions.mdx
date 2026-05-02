@@ -1,8 +1,10 @@
 ---
 title: Actions
 sidebar_position: 30
+description: "Call third-party services and external APIs from Convex"
 ---
 
+import { ComponentCardList } from "@site/src/components/ComponentCard";
 import Constructor from "!!raw-loader!@site/../private-demos/snippets/convex/actionsConstructor.ts";
 import ArgsWithValidation from "!!raw-loader!@site/../private-demos/snippets/convex/actionsArgsWithValidation.ts";
 import Context from "!!raw-loader!@site/../private-demos/snippets/convex/actionsContext.ts";
@@ -35,11 +37,7 @@ Actions follow the same naming rules as queries, see
 To declare an action in Convex you use the action constructor function. Pass it
 an object with a `handler` function, which performs the action:
 
-<TSAndJSSnippet
-  sourceTS={Constructor}
-  sourceJS={Constructor}
-  title="convex/myFunctions.ts"
-/>
+<Snippet source={Constructor} title="convex/myFunctions.ts" />
 
 Unlike a query, an action can but does not have to return a value.
 
@@ -48,11 +46,7 @@ Unlike a query, an action can but does not have to return a value.
 Action arguments and responses follow the same rules as
 [mutations](/functions/mutation-functions.mdx#mutation-arguments):
 
-<TSAndJSSnippet
-  sourceTS={ArgsWithValidation}
-  sourceJS={ArgsWithValidation}
-  title="convex/myFunctions.ts"
-/>
+<Snippet source={ArgsWithValidation} title="convex/myFunctions.ts" />
 
 The first argument to the handler function is reserved for the action context.
 
@@ -62,11 +56,7 @@ The `action` constructor enables interacting with the database, and other Convex
 features by passing an [ActionCtx](/api/interfaces/server.GenericActionCtx)
 object to the handler function as the first argument:
 
-<TSAndJSSnippet
-  sourceTS={Context}
-  sourceJS={Context}
-  title="convex/myFunctions.ts"
-/>
+<Snippet source={Context} title="convex/myFunctions.ts" />
 
 Which part of that action context is used depends on what your action needs to
 do:
@@ -74,9 +64,8 @@ do:
 - To read data from the database use the `runQuery` field, and call a query that
   performs the read:
 
-  <TSAndJSSnippet
-    sourceTS={ContextRunQuery}
-    sourceJS={ContextRunQuery}
+  <Snippet
+    source={ContextRunQuery}
     snippet="action"
     title="convex/myFunctions.ts"
   />
@@ -88,11 +77,7 @@ do:
 - To write data to the database use the `runMutation` field, and call a mutation
   that performs the write:
 
-  <TSAndJSSnippet
-    sourceTS={ContextRunMutation}
-    sourceJS={ContextRunMutation}
-    title="convex/myFunctions.ts"
-  />
+  <Snippet source={ContextRunMutation} title="convex/myFunctions.ts" />
 
   Use an [internal mutation](/functions/internal-functions.mdx) when you want to
   prevent users from calling the mutation directly.
@@ -163,7 +148,7 @@ By default, actions run in Convex's environment. This environment supports
 `fetch`, so actions that simply want to call a third-party API using `fetch` can
 be run in this environment:
 
-<TSAndJSSnippet sourceTS={NPM} sourceJS={NPM} title="convex/myFunctions.ts" />
+<Snippet source={NPM} title="convex/myFunctions.ts" />
 
 Actions running in Convex's environment are faster compared to Node.js, since
 they don't require extra time to start up before running your action (cold
@@ -176,9 +161,8 @@ run in Node.js by adding the `"use node"` directive at the top of the file. Note
 that other Convex functions cannot be defined in files with the `"use node";`
 directive.
 
-<TSAndJSSnippet
-  sourceTS={Node}
-  sourceJS={Node}
+<Snippet
+  source={Node}
   highlightPatterns={["use node"]}
   title="convex/myAction.ts"
 />
@@ -191,8 +175,7 @@ Learn more about the two [Convex Runtimes](/functions/runtimes.mdx).
   {/* Fragment for Prettier */}
   Just like with [queries](/functions/query-functions.mdx#splitting-up-query-code-via-helpers)
   and [mutations](/functions/mutation-functions.mdx#splitting-up-mutation-code-via-helpers)
-  you can define and call helper
-  <LanguageSelector verbose /> functions to split up the code in your actions or
+  you can define and call helper functions to split up the code in your actions or
   reuse logic across multiple Convex functions.
 
 But note that the [ActionCtx](/api/interfaces/server.GenericActionCtx) only has
@@ -207,7 +190,7 @@ To call an action from [React](/client/react.mdx) use the
 [`useAction`](/api/modules/react#useaction) hook along with the generated
 [`api`](/generated-api/api) object.
 
-<TSAndJSSnippet sourceTS={Call} sourceJS={Call} title="src/myApp.tsx" />
+<Snippet source={Call} title="src/myApp.tsx" />
 
 Unlike
 [mutations](/functions/mutation-functions.mdx#calling-mutations-from-clients),
@@ -223,11 +206,7 @@ anti-pattern**. Instead, have the client call a
 writing into the database and then
 [schedules](/scheduling/scheduled-functions.mdx) an action:
 
-<TSAndJSSnippet
-  sourceTS={ScheduleFromMutation}
-  sourceJS={ScheduleFromMutation}
-  title="convex/myFunctions.ts"
-/>
+<Snippet source={ScheduleFromMutation} title="convex/myFunctions.ts" />
 
 This way the mutation can enforce invariants, such as preventing the user from
 executing the same action twice.
@@ -244,6 +223,9 @@ Actions can do up to 1000 concurrent operations, such as executing queries,
 mutations or performing fetch requests.
 
 For information on other limits, see [here](/production/state/limits.mdx).
+
+If you need to allowlist Convex's outbound IP addresses in an external service's
+firewall, see [Networking](/production/networking.mdx).
 
 ## Error handling
 
@@ -304,3 +286,28 @@ database access.
 Caveats: Separate runQuery / runMutation calls are valid when intentionally
 trying to process more data than fits in a single transaction (e.g. running a
 migration, doing a live aggregate).
+
+## Related Components
+
+<ComponentCardList
+  items={[
+    {
+      title: "Action Cache",
+      description:
+        "Cache expensive or frequently run actions. Allows configurable cache duration and forcing updates.",
+      href: "https://www.convex.dev/components/action-cache",
+    },
+    {
+      title: "Workpool",
+      description:
+        "Workpool give critical tasks priority by organizing async operations into separate, customizable queues. Supports retries and parallelism limits.",
+      href: "https://www.convex.dev/components/workpool",
+    },
+    {
+      title: "Workflow",
+      description:
+        "Similar to Actions, Workflows can call queries, mutations, and actions. However, they are durable functions that can suspend, survive server crashes, specify retries for action calls, and more.",
+      href: "https://www.convex.dev/components/workflow",
+    },
+  ]}
+/>

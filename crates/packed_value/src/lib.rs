@@ -3,10 +3,7 @@
 #![feature(impl_trait_in_assoc_type)]
 #![feature(try_blocks)]
 use std::{
-    collections::{
-        BTreeMap,
-        BTreeSet,
-    },
+    collections::BTreeMap,
     ops::Deref,
 };
 
@@ -33,16 +30,12 @@ mod flexbuilder;
 mod json;
 mod walk;
 
-#[cfg(test)]
-mod tests;
-
 pub use self::buffer::{
     ByteBuffer,
     StringBuffer,
 };
 use self::flexbuilder::FlexBuilder;
 
-#[cfg_attr(any(test, feature = "testing"), derive(PartialEq))]
 pub struct PackedValue<B: Buffer>
 where
     B::BufferString: Clone,
@@ -73,17 +66,18 @@ where
         OpenedValue::new(Reader::get_root(self.buf)?)
     }
 
-    pub fn parse<T: ConvexSerializable>(self) -> anyhow::Result<T>
-    where
-        anyhow::Error: From<<T::Serialized as TryInto<T>>::Error>,
-    {
+    pub fn parse<T: ConvexSerializable>(self) -> anyhow::Result<T> {
         value::serde::from_value::<_, T::Serialized>(self.as_ref().open()?)?
             .try_into()
-            .map_err(anyhow::Error::from)
+            .map_err(Into::<anyhow::Error>::into)
     }
 
     pub fn size(&self) -> usize {
         self.buf.len()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
     }
 
     /// Get a shared reference to the PackedValue, so it can be opened multiple
@@ -162,33 +156,15 @@ impl PackedValue<ByteBuffer> {
             ConvexValue::Bytes(b) => {
                 builder.push(Blob(&b[..]));
             },
-            ConvexValue::Array(ref values) => {
+            ConvexValue::Array(values) => {
                 let mut vector = builder.start_vector();
                 for value in values {
                     Self::_pack(value, &mut vector);
                 }
                 vector.end_vector();
             },
-            ConvexValue::Set(ref values) => {
-                let mut map = builder.start_map();
-                let mut vector = map.start_vector("$set");
-                for value in values {
-                    Self::_pack(value, &mut vector);
-                }
-                vector.end_vector();
-                map.end_map();
-            },
-            ConvexValue::Map(ref values) => {
-                let mut map = builder.start_map();
-                let mut vector = map.start_vector("$map");
-                for (key, value) in values {
-                    Self::_pack(key, &mut vector);
-                    Self::_pack(value, &mut vector);
-                }
-                vector.end_vector();
-                map.end_map();
-            },
-            ConvexValue::Object(ref fields) => {
+
+            ConvexValue::Object(fields) => {
                 Self::_pack_object(fields, builder);
             },
         }
@@ -215,8 +191,6 @@ where
     String(OpenedString<B>),
     Bytes(OpenedBytes<B>),
     Array(OpenedArray<B>),
-    Set(OpenedSet<B>),
-    Map(OpenedMap<B>),
     Object(OpenedObject<B>),
 }
 
@@ -230,12 +204,10 @@ where
             OpenedValue::Int64(i) => OpenedValue::Int64(*i),
             OpenedValue::Float64(f) => OpenedValue::Float64(*f),
             OpenedValue::Boolean(b) => OpenedValue::Boolean(*b),
-            OpenedValue::String(ref s) => OpenedValue::String(s.clone()),
-            OpenedValue::Bytes(ref b) => OpenedValue::Bytes(b.clone()),
-            OpenedValue::Array(ref a) => OpenedValue::Array(a.clone()),
-            OpenedValue::Set(ref s) => OpenedValue::Set(s.clone()),
-            OpenedValue::Map(ref m) => OpenedValue::Map(m.clone()),
-            OpenedValue::Object(ref o) => OpenedValue::Object(o.clone()),
+            OpenedValue::String(s) => OpenedValue::String(s.clone()),
+            OpenedValue::Bytes(b) => OpenedValue::Bytes(b.clone()),
+            OpenedValue::Array(a) => OpenedValue::Array(a.clone()),
+            OpenedValue::Object(o) => OpenedValue::Object(o.clone()),
         }
     }
 }
@@ -262,18 +234,7 @@ where
             }),
             FlexBufferType::Map => {
                 let reader = reader.get_map()?;
-                if let Some(ix) = reader.index_key("$set") {
-                    anyhow::ensure!(reader.len() == 1);
-                    let reader = reader.index(ix)?.get_vector()?;
-                    OpenedValue::Set(OpenedSet { reader })
-                } else if let Some(ix) = reader.index_key("$map") {
-                    anyhow::ensure!(reader.len() == 1);
-                    let reader = reader.index(ix)?.get_vector()?;
-                    anyhow::ensure!(reader.len() % 2 == 0);
-                    OpenedValue::Map(OpenedMap { reader })
-                } else {
-                    OpenedValue::Object(OpenedObject { reader })
-                }
+                OpenedValue::Object(OpenedObject { reader })
             },
             // NB: Maps also satisfy `is_vector`, so be sure to check those first above.
             ty if ty.is_vector() => OpenedValue::Array(OpenedArray {
@@ -382,85 +343,6 @@ where
     }
 }
 
-pub struct OpenedSet<B: Buffer>
-where
-    B::BufferString: Clone,
-{
-    // Invariant: items are written in ascending `Value` order.
-    reader: VectorReader<B>,
-}
-
-impl<B: Buffer> Clone for OpenedSet<B>
-where
-    B::BufferString: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            reader: self.reader.clone(),
-        }
-    }
-}
-
-impl<B: Buffer> OpenedSet<B>
-where
-    B::BufferString: Clone,
-{
-    pub fn len(&self) -> usize {
-        self.reader.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.reader.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = anyhow::Result<OpenedValue<B>>> + '_ {
-        (0..self.reader.len()).map(|i| OpenedValue::new(self.reader.index(i)?))
-    }
-}
-
-pub struct OpenedMap<B: Buffer>
-where
-    B::BufferString: Clone,
-{
-    // Invariant: alternate keys and values are written in ascending `Value` key order.
-    reader: VectorReader<B>,
-}
-
-impl<B: Buffer> Clone for OpenedMap<B>
-where
-    B::BufferString: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            reader: self.reader.clone(),
-        }
-    }
-}
-
-impl<B: Buffer> OpenedMap<B>
-where
-    B::BufferString: Clone,
-{
-    pub fn len(&self) -> usize {
-        self.reader.len() / 2
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.reader.is_empty()
-    }
-
-    pub fn iter(
-        &self,
-    ) -> impl Iterator<Item = anyhow::Result<(OpenedValue<B>, OpenedValue<B>)>> + '_ {
-        assert_eq!(self.reader.len() % 2, 0);
-        (0..(self.reader.len() / 2)).map(move |i| {
-            let key = OpenedValue::new(self.reader.index(2 * i)?)?;
-            let value = OpenedValue::new(self.reader.index(2 * i + 1)?)?;
-            Ok((key, value))
-        })
-    }
-}
-
 pub struct OpenedObject<B: Buffer>
 where
     B::BufferString: Clone,
@@ -499,7 +381,9 @@ where
         Ok(Some(OpenedValue::new(reader)?))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = anyhow::Result<(B::BufferString, OpenedValue<B>)>> {
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = anyhow::Result<(B::BufferString, OpenedValue<B>)>> + use<B> {
         self.reader
             .iter_keys()
             .zip(self.reader.iter_values())
@@ -539,23 +423,6 @@ where
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 Self::Array(values.try_into()?)
             },
-            OpenedValue::Set(packed_values) => {
-                let values = packed_values
-                    .iter()
-                    .map(|r| Self::try_from(r?))
-                    .collect::<anyhow::Result<BTreeSet<_>>>()?;
-                Self::Set(values.try_into()?)
-            },
-            OpenedValue::Map(packed_values) => {
-                let values = packed_values
-                    .iter()
-                    .map(|r| {
-                        let (k, v) = r?;
-                        Ok((Self::try_from(k)?, Self::try_from(v)?))
-                    })
-                    .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-                Self::Map(values.try_into()?)
-            },
             OpenedValue::Object(packed_values) => {
                 let values = packed_values
                     .iter()
@@ -568,26 +435,5 @@ where
             },
         };
         Ok(result)
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-mod proptest {
-    use proptest::prelude::*;
-    use value::ConvexValue;
-
-    use super::{
-        buffer::ByteBuffer,
-        PackedValue,
-    };
-
-    impl Arbitrary for PackedValue<ByteBuffer> {
-        type Parameters = ();
-
-        type Strategy = impl Strategy<Value = PackedValue<ByteBuffer>>;
-
-        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-            any::<ConvexValue>().prop_map(|v| PackedValue::pack(&v))
-        }
     }
 }

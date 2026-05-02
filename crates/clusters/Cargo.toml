@@ -2,20 +2,20 @@
 name = "clusters"
 version = "0.1.0"
 authors = ["Convex, Inc. <no-reply@convex.dev>"]
-edition = "2021"
+edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
-
-[dependencies]
-anyhow = { workspace = true }
-clap = { workspace = true }
-common = { path = "../../crates/common" }
-url = { workspace = true }
 
 [features]
 testing = ["common/testing"]
 
-[lints]
-workspace = true
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+common = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-common = { path = "../../crates/common", features = ["testing"] }
+common = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

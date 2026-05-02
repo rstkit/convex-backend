@@ -1,13 +1,18 @@
 import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
-import convex from "@convex-dev/eslint-plugin";
+import convexPlugin from "@convex-dev/eslint-plugin";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export default tseslint.config(
   {
     ignores: ["dist", "convex/_generated/**"],
   },
   eslint.configs.recommended,
-  ...convex.configs.recommended,
+  ...convexPlugin.configs.recommended,
   ...tseslint.configs.recommended,
 
   {
@@ -21,12 +26,18 @@ export default tseslint.config(
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
-        project: ["convex/tsconfig.json"],
-        tsconfigRootDir: ".",
+        project: [path.join(__dirname, "convex", "tsconfig.json")],
+        tsconfigRootDir: __dirname,
       },
     },
     rules: {
       "@typescript-eslint/no-floating-promises": "error",
+      "@convex-dev/require-args-validator": [
+        "error",
+        {
+          ignoreUnusedArguments: true,
+        },
+      ],
     },
   },
 );

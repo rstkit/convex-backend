@@ -21,6 +21,8 @@ import {
   FunctionReturnType,
   getFunctionName,
 } from "convex/server";
+
+type EmptyObject = Record<string, never>;
 import { convexToJson } from "convex/values";
 
 // Re-export React Query-friendly names for Convex hooks.
@@ -84,16 +86,57 @@ function hash(
   )}`;
 }
 
-export interface ConvexQueryClientOptions extends ConvexReactClientOptions {
+export interface ConvexQueryClientOnlyOptions {
   /** queryClient can also be set later by calling .connect(ReactqueryClient) */
   queryClient?: QueryClient;
+  /** A custom fetch implementation to use for all HTTP requests made on the server.
+   *
+   * Take care to avoid bundling this `fetch` implementation on the client
+   * if you can help it. In TanStack Start you can use createServerOnlyFn
+   * for this, see
+   * https://tanstack.com/start/latest/docs/framework/react/guide/environment-functions#envonly-functions
+   */
+  serverFetch?: typeof globalThis.fetch | undefined;
+  /**
+   * opt out of consistent queries, resulting in (for now) faster SSR at the
+   * cost of potential inconsistency between queries
+   *
+   * Why might you need this? Consistency is important when clients expect
+   * multiple queries to make sense together, e.g. for "client-side joins."
+   *
+   * Say you make two queries that your React code expects to be from the same database state:
+   *
+   * ```
+   * const channels = useQuery(api.channels.all)
+   * const favChannelIds = useQuery(api.channels.favIds');
+   * const favChannels = (channels && favChannels) ? favChannels.map(c => channels[c]) : []
+   * ```
+   *
+   * During normal client operation, the `api.channels.all` and `api.channels.favIds`
+   * queries will both return results from the same logical timestamp: as long as these
+   * queries are written correctly, there will never be a favChannelId for a channel
+   * not in favChannels.
+   *
+   * But during SSR, if this value is set, these two queries may return results
+   * from different logical timestamps, as they're not just two HTTP requests.
+   *
+   * The upside of this is a faster SSR render: the current implementation
+   * of a consistent SSR render involves two roundtrips instead of one.
+   */
+  dangerouslyUseInconsistentQueriesDuringSSR?: boolean;
 }
+
+export interface ConvexQueryClientOptions
+  extends ConvexQueryClientOnlyOptions,
+    ConvexReactClientOptions {}
 
 /**
  * Subscribes to events from a TanStack Query QueryClient and populates query
  * results in it for all Convex query function subscriptions.
  */
-export class ConvexQueryClient {
+export class ConvexQueryClient<
+  ConvexClientArg extends ConvexReactClient | string,
+> {
   convexClient: ConvexReactClient;
   subscriptions: Record<
     string, // queryKey hash
@@ -112,6 +155,7 @@ export class ConvexQueryClient {
   // Only exists during SSR
   serverHttpClient?: ConvexHttpClient;
   _queryClient: QueryClient | undefined;
+  ssrQueryMode: "consistent" | "inconsistent";
   get queryClient() {
     if (!this._queryClient) {
       throw new Error(
@@ -122,14 +166,24 @@ export class ConvexQueryClient {
   }
   constructor(
     /** A ConvexReactClient instance or a URL to use to instantiate one. */
-    client: ConvexReactClient | string,
+    client: ConvexClientArg,
     /** Options mostly for the ConvexReactClient to be constructed. */
-    options: ConvexQueryClientOptions = {},
+    options: ConvexClientArg extends ConvexReactClient
+      ? ConvexQueryClientOnlyOptions
+      : ConvexQueryClientOptions = {},
   ) {
     if (typeof client === "string") {
-      this.convexClient = new ConvexReactClient(client, options);
+      this.convexClient = new ConvexReactClient(
+        client,
+        options as ConvexQueryClientOptions,
+      );
     } else {
-      this.convexClient = client as ConvexReactClient;
+      this.convexClient = client satisfies ConvexReactClient;
+    }
+    if (options.dangerouslyUseInconsistentQueriesDuringSSR) {
+      this.ssrQueryMode = "inconsistent";
+    } else {
+      this.ssrQueryMode = "consistent";
     }
     this.subscriptions = {};
     if (options.queryClient) {
@@ -139,10 +193,9 @@ export class ConvexQueryClient {
       );
     }
     if (isServer) {
-      this.serverHttpClient = new ConvexHttpClient(
-        // TODO use .url once convex@1.14 is released
-        (this.convexClient as any).address as string,
-      );
+      this.serverHttpClient = new ConvexHttpClient(this.convexClient.url, {
+        fetch: options.serverFetch,
+      });
     }
   }
   /** Complete initialization of ConvexQueryClient by connecting a TanStack QueryClient */
@@ -324,7 +377,11 @@ export class ConvexQueryClient {
       if (isConvexQuery(context.queryKey)) {
         const [_, func, args] = context.queryKey;
         if (isServer) {
-          return await this.serverHttpClient!.consistentQuery(func, args);
+          if (this.ssrQueryMode === "consistent") {
+            return await this.serverHttpClient!.consistentQuery(func, args);
+          } else {
+            return await this.serverHttpClient!.query(func, args);
+          }
         } else {
           return await this.convexClient.query(func, args);
         }
@@ -332,15 +389,9 @@ export class ConvexQueryClient {
       if (isConvexAction(context.queryKey)) {
         const [_, func, args] = context.queryKey;
         if (isServer) {
-          const client = new ConvexHttpClient(
-            // TODO expose this private property
-            (this.convexClient as any).address as string,
-          );
-          const data = await client.action(func, args);
-          return data;
+          return await this.serverHttpClient!.action(func, args);
         } else {
-          const data = await this.convexClient.action(func, args);
-          return data;
+          return await this.convexClient.action(func, args);
         }
       }
       return otherFetch(context);
@@ -415,6 +466,13 @@ export class ConvexQueryClient {
   };
 }
 
+type ConvexQueryArgsOrSkip<FuncRef extends FunctionReference<"query">> =
+  keyof FunctionArgs<FuncRef> extends never
+    ? [args?: EmptyObject | "skip"]
+    : EmptyObject extends FunctionArgs<FuncRef>
+      ? [args?: FunctionArgs<FuncRef> | "skip"]
+      : [args: FunctionArgs<FuncRef> | "skip"];
+
 /**
  * Query options factory for Convex query function subscriptions.
  * This options factory requires the `convexQueryClient.queryFn()` has been set
@@ -432,13 +490,12 @@ export class ConvexQueryClient {
  * });
  * ```
  */
-export const convexQuery = <
+export function convexQuery<
   ConvexQueryReference extends FunctionReference<"query">,
-  Args extends FunctionArgs<ConvexQueryReference> | "skip",
 >(
   funcRef: ConvexQueryReference,
-  queryArgs: Args,
-): Args extends "skip"
+  ...argsOrSkip: ConvexQueryArgsOrSkip<ConvexQueryReference>
+): (typeof argsOrSkip)[0] extends "skip"
   ? Pick<
       UseQueryOptions<
         FunctionReturnType<ConvexQueryReference>,
@@ -464,19 +521,28 @@ export const convexQuery = <
         ]
       >,
       "queryKey" | "queryFn" | "staleTime"
-    > => {
+    > {
+  const queryArgs = argsOrSkip[0];
+  const finalArgs = queryArgs ?? {};
   return {
     queryKey: [
       "convexQuery",
       // Make query key serializable
       getFunctionName(funcRef) as unknown as typeof funcRef,
       // TODO bigints are not serializable
-      queryArgs === "skip" ? "skip" : queryArgs,
+      finalArgs === "skip" ? "skip" : finalArgs,
     ],
     staleTime: Infinity,
-    ...(queryArgs === "skip" ? { enabled: false } : {}),
-  };
-};
+    ...(finalArgs === "skip" ? { enabled: false } : {}),
+  } as any;
+}
+
+type ConvexActionArgsOrSkip<FuncRef extends FunctionReference<"action">> =
+  keyof FunctionArgs<FuncRef> extends never
+    ? [args?: EmptyObject | "skip"]
+    : EmptyObject extends FunctionArgs<FuncRef>
+      ? [args?: FunctionArgs<FuncRef> | "skip"]
+      : [args: FunctionArgs<FuncRef> | "skip"];
 
 /**
  * Query options factory for Convex action function.
@@ -495,50 +561,34 @@ export const convexQuery = <
  * });
  * ```
  */
-export const convexAction = <
+export function convexAction<
   ConvexActionReference extends FunctionReference<"action">,
-  Args extends FunctionArgs<ConvexActionReference> | "skip",
 >(
   funcRef: ConvexActionReference,
-  args: Args,
-): Args extends "skip"
-  ? Pick<
-      UseQueryOptions<
-        FunctionReturnType<ConvexActionReference>,
-        Error,
-        FunctionReturnType<ConvexActionReference>,
-        [
-          "convexAction",
-          ConvexActionReference,
-          FunctionArgs<ConvexActionReference>,
-        ]
-      >,
-      "queryKey" | "queryFn" | "staleTime" | "enabled"
-    >
-  : Pick<
-      UseSuspenseQueryOptions<
-        FunctionReturnType<ConvexActionReference>,
-        Error,
-        FunctionReturnType<ConvexActionReference>,
-        [
-          "convexAction",
-          ConvexActionReference,
-          FunctionArgs<ConvexActionReference>,
-        ]
-      >,
-      "queryKey" | "queryFn" | "staleTime"
-    > => {
+  ...argsOrSkip: ConvexActionArgsOrSkip<ConvexActionReference>
+): Pick<
+  UseQueryOptions<
+    FunctionReturnType<ConvexActionReference>,
+    Error,
+    FunctionReturnType<ConvexActionReference>,
+    ["convexAction", ConvexActionReference, FunctionArgs<ConvexActionReference>]
+  >,
+  "queryKey" | "queryFn" | "staleTime" | "enabled"
+> {
+  const args = argsOrSkip[0];
+  const finalArgs = args ?? {};
   return {
     queryKey: [
       "convexAction",
       // Make query key serializable
       getFunctionName(funcRef) as unknown as typeof funcRef,
       // TODO bigints are not serializable
-      args === "skip" ? {} : args,
+      finalArgs === "skip" ? {} : finalArgs,
     ],
-    ...(args === "skip" ? { enabled: false } : {}),
-  };
-};
+    staleTime: Infinity,
+    ...(finalArgs === "skip" ? { enabled: false } : {}),
+  } as any;
+}
 
 function throwBecauseNotConvexQuery(
   context: QueryFunctionContext<ReadonlyArray<unknown>>,

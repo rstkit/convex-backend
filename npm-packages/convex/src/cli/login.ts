@@ -1,16 +1,14 @@
 import { Command, Option } from "@commander-js/extra-typings";
-import {
-  Context,
-  logFailure,
-  logFinishedStep,
-  logMessage,
-  oneoffContext,
-} from "../bundler/context.js";
+import { Context, oneoffContext } from "../bundler/context.js";
+import { logFinishedStep, logMessage } from "../bundler/log.js";
 import { checkAuthorization, performLogin } from "./lib/login.js";
-import { loadUuidForAnonymousUser } from "./lib/localDeployment/filePaths.js";
+import {
+  loadProjectLocalConfig,
+  loadUuidForAnonymousUser,
+} from "./lib/localDeployment/filePaths.js";
 import {
   handleLinkToProject,
-  listExistingAnonymousDeployments,
+  listLegacyAnonymousDeployments,
 } from "./lib/localDeployment/anonymous.js";
 import {
   DASHBOARD_HOST,
@@ -18,7 +16,7 @@ import {
   teamDashboardUrl,
 } from "./lib/dashboard.js";
 import { promptSearch, promptYesNo } from "./lib/utils/prompts.js";
-import { bigBrainAPI, validateOrSelectTeam } from "./lib/utils/utils.js";
+import { validateOrSelectTeam } from "./lib/utils/utils.js";
 import {
   selectProject,
   updateEnvAndConfigForDeploymentSelection,
@@ -27,7 +25,52 @@ import {
   getDeploymentSelection,
   shouldAllowAnonymousDevelopment,
 } from "./lib/deploymentSelection.js";
-import { removeAnonymousPrefix } from "./lib/deployment.js";
+import {
+  isAnonymousDeployment,
+  removeAnonymousPrefix,
+} from "./lib/deployment.js";
+import {
+  readGlobalConfig,
+  globalConfigPath,
+} from "./lib/utils/globalConfig.js";
+import { getTeamsForUser } from "./lib/api.js";
+
+const loginStatus = new Command("status")
+  .description("Check login status and list accessible teams")
+  .allowExcessArguments(false)
+  .action(async () => {
+    const ctx = await oneoffContext({
+      url: undefined,
+      adminKey: undefined,
+      envFile: undefined,
+    });
+
+    const globalConfig = readGlobalConfig(ctx);
+    const hasToken = globalConfig?.accessToken !== null;
+
+    if (hasToken) {
+      logMessage(`Convex account token found in: ${globalConfigPath()}`);
+    } else {
+      logMessage("No token found locally");
+      return;
+    }
+
+    const isLoggedIn = await checkAuthorization(ctx, false);
+
+    if (!isLoggedIn) {
+      logMessage("Status: Not logged in");
+      return;
+    }
+
+    logMessage("Status: Logged in");
+    const teams = await getTeamsForUser(ctx);
+    logMessage(
+      `Teams: ${teams.length} team${teams.length === 1 ? "" : "s"} accessible`,
+    );
+    for (const team of teams) {
+      logMessage(`  - ${team.name} (${team.slug})`);
+    }
+  });
 
 export const login = new Command("login")
   .description("Login to Convex")
@@ -67,6 +110,17 @@ export const login = new Command("login")
   .addOption(new Option("--dump-access-token").hideHelp())
   // Hidden option for tests to check if the user is logged in.
   .addOption(new Option("--check-login").hideHelp())
+  // Redirect to Vercel SSO integration URL
+  .addOption(
+    new Option(
+      "--vercel",
+      "Redirect to Vercel SSO integration for login",
+    ).hideHelp(),
+  )
+  // Override the Vercel URL slug (defaults to 'convex')
+  .addOption(new Option("--vercel-override <slug>").hideHelp())
+  .addCommand(loginStatus)
+  .addHelpCommand(false)
   .action(async (options, cmd: Command) => {
     const ctx = await oneoffContext({
       url: undefined,
@@ -78,7 +132,6 @@ export const login = new Command("login")
       (await checkAuthorization(ctx, !!options.acceptOptIns))
     ) {
       logFinishedStep(
-        ctx,
         "This device has previously been authorized and is ready for use with Convex.",
       );
       await handleLinkingDeployments(ctx, {
@@ -107,6 +160,8 @@ export const login = new Command("login")
     await performLogin(ctx, {
       ...options,
       anonymousId: uuid,
+      vercel: options.vercel,
+      vercelOverride: options.vercelOverride,
     });
 
     await handleLinkingDeployments(ctx, {
@@ -123,100 +178,48 @@ async function handleLinkingDeployments(
   if (!shouldAllowAnonymousDevelopment()) {
     return;
   }
-  const anonymousDeployments = await listExistingAnonymousDeployments(ctx);
-  if (anonymousDeployments.length === 0) {
+
+  // Check for project-local anonymous deployment first - this takes priority
+  const projectLocal = loadProjectLocalConfig(ctx);
+  if (
+    projectLocal !== null &&
+    isAnonymousDeployment(projectLocal.deploymentName)
+  ) {
+    const shouldLink = await promptYesNo(ctx, {
+      message: `Would you like to link your existing deployment to your account? ("${projectLocal.deploymentName}")`,
+      default: true,
+    });
+    if (!shouldLink) {
+      logMessage(
+        "Not linking your existing deployment. If you want to link it later, run `npx convex login --link-deployments`.",
+      );
+      logMessage(
+        `Visit ${DASHBOARD_HOST} or run \`npx convex dev\` to get started with your new account.`,
+      );
+      return;
+    }
+
+    const { dashboardUrl } = await linkSingleDeployment(
+      ctx,
+      projectLocal.deploymentName,
+      projectLocal.deploymentName,
+    );
+    logFinishedStep(`Visit ${dashboardUrl} to get started.`);
+    return;
+  }
+
+  // No project-local deployment - check for legacy deployments
+  const legacyDeployments = listLegacyAnonymousDeployments(ctx);
+  if (legacyDeployments.length === 0) {
     if (args.interactive) {
       logMessage(
-        ctx,
         "It doesn't look like you have any deployments to link. You can run `npx convex dev` to set up a new project or select an existing one.",
       );
     }
     return;
   }
 
-  if (!args.interactive) {
-    const message = getMessage(
-      anonymousDeployments.map((d) => d.deploymentName),
-    );
-    const createProjects = await promptYesNo(ctx, {
-      message,
-      default: true,
-    });
-    if (!createProjects) {
-      logMessage(
-        ctx,
-        "Not linking your existing deployments. If you want to link them later, run `npx convex login --link-deployments`.",
-      );
-      logMessage(
-        ctx,
-        `Visit ${DASHBOARD_HOST} or run \`npx convex dev\` to get started with your new account.`,
-      );
-      return;
-    }
-
-    const { teamSlug } = await validateOrSelectTeam(
-      ctx,
-      undefined,
-      "Choose a team for your deployments:",
-    );
-    const projectsRemaining = await getProjectsRemaining(ctx, teamSlug);
-    if (anonymousDeployments.length > projectsRemaining) {
-      logFailure(
-        ctx,
-        `You have ${anonymousDeployments.length} deployments to link, but only have ${projectsRemaining} projects remaining. If you'd like to choose which ones to link, run this command with the --link-deployments flag.`,
-      );
-      return;
-    }
-
-    const deploymentSelection = await getDeploymentSelection(ctx, {
-      url: undefined,
-      adminKey: undefined,
-      envFile: undefined,
-    });
-    const configuredDeployment =
-      deploymentSelection.kind === "anonymous"
-        ? deploymentSelection.deploymentName
-        : null;
-
-    let dashboardUrl = teamDashboardUrl(teamSlug);
-
-    for (const deployment of anonymousDeployments) {
-      const linkedDeployment = await handleLinkToProject(ctx, {
-        deploymentName: deployment.deploymentName,
-        teamSlug,
-        projectSlug: null,
-      });
-      logFinishedStep(
-        ctx,
-        `Added ${deployment.deploymentName} to project ${linkedDeployment.projectSlug}`,
-      );
-      if (deployment.deploymentName === configuredDeployment) {
-        // If the current project has a `CONVEX_DEPLOYMENT` env var configured, replace
-        // it with the new value.
-        await updateEnvAndConfigForDeploymentSelection(
-          ctx,
-          {
-            url: linkedDeployment.deploymentUrl,
-            deploymentName: linkedDeployment.deploymentName,
-            teamSlug,
-            projectSlug: linkedDeployment.projectSlug,
-            deploymentType: "local",
-          },
-          configuredDeployment,
-        );
-        dashboardUrl = deploymentDashboardUrlPage(
-          linkedDeployment.deploymentName,
-          "",
-        );
-      }
-    }
-    logFinishedStep(
-      ctx,
-      `Sucessfully linked your deployments! Visit ${dashboardUrl} to get started.`,
-    );
-    return;
-  }
-
+  // Get the currently configured deployment (if any) for env var updates
   const deploymentSelection = await getDeploymentSelection(ctx, {
     url: undefined,
     adminKey: undefined,
@@ -226,54 +229,71 @@ async function handleLinkingDeployments(
     deploymentSelection.kind === "anonymous"
       ? deploymentSelection.deploymentName
       : null;
-  while (true) {
-    logMessage(
+
+  if (!args.interactive) {
+    // Non-interactive: link all legacy deployments automatically
+    const message = getMessage(legacyDeployments.map((d) => d.deploymentName));
+    const createProjects = await promptYesNo(ctx, {
+      message,
+      default: true,
+    });
+    if (!createProjects) {
+      logMessage(
+        "Not linking your existing deployments. If you want to link them later, run `npx convex login --link-deployments`.",
+      );
+      logMessage(
+        `Visit ${DASHBOARD_HOST} or run \`npx convex dev\` to get started with your new account.`,
+      );
+      return;
+    }
+
+    const {
+      team: { slug: teamSlug },
+    } = await validateOrSelectTeam(
       ctx,
+      undefined,
+      "Choose a team for your deployments:",
+    );
+    let dashboardUrl = teamDashboardUrl(teamSlug);
+    for (const deployment of legacyDeployments) {
+      const result = await linkSingleDeployment(
+        ctx,
+        deployment.deploymentName,
+        configuredDeployment,
+        { teamSlug, projectSlug: null },
+      );
+      if (deployment.deploymentName === configuredDeployment) {
+        dashboardUrl = result.dashboardUrl;
+      }
+    }
+    logFinishedStep(
+      `Successfully linked your deployments! Visit ${dashboardUrl} to get started.`,
+    );
+    return;
+  }
+
+  // Interactive mode: let user choose which legacy deployments to link
+  while (true) {
+    const currentLegacyDeployments = listLegacyAnonymousDeployments(ctx);
+    if (currentLegacyDeployments.length === 0) {
+      logMessage("All deployments have been linked.");
+      break;
+    }
+    logMessage(
       getDeploymentListMessage(
-        anonymousDeployments.map((d) => d.deploymentName),
+        currentLegacyDeployments.map((d) => d.deploymentName),
       ),
     );
-    const updatedAnonymousDeployments =
-      await listExistingAnonymousDeployments(ctx);
     const deploymentToLink = await promptSearch(ctx, {
       message: "Which deployment would you like to link to your account?",
-      choices: updatedAnonymousDeployments.map((d) => ({
+      choices: currentLegacyDeployments.map((d) => ({
         name: d.deploymentName,
         value: d.deploymentName,
       })),
     });
-    const { teamSlug } = await validateOrSelectTeam(
-      ctx,
-      undefined,
-      "Choose a team for your deployment:",
-    );
-    const { projectSlug } = await selectProject(ctx, "ask", {
-      team: teamSlug,
-      devDeployment: "local",
-      defaultProjectName: removeAnonymousPrefix(deploymentToLink),
-    });
-    const linkedDeployment = await handleLinkToProject(ctx, {
-      deploymentName: deploymentToLink,
-      teamSlug,
-      projectSlug,
-    });
-    logFinishedStep(
-      ctx,
-      `Added ${deploymentToLink} to project ${linkedDeployment.projectSlug}`,
-    );
-    if (deploymentToLink === configuredDeployment) {
-      await updateEnvAndConfigForDeploymentSelection(
-        ctx,
-        {
-          url: linkedDeployment.deploymentUrl,
-          deploymentName: linkedDeployment.deploymentName,
-          teamSlug,
-          projectSlug: linkedDeployment.projectSlug,
-          deploymentType: "local",
-        },
-        configuredDeployment,
-      );
-    }
+
+    await linkSingleDeployment(ctx, deploymentToLink, configuredDeployment);
+
     const shouldContinue = await promptYesNo(ctx, {
       message: "Would you like to link another deployment?",
       default: true,
@@ -284,14 +304,65 @@ async function handleLinkingDeployments(
   }
 }
 
-async function getProjectsRemaining(ctx: Context, teamSlug: string) {
-  const response = await bigBrainAPI<{ projectsRemaining: number }>({
-    ctx,
-    method: "GET",
-    url: `/api/teams/${teamSlug}/projects_remaining`,
+/**
+ * Link a single deployment to a project, prompting for team and project selection.
+ * Updates env vars if this is the currently configured deployment.
+ */
+async function linkSingleDeployment(
+  ctx: Context,
+  deploymentName: string,
+  configuredDeployment: string | null,
+  options?: {
+    teamSlug?: string;
+    projectSlug?: string | null;
+  },
+): Promise<{ dashboardUrl: string }> {
+  const teamSlug =
+    options?.teamSlug ??
+    (
+      await validateOrSelectTeam(
+        ctx,
+        undefined,
+        "Choose a team for your deployment:",
+      )
+    ).team.slug;
+
+  const projectSlug =
+    options?.projectSlug ??
+    (
+      await selectProject(ctx, "ask", {
+        team: teamSlug,
+        devDeployment: "local",
+        defaultProjectName: removeAnonymousPrefix(deploymentName),
+      })
+    ).projectSlug;
+
+  const linkedDeployment = await handleLinkToProject(ctx, {
+    deploymentName,
+    teamSlug,
+    projectSlug,
   });
 
-  return response.projectsRemaining;
+  if (deploymentName === configuredDeployment) {
+    await updateEnvAndConfigForDeploymentSelection(
+      ctx,
+      {
+        url: linkedDeployment.deploymentUrl,
+        deploymentName: linkedDeployment.deploymentName,
+        teamSlug,
+        projectSlug: linkedDeployment.projectSlug,
+        deploymentType: "local",
+      },
+      configuredDeployment,
+    );
+  }
+
+  return {
+    dashboardUrl: deploymentDashboardUrlPage(
+      linkedDeployment.deploymentName,
+      "",
+    ),
+  };
 }
 
 function getDeploymentListMessage(anonymousDeploymentNames: string[]) {

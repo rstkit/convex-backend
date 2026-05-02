@@ -24,17 +24,47 @@ use crate::{
         CanonicalizedComponentFunctionPath,
         ComponentId,
     },
+    execution_context::ExecutionId,
     version::ClientVersion,
 };
 
 #[derive(Serialize, Copy, Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum UdfType {
     Query,
     Mutation,
     Action,
     HttpAction,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdfTypeJson {
+    Query,
+    Mutation,
+    Action,
+    HttpAction,
+}
+
+impl From<UdfType> for UdfTypeJson {
+    fn from(udf_type: UdfType) -> Self {
+        match udf_type {
+            UdfType::Query => UdfTypeJson::Query,
+            UdfType::Mutation => UdfTypeJson::Mutation,
+            UdfType::Action => UdfTypeJson::Action,
+            UdfType::HttpAction => UdfTypeJson::HttpAction,
+        }
+    }
+}
+
+impl From<UdfTypeJson> for UdfType {
+    fn from(udf_type: UdfTypeJson) -> Self {
+        match udf_type {
+            UdfTypeJson::Query => UdfType::Query,
+            UdfTypeJson::Mutation => UdfType::Mutation,
+            UdfTypeJson::Action => UdfType::Action,
+            UdfTypeJson::HttpAction => UdfType::HttpAction,
+        }
+    }
 }
 
 impl UdfType {
@@ -118,7 +148,7 @@ impl UdfIdentifier {
     pub fn into_component_and_udf_path(self) -> (Option<String>, String) {
         match self {
             UdfIdentifier::Function(path) => {
-                let (component_path, udf_path) = path.clone().into_component_and_udf_path();
+                let (component_path, udf_path) = path.into_component_and_udf_path();
                 (component_path.serialize(), udf_path.to_string())
             },
             UdfIdentifier::Http(_) | UdfIdentifier::SystemJob(_) => (None, self.to_string()),
@@ -143,7 +173,6 @@ pub enum AllowedVisibility {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum FunctionCaller {
     SyncWorker(ClientVersion),
     HttpApi(ClientVersion),
@@ -159,10 +188,8 @@ pub enum FunctionCaller {
     },
     Action {
         parent_scheduled_job: Option<(ComponentId, DeveloperDocumentId)>,
+        parent_execution_id: Option<ExecutionId>,
     },
-    #[cfg(any(test, feature = "testing"))]
-    #[proptest(weight = 0)]
-    Test,
 }
 
 impl FunctionCaller {
@@ -175,8 +202,6 @@ impl FunctionCaller {
             | FunctionCaller::Cron
             | FunctionCaller::Scheduler { .. }
             | FunctionCaller::Action { .. } => None,
-            #[cfg(any(test, feature = "testing"))]
-            FunctionCaller::Test => None,
         }
         .cloned()
     }
@@ -188,15 +213,29 @@ impl FunctionCaller {
             | FunctionCaller::Tester(_)
             | FunctionCaller::HttpEndpoint
             | FunctionCaller::Cron => None,
-            #[cfg(any(test, feature = "testing"))]
-            FunctionCaller::Test => None,
             FunctionCaller::Scheduler {
                 job_id,
                 component_id,
             } => Some((*component_id, *job_id)),
             FunctionCaller::Action {
                 parent_scheduled_job,
+                ..
             } => *parent_scheduled_job,
+        }
+    }
+
+    pub fn parent_execution_id(&self) -> Option<ExecutionId> {
+        match self {
+            FunctionCaller::SyncWorker(_)
+            | FunctionCaller::HttpApi(_)
+            | FunctionCaller::Tester(_)
+            | FunctionCaller::HttpEndpoint
+            | FunctionCaller::Cron
+            | FunctionCaller::Scheduler { .. } => None,
+            FunctionCaller::Action {
+                parent_execution_id,
+                ..
+            } => *parent_execution_id,
         }
     }
 
@@ -209,8 +248,6 @@ impl FunctionCaller {
             | FunctionCaller::Cron
             | FunctionCaller::Scheduler { .. } => true,
             FunctionCaller::Action { .. } => false,
-            #[cfg(any(test, feature = "testing"))]
-            FunctionCaller::Test => true,
         }
     }
 
@@ -226,8 +263,6 @@ impl FunctionCaller {
             FunctionCaller::Cron
             | FunctionCaller::Scheduler { .. }
             | FunctionCaller::Action { .. } => false,
-            #[cfg(any(test, feature = "testing"))]
-            FunctionCaller::Test => true,
         }
     }
 
@@ -244,8 +279,6 @@ impl FunctionCaller {
             | FunctionCaller::Cron
             | FunctionCaller::Scheduler { .. }
             | FunctionCaller::Action { .. } => AllowedVisibility::All,
-            #[cfg(any(test, feature = "testing"))]
-            FunctionCaller::Test => AllowedVisibility::PublicOnly,
         }
     }
 }
@@ -260,8 +293,6 @@ impl fmt::Display for FunctionCaller {
             FunctionCaller::Cron => "Cron",
             FunctionCaller::Scheduler { .. } => "Scheduler",
             FunctionCaller::Action { .. } => "Action",
-            #[cfg(any(test, feature = "testing"))]
-            FunctionCaller::Test => "Test",
         };
         write!(f, "{s}")
     }
@@ -293,6 +324,7 @@ impl From<FunctionCaller> for pb::common::FunctionCaller {
             },
             FunctionCaller::Action {
                 parent_scheduled_job,
+                parent_execution_id,
             } => {
                 let (component_id, document_id) = parent_scheduled_job.unzip();
                 let caller = pb::common::ActionFunctionCaller {
@@ -300,11 +332,11 @@ impl From<FunctionCaller> for pb::common::FunctionCaller {
                     component_id: component_id
                         .unwrap_or(ComponentId::Root)
                         .serialize_to_string(),
+                    parent_execution_id: parent_execution_id
+                        .map(|execution_id| execution_id.to_string()),
                 };
                 pb::common::function_caller::Caller::Action(caller)
             },
-            #[cfg(any(test, feature = "testing"))]
-            FunctionCaller::Test => panic!("Can't use test function caller"),
         };
         Self {
             caller: Some(caller),
@@ -346,6 +378,7 @@ impl TryFrom<pb::common::FunctionCaller> for FunctionCaller {
                 let pb::common::ActionFunctionCaller {
                     parent_scheduled_job,
                     component_id,
+                    parent_execution_id,
                 } = caller;
                 let parent_scheduled_job = parent_scheduled_job
                     .map(|job_id| job_id.try_into())
@@ -353,6 +386,9 @@ impl TryFrom<pb::common::FunctionCaller> for FunctionCaller {
                 let component_id = ComponentId::deserialize_from_string(component_id.as_deref())?;
                 FunctionCaller::Action {
                     parent_scheduled_job: parent_scheduled_job.map(|job_id| (component_id, job_id)),
+                    parent_execution_id: parent_execution_id
+                        .map(|id| ExecutionId::from_str(&id))
+                        .transpose()?,
                 }
             },
             None => anyhow::bail!("Missing `caller` field"),
@@ -363,7 +399,6 @@ impl TryFrom<pb::common::FunctionCaller> for FunctionCaller {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum ModuleEnvironment {
     Isolate,
     Node,
@@ -404,35 +439,6 @@ impl ModuleEnvironment {
             ModuleEnvironment::Isolate => "default",
             ModuleEnvironment::Node => "node",
             ModuleEnvironment::Invalid => "unknown",
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-    use sync_types::testing::assert_roundtrips;
-
-    use super::{
-        UdfType,
-        UdfTypeProto,
-    };
-    use crate::types::FunctionCaller;
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_udf_type_roundtrips(u in any::<UdfType>()) {
-            assert_roundtrips::<UdfType, UdfTypeProto>(u);
-        }
-
-        #[test]
-        fn test_function_caller_roundtrips(u in any::<FunctionCaller>()) {
-            assert_roundtrips::<FunctionCaller, pb::common::FunctionCaller>(u);
         }
     }
 }

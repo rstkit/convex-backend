@@ -1,7 +1,7 @@
 import { mutationWithZod, queryWithZod } from "./lib/zod";
 import { z } from "zod";
 import { Doc } from "./_generated/dataModel";
-import { withSystemFields } from "convex-helpers/server/zod";
+import { withSystemFields } from "convex-helpers/server/zod3";
 
 export const send = mutationWithZod({
   args: { body: z.string(), author: z.string() },
@@ -16,7 +16,7 @@ export const list = queryWithZod({
     return await ctx.db.query("messages").collect();
   },
   // Output validation is optional
-  output: z.array(
+  returns: z.array(
     z.object(
       withSystemFields("messages", { body: z.string(), author: z.string() }),
     ),

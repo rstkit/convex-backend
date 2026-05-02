@@ -88,6 +88,24 @@ static ERROR_METRICS: LazyLock<BTreeMap<&str, BTreeMap<&str, IntCounterVec>>> =
                     )
                 }
             },
+            "ManyIntersections" => btreemap!{
+                "mutation" => {
+                    register_convex_counter_owned!(
+                        MANY_INTERSECTIONS_INSERT_ERROR_TOTAL,
+                        "Errors on the insert mutation in many intersections scenario",
+                        &["backend_version", "load_description"],
+                    )
+                }
+            },
+            "HoldSubscriptions" => btreemap!{
+                "mutation" => {
+                    register_convex_counter_owned!(
+                        HOLD_SUBSCRIPTIONS_MUTATION_ERROR_TOTAL,
+                        "Errors on the mutation in hold subscriptions scenario",
+                        &["backend_version", "load_description"],
+                    )
+                }
+            },
             "SnapshotExport" => btreemap!{
                 "request_export_failed" => {
                     register_convex_counter_owned!(
@@ -250,6 +268,31 @@ static LATENCY_METRICS: LazyLock<BTreeMap<&str, BTreeMap<&str, VMHistogramVec>>>
                     )
                 }
             },
+            "ManyIntersections" => btreemap!{
+                "mutation_completed" => {
+                    register_convex_histogram_owned!(
+                        OBSERVE_INSERT_WITH_MANY_INTERSECTIONS_COMPLETED_LATENCY_SECONDS,
+                        "Latency on mutation completion for ManyIntersections",
+                        &["backend_version", "load_description"],
+                    )
+                },
+                "mutation_observed" => {
+                    register_convex_histogram_owned!(
+                        OBSERVE_INSERT_WITH_MANY_INTERSECTIONS_OBSERVED_LATENCY_SECONDS,
+                        "Latency on observing mutation for ManyIntersections",
+                        &["backend_version", "load_description"],
+                    )
+                },
+            },
+            "HoldSubscriptions" => btreemap!{
+                "invalidation_completed" => {
+                    register_convex_histogram_owned!(
+                        HOLD_SUBSCRIPTIONS_INVALIDATION_COMPLETED_LATENCY_SECONDS,
+                        "Latency on invalidation completion for HoldSubscriptions",
+                        &["backend_version", "load_description"],
+                    )
+                },
+            },
             "Search" => btreemap!{
                 "search" => {
                     register_convex_histogram_owned!(
@@ -327,6 +370,31 @@ static COUNT_METRICS: LazyLock<BTreeMap<&str, BTreeMap<&str, IntCounterVec>>> =
                     register_convex_counter_owned!(
                         OBSERVE_INSERT_OBSERVED_TIMEOUT_TOTAL,
                         "Count of observed timeouts for mutation in ObserveInsert",
+                        &["backend_version", "load_description"],
+                    )
+                }
+            },
+            "ManyIntersections" => btreemap!{
+                "mutation_send_timeout" => {
+                    register_convex_counter_owned!(
+                        OBSERVE_INSERT_WITH_MANY_INTERSECTIONS_SEND_TIMEOUT_TOTAL,
+                        "Count of send timeouts for mutation in ManyIntersections",
+                        &["backend_version", "load_description"],
+                    )
+                },
+                "mutation_observed_timeout" => {
+                    register_convex_counter_owned!(
+                        OBSERVE_INSERT_WITH_MANY_INTERSECTIONS_OBSERVED_TIMEOUT_TOTAL,
+                        "Count of observed timeouts for mutation in ManyIntersections",
+                        &["backend_version", "load_description"],
+                    )
+                }
+            },
+            "HoldSubscriptions" => btreemap!{
+                "invalidation_timeout" => {
+                    register_convex_counter_owned!(
+                        HOLD_SUBSCRIPTIONS_INVALIDATION_TIMEOUT_TOTAL,
+                        "Count of invalidation timeouts in HoldSubscriptions",
                         &["backend_version", "load_description"],
                     )
                 }
@@ -498,97 +566,4 @@ pub fn log_event<'a>(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::{
-            BTreeMap,
-            BTreeSet,
-        },
-        fmt::Write,
-        fs,
-        path::{
-            Path,
-            PathBuf,
-        },
-        sync::LazyLock,
-    };
-
-    use anyhow::Context;
-
-    use crate::metrics::{
-        COUNT_METRICS,
-        ERROR_METRICS,
-        LATENCY_METRICS,
-    };
-
-    #[test]
-    fn test_metrics_match_scenario_runner() -> anyhow::Result<()> {
-        let mut s = String::new();
-        writeln!(
-            &mut s,
-            "// This file is automatically generated by `cargo test -p load_generator`"
-        )?;
-        writeln!(
-            &mut s,
-            "// Metrics must first be added to crates/load_generator/src/metrics.rs"
-        )?;
-
-        let mut scenario_names: BTreeSet<&str> = BTreeSet::new();
-        scenario_names.extend(ERROR_METRICS.keys());
-        scenario_names.extend(LATENCY_METRICS.keys());
-        scenario_names.extend(COUNT_METRICS.keys());
-        write!(&mut s, "export type ScenarioName =")?;
-        for name in scenario_names {
-            writeln!(&mut s)?;
-            write!(&mut s, "  | \"{name}\"")?;
-        }
-        writeln!(&mut s, ";")?;
-
-        fn write_metrics<T>(
-            s: &mut String,
-            varname: &str,
-            metrics: &BTreeMap<&str, BTreeMap<&str, T>>,
-        ) -> anyhow::Result<()> {
-            write!(s, "export type {varname} =")?;
-            for (scenario_name, metrics) in metrics.iter() {
-                writeln!(s)?;
-                write!(s, "  // {scenario_name}")?;
-                for name in metrics.keys() {
-                    writeln!(s)?;
-                    write!(s, "  | \"{name}\"")?;
-                }
-            }
-            writeln!(s, ";")?;
-            Ok(())
-        }
-
-        write_metrics(&mut s, "ScenarioLatencyMetric", &LATENCY_METRICS)?;
-        write_metrics(&mut s, "ScenarioCountMetric", &COUNT_METRICS)?;
-        write_metrics(&mut s, "ScenarioError", &ERROR_METRICS)?;
-
-        let actual = fs::read_to_string(&*SCENARIO_RUNNER_METRICS_FILE)?;
-        if s != actual {
-            fs::write(&*SCENARIO_RUNNER_METRICS_FILE, s)
-                .context("SCENARIO_RUNNER_METRICS_FILE not found")?;
-            panic!(
-                "scenario-runner/metrics.ts does not match load-generator/src/metrics.rs.
-                 This test will automatically update it so it will pass next time. {{s}} != \
-                 {{actual}}",
-            );
-        }
-
-        Ok(())
-    }
-
-    static SCENARIO_RUNNER_METRICS_FILE: LazyLock<PathBuf> = LazyLock::new(|| {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("npm-packages/scenario-runner/metrics.ts")
-    });
 }

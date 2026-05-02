@@ -72,7 +72,7 @@ const runAfterTimeout = (
 ) => {
   const startTime = Date.now();
   ACTIVE_TIMERS.set(timerKey, startTime + timeoutMs);
-  performAsyncOp("sleep", name, timeoutMs).then(() => {
+  void performAsyncOp("sleep", name, timeoutMs).then(() => {
     // TODO(CX-4534) Wait until any invocations of this algorithm,
     // that started before this one, and whose milliseconds is equal to or less
     // than this one's, have completed.
@@ -82,7 +82,6 @@ const runAfterTimeout = (
 };
 
 const unusedTimerId = () => {
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     const id =
       1 + Math.floor(Math.random() * Math.max(1000, ACTIVE_TIMERS.size * 2));

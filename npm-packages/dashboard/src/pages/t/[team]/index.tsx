@@ -1,202 +1,400 @@
 import {
+  ExternalLinkIcon,
   GridIcon,
   ListBulletIcon,
   PlusIcon,
-  RocketIcon,
 } from "@radix-ui/react-icons";
 import { Button } from "@ui/Button";
-import { Callout } from "@ui/Callout";
 import { TextInput } from "@ui/TextInput";
 import { useGlobalLocalStorage } from "@common/lib/useGlobalLocalStorage";
 import { ProjectCard } from "components/projects/ProjectCard";
-import { useProjects } from "api/projects";
-import { useCurrentTeam, useTeamEntitlements } from "api/teams";
+import {
+  DeploymentList,
+  DeploymentToolbar,
+  useDeploymentsWithFilters,
+} from "components/deployments/DeploymentList";
+import { usePaginatedProjects } from "api/projects";
+import {
+  useProjectsPageSize,
+  PROJECT_PAGE_SIZES,
+} from "hooks/useProjectsPageSize";
+import { useCurrentTeam } from "api/teams";
 import { useTeamOrbSubscription } from "api/billing";
 import { useReferralState } from "api/referrals";
-import { ProjectDetails } from "generatedApi";
-import Link from "next/link";
+import { ProjectDetails, TeamResponse } from "generatedApi";
 import { ReferralsBanner } from "components/referral/ReferralsBanner";
-import { DocsGrid } from "components/projects/DocsGrid";
 import { useCreateProjectModal } from "hooks/useCreateProjectModal";
 import { withAuthenticatedPage } from "lib/withAuthenticatedPage";
 import Head from "next/head";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useDebounce } from "react-use";
 import { cn } from "@ui/cn";
+import { SegmentedControl } from "@ui/SegmentedControl";
+import { EmptySection } from "@common/elements/EmptySection";
+import { OpenInVercel } from "components/OpenInVercel";
+import { LoadingLogo } from "@ui/Loading";
+import { PaginationControls } from "elements/PaginationControls";
+import { useRouter } from "next/router";
 
 export { getServerSideProps } from "lib/ssr";
 
-export default withAuthenticatedPage(() => {
+export function TeamIndexPage() {
   const team = useCurrentTeam();
-  const projects = useProjects(team?.id, 30000);
-  const nonDemoProjects = projects?.filter((p) => !p.isDemo);
-  const entitlements = useTeamEntitlements(team?.id);
+  const router = useRouter();
   const referralState = useReferralState(team?.id);
-  const [showAsList] = useGlobalLocalStorage("showProjectsAsList", false);
   const { subscription } = useTeamOrbSubscription(team?.id);
   const isFreePlan =
     subscription === undefined ? undefined : subscription === null;
   const [prefersReferralsBannerHidden, setPrefersReferralsBannerHidden] =
     useGlobalLocalStorage("prefersReferralsBannerHidden", false);
-  const isReferralsBannerVisible =
-    projects &&
-    projects.length > 0 &&
-    isFreePlan &&
-    team &&
-    referralState &&
-    !prefersReferralsBannerHidden;
+
+  const viewFromQuery = (router.query.view as string | undefined) ?? "projects";
+  const currentView = viewFromQuery;
+  const isDeploymentsView = currentView === "deployments";
+  const projectFilter = router.query.projectId
+    ? Number(router.query.projectId)
+    : undefined;
+
+  const handleViewChange = (view: string) => {
+    const query: Record<string, string> = {};
+    if (view !== "projects") {
+      query.view = view;
+    }
+    void router.replace({ pathname: `/t/${team?.slug}`, query }, undefined, {
+      shallow: true,
+    });
+  };
 
   return (
     <>
       <Head>{team && <title>{team.name} | Convex Dashboard</title>}</Head>
       <div className="h-full grow bg-background-primary p-4">
-        <div
-          className={cn(
-            "m-auto transition-all",
-            showAsList ? "max-w-3xl" : "max-w-3xl lg:max-w-5xl xl:max-w-7xl",
-          )}
-        >
+        <div className="m-auto max-w-3xl transition-all lg:max-w-5xl xl:max-w-7xl">
           <div className="flex w-full flex-col gap-2">
-            {team && nonDemoProjects && (
+            {team && (
               <div className="w-full">
-                {entitlements &&
-                  nonDemoProjects.length >= entitlements.maxProjects &&
-                  (subscription ? (
-                    <Callout className="mb-4" variant="upsell">
-                      You've reached a soft limit on the number of projects you
-                      can create for this team. Please contact support to
-                      increase this limit.
-                    </Callout>
-                  ) : (
-                    <Callout className="mb-4" variant="upsell">
-                      <div className="flex gap-1">
-                        You've reached the project limit for this team.
-                        <Link
-                          href={`/${team?.slug}/settings/billing`}
-                          className="items-center text-content-link"
-                        >
-                          Upgrade
-                        </Link>
-                        to create more projects.
-                      </div>
-                    </Callout>
-                  ))}
-
-                {isReferralsBannerVisible && (
-                  <ReferralsBanner
-                    className="mb-4"
-                    team={team}
-                    referralState={referralState}
-                    onHide={() => setPrefersReferralsBannerHidden(true)}
-                  />
-                )}
-
-                <ProjectGrid projects={nonDemoProjects} />
+                <TeamContent
+                  team={team}
+                  isDeploymentsView={isDeploymentsView}
+                  currentView={currentView}
+                  onViewChange={handleViewChange}
+                  projectFilter={projectFilter}
+                  referralState={referralState}
+                  isFreePlan={isFreePlan}
+                  prefersReferralsBannerHidden={prefersReferralsBannerHidden}
+                  setPrefersReferralsBannerHidden={
+                    setPrefersReferralsBannerHidden
+                  }
+                />
               </div>
             )}
           </div>
-          <DocsGrid />
         </div>
       </div>
     </>
   );
-});
+}
 
-function ProjectGrid({ projects }: { projects: ProjectDetails[] }) {
-  const [createProjectModal, showCreateProjectModal] = useCreateProjectModal();
+export default withAuthenticatedPage(TeamIndexPage);
+
+const VIEW_OPTIONS = [
+  { label: "Projects", value: "projects" },
+  { label: "Deployments", value: "deployments" },
+] as const;
+
+function TeamContent({
+  team,
+  isDeploymentsView,
+  currentView,
+  onViewChange,
+  projectFilter,
+  referralState,
+  isFreePlan,
+  prefersReferralsBannerHidden,
+  setPrefersReferralsBannerHidden,
+}: {
+  team: TeamResponse;
+  isDeploymentsView: boolean;
+  currentView: string;
+  onViewChange: (view: string) => void;
+  projectFilter?: number;
+  referralState: any;
+  isFreePlan: boolean | undefined;
+  prefersReferralsBannerHidden: boolean;
+  setPrefersReferralsBannerHidden: (value: boolean) => void;
+}) {
+  const [projectQuery, setProjectQuery] = useState("");
+  const [debouncedProjectQuery, setDebouncedProjectQuery] = useState("");
   const [showAsList, setShowAsList] = useGlobalLocalStorage(
     "showProjectsAsList",
     false,
   );
 
-  const [projectQuery, setProjectQuery] = useState("");
+  useDebounce(
+    () => {
+      setDebouncedProjectQuery(projectQuery);
+    },
+    300,
+    [projectQuery],
+  );
 
-  const filteredProjects = projects
-    .filter((p) => p.name.toLowerCase().includes(projectQuery.toLowerCase()))
-    .sort((a, b) => b.createTime - a.createTime);
+  return (
+    <>
+      {!prefersReferralsBannerHidden && isFreePlan && referralState && (
+        <div className="mb-4">
+          <ReferralsBanner
+            team={team}
+            referralState={referralState}
+            onHide={() => setPrefersReferralsBannerHidden(true)}
+          />
+        </div>
+      )}
+      <div className="mb-4 flex w-full animate-fadeInFromLoading flex-col gap-3">
+        <div className="flex items-center gap-4">
+          <SegmentedControl
+            options={[...VIEW_OPTIONS]}
+            value={currentView}
+            onChange={onViewChange}
+          />
+          {!isDeploymentsView && <ProjectActions team={team} />}
+        </div>
+        {!isDeploymentsView && (
+          <div className="mt-1 flex items-center gap-2">
+            <div className="min-w-[13rem] shrink-0">
+              <TextInput
+                placeholder="Search projects"
+                value={projectQuery}
+                onChange={(e) => setProjectQuery(e.target.value)}
+                type="search"
+                id="Search projects"
+                isSearchLoading={debouncedProjectQuery !== projectQuery}
+              />
+            </div>
+            <div className="hidden gap-1 rounded-md border bg-background-secondary p-1 lg:flex">
+              <Button
+                icon={<GridIcon />}
+                variant="neutral"
+                inline
+                size="xs"
+                className={cn(!showAsList && "bg-background-tertiary")}
+                onClick={() => setShowAsList(false)}
+              />
+              <Button
+                icon={<ListBulletIcon />}
+                variant="neutral"
+                inline
+                size="xs"
+                className={cn(showAsList && "bg-background-tertiary")}
+                onClick={() => setShowAsList(true)}
+              />
+            </div>
+          </div>
+        )}
+      </div>
+      {isDeploymentsView ? (
+        <DeploymentsView team={team} projectFilter={projectFilter} />
+      ) : (
+        <ProjectGrid
+          team={team}
+          debouncedProjectQuery={debouncedProjectQuery}
+          showAsList={showAsList}
+        />
+      )}
+    </>
+  );
+}
+
+function DeploymentsView({
+  team,
+  projectFilter,
+}: {
+  team: TeamResponse;
+  projectFilter?: number;
+}) {
+  const filters = useDeploymentsWithFilters(team.id, projectFilter);
+  return (
+    <div className="flex flex-col gap-4">
+      <DeploymentToolbar projectFilter={projectFilter} filters={filters} />
+      <DeploymentList team={team} filters={filters} />
+    </div>
+  );
+}
+
+function ProjectActions({ team }: { team: TeamResponse }) {
+  const [createProjectModal, showCreateProjectModal] = useCreateProjectModal();
+  return (
+    <div className="ml-auto flex items-center gap-2">
+      {!team.managedBy && (
+        <Button
+          onClick={() => showCreateProjectModal()}
+          variant="neutral"
+          size="sm"
+          icon={<PlusIcon />}
+        >
+          Create Project
+        </Button>
+      )}
+      <OpenInVercel team={team} />
+      <Button
+        href="https://docs.convex.dev/tutorial"
+        size="sm"
+        target="_blank"
+        icon={<ExternalLinkIcon />}
+      >
+        Start Tutorial
+      </Button>
+      {createProjectModal}
+    </div>
+  );
+}
+
+function ProjectGrid({
+  team,
+  debouncedProjectQuery,
+  showAsList,
+}: {
+  team: TeamResponse;
+  debouncedProjectQuery: string;
+  showAsList: boolean;
+}) {
+  const { pageSize, setPageSize } = useProjectsPageSize();
+
+  const debouncedQuery = debouncedProjectQuery;
+  const [currentCursor, setCurrentCursor] = useState<string | undefined>(
+    undefined,
+  );
+  const [cursorHistory, setCursorHistory] = useState<(string | undefined)[]>([
+    undefined,
+  ]);
+
+  // Fetch paginated projects with debounced query
+  const paginatedData = usePaginatedProjects(
+    team?.id,
+    {
+      cursor: currentCursor,
+      q: debouncedQuery.trim() || undefined,
+    },
+    30000,
+  );
+
+  const projects = paginatedData?.items ?? [];
+  const hasMore = paginatedData?.pagination.hasMore ?? false;
+  const nextCursor = paginatedData?.pagination.nextCursor;
+  const isLoading = paginatedData === undefined;
+
+  // Calculate current page range for display
+  const currentPageNumber = cursorHistory.length;
+
+  const handleNextPage = () => {
+    if (nextCursor) {
+      setCursorHistory((prev) => [...prev, nextCursor]);
+      setCurrentCursor(nextCursor);
+    }
+  };
+
+  const handlePrevPage = () => {
+    if (cursorHistory.length > 1) {
+      const newHistory = [...cursorHistory];
+      newHistory.pop();
+      setCursorHistory(newHistory);
+      setCurrentCursor(newHistory[newHistory.length - 1]);
+    }
+  };
+
+  const handlePageSizeChange = (newPageSize: number) => {
+    setPageSize(newPageSize);
+    // Reset to first page when page size changes
+    setCurrentCursor(undefined);
+    setCursorHistory([undefined]);
+  };
+
+  // Reset cursor when debounced search query changes
+  useEffect(() => {
+    setCurrentCursor(undefined);
+    setCursorHistory([undefined]);
+  }, [debouncedQuery]);
 
   return (
     <div className="flex flex-col items-center">
-      <div className="mb-4 flex w-full animate-fadeInFromLoading flex-col flex-wrap gap-4 sm:flex-row sm:items-center">
-        <h3>Projects</h3>
-        <div className="flex flex-wrap gap-2 sm:ml-auto sm:flex-nowrap">
-          <div className="hidden gap-1 rounded-md border bg-background-secondary p-1 lg:flex">
-            <Button
-              icon={<GridIcon />}
-              variant="neutral"
-              inline
-              size="xs"
-              className={cn(!showAsList && "bg-background-tertiary")}
-              onClick={() => setShowAsList(false)}
-            />
-            <Button
-              icon={<ListBulletIcon />}
-              variant="neutral"
-              inline
-              size="xs"
-              className={cn(showAsList && "bg-background-tertiary")}
-              onClick={() => setShowAsList(true)}
-            />
-          </div>
-          <TextInput
-            outerClassname="min-w-[13rem] max-w-xs"
-            placeholder="Search projects"
-            value={projectQuery}
-            onChange={(e) => setProjectQuery(e.target.value)}
-            type="search"
-            id="Search projects"
-          />
-          <Button
-            onClick={() => showCreateProjectModal()}
-            variant="neutral"
-            size="sm"
-            icon={<PlusIcon />}
-          >
-            Create Project
-          </Button>
-          {filteredProjects.length > 0 && (
-            <Button
-              href="https://docs.convex.dev/tutorial"
-              size="sm"
-              target="_blank"
-              icon={<RocketIcon />}
-            >
-              Start Tutorial
-            </Button>
-          )}
+      {projects.length === 0 && isLoading && (
+        <div className="my-24 flex flex-col items-center gap-2">
+          <LoadingLogo />
         </div>
-      </div>
-      {projects.length > 0 && filteredProjects.length === 0 && (
-        <div className="my-24 flex flex-col items-center gap-2 text-content-secondary">
+      )}
+      {projects.length === 0 && !isLoading && debouncedQuery.trim() && (
+        <div className="my-24 flex animate-fadeInFromLoading flex-col items-center gap-2 text-content-secondary">
           There are no projects matching your search.
         </div>
       )}
-      {projects.length === 0 && (
-        <div className="mb-24 mt-8 flex w-full animate-fadeInFromLoading flex-col items-center justify-center gap-6">
-          <h3>Welcome to Convex!</h3>
-          <p>Get started by following the tutorial.</p>
-
-          <Button
-            size="lg"
-            href="https://docs.convex.dev/tutorial"
-            target="_blank"
-            className="gap-3 text-base"
-          >
-            <RocketIcon className="h-8 w-8 text-white" />
-            Start Tutorial
-          </Button>
+      {projects.length === 0 && !isLoading && !debouncedQuery.trim() && (
+        <EmptySection
+          header="Welcome to Convex!"
+          sheet={false}
+          body={
+            <>
+              <p className="text-sm">
+                This team doesn't have any projects yet.{" "}
+              </p>
+              <p className="text-sm">Get started by following the tutorial.</p>
+            </>
+          }
+          action={
+            <Button
+              href="https://docs.convex.dev/tutorial"
+              target="_blank"
+              icon={<ExternalLinkIcon />}
+              className="mt-2"
+            >
+              Start Tutorial
+            </Button>
+          }
+        />
+      )}
+      {showAsList ? (
+        projects.length > 0 && (
+          <div className="w-full overflow-hidden rounded-xl bg-background-secondary ring-1 ring-border-transparent">
+            {projects.slice(0, pageSize).map((p: ProjectDetails, i: number) => (
+              <div
+                key={p.id}
+                className={cn(
+                  "first:rounded-t-xl last:rounded-b-xl",
+                  i > 0 && "border-t",
+                )}
+              >
+                <ProjectCard
+                  project={p}
+                  listItem
+                  searchQuery={debouncedQuery}
+                />
+              </div>
+            ))}
+          </div>
+        )
+      ) : (
+        <div className="grid w-full grow grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-3">
+          {projects.slice(0, pageSize).map((p: ProjectDetails) => (
+            <ProjectCard key={p.id} project={p} searchQuery={debouncedQuery} />
+          ))}
         </div>
       )}
-      <div
-        className={cn(
-          "mb-4 grid w-full grow grid-cols-1 gap-4",
-          !showAsList && "lg:grid-cols-2 xl:grid-cols-3",
-        )}
-      >
-        {filteredProjects.map((p: ProjectDetails) => (
-          <ProjectCard key={p.id} project={p} />
-        ))}
-      </div>
-      {createProjectModal}
+
+      {/* Bottom pagination controls */}
+      {projects.length > 0 && (
+        <div className="mt-4 mb-4 flex w-full justify-end">
+          <PaginationControls
+            showPageSize
+            isCursorBasedPagination
+            currentPage={currentPageNumber}
+            hasMore={hasMore}
+            pageSize={pageSize}
+            onPageSizeChange={handlePageSizeChange}
+            onPreviousPage={handlePrevPage}
+            onNextPage={handleNextPage}
+            canGoPrevious={cursorHistory.length > 1}
+            pageSizeOptions={PROJECT_PAGE_SIZES}
+          />
+        </div>
+      )}
     </div>
   );
 }

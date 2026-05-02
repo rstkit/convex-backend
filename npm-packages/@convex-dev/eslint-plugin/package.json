@@ -1,32 +1,42 @@
 {
   "name": "@convex-dev/eslint-plugin",
-  "version": "0.0.1-alpha.4",
+  "version": "2.0.0",
   "license": "Apache-2.0",
   "type": "module",
+  "homepage": "https://docs.convex.dev/eslint",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/get-convex/convex-backend.git",
+    "directory": "npm-packages/@convex-dev/eslint-plugin"
+  },
   "scripts": {
-    "dev": "npm-run-all --parallel dev:db dev:frontend",
-    "dev:db": "convex dev",
-    "dev:frontend": "vite --open --clearScreen false",
     "build": "tshy",
-    "preview": "vite preview",
-    "test": "vitest run",
+    "test": "vitest run && node src/scripts/version-check.mjs",
     "test:types": "tsc --noEmit",
     "test:watch": "vitest",
-    "prepare": "tshy"
+    "prepare": "tshy",
+    "prepublishOnly": "node src/scripts/version-check.mjs",
+    "prepack": "node src/scripts/dont-publish-alpha-as-latest.mjs"
   },
   "dependencies": {
-    "@typescript-eslint/utils": "~8.4.0"
+    "@typescript-eslint/types": "~8.58.0",
+    "@typescript-eslint/utils": "~8.58.0"
+  },
+  "peerDependencies": {
+    "convex": "^1.37.0"
   },
   "devDependencies": {
+    "@eslint/js": "~9.39.0",
     "@types/eslint": "~9.6.1",
     "@types/node": "^18.17.0",
-    "@typescript-eslint/rule-tester": "~8.4.0",
-    "@typescript-eslint/types": "~8.4.0",
-    "eslint": "9.24.0",
-    "eslint-doc-generator": "^1.7.1",
+    "@typescript-eslint/rule-tester": "~8.58.0",
+    "convex": "workspace:*",
+    "eslint": "^9.37.0",
+    "globals": "~17.4.0",
     "tshy": "^3.0.0",
-    "typescript": "^5.7.2",
-    "vitest": "^3.1.4"
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.45.0",
+    "vitest": "^3.2.4"
   },
   "tshy": {
     "dialects": [

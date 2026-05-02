@@ -3,7 +3,7 @@ import { Button } from "@ui/Button";
 import { SelectorItem } from "elements/SelectorItem";
 import { useCurrentTeam } from "api/teams";
 import { useRouter } from "next/router";
-import { Team } from "generatedApi";
+import { TeamResponse } from "generatedApi";
 import { Avatar } from "elements/Avatar";
 
 export function TeamMenuOptions({
@@ -12,18 +12,25 @@ export function TeamMenuOptions({
   team,
   onCreateTeamClick,
 }: {
-  teams?: Team[];
-  team: Team | null;
+  teams?: TeamResponse[];
+  team: TeamResponse | null;
   onCreateTeamClick: () => void;
   close(): void;
 }) {
-  const { pathname } = useRouter();
+  const { pathname, query } = useRouter();
   const currentTeam = useCurrentTeam();
+
+  // When switching teams, only preserve view and sort params
+  const teamSwitchQuery = (slug: string) => ({
+    team: slug,
+    ...(query.view ? { view: query.view } : {}),
+    ...(query.sort ? { sort: query.sort } : {}),
+  });
   return (
     <>
       {teams && (
         <div
-          className="flex w-full grow flex-col items-start gap-0.5 overflow-y-auto p-0.5 scrollbar"
+          className="scrollbar flex w-full grow flex-col items-start gap-0.5 overflow-y-auto p-0.5"
           role="menu"
         >
           {currentTeam && (
@@ -33,7 +40,7 @@ export function TeamMenuOptions({
                 pathname: pathname.startsWith("/t/[team]/settings")
                   ? pathname
                   : "/t/[team]",
-                query: { team: currentTeam.slug },
+                query: teamSwitchQuery(currentTeam.slug),
               }}
               key={currentTeam?.slug}
               active={team?.slug === currentTeam.slug}
@@ -42,7 +49,10 @@ export function TeamMenuOptions({
             >
               {/* Make room for the checkbox on selected items with this width calculation */}
               <div className="flex w-[calc(100%-0.75rem)] items-center gap-2">
-                <Avatar size="small" name={currentTeam.name} />
+                <Avatar
+                  name={currentTeam.name}
+                  hashKey={currentTeam.id.toString()}
+                />
                 <span className="grow truncate">{currentTeam.name}</span>
               </div>
             </SelectorItem>
@@ -57,7 +67,7 @@ export function TeamMenuOptions({
                   pathname: pathname.startsWith("/t/[team]/settings")
                     ? pathname
                     : "/t/[team]",
-                  query: { team: t.slug },
+                  query: teamSwitchQuery(t.slug),
                 }}
                 key={t.slug}
                 active={team?.slug === t.slug}
@@ -65,7 +75,7 @@ export function TeamMenuOptions({
               >
                 {/* Make room for the checkbox on selected items with this width calculation */}
                 <div className="flex w-[calc(100%-0.75rem)] items-center gap-2">
-                  <Avatar size="small" name={t.name} />
+                  <Avatar name={t.name} hashKey={t.id.toString()} />
                   <span className="grow truncate">{t.name}</span>
                 </div>
               </SelectorItem>

@@ -5,6 +5,7 @@ pub mod selection;
 
 use std::collections::BTreeMap;
 
+use selection::Selection;
 use serde::{
     Deserialize,
     Serialize,
@@ -18,10 +19,11 @@ pub struct DocumentDeltasArgs {
     /// the first page. Then pass DocumentDeltasResponse.cursor for
     /// subsequent pages.
     pub cursor: Option<i64>,
-    /// Leave as None to get all tables.
-    pub table_name: Option<String>,
-    /// Component path. Leave as None to get all components.
-    pub component: Option<String>,
+
+    /// The components, tables, and columns to export.
+    #[serde(flatten)]
+    pub selection: SelectionArg,
+
     /// Export format
     pub format: Option<String>,
 }
@@ -71,13 +73,15 @@ pub struct ListSnapshotArgs {
     /// Timestamp snapshot. Initially pass None, then pass
     /// ListSnapshotResponse.snapshot for subsequent pages.
     pub snapshot: Option<i64>,
+
     /// Exclusive internal identifier. Initially pass None, then pass
     /// ListSnapshotResponse.cursor for subsequent pages.
     pub cursor: Option<String>,
-    /// Leave as None to get all tables.
-    pub table_name: Option<String>,
-    /// Component path. Leave as None to get all components.
-    pub component: Option<String>,
+
+    /// The components, tables, and columns to export.
+    #[serde(flatten)]
+    pub selection: SelectionArg,
+
     /// Export format
     pub format: Option<String>,
 }
@@ -122,8 +126,44 @@ pub struct ListSnapshotValue {
     pub fields: BTreeMap<String, JsonValue>,
 }
 
+/// Since [ListSnapshotArgs] and [DocumentDeltasArgs] need to support the older
+/// selection formats, this wraps the newer selection format ([Selection]) while
+/// providing a way to deserialize the older formats.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SelectionArg {
+    /// Newer selection format, allows to select specific tables, components,
+    /// and columns.
+    Exact { selection: Selection },
+
+    /// If only the table name is provided, assumes it’s in the root component.
+    SingleTable {
+        #[serde(alias = "tableName")]
+        table_name: String,
+
+        /// The component path of the table. If not provided, the table is
+        /// assumed to be in the root component.
+        component: Option<String>,
+    },
+
+    /// The user can also provide a component name to export all tables in that
+    /// component.
+    SingleComponent { component: String },
+
+    /// If no selection parameter is provided, return all components, tables and
+    /// columns.
+    Everything {},
+}
+
+impl Default for SelectionArg {
+    fn default() -> Self {
+        SelectionArg::Everything {}
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct GetTableColumnNamesResponse {
     pub by_component: BTreeMap<String, Vec<GetTableColumnNameTable>>,
 }

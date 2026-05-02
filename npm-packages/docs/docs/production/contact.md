@@ -1,6 +1,9 @@
 ---
 title: "Contact Us"
 sidebar_position: 500
+description:
+  "Get support, provide feedback, stay updated with Convex releases, and report
+  security vulnerabilities through our community channels."
 ---
 
 Convex is a rapidly developing platform and we're always eager to hear your
@@ -24,7 +27,7 @@ and the [Convex Discord Community](https://convex.dev/community).
 Product announcements, articles and demos are posted on
 [Stack](https://stack.convex.dev/), [News](https://news.convex.dev/),
 [our YouTube channel](https://www.youtube.com/channel/UCoC_9mdiPwIu1sDxDtGQggQ),
-and [X (fka Twitter)](https://x.com/convex_dev).
+and [X (fka Twitter)](https://x.com/convex).
 
 ## Vulnerability Disclosure
 

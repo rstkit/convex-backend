@@ -1,7 +1,6 @@
 import { PlayIcon } from "@radix-ui/react-icons";
 import { useQuery } from "convex/react";
 import { useContext, useState } from "react";
-import { useSessionStorage } from "react-use";
 import { lt } from "semver";
 import udfs from "@common/udfs";
 import { UdfType } from "system-udfs/convex/_system/frontend/common";
@@ -11,20 +10,17 @@ import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import { useShowGlobalRunner } from "@common/features/functionRunner/lib/functionRunner";
 import { ModuleFunction } from "@common/lib/functions/types";
 import { Loading } from "@ui/Loading";
-import { ProductionEditsConfirmationDialog } from "@common/elements/ProductionEditsConfirmationDialog";
+import { AuthorizeEditsConfirmationDialog } from "@common/elements/AuthorizeEditsConfirmationDialog";
 import { Button } from "@ui/Button";
+import { useEditsAuthorization } from "@common/features/data/lib/useEditsAuthorization";
 
 export function FunctionSummary({
   currentOpenFunction,
 }: {
   currentOpenFunction: ModuleFunction;
 }) {
-  const [prodEditsEnabled, setProdEditsEnabled] = useSessionStorage(
-    "prodEditsEnabled",
-    false,
-  );
-  const [showEnableProdEditsModal, setShowEnableProdEditsModal] =
-    useState(false);
+  const { areEditsAuthorized, authorizeEdits } = useEditsAuthorization();
+  const [showAuthorizeEditsModal, setShowAuthorizeEditsModal] = useState(false);
 
   const npmPackageVersion = useQuery(udfs.getVersion.default);
   const versionTooOld = !!npmPackageVersion && lt(npmPackageVersion, "0.13.0");
@@ -32,16 +28,41 @@ export function FunctionSummary({
   const {
     useCurrentDeployment,
     useHasProjectAdminPermissions,
+    useIsOperationAllowed,
     useIsDeploymentPaused,
   } = useContext(DeploymentInfoContext);
 
   const deployment = useCurrentDeployment();
-  const isProd = deployment?.deploymentType === "prod";
   const hasAdminPermissions = useHasProjectAdminPermissions(
     deployment?.projectId,
   );
+  const isProd = deployment?.deploymentType === "prod";
+  const udfType = currentOpenFunction.udfType;
+  const canRunInternalQueries = useIsOperationAllowed("RunInternalQueries");
+  const canRunInternalMutations = useIsOperationAllowed("RunInternalMutations");
+  const canRunInternalActions = useIsOperationAllowed("RunInternalActions");
+  const canViewData = useIsOperationAllowed("ViewData");
+  const canWriteData = useIsOperationAllowed("WriteData");
+
+  const isInternal = currentOpenFunction.visibility?.kind === "internal";
+  const isInComponent = !!currentOpenFunction.componentPath;
+
+  const canRunOp = (() => {
+    if (isInternal) {
+      return udfType === "Query"
+        ? canRunInternalQueries
+        : udfType === "Mutation"
+          ? canRunInternalMutations
+          : canRunInternalActions;
+    }
+    if (isInComponent) {
+      return udfType === "Query" ? canViewData : canWriteData;
+    }
+    return true;
+  })();
+
   const canRunFunction =
-    currentOpenFunction.udfType === "Query" || !isProd || hasAdminPermissions;
+    (udfType === "Query" || !isProd || hasAdminPermissions) && canRunOp;
 
   const showGlobalRunner = useShowGlobalRunner();
   const showFunctionRunner = () => {
@@ -55,14 +76,14 @@ export function FunctionSummary({
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <div className="flex flex-wrap items-end justify-between gap-2 pb-2">
-        {showEnableProdEditsModal && (
-          <ProductionEditsConfirmationDialog
+        {showAuthorizeEditsModal && (
+          <AuthorizeEditsConfirmationDialog
             onClose={() => {
-              setShowEnableProdEditsModal(false);
+              setShowAuthorizeEditsModal(false);
             }}
             onConfirm={async () => {
-              setProdEditsEnabled(true);
-              setShowEnableProdEditsModal(false);
+              authorizeEdits?.();
+              setShowAuthorizeEditsModal(false);
               showFunctionRunner();
             }}
           />
@@ -71,7 +92,7 @@ export function FunctionSummary({
           <div className="flex flex-wrap items-center gap-x-2">
             <h3 className="font-mono">{currentOpenFunction.name}</h3>
             <div
-              className={`rounded p-1 text-xs font-semibold ${getFunctionTypeStyles(currentOpenFunction.udfType).text} ${getFunctionTypeStyles(currentOpenFunction.udfType).background}`}
+              className={`rounded-sm p-1 text-xs font-semibold ${getFunctionTypeStyles(currentOpenFunction.udfType).text} ${getFunctionTypeStyles(currentOpenFunction.udfType).background}`}
             >
               {currentOpenFunction.visibility.kind === "internal" &&
                 "Internal "}
@@ -93,7 +114,7 @@ export function FunctionSummary({
             <Button
               tip={
                 !canRunFunction ? (
-                  "You do not have permission to run this function in production."
+                  "You do not have permission to run this function in this deployment."
                 ) : isPaused ? (
                   <FunctionRunnerDisabledWhilePaused />
                 ) : (
@@ -107,11 +128,9 @@ export function FunctionSummary({
               }
               disabled={isPaused || versionTooOld || !canRunFunction}
               onClick={() =>
-                !isProd ||
-                prodEditsEnabled ||
-                currentOpenFunction.udfType === "Query"
+                currentOpenFunction.udfType === "Query" || areEditsAuthorized
                   ? showFunctionRunner()
-                  : setShowEnableProdEditsModal(true)
+                  : setShowAuthorizeEditsModal(true)
               }
               icon={<PlayIcon />}
               size="xs"
@@ -143,7 +162,7 @@ export const functionTypeLabel = (udfType: UdfType) => {
       break;
     default:
       // eslint-disable-next-line no-case-declarations, @typescript-eslint/no-unused-vars
-      const _typeCheck: never = udfType;
+      udfType satisfies never;
       text = "Function";
   }
   return text;

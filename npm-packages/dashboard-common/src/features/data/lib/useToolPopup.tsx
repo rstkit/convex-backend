@@ -6,15 +6,17 @@ import udfs from "@common/udfs";
 import { SchemaJson } from "system-udfs/convex/_system/frontend/lib/filters";
 import { useNents } from "@common/lib/useNents";
 import { ConfirmationDialog } from "@ui/ConfirmationDialog";
-import { ProductionEditsConfirmationDialog } from "@common/elements/ProductionEditsConfirmationDialog";
+import { AuthorizeEditsConfirmationDialog } from "@common/elements/AuthorizeEditsConfirmationDialog";
 import { useInvalidateShapes } from "@common/features/data/lib/api";
 import { ClearTableConfirmation } from "@common/features/data/components/DataToolbar/ClearTableConfirmation";
 import { EditDocumentPanel } from "@common/features/data/components/Table/EditDocumentPanel/EditDocumentPanel";
 import { EditFieldsPanel } from "@common/features/data/components/Table/EditDocumentPanel/EditFieldsPanel";
 import { TableMetrics } from "@common/features/data/components/TableMetrics";
-import { TableSchemaAndIndexes } from "@common/features/data/components/TableSchemaAndIndexes";
+import { TableSchemaPanel } from "@common/features/data/components/TableSchemaPanel";
 import { useDefaultDocument } from "@common/features/data/lib/useDefaultDocument";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
+import { useRouter } from "next/router";
+import { TableIndexesPanel } from "../components/TableIndexesPanel";
 
 type PopupType =
   | { type: "addDocuments"; tableName: string }
@@ -24,7 +26,8 @@ type PopupType =
   | { type: "deleteRows"; rowIds: Set<string> }
   | { type: "deleteTable"; tableName: string }
   | { type: "metrics"; tableName: string }
-  | { type: "viewSchema"; tableName: string };
+  | { type: "viewSchema"; tableName: string }
+  | { type: "viewIndexes"; tableName: string };
 
 export type PopupState = ReturnType<typeof useToolPopup>;
 
@@ -39,7 +42,7 @@ export function useToolPopup({
   numRows,
   tableName,
   areEditsAuthorized,
-  onAuthorizeEdits,
+  authorizeEdits,
   activeSchema,
 }: {
   addDocuments: (table: string, documents: GenericDocument[]) => Promise<void>;
@@ -60,13 +63,28 @@ export function useToolPopup({
   numRows?: number;
   tableName: string;
   areEditsAuthorized: boolean;
-  onAuthorizeEdits: (() => void) | undefined;
+  authorizeEdits: (() => void) | undefined;
   activeSchema: SchemaJson | null;
 }) {
   // Popover and menu state.
   const [popup, setPopup] = useState<PopupType>();
 
-  const closePopup = () => setPopup(undefined);
+  const router = useRouter();
+  const closePopup = () => {
+    if (router.query.showIndexes === "true") {
+      const { showIndexes: _, ...restOfQuery } = router.query;
+      router.query.showIndexes = "false";
+      void router.push(
+        {
+          pathname: router.pathname,
+          query: restOfQuery,
+        },
+        undefined,
+        { shallow: true },
+      );
+    }
+    setPopup(undefined);
+  };
 
   const defaultDocument = useDefaultDocument(tableName);
 
@@ -92,10 +110,10 @@ export function useToolPopup({
       break;
     case "editDocument":
       popupEl = !areEditsAuthorized ? (
-        <ProductionEditsConfirmationDialog
+        <AuthorizeEditsConfirmationDialog
           onClose={closePopup}
           onConfirm={async () => {
-            onAuthorizeEdits!();
+            authorizeEdits!();
           }}
         />
       ) : (
@@ -110,10 +128,10 @@ export function useToolPopup({
       break;
     case "bulkEdit":
       popupEl = !areEditsAuthorized ? (
-        <ProductionEditsConfirmationDialog
+        <AuthorizeEditsConfirmationDialog
           onClose={closePopup}
           onConfirm={async () => {
-            onAuthorizeEdits!();
+            authorizeEdits!();
           }}
         />
       ) : (
@@ -171,14 +189,18 @@ export function useToolPopup({
       );
       break;
     case "viewSchema":
+      popupEl = <TableSchemaPanel onClose={closePopup} tableName={tableName} />;
+      break;
+    case "viewIndexes":
       popupEl = (
-        <TableSchemaAndIndexes onClose={closePopup} tableName={tableName} />
+        <TableIndexesPanel onClose={closePopup} tableName={tableName} />
       );
       break;
     case "metrics":
       popupEl = <TableMetrics onClose={closePopup} tableName={tableName} />;
       break;
     default:
+      popup satisfies undefined;
       break;
   }
 
@@ -213,6 +235,7 @@ function EditSingleDocumentPanel({
         if (documents.length !== 1) {
           captureMessage(
             `Unexpected documents array with ${documents.length} elements`,
+            "error",
           );
         }
         const [document] = documents;

@@ -1,10 +1,9 @@
-#![feature(assert_matches)]
 #![feature(never_type)]
-#![feature(let_chains)]
 #![feature(unwrap_infallible)]
 #![feature(iterator_try_collect)]
 #![feature(stmt_expr_attributes)]
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(slice_split_once)]
 #![feature(coroutines)]
 
@@ -30,5 +29,6 @@ pub use crate::executor::{
     Package,
     ResponsePart,
     SourcePackage,
+    ARGS_TOO_LARGE_RESPONSE_MESSAGE,
     EXECUTE_TIMEOUT_RESPONSE_JSON,
 };

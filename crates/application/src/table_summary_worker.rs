@@ -4,12 +4,16 @@ use std::{
 };
 
 use common::{
-    errors::report_error,
+    errors::{
+        lease_lost_error,
+        report_error,
+        LeaseLostError,
+    },
     knobs::{
-        DATABASE_WORKERS_MAX_CHECKPOINT_AGE,
         DATABASE_WORKERS_MIN_COMMITS,
         TABLE_SUMMARY_AGE_JITTER_SECONDS,
         TABLE_SUMMARY_BOOTSTRAP_RECENT_THRESHOLD,
+        TABLE_SUMMARY_MAX_CHECKPOINT_AGE,
     },
     persistence::Persistence,
     runtime::{
@@ -17,6 +21,7 @@ use common::{
         SpawnHandle,
         UnixTimestamp,
     },
+    shutdown::ShutdownSignal,
 };
 use database::{
     table_summary::write_snapshot,
@@ -64,6 +69,7 @@ impl<RT: Runtime> TableSummaryWorker<RT> {
         runtime: RT,
         database: Database<RT>,
         persistence: Arc<dyn Persistence>,
+        lease_lost_shutdown: ShutdownSignal,
     ) -> TableSummaryClient {
         let table_summary_worker = Self {
             runtime: runtime.clone(),
@@ -73,7 +79,7 @@ impl<RT: Runtime> TableSummaryWorker<RT> {
         let (cancel_sender, cancel_receiver) = oneshot::channel();
         let handle = runtime.spawn(
             "table_summary_worker",
-            table_summary_worker.go(cancel_receiver),
+            table_summary_worker.go(cancel_receiver, lease_lost_shutdown),
         );
         let inner = Inner {
             handle,
@@ -89,7 +95,7 @@ impl<RT: Runtime> TableSummaryWorker<RT> {
         last_write_info: &mut Option<LastWriteInfo>,
         has_bootstrapped: &mut bool,
         writer: &TableSummaryWriter<RT>,
-        max_age: Duration,
+        jittered_max_age: &mut Duration,
     ) -> anyhow::Result<()> {
         let _status = log_worker_starting("TableSummaryWorker");
         let commits_since_load = self.database.write_commits_since_load();
@@ -97,7 +103,7 @@ impl<RT: Runtime> TableSummaryWorker<RT> {
         if let Some(last_write_info) = last_write_info
             && *has_bootstrapped
             && commits_since_load - last_write_info.observed_commits < *DATABASE_WORKERS_MIN_COMMITS
-            && now - last_write_info.ts < max_age
+            && now - last_write_info.ts < *jittered_max_age
         {
             return Ok(());
         }
@@ -124,10 +130,19 @@ impl<RT: Runtime> TableSummaryWorker<RT> {
             observed_commits: commits_since_load,
             ts: now,
         });
+        *jittered_max_age = self.jittered_max_age();
         Ok(())
     }
 
-    async fn go(self, cancel_receiver: oneshot::Receiver<()>) {
+    fn jittered_max_age(&self) -> Duration {
+        let max_age_jitter = (*TABLE_SUMMARY_AGE_JITTER_SECONDS)
+            .min(TABLE_SUMMARY_MAX_CHECKPOINT_AGE.as_secs_f32() / 2.0)
+            * self.runtime.rng().random_range(-1.0..=1.0);
+        Duration::try_from_secs_f32(TABLE_SUMMARY_MAX_CHECKPOINT_AGE.as_secs_f32() + max_age_jitter)
+            .unwrap_or_default()
+    }
+
+    async fn go(self, cancel_receiver: oneshot::Receiver<()>, lease_lost_shutdown: ShutdownSignal) {
         tracing::info!("Starting background table summary worker");
         let mut timer = Some(table_summary_bootstrap_timer());
         let cancel_fut = cancel_receiver.fuse();
@@ -142,18 +157,14 @@ impl<RT: Runtime> TableSummaryWorker<RT> {
 
         let mut last_write_info = None;
         let mut has_bootstrapped = false;
-        let max_age_jitter =
-            *TABLE_SUMMARY_AGE_JITTER_SECONDS * self.runtime.rng().random_range(-1.0..=1.0);
-        let jittered_max_age = Duration::from_secs_f32(
-            DATABASE_WORKERS_MAX_CHECKPOINT_AGE.as_secs_f32() + max_age_jitter,
-        );
+        let mut jittered_max_age = self.jittered_max_age();
         loop {
             let result = self
                 .checkpoint_table_summaries(
                     &mut last_write_info,
                     &mut has_bootstrapped,
                     &writer,
-                    jittered_max_age,
+                    &mut jittered_max_age,
                 )
                 .await;
             if timer.is_some() && has_bootstrapped {
@@ -166,6 +177,11 @@ impl<RT: Runtime> TableSummaryWorker<RT> {
             }
             if let Err(mut err) = result {
                 report_error(&mut err).await;
+                if let Some(LeaseLostError) = err.downcast_ref() {
+                    lease_lost_shutdown.signal(
+                        lease_lost_error().context("Failed to write table summary checkpoint"),
+                    );
+                }
             }
             let wait_fut = self.runtime.wait(Duration::from_secs(10)).fuse();
             pin_mut!(wait_fut);

@@ -1,11 +1,13 @@
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
-import { Disclosure } from "@headlessui/react";
+import {
+  Disclosure,
+  DisclosureButton,
+  DisclosurePanel,
+} from "@headlessui/react";
 import {
   CaretDownIcon,
   ChevronDownIcon,
   ChevronUpIcon,
-  ExternalLinkIcon,
-  InfoCircledIcon,
   QuestionMarkCircledIcon,
 } from "@radix-ui/react-icons";
 import { Insight } from "api/insights";
@@ -13,12 +15,13 @@ import { Button } from "@ui/Button";
 import { FunctionNameOption } from "@common/elements/FunctionNameOption";
 import { Loading } from "@ui/Loading";
 import { Tooltip } from "@ui/Tooltip";
+import { HelpTooltip } from "@ui/HelpTooltip";
 import { formatBytes, formatNumberCompact } from "@common/lib/format";
 import { functionIdentifierValue } from "@common/lib/functions/generateFileTree";
 import { ComponentId, useNents } from "@common/lib/useNents";
 import { documentHref } from "@common/lib/utils";
 import { cn } from "@ui/cn";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { useContext } from "react";
 
 // Type definitions to match what's in api/insights.ts
@@ -156,7 +159,7 @@ export function EventsForInsight({ insight }: { insight: Insight }) {
               />
             );
           default: {
-            const _exhaustiveCheck: never = insight;
+            insight satisfies never;
             return null;
           }
         }
@@ -428,8 +431,8 @@ function EventsTable<T, I extends Insight>({
   const { nents } = useNents();
   const nentId = nents?.find((nent) => nent.path === insight.componentPath)?.id;
   return (
-    <div className="flex max-h-full w-full flex-col overflow-y-auto rounded border scrollbar">
-      <div className="sticky top-0 z-20 flex min-w-fit gap-2 border-b bg-background-secondary px-2 pb-1 pt-2 text-xs text-content-secondary">
+    <div className="scrollbar flex max-h-full w-full flex-col overflow-y-auto rounded-sm border">
+      <div className="sticky top-0 z-20 flex min-w-fit gap-2 border-b bg-background-secondary px-2 pt-2 pb-1 text-xs text-content-secondary">
         {columns.map((col) => (
           <div
             key={col.key}
@@ -501,7 +504,7 @@ function EventTimestamp({ event }: { event: { timestamp: string } }) {
             ? event.timestamp
             : `${event.timestamp}Z`;
           return new Date(timestamp).toLocaleString();
-        } catch (e) {
+        } catch {
           // Fallback to more forgiving date parsing
           return new Date(event.timestamp).toLocaleString();
         }
@@ -543,22 +546,22 @@ function EventOccDocumentId({
   event: FormattedOccEvent;
   componentId: ComponentId | undefined;
 }) {
-  const { deploymentsURI } = useContext(DeploymentInfoContext);
+  const { deploymentsURI, captureMessage } = useContext(DeploymentInfoContext);
   return (
     <div className="flex w-[16rem]">
       {event.occDocumentId && insight.details.occTableName ? (
         <Link
-          href={documentHref(
+          href={documentHref({
             deploymentsURI,
-            insight.details.occTableName,
-            event.occDocumentId,
-            componentId || undefined,
-          )}
+            tableName: insight.details.occTableName,
+            id: event.occDocumentId,
+            componentId: componentId ?? null,
+            captureMessage,
+          })}
           target="_blank"
-          className="flex items-center gap-1 text-content-link hover:underline"
+          externalIcon
         >
           {event.occDocumentId}
-          <ExternalLinkIcon className="size-3 shrink-0" />
         </Link>
       ) : (
         <span className="text-content-secondary">Unknown</span>
@@ -587,9 +590,9 @@ function EventOccWriteSource({
         (insight.functionId === event.occWriteSource ? (
           <span className="flex items-center gap-1 text-content-secondary">
             Self{" "}
-            <Tooltip tip="Two calls to the same function resulted in this write conflict.">
-              <InfoCircledIcon />
-            </Tooltip>
+            <HelpTooltip>
+              Two calls to the same function resulted in this write conflict.
+            </HelpTooltip>
           </span>
         ) : (
           <FunctionNameOption
@@ -655,19 +658,20 @@ function EventReadAmount({
               <span className="min-w-[4.25rem]">
                 {format(event.totalCount)}
               </span>
-              <Disclosure.Button
-                as={Button}
-                inline
-                variant="neutral"
-                size="xs"
-                tipSide="right"
-                tip="View breakdown"
-                className="-my-1"
-              >
-                {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
-              </Disclosure.Button>
+              <Tooltip tip="View breakdown" side="right" asChild>
+                <DisclosureButton
+                  as={Button}
+                  inline
+                  variant="neutral"
+                  size="xs"
+                  className="-my-1"
+                  aria-label={open ? "Hide breakdown" : "Show breakdown"}
+                >
+                  {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
+                </DisclosureButton>
+              </Tooltip>
             </div>
-            <Disclosure.Panel>
+            <DisclosurePanel>
               <ul className="mt-2 flex animate-fadeInFromLoading flex-col gap-1">
                 {event.events.map((e, idx) => (
                   <li
@@ -679,7 +683,7 @@ function EventReadAmount({
                   </li>
                 ))}
               </ul>
-            </Disclosure.Panel>
+            </DisclosurePanel>
           </>
         )}
       </Disclosure>

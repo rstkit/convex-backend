@@ -38,7 +38,7 @@ use super::{
         soft_data_limit,
         CursorInterval,
     },
-    DeveloperIndexRangeResponse,
+    IndexRangeResponse,
     QueryStream,
     QueryStreamNext,
 };
@@ -94,7 +94,7 @@ impl SearchQuery {
     ) -> anyhow::Result<SearchResultIterator> {
         let search_version = self.get_cli_gated_search_version();
         let revisions = tx
-            .search(&self.stable_index_name, &self.query, search_version)
+            .text_search(&self.stable_index_name, self.query.clone(), search_version)
             .await?;
         let revisions_in_range = revisions
             .into_iter()
@@ -177,7 +177,7 @@ impl QueryStream for SearchQuery {
         self._next(tx).await.map(QueryStreamNext::Ready)
     }
 
-    fn feed(&mut self, _index_range_response: DeveloperIndexRangeResponse) -> anyhow::Result<()> {
+    fn feed(&mut self, _index_range_response: IndexRangeResponse) -> anyhow::Result<()> {
         anyhow::bail!("cannot feed an index range response into a search query");
     }
 
@@ -234,10 +234,9 @@ impl SearchResultIterator {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "SearchQueryScannedTooManyDocumentsError",
                 format!(
-                    "Search query scanned too many documents (fetched {}). Consider using a \
-                     smaller limit, paginating the query, or using a filter field to limit the \
-                     number of documents pulled from the search index.",
-                    MAX_CANDIDATE_REVISIONS
+                    "Search query scanned too many documents (fetched {MAX_CANDIDATE_REVISIONS}). \
+                     Consider using a smaller limit, paginating the query, or using a filter \
+                     field to limit the number of documents pulled from the search index."
                 )
             ))
         }

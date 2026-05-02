@@ -1,9 +1,5 @@
-// eslint-disable-next-line import/no-relative-packages
-import "../../../dashboard-common/src/styles/globals.css";
-// eslint-disable-next-line import/no-relative-packages
-import "../../../@convex-dev/design-system/src/styles/shared.css";
-// eslint-disable-next-line import/no-relative-packages
-import "../elements/styles/commandPalette.css";
+import "../styles/global.css";
+
 import type { AppProps } from "next/app";
 import { useRouter } from "next/router";
 import React from "react";
@@ -12,12 +8,10 @@ import { SWRConfig } from "swr";
 import { swrConfig } from "hooks/swrConfig";
 import { DashboardLayout } from "layouts/DashboardLayout";
 import { DashboardHeader } from "components/header/DashboardHeader";
-import { UserProvider } from "@auth0/nextjs-auth0/client";
 import { useInitialData } from "hooks/useServerSideData";
 import { useRouterProgress } from "hooks/useRouterProgress";
 import Head from "next/head";
-import { RefreshSession } from "components/login/RefreshSession";
-import { useDashboardVersion } from "hooks/useDashboardVersion";
+
 import { Favicon } from "@common/elements/Favicon";
 import { ThemeConsumer } from "@common/elements/ThemeConsumer";
 import { ToastContainer } from "@common/elements/ToastContainer";
@@ -28,7 +22,6 @@ import { MaybeDeploymentApiProvider } from "providers/MaybeDeploymentApiProvider
 import { PostHogProvider } from "providers/PostHogProvider";
 import { SentryUserProvider } from "providers/SentryUserProvider";
 import {
-  AnonymousLaunchDarklyProvider,
   LaunchDarklyConsumer,
   MaybeLaunchDarklyProvider,
 } from "providers/LaunchDarklyProviders";
@@ -36,6 +29,13 @@ import { CommandPalette } from "elements/CommandPalette";
 import { Fallback } from "pages/500";
 import { UIProvider } from "@ui/UIContext";
 import Link from "next/link";
+import { RefreshSession } from "components/login/RefreshSession";
+import { AuthProvider } from "providers/AuthProvider";
+import { useSSOLoginRequired } from "api/api";
+import { Sheet } from "@ui/Sheet";
+import { Button } from "@ui/Button";
+import { ExitIcon, LockClosedIcon } from "@radix-ui/react-icons";
+import { useDashboardVersion } from "hooks/useDashboardVersion";
 
 declare global {
   interface Window {
@@ -56,7 +56,37 @@ const UNAUTHED_ROUTES = [
 ];
 
 export default function App({ Component, pageProps }: AppProps) {
+  useRouterProgress();
+
+  return (
+    <>
+      <Head>
+        <title>Convex Dashboard</title>
+        <meta name="description" content="Manage your Convex apps" />
+        <Favicon />
+      </Head>
+      <UIProvider Link={Link}>
+        <AuthProvider>
+          <PostHogProvider>
+            <ThemeProvider attribute="class" disableTransitionOnChange>
+              <ThemeConsumer />
+              <MaybeLaunchDarklyProvider>
+                <LaunchDarklyConsumer>
+                  <AppInner Component={Component} pageProps={pageProps} />
+                </LaunchDarklyConsumer>
+              </MaybeLaunchDarklyProvider>
+            </ThemeProvider>
+          </PostHogProvider>
+        </AuthProvider>
+      </UIProvider>
+    </>
+  );
+}
+
+function AppInner({ Component, pageProps }: Omit<AppProps, "router">) {
   const router = useRouter();
+
+  const [ssoLoginRequired] = useSSOLoginRequired();
   const pathWithoutQueryString = router.asPath.split("?")[0].split("#")[0];
 
   const inUnauthedRoute = UNAUTHED_ROUTES.some((r) =>
@@ -70,95 +100,83 @@ export default function App({ Component, pageProps }: AppProps) {
 
   const [initialData] = useInitialData();
 
-  useRouterProgress();
-
   useDashboardVersion();
-
-  // The link identity page is special because we want do want to load its access token via ssr
-  // but we don't want to call any big brain routes because they will fail.
-  if (router.pathname === "/link_identity") {
-    return (
-      <>
-        <Head>
-          <title>Convex Dashboard</title>
-          <meta name="description" content="Manage your Convex apps" />
-        </Head>
-        <UIProvider Link={Link}>
-          <AnonymousLaunchDarklyProvider>
-            <ThemeProvider attribute="class" disableTransitionOnChange>
-              <ThemeConsumer />
-              <UserProvider user={pageProps.user}>
-                <Component {...pageProps} />
-              </UserProvider>
-            </ThemeProvider>
-          </AnonymousLaunchDarklyProvider>
-        </UIProvider>
-      </>
-    );
-  }
 
   return (
     <>
-      <Head>
-        <title>Convex Dashboard</title>
-        <meta name="description" content="Manage your Convex apps" />
-        <Favicon />
-      </Head>
-      <UIProvider Link={Link}>
-        <PostHogProvider>
-          <ThemeProvider attribute="class" disableTransitionOnChange>
-            <ThemeConsumer />
-            <UserProvider user={pageProps.user}>
-              <RefreshSession />
-              <SentryUserProvider>
-                <ErrorBoundary fallback={Fallback}>
-                  <SWRConfig
-                    value={{ ...swrConfig(), fallback: { initialData } }}
-                  >
-                    <ToastContainer />
+      <RefreshSession />
+      <SentryUserProvider>
+        <ErrorBoundary fallback={Fallback}>
+          <SWRConfig
+            value={{
+              ...swrConfig(),
+              fallback: { initialData },
+            }}
+          >
+            <ToastContainer />
 
-                    {inUnauthedRoute ? (
+            {inUnauthedRoute ? (
+              <Component {...pageProps} />
+            ) : (
+              <div className="flex h-screen flex-col">
+                <CommandPalette />
+                <DashboardHeader />
+                {!!ssoLoginRequired &&
+                ssoLoginRequired === router.query.team ? (
+                  <div className="flex h-full w-full items-center justify-center">
+                    <Sheet className="flex max-w-prose flex-col gap-4">
+                      <div className="flex items-center gap-2">
+                        <LockClosedIcon className="size-8" />
+                        <h3>Single Sign-On Login Required</h3>
+                      </div>
+                      <span className="flex flex-col gap-2">
+                        <p>
+                          This team requires you to log in with Single Sign-On
+                          to access it.
+                        </p>
+                        <p>
+                          You may log out and log back in through your Single
+                          Sign-On provider, or switch teams by using the
+                          selector on the top of this page.
+                        </p>
+                      </span>
+                      <Button
+                        className="ml-auto w-fit"
+                        href="/api/auth/logout?returnTo=/api/auth/login"
+                        icon={<ExitIcon />}
+                      >
+                        Log Out
+                      </Button>
+                    </Sheet>
+                  </div>
+                ) : inDeployment ? (
+                  <DeploymentInfoProvider>
+                    <MaybeDeploymentApiProvider>
+                      <CurrentDeploymentDashboardLayout>
+                        <ErrorBoundary
+                          fallback={Fallback}
+                          key={pathWithoutQueryString}
+                        >
+                          <Component {...pageProps} />
+                        </ErrorBoundary>
+                      </CurrentDeploymentDashboardLayout>
+                    </MaybeDeploymentApiProvider>
+                  </DeploymentInfoProvider>
+                ) : (
+                  <DashboardLayout>
+                    <ErrorBoundary
+                      fallback={Fallback}
+                      key={pathWithoutQueryString}
+                    >
                       <Component {...pageProps} />
-                    ) : (
-                      <MaybeLaunchDarklyProvider>
-                        <LaunchDarklyConsumer>
-                          <div className="flex h-screen flex-col">
-                            <CommandPalette />
-                            <DashboardHeader />
-                            {inDeployment ? (
-                              <DeploymentInfoProvider>
-                                <MaybeDeploymentApiProvider>
-                                  <CurrentDeploymentDashboardLayout>
-                                    <ErrorBoundary
-                                      fallback={Fallback}
-                                      key={pathWithoutQueryString}
-                                    >
-                                      <Component {...pageProps} />
-                                    </ErrorBoundary>
-                                  </CurrentDeploymentDashboardLayout>
-                                </MaybeDeploymentApiProvider>
-                              </DeploymentInfoProvider>
-                            ) : (
-                              <DashboardLayout>
-                                <ErrorBoundary
-                                  fallback={Fallback}
-                                  key={pathWithoutQueryString}
-                                >
-                                  <Component {...pageProps} />
-                                </ErrorBoundary>
-                              </DashboardLayout>
-                            )}
-                          </div>
-                        </LaunchDarklyConsumer>
-                      </MaybeLaunchDarklyProvider>
-                    )}
-                  </SWRConfig>
-                </ErrorBoundary>
-              </SentryUserProvider>
-            </UserProvider>
-          </ThemeProvider>
-        </PostHogProvider>
-      </UIProvider>
+                    </ErrorBoundary>
+                  </DashboardLayout>
+                )}
+              </div>
+            )}
+          </SWRConfig>
+        </ErrorBoundary>
+      </SentryUserProvider>
     </>
   );
 }

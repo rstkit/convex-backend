@@ -1,20 +1,17 @@
 import { GenericId, Value } from "convex/values";
 import { GenericDocument } from "convex/server";
 import classNames from "classnames";
-import React, { Fragment, memo, useRef, useState } from "react";
-import { useClickAway, useHoverDirty } from "react-use";
+import React, { memo, useRef, useState } from "react";
+import { useClickAway } from "react-use";
 import { areEqual } from "react-window";
 import { usePopper } from "react-popper";
 import { ColumnInstance } from "react-table";
-import {
-  CheckCircledIcon,
-  DotsVerticalIcon,
-  Link2Icon,
-} from "@radix-ui/react-icons";
-import { Portal, Transition } from "@headlessui/react";
+import { DotsVerticalIcon, Link2Icon } from "@radix-ui/react-icons";
+import { Portal } from "@headlessui/react";
 import { useTableDensity } from "@common/features/data/lib/useTableDensity";
+import { CopiedPopper } from "@common/elements/CopiedPopper";
 
-import { ProductionEditsConfirmationDialog } from "@common/elements/ProductionEditsConfirmationDialog";
+import { AuthorizeEditsConfirmationDialog } from "@common/elements/AuthorizeEditsConfirmationDialog";
 
 import { KeyboardShortcut } from "@ui/KeyboardShortcut";
 import { DataDetail } from "@common/features/data/components/Table/DataCell/DataDetail";
@@ -49,7 +46,7 @@ export type DataCellProps = {
   column: ColumnInstance<GenericDocument>;
   editDocument: () => void;
   areEditsAuthorized: boolean;
-  onAuthorizeEdits?: () => void;
+  authorizeEdits?: () => void;
   rowId: GenericId<string>;
   didRowChange: boolean;
   width?: string;
@@ -68,7 +65,7 @@ export const DataCell = memo(DataCellImpl, areEqual);
 function DataCellImpl({
   value,
   column,
-  onAuthorizeEdits,
+  authorizeEdits,
   areEditsAuthorized,
   width,
   rowId,
@@ -90,15 +87,14 @@ function DataCellImpl({
   // Derive all the information needed to render the cell
   const columnName = column.Header as string;
   const stringValue = typeof value === "string" ? value : stringifyValue(value);
-  const isHoveringCell = useHoverDirty(cellRef);
+  const [isHoveringCell, setIsHoveringCell] = useState(false);
   const [isFocused, setIsFocused] = useState(false);
   const isSystemField = columnName?.startsWith("_");
   const isEditable = !isSystemField && canManageTable;
   const isDateField = columnName === "_creationTime";
 
   // State for showing various modals and popovers
-  const [showEnableProdEditsModal, setShowEnableProdEditsModal] =
-    useState(false);
+  const [showAuthorizeEditsModal, setShowAuthorizeEditsModal] = useState(false);
   const [showEditor, setShowEditor] = useState(false);
   const [pastedValue, setPastedValue] = useState<Value>();
   const [showDetail, setShowDetail] = useState(false);
@@ -126,11 +122,11 @@ function DataCellImpl({
     value,
     document,
     areEditsAuthorized,
-    onAuthorizeEdits,
+    authorizeEdits,
     canManageTable,
     setPastedValue,
     setShowEditor,
-    setShowEnableProdEditsModal,
+    setShowAuthorizeEditsModal,
     setShowDetail,
     setShowDocumentDetail,
     editDocument,
@@ -145,11 +141,12 @@ function DataCellImpl({
     editDocCb: editDocument,
     goToDocCb: goToDoc,
     openContextMenu: () => {
-      cellRef.current &&
+      if (cellRef.current) {
         contextMenuCallback({
           x: cellRef.current!.getBoundingClientRect().right,
           y: cellRef.current!.getBoundingClientRect().top,
         });
+      }
     },
   });
 
@@ -168,19 +165,6 @@ function DataCellImpl({
   // Controls the copied value popper that shows up when a value is copied
   const [copiedPopperElement, setCopiedPopperElement] =
     useState<HTMLDivElement | null>(null);
-  const { styles, attributes } = usePopper(
-    cellRef.current,
-    copiedPopperElement,
-    {
-      placement: "bottom-start",
-      modifiers: [
-        {
-          name: "offset",
-          options: { offset: [densityValues.paddingX - 4, 4] },
-        },
-      ],
-    },
-  );
 
   // Controls the editor popper -- the popper that shows the ObjectEditor for the cell
   const [editorPopper, setEditorPopper] = useState<HTMLDivElement | null>(null);
@@ -218,6 +202,8 @@ function DataCellImpl({
         }}
         className="relative flex h-full w-full items-center hover:bg-background-tertiary/75"
         style={{ width }}
+        onMouseEnter={() => setIsHoveringCell(true)}
+        onMouseLeave={() => setIsHoveringCell(false)}
       >
         {/* We do not use Button here because it's expensive and this table needs to be fast */}
         {/* eslint-disable-next-line react/forbid-elements */}
@@ -229,7 +215,7 @@ function DataCellImpl({
             // from overlapping other cells
             didValueJustChange && "animate-highlight border-r",
             "font-mono text-xs text-content-primary",
-            "w-full h-full flex items-center focus:outline-none",
+            "w-full h-full flex items-center focus:outline-hidden",
             "focus:ring-1 focus:ring-border-selected text-left",
             isContextMenuOpen && "ring-1 ring-border-selected",
             !isEditable && "cursor-default",
@@ -251,7 +237,7 @@ function DataCellImpl({
               contentClassName="bg-background-secondary animate-fadeInFromLoading"
               maxWidthClassName="max-w-[22rem]"
               delayDuration={250}
-              wrapsButton
+              asChild
             >
               <Link2Icon className="mr-2 flex-none text-content-secondary" />
             </Tooltip>
@@ -270,7 +256,7 @@ function DataCellImpl({
           {!column.disableResizing && (
             <div
               {...column.getResizerProps()}
-              className="absolute right-0 top-0 inline-block h-full"
+              className="absolute top-0 right-0 inline-block h-full"
               style={{
                 // @ts-expect-error bad typing in react-table
                 ...column.getResizerProps().style,
@@ -293,7 +279,7 @@ function DataCellImpl({
             }
             className={cn(
               buttonClasses({ size: "xs", variant: "neutral" }),
-              "absolute z-20 shadow-sm",
+              "absolute z-20 shadow-xs hover:bg-background-tertiary",
               isFocused && "focused",
               "animate-none",
             )}
@@ -322,7 +308,7 @@ function DataCellImpl({
             <div className="flex items-center gap-1" data-testid="cell-detail">
               Viewing
               <span className="mr-2 font-mono">{columnName}</span>
-              <span className="rounded border p-1 font-mono text-xs">
+              <span className="rounded-sm border p-1 font-mono text-xs">
                 Document: {rowId}
               </span>
             </div>
@@ -340,7 +326,7 @@ function DataCellImpl({
               data-testid="cell-detail-document"
             >
               Viewing
-              <span className="rounded border p-1 font-mono text-xs">
+              <span className="rounded-sm border p-1 font-mono text-xs">
                 Document: {rowId}
               </span>
             </div>
@@ -382,51 +368,40 @@ function DataCellImpl({
               defaultValue={pastedValue}
               value={value}
               onSave={async (v) => {
-                v !== undefined &&
-                  (await patchDocument(tableName, rowId, columnName, v));
+                if (v !== undefined) {
+                  await patchDocument(tableName, rowId, columnName, v);
+                }
               }}
             />
           </div>
         </Portal>
       )}
       {/* Show confirmation dialog in production */}
-      {showEnableProdEditsModal && (
-        <ProductionEditsConfirmationDialog
+      {showAuthorizeEditsModal && (
+        <AuthorizeEditsConfirmationDialog
           onClose={() => {
-            setShowEnableProdEditsModal(false);
+            setShowAuthorizeEditsModal(false);
           }}
           onConfirm={async () => {
-            onAuthorizeEdits && onAuthorizeEdits();
-            setShowEnableProdEditsModal(false);
+            authorizeEdits?.();
+            setShowAuthorizeEditsModal(false);
             setShowEditor(true);
           }}
         />
       )}
       {/* Show the popper when a value is copied */}
-      <Transition
+      <CopiedPopper
+        referenceElement={cellRef.current}
+        copiedPopperElement={copiedPopperElement}
+        setCopiedPopperElement={setCopiedPopperElement}
         show={didJustCopy !== null}
-        as={Fragment}
-        enter="transition-opacity ease-in-out duration-200"
-        enterFrom="opacity-0"
-        enterTo="opacity-100"
-        leave="transition-opacity ease-in-out duration-200"
-        leaveFrom="opacity-100"
-        leaveTo="opacity-0"
-      >
-        <div
-          ref={setCopiedPopperElement}
-          style={styles.popper}
-          className="z-50 flex items-center gap-1 rounded border bg-background-tertiary p-1 text-xs"
-          data-testid="copied-popper"
-          {...attributes.popper}
-        >
-          <CheckCircledIcon />
-          Copied{" "}
-          {didJustCopy && (
-            <code>{didJustCopy === "value" ? columnName : "document"}</code>
-          )}
-        </div>
-      </Transition>
+        message={
+          didJustCopy
+            ? `Copied ${didJustCopy === "value" ? columnName : "document"}`
+            : "Copied"
+        }
+        offset={[densityValues.paddingX - 4, 4]}
+      />
     </>
   );
 }

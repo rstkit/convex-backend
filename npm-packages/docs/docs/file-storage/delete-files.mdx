@@ -2,6 +2,7 @@
 title: "Deleting Files"
 sidebar_label: "Delete"
 sidebar_position: 4
+description: "Delete files stored in Convex"
 ---
 
 import DeleteImage from "!!raw-loader!@site/../private-demos/snippets/convex/deletingFiles.ts";
@@ -17,9 +18,8 @@ Storage IDs correspond to documents in the `"_storage"` system table (see
 [Metadata](/file-storage/file-metadata.mdx)), so they can be validated using the
 `v.id("_storage")`.
 
-<TSAndJSSnippet
+<Snippet
   title="convex/images.ts"
-  sourceTS={DeleteImage}
-  sourceJS={DeleteImage}
+  source={DeleteImage}
   highlightPatterns={["delete\\("]}
 />

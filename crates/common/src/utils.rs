@@ -5,6 +5,7 @@ use std::{
     sync::LazyLock,
 };
 
+use rand;
 use regex::Regex;
 pub use value::utils::{
     display_map,
@@ -33,20 +34,31 @@ static NAME_NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*) \((\
 
 /// "Increment" a string.
 /// E.g. `Foo` becomes `Foo (1)`, and `Foo (1)` becomes `Foo (2)`.
+/// If amt is None, uses 8 random hex characters instead.
 /// Useful for strings (team names, device names) remain unique.
-pub fn increment_name(name: &str, amt: u64) -> String {
-    if let Some(number) = NAME_NUMBER_RE
-        .captures(name)
-        .and_then(|c| c.get(2))
-        .and_then(|m| m.as_str().parse::<u64>().ok())
-    {
-        NAME_NUMBER_RE
-            .replace(name, |caps: &regex::Captures| {
-                format!("{} ({})", &caps[1], number + amt)
-            })
-            .into()
-    } else {
-        format!("{name} ({amt})")
+pub fn increment_name(name: &str, amt: Option<u64>) -> String {
+    match amt {
+        Some(amt) => {
+            if let Some(number) = NAME_NUMBER_RE
+                .captures(name)
+                .and_then(|c| c.get(2))
+                .and_then(|m| m.as_str().parse::<u64>().ok())
+            {
+                NAME_NUMBER_RE
+                    .replace(name, |caps: &regex::Captures| {
+                        format!("{} ({})", &caps[1], number + amt)
+                    })
+                    .into()
+            } else {
+                format!("{name} ({amt})")
+            }
+        },
+        None => {
+            let hex_suffix: String = (0..8)
+                .map(|_| format!("{:x}", rand::random::<u8>() % 16))
+                .collect();
+            format!("{name} ({hex_suffix})")
+        },
     }
 }
 
@@ -57,24 +69,7 @@ pub fn ensure_utc() -> anyhow::Result<()> {
     {
         anyhow::bail!("TZ is set, but Convex requires UTC. Unset TZ to continue.")
     }
-    std::env::set_var("TZ", "UTC");
+    unsafe { std::env::set_var("TZ", "UTC") };
 
     Ok(())
-}
-
-#[test]
-fn test_increment_name() {
-    let cases = [
-        ("Foo", "Foo (1)"),
-        ("Foo (1)", "Foo (2)"),
-        ("Foo's (1) Bar (1001)", "Foo's (1) Bar (1002)"),
-        ("Foo (1", "Foo (1 (1)"),
-        ("Foo (a)", "Foo (a) (1)"),
-    ];
-    for (test, expected) in cases {
-        assert_eq!(increment_name(test, 1), expected);
-    }
-
-    assert_eq!(increment_name("Foo", 50), "Foo (50)");
-    assert_eq!(increment_name("Foo (20)", 50), "Foo (70)");
 }

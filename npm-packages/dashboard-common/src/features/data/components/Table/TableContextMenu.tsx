@@ -2,9 +2,11 @@ import {
   ClipboardCopyIcon,
   EnterFullScreenIcon,
   ExternalLinkIcon,
+  FileIcon,
   MixerHorizontalIcon,
   Pencil1Icon,
   ResetIcon,
+  StopwatchIcon,
   TrashIcon,
 } from "@radix-ui/react-icons";
 import React, { useCallback, useContext, useState } from "react";
@@ -63,12 +65,12 @@ export type TableContextMenuProps = {
   state: TableContextMenuState | null;
   close: () => void;
   deleteRows: (rowIds: Set<string>) => Promise<void>;
-  isProd: boolean;
   setPopup: PopupState["setPopup"];
   onAddDraftFilter: (newFilter: Filter) => void;
   defaultDocument: GenericDocument;
   resetColumns: () => void;
   canManageTable: boolean;
+  isProtectedDeployment: boolean;
 };
 
 export function TableContextMenu({
@@ -76,12 +78,12 @@ export function TableContextMenu({
   state,
   close,
   deleteRows,
-  isProd,
   setPopup,
   onAddDraftFilter,
   defaultDocument,
   resetColumns,
   canManageTable,
+  isProtectedDeployment,
 }: TableContextMenuProps) {
   const { selectedNent } = useNents();
   const isInUnmountedComponent = !!(
@@ -115,7 +117,10 @@ export function TableContextMenu({
         const selectedRowId = state.selectedCell?.rowId;
         const document = data.find((row) => row._id === selectedRowId);
         if (!document) {
-          captureMessage("Can’t find the right-clicked document in data");
+          captureMessage(
+            "Can’t find the right-clicked document in data",
+            "error",
+          );
           return;
         }
       }
@@ -161,7 +166,6 @@ export function TableContextMenu({
           {/* actions you can take on a specific document */}
           <DocumentActions
             state={state}
-            isProd={isProd}
             setPopup={setPopup}
             deleteRows={deleteRows}
             disableEditDoc={disableEditDoc}
@@ -170,6 +174,7 @@ export function TableContextMenu({
             editDocCb={editDocCb}
             viewDocCb={viewDocCb}
             copyDocCb={copyDocCb}
+            isProtectedDeployment={isProtectedDeployment}
           />
 
           {/* actions you can take on the header */}
@@ -301,15 +306,33 @@ function CellActions({
     )
   );
 
+  const isFileRef =
+    state.selectedCell?.callbacks?.docRefLink?.pathname?.endsWith("/files");
+  const isScheduledFunctionRef =
+    state.selectedCell?.callbacks?.docRefLink?.pathname?.endsWith(
+      "/schedules/functions",
+    );
+
   const cellActions =
     state.selectedCell?.rowId && state.selectedCell.callbacks
       ? [
           state.selectedCell.callbacks.docRefLink !== undefined
             ? {
-                action: state.selectedCell.callbacks.docRefLink as UrlObject,
+                action: state.selectedCell.callbacks
+                  .docRefLink satisfies UrlObject,
                 shortcut: ["CtrlOrCmd", "G"] satisfies Key[],
-                icon: <ExternalLinkIcon aria-hidden="true" />,
-                label: "Go to reference",
+                icon: isFileRef ? (
+                  <FileIcon aria-hidden="true" />
+                ) : isScheduledFunctionRef ? (
+                  <StopwatchIcon aria-hidden="true" />
+                ) : (
+                  <ExternalLinkIcon aria-hidden="true" />
+                ),
+                label: isFileRef
+                  ? "Go to File"
+                  : isScheduledFunctionRef
+                    ? "Go to Scheduled Functions"
+                    : "Go to Reference",
                 disabled: false,
                 tip: null,
               }
@@ -350,7 +373,7 @@ function CellActions({
             tip: isInUnmountedComponent
               ? "Cannot edit documents in an unmounted component."
               : !canManageTable
-                ? "You do not have permission to edit data in production."
+                ? "You do not have permission to edit data in this deployment."
                 : null,
           },
         ]
@@ -386,7 +409,7 @@ function FilterWithSubmenu({
 }) {
   const { captureMessage } = useContext(DeploymentInfoContext);
   if (!state.selectedCell) {
-    captureMessage("No selected cell in FilterWithSubmenu");
+    captureMessage("No selected cell in FilterWithSubmenu", "error");
     return null;
   }
   return (
@@ -453,7 +476,7 @@ function FilterWithSubmenu({
                 addDraftFilter({
                   id: Math.random().toString(),
                   field: state.selectedCell?.column,
-                  op: "eq",
+                  op: operator,
                   value:
                     selectedValue === undefined
                       ? undefined
@@ -470,7 +493,6 @@ function FilterWithSubmenu({
 
 function DocumentActions({
   state,
-  isProd,
   setPopup,
   deleteRows,
   disableEditDoc,
@@ -479,9 +501,9 @@ function DocumentActions({
   editDocCb,
   viewDocCb,
   copyDocCb,
+  isProtectedDeployment,
 }: {
   state: TableContextMenuState;
-  isProd: boolean;
   setPopup: PopupState["setPopup"];
   deleteRows: (rowIds: Set<string>) => Promise<void>;
   disableEditDoc: boolean;
@@ -490,6 +512,7 @@ function DocumentActions({
   editDocCb: () => void;
   viewDocCb: () => void;
   copyDocCb: () => void;
+  isProtectedDeployment: boolean;
 }) {
   if (!state?.selectedCell?.callbacks || !state?.selectedCell.callbacks)
     return null;
@@ -515,7 +538,7 @@ function DocumentActions({
       tip: isInUnmountedComponent
         ? "Cannot edit documents in an unmounted component."
         : !canManageTable &&
-          "You do not have permission to edit data in production.",
+          "You do not have permission to edit data in this deployment.",
       tipSide: "right",
       action: editDocCb,
     },
@@ -526,12 +549,12 @@ function DocumentActions({
       tip: isInUnmountedComponent
         ? "Cannot delete documents in an unmounted component."
         : !canManageTable &&
-          "You do not have permission to edit data in production.",
+          "You do not have permission to edit data in this deployment.",
       tipSide: "right",
       danger: true,
       action: () => {
         if (!state.selectedCell?.rowId) return;
-        if (isProd) {
+        if (isProtectedDeployment) {
           setPopup({
             type: "deleteRows",
             rowIds: new Set([state.selectedCell.rowId]),

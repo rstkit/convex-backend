@@ -1,34 +1,8 @@
 [package]
 name = "big_brain_private_api_types"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
-
-[lib]
-doctest = false
-
-[dependencies]
-anyhow = { workspace = true }
-common = { path = "../../crates/common" }
-derive_more = { workspace = true }
-enum-iterator = { workspace = true }
-keybroker = { path = "../../crates/keybroker" }
-proptest = { workspace = true, optional = true }
-proptest-derive = { workspace = true, optional = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-strum = { workspace = true }
-tuple_struct = { path = "../../crates/tuple_struct" }
-utoipa = { workspace = true }
-
-[dev-dependencies]
-common = { path = "../../crates/common", features = ["testing"] }
-keybroker = { path = "../../crates/keybroker", features = ["testing"] }
-proptest = { workspace = true }
-proptest-derive = { workspace = true }
-
-[features]
-testing = ["common/testing", "keybroker/testing", "proptest", "proptest-derive"]
 
 [package.metadata.cargo-machete]
 ignored = [
@@ -37,8 +11,32 @@ ignored = [
     "proptest_derive",
     # Used in macros
     "derive_more",
-    "serde_json",
 ]
+
+[lib]
+doctest = false
+
+[features]
+testing = ["common/testing", "keybroker/testing", "proptest", "proptest-derive"]
+
+[dependencies]
+anyhow = { workspace = true }
+common = { workspace = true }
+derive_more = { workspace = true }
+keybroker = { workspace = true }
+proptest = { workspace = true, optional = true }
+proptest-derive = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+tuple_struct = { workspace = true }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+common = { workspace = true, features = ["testing"] }
+keybroker = { workspace = true, features = ["testing"] }
+proptest = { workspace = true }
+proptest-derive = { workspace = true }
 
 [lints]
 workspace = true

@@ -6,7 +6,7 @@ import { useCopy } from "@common/lib/useCopy";
 import { CopyIcon } from "@radix-ui/react-icons";
 import { useFormik } from "formik";
 import { useUpdateProject } from "api/projects";
-import { ProjectDetails, Team } from "generatedApi";
+import { ProjectDetails, TeamResponse } from "generatedApi";
 import * as Yup from "yup";
 
 const TeamSchema = Yup.object().shape({
@@ -29,7 +29,7 @@ export function ProjectForm({
   team,
   hasAdminPermissions,
 }: {
-  team: Team;
+  team: TeamResponse;
   project: ProjectDetails;
   hasAdminPermissions: boolean;
 }) {
@@ -90,6 +90,7 @@ export function ProjectForm({
                 label="Project Slug"
                 outerClassname="max-w-[20rem]"
                 placeholder="Enter a slug for your project"
+                description="Changing the project slug will require you to update any deploy keys currently in use."
                 onChange={formState.handleChange}
                 value={formState.values.slug}
                 Icon={CopyIcon}

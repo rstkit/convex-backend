@@ -1,8 +1,5 @@
 use std::{
-    collections::{
-        BTreeMap,
-        HashSet,
-    },
+    collections::HashSet,
     sync::Arc,
     time::Duration,
 };
@@ -24,6 +21,8 @@ use common::{
     execution_context::{
         ExecutionContext,
         ExecutionId,
+        RequestContext,
+        RequestMetadata,
     },
     fastrace_helpers::get_sampled_span,
     identity::InertIdentity,
@@ -32,6 +31,7 @@ use common::{
         UDF_EXECUTOR_OCC_MAX_RETRIES,
     },
     log_lines::LogLines,
+    pause::Fault,
     runtime::Runtime,
     types::{
         FunctionCaller,
@@ -92,6 +92,7 @@ mod metrics;
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
+pub(crate) const CRON_COMITTING: &str = "cron_committing";
 
 // Truncate result and log lines for cron job logs since they are only
 // used for the dashboard
@@ -102,7 +103,6 @@ const CRON_LOG_MAX_LOG_LINE_LENGTH: usize = 1000;
 // refactored later.
 pub struct CronJobExecutor<RT: Runtime> {
     context: CronJobContext<RT>,
-    instance_name: String,
     running_job_ids: HashSet<ResolvedDocumentId>,
     /// Some if there's at least one pending job. May be in the past!
     next_job_ready_time: Option<Timestamp>,
@@ -113,6 +113,7 @@ pub struct CronJobExecutor<RT: Runtime> {
 #[derive(Clone)]
 pub struct CronJobContext<RT: Runtime> {
     rt: RT,
+    instance_name: String,
     database: Database<RT>,
     runner: Arc<ApplicationFunctionRunner<RT>>,
     function_log: FunctionExecutionLog<RT>,
@@ -131,11 +132,11 @@ impl<RT: Runtime> CronJobExecutor<RT> {
         let mut executor = Self {
             context: CronJobContext {
                 rt,
+                instance_name,
                 database,
                 runner,
                 function_log,
             },
-            instance_name,
             running_job_ids: HashSet::new(),
             next_job_ready_time: None,
             job_finished_tx,
@@ -190,7 +191,10 @@ impl<RT: Runtime> CronJobExecutor<RT> {
         };
 
         let token = tx.into_token()?;
-        let subscription = self.context.database.subscribe(token).await?;
+        let subscription_fut = self
+            .context
+            .database
+            .subscribe_and_wait_for_invalidation(token);
         select_biased! {
             job_id = self.job_finished_rx.recv().fuse() => {
                 if let Some(job_id) = job_id {
@@ -201,7 +205,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
             },
             _ = next_job_future.fuse() => {
             }
-            _ = subscription.wait_for_invalidation().fuse() => {
+            _ = subscription_fut.fuse() => {
             },
         }
         Ok(())
@@ -226,12 +230,6 @@ impl<RT: Runtime> CronJobExecutor<RT> {
             if next_ts > now || self.running_job_ids.len() == *SCHEDULED_JOB_EXECUTION_PARALLELISM {
                 return Ok(Some(next_ts));
             }
-            let root = get_sampled_span(
-                &self.instance_name,
-                "crons/execute_job",
-                &mut self.context.rt.rng(),
-                BTreeMap::new(),
-            );
             let sentry_hub = sentry::Hub::with(|hub| sentry::Hub::new_from_top(hub));
             let context = self.context.clone();
             let tx = self.job_finished_tx.clone();
@@ -248,7 +246,6 @@ impl<RT: Runtime> CronJobExecutor<RT> {
                         },
                     }
                 }
-                .in_span(root)
                 .bind_hub(sentry_hub),
             );
             self.running_job_ids.insert(job_id);
@@ -258,28 +255,28 @@ impl<RT: Runtime> CronJobExecutor<RT> {
 }
 
 impl<RT: Runtime> CronJobContext<RT> {
-    #[cfg(any(test, feature = "testing"))]
-    pub fn new(
-        rt: RT,
-        database: Database<RT>,
-        runner: Arc<ApplicationFunctionRunner<RT>>,
-        function_log: FunctionExecutionLog<RT>,
-    ) -> Self {
-        Self {
-            rt,
-            database,
-            runner,
-            function_log,
-        }
-    }
-
     // This handles re-running the cron job on transient errors. It
     // guarantees that the job was successfully run or the job state changed.
     pub async fn execute_job(&self, job: CronJob) -> ResolvedDocumentId {
         let mut function_backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
         loop {
             let mutation_retry_count = function_backoff.failures() as usize;
-            let result = self.run_function(job.clone(), mutation_retry_count).await;
+            let root = get_sampled_span(
+                &self.instance_name,
+                "crons/run_function",
+                &mut self.rt.rng(),
+            )
+            .with_properties(|| {
+                [
+                    ("job_id", job.id.to_string()),
+                    ("component", format!("{:?}", job.component)),
+                    ("job_name", job.name.to_string()),
+                ]
+            });
+            let result = self
+                .run_function(job.clone(), mutation_retry_count)
+                .in_span(root)
+                .await;
             match result {
                 Ok(result) => {
                     metrics::log_cron_job_success(function_backoff.failures());
@@ -287,7 +284,12 @@ impl<RT: Runtime> CronJobContext<RT> {
                 },
                 Err(mut e) => {
                     let delay = function_backoff.fail(&mut self.rt.rng());
-                    tracing::error!("System error executing job:, sleeping {delay:?}");
+                    tracing::error!(
+                        "System error executing job {} in {:?}: {}, sleeping {delay:?}",
+                        job.id,
+                        job.component,
+                        job.name
+                    );
                     report_error(&mut e).await;
                     metrics::log_cron_job_failure(&e);
                     self.rt.wait(delay).await;
@@ -349,15 +351,15 @@ impl<RT: Runtime> CronJobContext<RT> {
         Ok(job_id)
     }
 
-    fn truncate_result(&self, result: JsonPackedValue) -> CronJobResult {
-        let value = result.unpack();
+    fn truncate_result(&self, result: JsonPackedValue) -> anyhow::Result<CronJobResult> {
+        let value = result.unpack()?;
         let mut value_str = value.to_string();
         if value_str.len() <= CRON_LOG_MAX_RESULT_LENGTH {
-            CronJobResult::Default(value)
+            Ok(CronJobResult::Default(value))
         } else {
             value_str =
                 value_str[..value_str.floor_char_boundary(CRON_LOG_MAX_RESULT_LENGTH)].to_string();
-            CronJobResult::Truncated(value_str)
+            Ok(CronJobResult::Truncated(value_str))
         }
     }
 
@@ -410,12 +412,19 @@ impl<RT: Runtime> CronJobContext<RT> {
         let caller = FunctionCaller::Cron;
         let (component, component_path) = self.get_job_component(&mut tx, job.id).await?;
         let request_id = RequestId::new();
-        let context = ExecutionContext::new(request_id, &caller);
+        let context =
+            ExecutionContext::new(RequestContext::new_for_system_request(request_id), &caller);
         sentry::configure_scope(|scope| context.add_sentry_tags(scope));
         let path = CanonicalizedComponentFunctionPath {
             component: component_path,
             udf_path: job.cron_spec.udf_path.clone(),
         };
+        // Hacks: Clean up old logs *before* running the mutation to avoid a
+        // system error if the user mutation leaves the transaction's read set
+        // at exactly the max size
+        CronModel::new(&mut tx, component)
+            .prepare_insert_cron_job_log(&job)
+            .await?;
         let mutation_result = self
             .runner
             .run_mutation_no_udf_log(
@@ -430,19 +439,36 @@ impl<RT: Runtime> CronJobContext<RT> {
         let (mut tx, mut outcome) = match mutation_result {
             Ok(r) => r,
             Err(e) => {
-                self.function_log
-                    .log_mutation_system_error(
-                        &e,
-                        path,
-                        job.cron_spec.udf_args.clone(),
-                        identity,
-                        start,
-                        caller,
-                        context,
-                        None,
-                        mutation_retry_count,
-                    )
-                    .await?;
+                if e.short_msg() == "TooManyWrites" {
+                    self.function_log
+                        .log_mutation_write_throughput_error(
+                            &e,
+                            path,
+                            job.cron_spec.udf_args.clone(),
+                            identity,
+                            start,
+                            caller,
+                            context,
+                            None,
+                            mutation_retry_count,
+                            true,
+                        )
+                        .await?;
+                } else {
+                    self.function_log
+                        .log_mutation_system_error(
+                            &e,
+                            path,
+                            job.cron_spec.udf_args.clone(),
+                            identity,
+                            start,
+                            caller,
+                            context,
+                            None,
+                            mutation_retry_count,
+                        )
+                        .await?;
+                }
                 return Err(e);
             },
         };
@@ -451,12 +477,10 @@ impl<RT: Runtime> CronJobContext<RT> {
         let execution_time_f64 = execution_time.as_secs_f64();
         let truncated_log_lines = self.truncate_log_lines(outcome.log_lines.clone());
 
-        let mut model = CronModel::new(&mut tx, component);
-
         if let Ok(ref result) = outcome.result {
-            let truncated_result = self.truncate_result(result.clone());
+            let truncated_result = self.truncate_result(result.clone())?;
             let status = CronJobStatus::Success(truncated_result);
-            model
+            CronModel::new(&mut tx, component)
                 .insert_cron_job_log(
                     &job,
                     status,
@@ -473,13 +497,34 @@ impl<RT: Runtime> CronJobContext<RT> {
                 Some(mutation_retry_count),
             )
             .await?;
-            if let Err(err) = self
-                .database
-                .commit_with_write_source(tx, "cron_commit_mutation")
-                .await
-            {
+            let commit_result =
+                if let Fault::Error(e) = self.rt.pause_client().wait(CRON_COMITTING).await {
+                    tracing::info!("Injected error before committing mutation");
+                    Err(e)
+                } else {
+                    self.database
+                        .commit_with_write_source(tx, "cron_commit_mutation")
+                        .await
+                };
+            if let Err(err) = commit_result {
                 if err.is_deterministic_user_error() {
                     outcome.result = Err(JsError::from_error(err));
+                } else if let Some(occ_info) = err.occ_info() {
+                    self.function_log
+                        .log_mutation_occ_error(
+                            outcome,
+                            stats,
+                            execution_time,
+                            caller,
+                            usage_tracker,
+                            context,
+                            occ_info,
+                            None,
+                            mutation_retry_count,
+                            true,
+                        )
+                        .await;
+                    return Err(err);
                 } else {
                     return Err(err);
                 }
@@ -550,14 +595,17 @@ impl<RT: Runtime> CronJobContext<RT> {
             CronJobState::Pending => {
                 // Create a new request & execution ID
                 let request_id = RequestId::new();
-                let context = ExecutionContext::new(request_id, &caller);
+                let context = ExecutionContext::new(
+                    RequestContext::new_for_system_request(request_id),
+                    &caller,
+                );
                 sentry::configure_scope(|scope| context.add_sentry_tags(scope));
 
                 // Set state to in progress
                 let mut updated_job = job.clone();
                 updated_job.state = CronJobState::InProgress {
                     request_id: Some(context.request_id.clone()),
-                    execution_id: Some(context.execution_id.clone()),
+                    execution_id: Some(context.execution_id),
                 };
                 CronModel::new(&mut tx, component)
                     .update_job_state(updated_job.cron_next_run())
@@ -575,7 +623,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                     .runner
                     .run_action_no_udf_log(
                         PublicFunctionPath::Component(path),
-                        job.cron_spec.udf_args,
+                        job.cron_spec.udf_args.clone(),
                         identity.clone(),
                         caller,
                         usage_tracker.clone(),
@@ -587,7 +635,7 @@ impl<RT: Runtime> CronJobContext<RT> {
 
                 let status = match completion.outcome.result.clone() {
                     Ok(result) => {
-                        let truncated_result = self.truncate_result(result);
+                        let truncated_result = self.truncate_result(result)?;
                         CronJobStatus::Success(truncated_result)
                     },
                     Err(e) => CronJobStatus::Err(e.to_string()),
@@ -637,9 +685,10 @@ impl<RT: Runtime> CronJobContext<RT> {
                 // Restore the execution ID of the failed execution.
                 let context = ExecutionContext::new_from_parts(
                     request_id.clone().unwrap_or_else(RequestId::new),
-                    execution_id.clone().unwrap_or_else(ExecutionId::new),
+                    execution_id.unwrap_or_else(ExecutionId::new),
                     caller.parent_scheduled_job(),
                     caller.is_root(),
+                    RequestMetadata::system(),
                 );
                 sentry::configure_scope(|scope| context.add_sentry_tags(scope));
                 let mut model = CronModel::new(&mut tx, component);
@@ -806,7 +855,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                         mutation_retry_count.is_none(),
                         "Actions should not have mutation_retry_count set"
                     );
-                    let mut err = anyhow::anyhow!(ErrorMetadata::bad_request(
+                    let err = anyhow::anyhow!(ErrorMetadata::bad_request(
                         "SkippingPastScheduledRuns",
                         format!(
                             "Skipping {num_skipped} run(s) of job {job_id} because multiple \
@@ -828,7 +877,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                             context,
                         )
                         .await?;
-                    report_error(&mut err).await;
+                    tracing::error!("{err:#}");
                 },
                 UdfType::Query | UdfType::HttpAction => {
                     anyhow::bail!("Executing unexpected function type as a cron")

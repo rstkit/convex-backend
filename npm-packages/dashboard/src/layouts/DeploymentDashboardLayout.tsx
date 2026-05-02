@@ -3,10 +3,10 @@ import { GoogleAnalytics } from "elements/GoogleAnalytics";
 import { useCurrentDeployment, useDeployments } from "api/deployments";
 import { useTeamEntitlements } from "api/teams";
 import { useCurrentProject } from "api/projects";
-import { useAuth0 } from "hooks/useAuth0";
 import { useAccessToken } from "hooks/useServerSideData";
 import { useRouter } from "next/router";
 import { useEffect } from "react";
+import { usePostHog } from "hooks/usePostHog";
 import {
   useGlobalLDContext,
   useLDContextWithDeployment,
@@ -44,7 +44,10 @@ function CurrentDeploymentDashboardLayoutWhenLoggedIn({
   const isLoading = deployments === undefined;
 
   const entitlements = useTeamEntitlements(project?.teamId);
-  const auditLogsEnabled = entitlements?.auditLogsEnabled;
+  const auditLogsEnabled =
+    entitlements && entitlements.auditLogRetentionDays !== 0;
+
+  const { capture } = usePostHog();
 
   useEffect(() => {
     if (
@@ -61,7 +64,11 @@ function CurrentDeploymentDashboardLayoutWhenLoggedIn({
     <WaitForDeploymentApi>
       <GoogleAnalytics />
       <LaunchDarklyWithDeployment>
-        <CommonDeploymentDashboardLayout auditLogsEnabled={auditLogsEnabled}>
+        <CommonDeploymentDashboardLayout
+          auditLogsEnabled={auditLogsEnabled}
+          onRanCustomQuery={() => capture("ran_custom_query")}
+          onCopiedQueryResult={() => capture("copied_query_result")}
+        >
           {children}
         </CommonDeploymentDashboardLayout>
       </LaunchDarklyWithDeployment>
@@ -74,11 +81,12 @@ function LaunchDarklyWithDeployment({
 }: {
   children: React.ReactElement;
 }) {
-  const { user } = useAuth0();
   const [, setContext] = useGlobalLDContext();
-  const localContext = useLDContextWithDeployment(user);
+  const localContext = useLDContextWithDeployment();
   useEffect(() => {
-    localContext && setContext(localContext);
+    if (localContext) {
+      setContext(localContext);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(localContext), setContext]);
 

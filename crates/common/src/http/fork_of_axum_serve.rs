@@ -262,10 +262,10 @@ where
                     None => continue,
                 };
 
-                if let Some(nodelay) = tcp_nodelay {
-                    if let Err(err) = tcp_stream.set_nodelay(nodelay) {
-                        trace!("failed to set TCP_NODELAY on incoming connection: {err:#}");
-                    }
+                if let Some(nodelay) = tcp_nodelay
+                    && let Err(err) = tcp_stream.set_nodelay(nodelay)
+                {
+                    trace!("failed to set TCP_NODELAY on incoming connection: {err:#}");
                 }
 
                 let tcp_stream = TokioIo::new(tcp_stream);
@@ -423,10 +423,10 @@ where
                     }
                 };
 
-                if let Some(nodelay) = tcp_nodelay {
-                    if let Err(err) = tcp_stream.set_nodelay(nodelay) {
-                        trace!("failed to set TCP_NODELAY on incoming connection: {err:#}");
-                    }
+                if let Some(nodelay) = tcp_nodelay
+                    && let Err(err) = tcp_stream.set_nodelay(nodelay)
+                {
+                    trace!("failed to set TCP_NODELAY on incoming connection: {err:#}");
                 }
 
                 let tcp_stream = TokioIo::new(tcp_stream);
@@ -644,80 +644,3 @@ const _: () = {
         }
     }
 };
-
-#[cfg(test)]
-mod tests {
-    use axum::{
-        handler::{
-            Handler,
-            HandlerWithoutStateExt,
-        },
-        routing::get,
-        Router,
-    };
-
-    use super::*;
-
-    #[allow(dead_code, unused_must_use)]
-    async fn if_it_compiles_it_works() {
-        let router: Router = Router::new();
-
-        let addr = "0.0.0.0:0";
-
-        // router
-        serve(TcpListener::bind(addr).await.unwrap(), router.clone());
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            router.clone().into_make_service(),
-        );
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        );
-
-        // method router
-        serve(TcpListener::bind(addr).await.unwrap(), get(handler));
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            get(handler).into_make_service(),
-        );
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            get(handler).into_make_service_with_connect_info::<SocketAddr>(),
-        );
-
-        // handler
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            handler.into_service(),
-        );
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            handler.with_state(()),
-        );
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            handler.into_make_service(),
-        );
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            handler.into_make_service_with_connect_info::<SocketAddr>(),
-        );
-
-        // nodelay
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            handler.into_service(),
-        )
-        .tcp_nodelay(true);
-
-        serve(
-            TcpListener::bind(addr).await.unwrap(),
-            handler.into_service(),
-        )
-        .with_graceful_shutdown(async { /*...*/ })
-        .tcp_nodelay(true);
-    }
-
-    async fn handler() {}
-}

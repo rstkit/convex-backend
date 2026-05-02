@@ -1,15 +1,8 @@
 import { Command } from "@commander-js/extra-typings";
-import {
-  deploymentSelectionWithinProjectFromOptions,
-  loadSelectedDeploymentCredentials,
-} from "./lib/api.js";
-import {
-  Context,
-  oneoffContext,
-  showSpinner,
-  logMessage,
-} from "../bundler/context.js";
-import chalk from "chalk";
+import { loadSelectedDeploymentCredentials } from "./lib/api.js";
+import { Context, oneoffContext } from "../bundler/context.js";
+import { showSpinner, logMessage } from "../bundler/log.js";
+import { chalkStderr } from "chalk";
 import { actionDescription } from "./lib/command.js";
 import { runNetworkTestOnUrl, withTimeout } from "./lib/networkTest.js";
 import { getDeploymentSelection } from "./lib/deploymentSelection.js";
@@ -20,8 +13,8 @@ export const networkTest = new Command("network-test")
   .addNetworkTestOptions()
   .addDeploymentSelectionOptions(
     actionDescription("Perform the network test on"),
+    { showUrlHelp: true },
   )
-  .option("--url <url>") // unhide help
   .action(async (options) => {
     const ctx = await oneoffContext(options);
     const timeoutSeconds = options.timeout
@@ -47,7 +40,7 @@ async function runNetworkTest(
     speedTest?: boolean;
   },
 ) {
-  showSpinner(ctx, "Performing network test...");
+  showSpinner("Performing network test...");
   // Try to fetch the URL following the usual paths, but special case the
   // `--url` argument in case the developer doesn't have network connectivity.
   let url: string;
@@ -59,17 +52,14 @@ async function runNetworkTest(
     url = options.url;
     adminKey = null;
   } else {
-    const selectionWithinProject =
-      await deploymentSelectionWithinProjectFromOptions(ctx, options);
     const deploymentSelection = await getDeploymentSelection(ctx, options);
     const credentials = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      selectionWithinProject,
     );
     url = credentials.url;
     adminKey = credentials.adminKey;
   }
-  logMessage(ctx, `${chalk.green(`✔`)} Deployment URL: ${url}`);
+  logMessage(`${chalkStderr.green(`✔`)} Deployment URL: ${url}`);
   await runNetworkTestOnUrl(ctx, { url, adminKey }, options);
 }

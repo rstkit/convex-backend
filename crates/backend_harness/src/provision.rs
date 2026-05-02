@@ -18,7 +18,6 @@ use backoff::{
 };
 use big_brain_client::BigBrainClient;
 use big_brain_private_api_types::{
-    types::PartitionId,
     DeploymentAuthPreviewArgs,
     DeploymentAuthProdArgs,
     DeploymentAuthResponse,
@@ -284,14 +283,10 @@ async fn deployment_credentials(
                 .await
         },
         DeploymentSelector::Prod => {
-            let partition_id = env::var("PARTITION_ID")
-                .ok()
-                .map(|s| anyhow::Ok(PartitionId(s.parse::<u64>()?)))
-                .transpose()?;
             client
                 .prod_deployment_credentials(DeploymentAuthProdArgs {
                     deployment_name: configured_deployment_name,
-                    partition_id,
+                    deployment_class: None,
                 })
                 .await
         },
@@ -313,14 +308,14 @@ async fn preview_deploy_key(
     let prod_credentials = client
         .prod_deployment_credentials(DeploymentAuthProdArgs {
             deployment_name,
-            partition_id: None,
+            deployment_class: None,
         })
         .await?;
 
     let admin_key_parts = prod_credentials.admin_key.split_once('|');
     let admin_key = match admin_key_parts {
         Some(parts) => parts.1,
-        None => &prod_credentials.admin_key,
+        None => prod_credentials.admin_key.as_str(),
     };
 
     Ok(format!(
@@ -347,7 +342,10 @@ fn start_local_usher(logs: &LogInterleaver, release: bool) -> anyhow::Result<Chi
             .arg("--port")
             .arg(USHER_PORT.to_string())
             .arg("--register-service")
-            .arg("convex-backend-carnitas=127.0.0.1:8000,grpc.port=7999")
+            .arg("convex-conductor-0=127.0.0.1:8000,grpc.port=7999")
+            .arg("--partition-mapping")
+            .arg("carnitas=0")
+            .arg("--region=local")
             .kill_on_drop(true),
     )
 }
@@ -367,7 +365,7 @@ fn start_local_funrun(
         Command::new(funrun_binary)
             .arg("--register-database")
             .arg(format!(
-                "local=sqlite://{}",
+                "local=sqlite=sqlite://{}",
                 db_path.to_str().expect("Invalid db path")
             ))
             .arg("--metrics-addr")
@@ -383,10 +381,6 @@ async fn provision(
     package_dir: &Path,
     metric_label: StaticMetricLabel,
 ) -> anyhow::Result<Provision> {
-    // Skip backend build if the proper env variable is set.
-    let skip_build = option_env!("CONVEX_SKIP_BACKEND_BUILD")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
     let (admin_key, handle, deployment_url) = match backend_provisioner {
         BackendProvisioner::Production | BackendProvisioner::LocalBigBrain => {
             let provision_host_credentials = backend_provisioner
@@ -415,7 +409,7 @@ async fn provision(
             .await?;
             tracing::info!("{deployment_name} provisioned for {opt_deployment_info:?} at {url}");
             (
-                admin_key,
+                admin_key.to_string(),
                 ProvisionHandle::BigBrain {
                     provision_host_credentials,
                     package_dir: package_dir.to_path_buf(),
@@ -425,30 +419,20 @@ async fn provision(
             )
         },
         BackendProvisioner::ConductorDebug | BackendProvisioner::ConductorRelease => {
-            let release = matches!(
-                backend_provisioner,
-                BackendProvisioner::ConductorRelease { .. }
-            );
+            let release = matches!(backend_provisioner, BackendProvisioner::ConductorRelease);
             let mut build_cmd = Command::new("cargo");
-            build_cmd
-                .arg("build")
-                .arg("-p")
-                .arg("conductor")
-                .arg("--bin")
-                .arg("conductor");
+            build_cmd.arg("build").arg("--bin").arg("conductor");
             let udf_use_funrun = env_config("UDF_USE_FUNRUN", true);
             if udf_use_funrun {
-                build_cmd.arg("-p").arg("funrun").arg("--bin").arg("funrun");
+                build_cmd.arg("--bin").arg("funrun");
             }
             if release {
                 build_cmd.arg("--release");
             }
-            if !skip_build {
-                logs.spawn_with_prefixed_logs("cargo build".into(), &mut build_cmd)?
-                    .wait()
-                    .map(|result| anyhow::Ok(result?.exit_ok()?))
-                    .await?;
-            }
+            logs.spawn_with_prefixed_logs("cargo build".into(), &mut build_cmd)?
+                .wait()
+                .map(|result| anyhow::Ok(result?.exit_ok()?))
+                .await?;
             let conductor_binary = if release {
                 REPO_ROOT.join("target/release/conductor")
             } else {
@@ -474,7 +458,6 @@ async fn provision(
                 .arg("--instance")
                 .arg(format!("carnitas={DEV_SECRET}"))
                 .env("UDF_USE_FUNRUN", udf_use_funrun.to_string())
-                .env("ENABLE_LOG_STREAMING", "true")
                 .env("CONVEX_RELEASE_VERSION_DEV", "0.0.0-backendharness");
             if udf_use_funrun {
                 run_conductor_cmd
@@ -489,7 +472,7 @@ async fn provision(
             let funrun_handle = udf_use_funrun
                 .then(|| start_local_funrun(logs, release, &db_path))
                 .transpose()?;
-            // Give it 15 seconds to start up (30 retries at 500ms)
+            // Give it ~15 seconds to start up (5 retries with 500ms exponential backoff)
             wait_for_http_health(
                 &USHER_INSTANCE_URL.parse()?,
                 Some("0.0.0-backendharness"),
@@ -497,7 +480,7 @@ async fn provision(
                 // admin key. Right now the admin key is static, so either we use a static name
                 // which will always match, or we refactor to allow dynamic admin keys here.
                 None,
-                30,
+                5,
                 Duration::from_millis(500),
             )
             .await
@@ -515,26 +498,17 @@ async fn provision(
             )
         },
         BackendProvisioner::OpenSourceDebug | BackendProvisioner::OpenSourceRelease => {
-            let release = matches!(
-                backend_provisioner,
-                BackendProvisioner::OpenSourceRelease { .. }
-            );
+            let release = matches!(backend_provisioner, BackendProvisioner::OpenSourceRelease);
             let mut cmd = Command::new("cargo");
-            cmd.arg("build")
-                .arg("-p")
-                .arg("local_backend")
-                .arg("--bin")
-                .arg("convex-local-backend");
+            cmd.arg("build").arg("--bin").arg("convex-local-backend");
             if release {
                 cmd.arg("--release");
             }
 
-            if !skip_build {
-                logs.spawn_with_prefixed_logs("cargo build".into(), &mut cmd)?
-                    .wait()
-                    .await?
-                    .exit_ok()?;
-            }
+            logs.spawn_with_prefixed_logs("cargo build".into(), &mut cmd)?
+                .wait()
+                .await?
+                .exit_ok()?;
 
             let backend_binary = if release {
                 REPO_ROOT.join("target/release/convex-local-backend")
@@ -557,7 +531,7 @@ async fn provision(
                     .kill_on_drop(true),
             )?;
             let backend_url = "http://127.0.0.1:8000".to_string();
-            // Give it 15 seconds to start up (30 retries at 500ms)
+            // Give it ~15 seconds to start up (5 retries with 500ms exponential backoff)
             wait_for_http_health(
                 &backend_url.parse()?,
                 Some("0.0.0-backendharness"),
@@ -565,7 +539,7 @@ async fn provision(
                 // admin key. Right now the admin key is static, so either we use a static name
                 // which will always match, or we refactor to allow dynamic admin keys here.
                 None,
-                30,
+                5,
                 Duration::from_millis(500),
             )
             .await
@@ -610,7 +584,7 @@ async fn provision(
             let backend_handle =
                 logs.spawn_with_prefixed_logs("docker up".into(), &mut docker_up_cmd)?;
             let backend_url = "http://127.0.0.1:8000".to_string();
-            // Give it 15 seconds to start up (30 retries at 500ms)
+            // Give it ~15 seconds to start up (5 retries with 500ms exponential backoff)
             wait_for_http_health(
                 &backend_url.parse()?,
                 Some("0.0.0-backendharness"),
@@ -618,7 +592,7 @@ async fn provision(
                 // admin key. Right now the admin key is static, so either we use a static name
                 // which will always match, or we refactor to allow dynamic admin keys here.
                 None,
-                30,
+                5,
                 Duration::from_millis(500),
             )
             .await
@@ -665,7 +639,7 @@ async fn provision_from_big_brain(
     provision_request: &ProvisionRequest,
     metric_label: StaticMetricLabel,
 ) -> anyhow::Result<DeploymentSelector> {
-    let result: anyhow::Result<_> = try {
+    let result: anyhow::Result<_> = try bikeshed anyhow::Result<_> {
         let ProvisionHostCredentials {
             provision_host,
             access_token,
@@ -705,9 +679,6 @@ async fn provision_from_big_brain(
                     .arg("--configure=new")
                     .arg("--project")
                     .arg("load_generator");
-                if let Ok(partition_id) = env::var("PARTITION_ID") {
-                    cmd.arg("--partition-id").arg(partition_id);
-                }
                 logs.spawn_with_prefixed_logs(
                     "npx convex dev --configure=new".into(),
                     cmd.env("CONVEX_PROVISION_HOST", provision_host)
@@ -729,9 +700,6 @@ async fn provision_from_big_brain(
                     .arg("deploy")
                     .arg("--preview-create")
                     .arg(identifier);
-                if let Ok(partition_id) = env::var("PARTITION_ID") {
-                    cmd.arg("--partition-id").arg(partition_id);
-                }
                 logs.spawn_with_prefixed_logs(
                     format!("npx convex deploy --preview-create {identifier}"),
                     cmd.env("CONVEX_PROVISION_HOST", provision_host)
@@ -794,19 +762,12 @@ async fn deploy(
                         access_token,
                     },
                 ..
-            } => {
-                let cmd = command
-                    .arg("convex")
-                    .arg("deploy")
-                    .arg("--yes")
-                    .env("CONVEX_PROVISION_HOST", provision_host)
-                    .env("CONVEX_OVERRIDE_ACCESS_TOKEN", access_token);
-                if let Ok(partition_id) = env::var("PARTITION_ID") {
-                    tracing::info!("Using partition_id: {partition_id}");
-                    cmd.arg("--partition-id").arg(partition_id);
-                }
-                cmd
-            },
+            } => command
+                .arg("convex")
+                .arg("deploy")
+                .arg("--yes")
+                .env("CONVEX_PROVISION_HOST", provision_host)
+                .env("CONVEX_OVERRIDE_ACCESS_TOKEN", access_token),
             // Only pass the ADMIN_KEY in directly with local backend to bypass dependency on
             // big-brain
             ProvisionHandle::LocalBackend { .. } | ProvisionHandle::LocalConductor { .. } => {
@@ -828,7 +789,7 @@ async fn deploy(
                     .arg(url)
             },
         };
-        let push_result: anyhow::Result<()> = try {
+        let push_result: anyhow::Result<()> = try bikeshed anyhow::Result<_> {
             logs.spawn_with_prefixed_logs(
                 "npx convex deploy".into(),
                 push_command.current_dir(package_dir),
@@ -856,7 +817,7 @@ async fn delete_project(
     tracing::info!("Tearing down project");
     let big_brain_client = BigBrainClient::new(provision_host.into(), access_token);
 
-    let result: anyhow::Result<()> = try {
+    let result: anyhow::Result<()> = try bikeshed anyhow::Result<_> {
         let deployment_name = get_configured_deployment_name(package_dir)?;
         let project_id = big_brain_client
             .get_project_and_team_for_deployment(deployment_name)

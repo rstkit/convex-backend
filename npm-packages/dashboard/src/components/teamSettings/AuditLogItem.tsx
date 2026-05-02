@@ -1,30 +1,35 @@
-import { Disclosure } from "@headlessui/react";
+import {
+  Disclosure,
+  DisclosurePanel,
+  DisclosureButton,
+} from "@headlessui/react";
 import {
   ChevronUpIcon,
   ChevronDownIcon,
-  QuestionMarkCircledIcon,
   ArrowRightIcon,
 } from "@radix-ui/react-icons";
 import { Button } from "@ui/Button";
 import { ReadonlyCode } from "@common/elements/ReadonlyCode";
 import { TimestampDistance } from "@common/elements/TimestampDistance";
 import { stringifyValue } from "@common/lib/stringifyValue";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
 import {
-  Team,
+  TeamResponse,
   MemberResponse,
-  ProjectDetails,
   AuditLogAction,
-  DeploymentResponse,
   AuditLogEventResponse,
+  DeploymentResponse,
 } from "generatedApi";
 import { captureMessage } from "@sentry/nextjs";
 import startCase from "lodash/startCase";
-import Link from "next/link";
-import { useDeploymentById } from "api/deployments";
+import { Link } from "@ui/Link";
+import { useDeploymentByName } from "api/deployments";
 import { BackupIdentifier } from "elements/BackupIdentifier";
 import { TeamMemberLink } from "elements/TeamMemberLink";
 import { Tooltip } from "@ui/Tooltip";
+import { HelpTooltip } from "@ui/HelpTooltip";
 import { formatUsd } from "@common/lib/utils";
+import { useProjectById } from "api/projects";
 
 // TODO: Figure out how to get typing on metadata in
 // big brain
@@ -39,13 +44,11 @@ export function AuditLogItem({
   team,
   memberId,
   members,
-  projects,
 }: {
   entry: AuditLogEventResponse;
-  team: Team;
+  team: TeamResponse;
   memberId: number | null;
   members: MemberResponse[];
-  projects: ProjectDetails[];
 }) {
   return (
     <Disclosure>
@@ -66,24 +69,24 @@ export function AuditLogItem({
                 metadata={entry.metadata as AuditLogEntryMetadata}
                 team={team}
                 members={members}
-                projects={projects}
               />
             </span>
             <span className="ml-auto flex gap-1">
               <TimestampDistance date={new Date(entry.createTime)} />
-              <Disclosure.Button
-                as={Button}
-                inline
-                variant="neutral"
-                size="xs"
-                tipSide="left"
-                tip="View entry metadata"
-              >
-                {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
-              </Disclosure.Button>
+              <Tooltip tip="View entry metadata" side="left" asChild>
+                <DisclosureButton
+                  as={Button}
+                  inline
+                  variant="neutral"
+                  size="xs"
+                  aria-label={open ? "Hide details" : "Show details"}
+                >
+                  {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
+                </DisclosureButton>
+              </Tooltip>
             </span>
           </div>
-          <Disclosure.Panel>
+          <DisclosurePanel>
             <ReadonlyCode
               height={{
                 type: "content",
@@ -95,7 +98,7 @@ export function AuditLogItem({
               ).slice(1, -1)}
               path={`${entry.createTime}`}
             />
-          </Disclosure.Panel>
+          </DisclosurePanel>
         </div>
       )}
     </Disclosure>
@@ -107,25 +110,18 @@ function EntryAction({
   metadata,
   team,
   members,
-  projects,
 }: {
   action: AuditLogAction;
   metadata: AuditLogEntryMetadata;
-  team: Team;
+  team: TeamResponse;
   members: MemberResponse[];
-  projects: ProjectDetails[];
 }) {
   switch (action) {
     case "createProject":
     case "updateProject":
     case "deleteProject":
       return (
-        <ProjectEntryAction
-          projects={projects}
-          team={team}
-          action={action}
-          metadata={metadata}
-        />
+        <ProjectEntryAction team={team} action={action} metadata={metadata} />
       );
     case "receiveProject":
       return (
@@ -134,7 +130,6 @@ function EntryAction({
           <ProjectLink
             projectId={metadata.current?.id}
             metadata={metadata}
-            projects={projects}
             team={team}
           />{" "}
           to this team.
@@ -147,7 +142,6 @@ function EntryAction({
           <ProjectLink
             projectId={metadata.previous?.id}
             metadata={metadata}
-            projects={projects}
             team={team}
           />{" "}
           to another team.
@@ -161,7 +155,7 @@ function EntryAction({
       return <span>updated the payment method</span>;
     case "removeMember":
       if (!metadata.previous?.email) {
-        captureMessage(`Found malformed metadata for ${action}`);
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
       return (
@@ -173,7 +167,7 @@ function EntryAction({
       );
     case "inviteMember":
       if (!metadata.current?.email) {
-        captureMessage(`Found malformed metadata for ${action}`);
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
       return (
@@ -185,7 +179,7 @@ function EntryAction({
       );
     case "cancelMemberInvitation":
       if (!metadata.previous?.email) {
-        captureMessage(`Found malformed metadata for ${action}`);
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
       return (
@@ -200,7 +194,7 @@ function EntryAction({
         !metadata.current?.id ||
         (!metadata.current?.name && !metadata.current?.email)
       ) {
-        captureMessage(`Found malformed metadata for ${action}`);
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
       return (
@@ -229,7 +223,6 @@ function EntryAction({
             members={members}
             memberId={metadata.current.member_id}
             projectId={metadata.current.project_id}
-            projects={projects}
             team={team}
           />
         );
@@ -247,14 +240,13 @@ function EntryAction({
             members={members}
             memberId={metadata.previous.member_id}
             projectId={metadata.previous.project_id}
-            projects={projects}
             team={team}
             removed
           />
         );
       }
 
-      captureMessage(`Found malformed metadata for ${action}`);
+      captureMessage(`Found malformed metadata for ${action}`, "error");
       return <UnhandledAction action={action} />;
 
     case "joinTeam":
@@ -265,43 +257,75 @@ function EntryAction({
       return <span>updated the team</span>;
     case "deleteTeam":
       return <span>deleted the team</span>;
-    case "createDeployment":
-      if (!metadata.current?.type || !metadata.current?.projectId) {
-        captureMessage(`Found malformed metadata for ${action}`);
+    case "createDeployment": {
+      const deploymentType =
+        metadata.current?.deploymentType ?? metadata.current?.type;
+      if (!deploymentType || !metadata.current?.projectId) {
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
 
       return (
         <span>
-          created a{" "}
-          <span className="font-semibold">{metadata.current.type}</span>{" "}
-          deployment for{" "}
+          created a <span className="font-semibold">{deploymentType}</span>{" "}
+          deployment
+          {metadata.current?.reference && (
+            <>
+              {" "}
+              <span className="font-semibold">
+                {metadata.current.reference}
+              </span>
+            </>
+          )}{" "}
+          for{" "}
           <ProjectLink
             projectId={metadata.current.projectId}
             metadata={metadata}
-            projects={projects}
             team={team}
           />
         </span>
       );
-    case "deleteDeployment":
-      if (!metadata.previous?.type || !metadata.previous?.projectId) {
-        captureMessage(`Found malformed metadata for ${action}`);
+    }
+    case "deleteDeployment": {
+      const deploymentType =
+        metadata.previous?.deploymentType ?? metadata.previous?.type;
+      if (!deploymentType || !metadata.previous?.projectId) {
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
       return (
         <span>
-          deleted a{" "}
-          <span className="font-semibold">{metadata.previous.type}</span>{" "}
-          deployment for{" "}
+          deleted a <span className="font-semibold">{deploymentType}</span>{" "}
+          deployment
+          {metadata.previous?.reference && (
+            <>
+              {" "}
+              <span className="font-semibold">
+                {metadata.previous.reference}
+              </span>
+            </>
+          )}{" "}
+          for{" "}
           <ProjectLink
             projectId={metadata.previous.projectId}
             metadata={metadata}
-            projects={projects}
             team={team}
           />
         </span>
       );
+    }
+    case "updateDeployment": {
+      return (
+        <span>
+          updated deployment{" "}
+          {metadata.current?.deploymentName && (
+            <span className="font-semibold">
+              {metadata.current.deploymentName}
+            </span>
+          )}
+        </span>
+      );
+    }
     case "createProjectEnvironmentVariable":
     case "updateProjectEnvironmentVariable":
     case "deleteProjectEnvironmentVariable":
@@ -309,7 +333,6 @@ function EntryAction({
         <EnvironmentVariableEntryAction
           action={action}
           metadata={metadata}
-          projects={projects}
           team={team}
         />
       );
@@ -329,6 +352,18 @@ function EntryAction({
           resumed the {metadata.current?.plan || "Convex"} subscription
         </span>
       );
+    case "changeSubscriptionPlan":
+      if (!metadata.previous?.plan || !metadata.current?.plan) {
+        captureMessage(`Found malformed metadata for ${action}`, "error");
+        return <UnhandledAction action={action} />;
+      }
+      return (
+        <span>
+          changed the subscription plan from{" "}
+          <span className="font-semibold">{metadata.previous?.plan}</span>·to{" "}
+          <span className="font-semibold">{metadata.current?.plan}</span>
+        </span>
+      );
     case "createCustomDomain":
       return (
         <span>
@@ -342,7 +377,6 @@ function EntryAction({
               <ProjectLink
                 projectId={metadata.current?.projectId}
                 metadata={metadata}
-                projects={projects}
                 team={team}
               />
             </span>
@@ -362,7 +396,6 @@ function EntryAction({
               <ProjectLink
                 projectId={metadata.previous?.projectId}
                 metadata={metadata}
-                projects={projects}
                 team={team}
               />
             </span>
@@ -370,12 +403,13 @@ function EntryAction({
         </span>
       );
     case "createTeamAccessToken":
+    case "createProjectAccessToken":
+    case "createDeploymentAccessToken":
       return (
         <span>
           {metadata.current && (
             <AccessTokenSettingsLink
               team={team}
-              projects={projects}
               metadataEntity={metadata.current}
               verb="created"
             />
@@ -383,14 +417,15 @@ function EntryAction({
         </span>
       );
     case "viewTeamAccessToken":
+    case "viewProjectAccessToken":
+    case "viewDeploymentAccessToken":
       // we expect these to never be logged
-      captureMessage("Found viewTeamAccessToken audit log");
+      captureMessage("Found viewAccessToken audit log", "error");
       return (
         <span>
           {metadata.current && (
             <AccessTokenSettingsLink
               team={team}
-              projects={projects}
               metadataEntity={metadata.current}
               verb="viewed"
             />
@@ -398,12 +433,13 @@ function EntryAction({
         </span>
       );
     case "updateTeamAccessToken":
+    case "updateProjectAccessToken":
+    case "updateDeploymentAccessToken":
       return (
         <span>
           {metadata.current && (
             <AccessTokenSettingsLink
               team={team}
-              projects={projects}
               metadataEntity={metadata.current}
               verb="updated"
             />
@@ -411,12 +447,13 @@ function EntryAction({
         </span>
       );
     case "deleteTeamAccessToken":
+    case "deleteProjectAccessToken":
+    case "deleteDeploymentAccessToken":
       return (
         <span>
           {metadata.previous && (
             <AccessTokenSettingsLink
               team={team}
-              projects={projects}
               metadataEntity={metadata.previous}
               verb="deleted"
             />
@@ -431,20 +468,19 @@ function EntryAction({
           : metadata.previous
             ? "deleted"
             : "requested";
-      const deploymentId =
-        metadata.current?.sourceDeploymentId ||
-        metadata.previous?.sourceDeploymentId;
-      if (!deploymentId) {
-        captureMessage(`Found malformed metadata for ${action}`);
+      const deploymentName =
+        metadata.current?.sourceDeploymentName ||
+        metadata.previous?.sourceDeploymentName;
+      if (!deploymentName) {
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
       return (
         <span>
           {verb} a backup of{" "}
           <DeploymentSettingsLink
-            projects={projects}
             team={team}
-            deploymentId={deploymentId}
+            deploymentName={deploymentName}
             urlSuffix="/backups"
           />
         </span>
@@ -452,21 +488,20 @@ function EntryAction({
     }
     case "restoreFromCloudBackup":
       if (
-        !metadata.current?.targetDeploymentId ||
+        !metadata.current?.targetDeploymentName ||
         !metadata.current?.backup ||
-        !metadata.current?.backup?.sourceDeploymentId ||
+        !metadata.current?.backup?.sourceDeploymentName ||
         !metadata.current?.backup?.requestedTime
       ) {
-        captureMessage(`Found malformed metadata for ${action}`);
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
       return (
         <span>
           restored into{" "}
           <DeploymentSettingsLink
-            projects={projects}
             team={team}
-            deploymentId={metadata.current?.targetDeploymentId}
+            deploymentName={metadata.current?.targetDeploymentName}
             urlSuffix="/backups"
           />{" "}
           from the backup <BackupIdentifier backup={metadata.current?.backup} />
@@ -475,10 +510,10 @@ function EntryAction({
     case "configurePeriodicBackup":
     case "disablePeriodicBackup": {
       if (
-        !metadata.current?.sourceDeploymentId &&
-        !metadata.previous?.sourceDeploymentId
+        !metadata.current?.sourceDeploymentName &&
+        !metadata.previous?.sourceDeploymentName
       ) {
-        captureMessage(`Found malformed metadata for ${action}`);
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
       const verb =
@@ -491,11 +526,10 @@ function EntryAction({
         <span>
           {verb} a periodic backup schedule for{" "}
           <DeploymentSettingsLink
-            projects={projects}
             team={team}
-            deploymentId={
-              metadata.current?.sourceDeploymentId ||
-              metadata.previous?.sourceDeploymentId
+            deploymentName={
+              metadata.current?.sourceDeploymentName ||
+              metadata.previous?.sourceDeploymentName
             }
             urlSuffix="/backups"
           />{" "}
@@ -518,7 +552,7 @@ function EntryAction({
         !isValidSpendingLimitDiff(previous) ||
         !isValidSpendingLimitDiff(current)
       ) {
-        captureMessage(`Found malformed metadata for ${action}`);
+        captureMessage(`Found malformed metadata for ${action}`, "error");
         return <UnhandledAction action={action} />;
       }
 
@@ -549,26 +583,127 @@ function EntryAction({
         </>
       );
     }
+    case "verifyOAuthApplication": {
+      return <span>verified an OAuth application</span>;
+    }
+    case "deleteOAuthApplication": {
+      return <span>deleted an OAuth application</span>;
+    }
+    case "createOAuthApplication": {
+      return <span>created an OAuth application</span>;
+    }
+    case "updateOAuthApplication": {
+      return <span>updated an OAuth application</span>;
+    }
+    case "generateOAuthClientSecret": {
+      return <span>generated a client secret for an OAuth application</span>;
+    }
+    case "createWorkosTeam": {
+      return <span>created a WorkOS team</span>;
+    }
+    case "createWorkosEnvironment": {
+      return <span>created a WorkOS environment</span>;
+    }
+    case "retrieveWorkosEnvironmentCredentials": {
+      return <span>retrieve WorkOS Environment credentials</span>;
+    }
+    case "disconnectWorkosTeam": {
+      return <span>disconnected a WorkOS team</span>;
+    }
+    case "deleteWorkosEnvironment": {
+      return <span>deleted a WorkOS environment</span>;
+    }
+    case "inviteWorkosTeamMember": {
+      return <span>invited a WorkOS team member</span>;
+    }
+    case "enableSSO": {
+      return <span>enabled SSO</span>;
+    }
+    case "disableSSO": {
+      return <span>disabled SSO</span>;
+    }
+    case "updateSSO": {
+      return <span>updated SSO settings</span>;
+    }
+    case "createProjectWorkosEnvironment": {
+      return <span>created a project WorkOS environment</span>;
+    }
+    case "deleteProjectWorkosEnvironment": {
+      return <span>deleted a project WorkOS environment</span>;
+    }
+    case "retrieveProjectWorkosEnvironmentCredentials": {
+      return <span>retrieved project WorkOS environment credentials</span>;
+    }
+    case "transferDeployment": {
+      return (
+        <span>
+          transferred deployment{" "}
+          <span className="font-semibold">
+            {metadata.previous?.reference ?? "unknown"}
+          </span>{" "}
+          from{" "}
+          {metadata.previous?.projectId ? (
+            <ProjectLink
+              projectId={metadata.previous.projectId}
+              metadata={metadata}
+              team={team}
+            />
+          ) : (
+            <span className="font-semibold">unknown project</span>
+          )}{" "}
+          to{" "}
+          {metadata.current?.projectId ? (
+            <ProjectLink
+              projectId={metadata.current.projectId}
+              metadata={metadata}
+              team={team}
+            />
+          ) : (
+            <span className="font-semibold">unknown project</span>
+          )}
+        </span>
+      );
+    }
+    case "receiveDeployment": {
+      return <span>received a deployment from another project</span>;
+    }
+    case "createCustomRole":
+    case "updateCustomRole":
+    case "deleteCustomRole": {
+      const name = metadata.current?.name || metadata.previous?.name;
+      if (!name) {
+        captureMessage(`Found malformed metadata for ${action}`, "error");
+        return <UnhandledAction action={action} />;
+      }
+      const verb =
+        action === "createCustomRole"
+          ? "created"
+          : action === "updateCustomRole"
+            ? "updated"
+            : "deleted";
+      return (
+        <span>
+          {verb} the custom role <span className="font-semibold">{name}</span>
+        </span>
+      );
+    }
     default:
-      // eslint-disable-next-line no-case-declarations, @typescript-eslint/no-unused-vars
-      const notAllowed: never = action;
-      captureMessage(`Unhandled audit log action: ${action}`);
+      action satisfies never;
+      captureMessage(`Unhandled audit log action: ${action}`, "error");
       return <UnhandledAction action={action} />;
   }
 }
 
 export function ProjectLink({
   metadata,
-  projects,
   team,
   projectId,
 }: {
   projectId: number;
   metadata: AuditLogEntryMetadata;
-  projects: ProjectDetails[];
-  team: Team;
+  team: TeamResponse;
 }) {
-  const project = projects.find((p) => p.id === projectId);
+  const { project } = useProjectById(projectId);
 
   const projectName =
     project?.name ||
@@ -579,7 +714,7 @@ export function ProjectLink({
   return project ? (
     <Link
       href={`/t/${team.slug}/${project.slug}/settings`}
-      className="font-semibold text-content-link hover:underline"
+      className="font-semibold"
       target="_blank"
     >
       {projectName}
@@ -590,18 +725,16 @@ export function ProjectLink({
 }
 
 function EnvironmentVariableEntryAction({
-  projects,
   team,
   action,
   metadata,
 }: {
-  projects: ProjectDetails[];
-  team: Team;
+  team: TeamResponse;
   action: string;
   metadata: AuditLogEntryMetadata;
 }) {
   if (!metadata.current?.projectId && !metadata.previous?.projectId) {
-    captureMessage(`Found malformed metadata for ${action}`);
+    captureMessage(`Found malformed metadata for ${action}`, "error");
     return <UnhandledAction action={action} />;
   }
   const verb =
@@ -614,7 +747,10 @@ function EnvironmentVariableEntryAction({
   const variableName = metadata.current?.name || metadata.previous?.name;
 
   if (!variableName) {
-    captureMessage(`Could not find variable name in metadata for ${action}`);
+    captureMessage(
+      `Could not find variable name in metadata for ${action}`,
+      "error",
+    );
     return <UnhandledAction action={action} />;
   }
 
@@ -625,7 +761,6 @@ function EnvironmentVariableEntryAction({
       <ProjectLink
         projectId={metadata.current?.projectId || metadata.previous?.projectId}
         metadata={metadata}
-        projects={projects}
         team={team}
       />
     </span>
@@ -633,18 +768,16 @@ function EnvironmentVariableEntryAction({
 }
 
 function ProjectEntryAction({
-  projects,
   team,
   action,
   metadata,
 }: {
-  projects: ProjectDetails[];
-  team: Team;
+  team: TeamResponse;
   action: string;
   metadata: AuditLogEntryMetadata;
 }) {
   if (!metadata.current?.id && !metadata.previous?.id) {
-    captureMessage(`Found malformed metadata for ${action}`);
+    captureMessage(`Found malformed metadata for ${action}`, "error");
     return <UnhandledAction action={action} />;
   }
 
@@ -661,7 +794,6 @@ function ProjectEntryAction({
       <ProjectLink
         projectId={metadata.current?.id || metadata.previous?.id}
         metadata={metadata}
-        projects={projects}
         team={team}
       />
     </span>
@@ -682,7 +814,6 @@ function ProjectRoleUpdateEntry({
   members,
   memberId,
   projectId,
-  projects,
   team,
   removed = false,
 }: {
@@ -690,8 +821,7 @@ function ProjectRoleUpdateEntry({
   role?: "admin";
   memberId: number;
   projectId: number;
-  projects: ProjectDetails[];
-  team: Team;
+  team: TeamResponse;
   removed?: boolean;
 }) {
   return (
@@ -710,7 +840,6 @@ function ProjectRoleUpdateEntry({
         projectId={projectId}
         // Don't need metadata for this project link
         metadata={{}}
-        projects={projects}
         team={team}
       />
     </span>
@@ -735,6 +864,11 @@ function AuditLogItemActor({
   const member = members?.find((m) => m.id === memberId);
   return member ? (
     <TeamMemberLink memberId={member.id} name={member.name || member.email} />
+  ) : (entry.metadata as AuditLogEntryMetadata).noun === "member" ? (
+    <span className="font-semibold">
+      {(entry.metadata as AuditLogEntryMetadata)?.current?.email ||
+        (entry.metadata as AuditLogEntryMetadata)?.previous?.email}
+    </span>
   ) : (
     <span className="font-semibold">
       A team member{" "}
@@ -745,40 +879,51 @@ function AuditLogItemActor({
   );
 }
 
-function deploymentDisplayName(deployment: DeploymentResponse) {
+function deploymentDisplayName(
+  deployment: PlatformDeploymentResponse | DeploymentResponse,
+) {
   switch (deployment.deploymentType) {
     case "prod":
-      return "the production deployment";
+      return "a production deployment";
     case "dev":
       return "a development deployment";
     case "preview":
       return "a preview deployment";
+    case "custom":
+      return "a custom deployment";
     default:
+      deployment.deploymentType satisfies never;
       return "a deployment";
   }
 }
 function DeploymentSettingsLink({
-  projects,
   team,
-  deploymentId,
+  deploymentName,
   urlSuffix = "",
 }: {
-  projects: ProjectDetails[];
-  team: Team;
-  deploymentId: number;
+  team: TeamResponse;
+  deploymentName: string;
   urlSuffix?: string;
 }) {
-  const deployment = useDeploymentById(team.id, deploymentId);
+  const deployment = useDeploymentByName(deploymentName);
+  const { project, isLoading: isLoadingProject } = useProjectById(
+    deployment?.projectId,
+  );
+
   if (!deployment) {
     return <span>a deployment</span>;
   }
 
-  const project = projects.find((p) => p.id === deployment.projectId);
+  if (isLoadingProject) {
+    return <span>a deployment</span>;
+  }
+
   if (!project) {
     captureMessage(
-      `Malformed deploy key audit log entry: 
-      deployment ${deploymentId} has project id ${deployment.projectId} 
+      `Malformed deploy key audit log entry:
+      deployment ${deploymentName} has project id ${deployment.projectId}
       which is not found within the projects of team ${team.id}`,
+      "error",
     );
     return <span>a deployment</span>;
   }
@@ -787,7 +932,7 @@ function DeploymentSettingsLink({
     <>
       <Link
         href={`/t/${team.slug}/${project.slug}/${deployment.name}/settings${urlSuffix}`}
-        className="font-semibold text-content-link hover:underline"
+        className="font-semibold"
         target="_blank"
       >
         {deploymentDisplayName(deployment)}
@@ -798,23 +943,21 @@ function DeploymentSettingsLink({
 }
 
 function ProjectSettingsLink({
-  projects,
   team,
   projectId,
 }: {
-  projects: ProjectDetails[];
-  team: Team;
+  team: TeamResponse;
   projectId: number;
 }) {
-  const project = projects.find((p) => p.id === projectId);
-  if (!project) {
+  const { project, isLoading } = useProjectById(projectId);
+  if (isLoading || !project) {
     return <span>Project {projectId}</span>;
   }
 
   return (
     <Link
       href={`/t/${team.slug}/${project.slug}/settings`}
-      className="font-semibold text-content-link hover:underline"
+      className="font-semibold"
       target="_blank"
     >
       {project.name}
@@ -824,36 +967,28 @@ function ProjectSettingsLink({
 
 function AccessTokenSettingsLink({
   team,
-  projects,
   metadataEntity,
   verb,
 }: {
-  team: Team;
-  projects: ProjectDetails[];
+  team: TeamResponse;
   metadataEntity: Record<string, any>;
   verb: string;
 }) {
+  const keyType = metadataEntity.deploymentId
+    ? "deploy key"
+    : metadataEntity.projectId
+      ? "preview deploy key"
+      : "access token";
+
   return (
     <>
-      {verb} the deploy key{" "}
+      {verb} the {keyType}{" "}
       <span className="font-semibold">{metadataEntity.name}</span>
-      {metadataEntity.deploymentId && (
-        <>
-          {" "}
-          in{" "}
-          <DeploymentSettingsLink
-            projects={projects}
-            team={team}
-            deploymentId={metadataEntity?.deploymentId}
-          />
-        </>
-      )}
       {metadataEntity.projectId && (
         <>
           {" "}
           in{" "}
           <ProjectSettingsLink
-            projects={projects}
             team={team}
             projectId={metadataEntity?.projectId}
           />
@@ -896,12 +1031,10 @@ function SpendingLimitLine({
 }) {
   return (
     <div className="contents">
-      <header className="mr-2 flex items-center gap-1">
+      <div className="mr-2 flex items-center gap-1">
         <div className="text-content-secondary">{label}</div>
-        <Tooltip tip={tooltip} side="top">
-          <QuestionMarkCircledIcon className="text-content-tertiary" />
-        </Tooltip>
-      </header>
+        <HelpTooltip tipSide="top">{tooltip}</HelpTooltip>
+      </div>
       <SpendingValue valueCents={previousValue} />
       <ArrowRightIcon className="text-content-tertiary" />
       <SpendingValue valueCents={currentValue} />
@@ -911,7 +1044,7 @@ function SpendingLimitLine({
 
 function SpendingValue({ valueCents }: { valueCents: number | null }) {
   return (
-    <div className="text-right font-medium tabular-nums text-content-primary">
+    <div className="text-right font-medium text-content-primary tabular-nums">
       {valueCents === null ? "None" : formatUsd(valueCents / 100)}
     </div>
   );

@@ -1,26 +1,40 @@
 use std::fmt;
 
+use common::runtime::Runtime;
 use serde::{
     Deserialize,
     Serialize,
 };
+use utoipa::ToSchema;
 
-#[derive(Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WebhookConfig {
     pub url: reqwest::Url,
+    pub format: WebhookFormat,
+    pub hmac_secret: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum WebhookFormat {
+    Json,
+    Jsonl,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SerializedWebhookConfig {
     pub url: String,
+    pub format: WebhookFormat,
+    pub hmac_secret: String,
 }
 
 impl From<WebhookConfig> for SerializedWebhookConfig {
     fn from(value: WebhookConfig) -> Self {
         Self {
             url: value.url.to_string(),
+            format: value.format,
+            hmac_secret: value.hmac_secret,
         }
     }
 }
@@ -31,6 +45,8 @@ impl TryFrom<SerializedWebhookConfig> for WebhookConfig {
     fn try_from(value: SerializedWebhookConfig) -> Result<Self, Self::Error> {
         Ok(WebhookConfig {
             url: value.url.parse()?,
+            format: value.format,
+            hmac_secret: value.hmac_secret,
         })
     }
 }
@@ -41,26 +57,6 @@ impl fmt::Display for WebhookConfig {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-mod proptest {
-    use proptest::prelude::*;
-
-    use super::WebhookConfig;
-
-    impl Arbitrary for WebhookConfig {
-        type Parameters = ();
-
-        type Strategy = impl Strategy<Value = WebhookConfig>;
-
-        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-            any::<proptest_http::ArbitraryUri>().prop_filter_map(
-                "Invalid URL for WebhookConfig",
-                |url| {
-                    reqwest::Url::parse(url.0.to_string().as_str())
-                        .ok()
-                        .map(|url| WebhookConfig { url })
-                },
-            )
-        }
-    }
+pub fn generate_webhook_hmac_secret<RT: Runtime>(rt: RT) -> String {
+    rt.new_uuid_v4().as_simple().to_string()
 }

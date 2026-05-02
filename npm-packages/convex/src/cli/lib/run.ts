@@ -1,4 +1,4 @@
-import chalk from "chalk";
+import { chalkStderr } from "chalk";
 import util from "util";
 import ws from "ws";
 import { ConvexHttpClient } from "../../browser/http_client.js";
@@ -9,18 +9,14 @@ import {
   makeFunctionReference,
 } from "../../server/index.js";
 import { Value, convexToJson, jsonToConvex } from "../../values/value.js";
-import {
-  Context,
-  logFinishedStep,
-  logMessage,
-  logOutput,
-  OneoffCtx,
-} from "../../bundler/context.js";
+import { Context, OneoffCtx } from "../../bundler/context.js";
+import { logFinishedStep, logMessage, logOutput } from "../../bundler/log.js";
 import { waitForever, waitUntilCalled } from "./utils/utils.js";
 import JSON5 from "json5";
 import path from "path";
 import { readProjectConfig } from "./config.js";
 import { watchAndPush } from "./dev.js";
+import { Logger, DefaultLogger } from "../../browser/logging.js";
 
 export async function runFunctionAndLog(
   ctx: Context,
@@ -29,14 +25,18 @@ export async function runFunctionAndLog(
     adminKey: string;
     functionName: string;
     argsString: string;
-    identityString?: string;
-    componentPath?: string;
-    callbacks?: {
-      onSuccess?: () => void;
-    };
+    identityString?: string | undefined;
+    componentPath?: string | undefined;
+    callbacks?:
+      | {
+          onSuccess?: () => void | undefined;
+        }
+      | undefined;
   },
 ) {
-  const client = new ConvexHttpClient(args.deploymentUrl);
+  const client = new ConvexHttpClient(args.deploymentUrl, {
+    logger: instantiateStderrLogger(),
+  });
   const identity = args.identityString
     ? await getFakeIdentity(ctx, args.identityString)
     : undefined;
@@ -57,10 +57,65 @@ export async function runFunctionAndLog(
       functionArgs,
     );
   } catch (err) {
+    const errorMessage = (err as Error).toString().trim();
+
+    if (errorMessage.includes("Could not find function")) {
+      const functions = (await runSystemQuery(ctx, {
+        deploymentUrl: args.deploymentUrl,
+        adminKey: args.adminKey,
+        functionName: "_system/cli/modules:apiSpec",
+        componentPath: args.componentPath,
+        args: {},
+      })) as (
+        | {
+            functionType: "Query" | "Mutation" | "Action";
+            identifier: string;
+          }
+        | {
+            functionType: "HttpAction";
+          }
+      )[];
+
+      const functionNames = functions
+        .filter(
+          (
+            fn,
+          ): fn is {
+            functionType: "Query" | "Mutation" | "Action";
+            identifier: string;
+          } => fn.functionType !== "HttpAction",
+        )
+        .map(({ identifier }) => {
+          const separatorPos = identifier.indexOf(":");
+
+          const path =
+            separatorPos === -1
+              ? ""
+              : identifier.substring(0, separatorPos).replace(/\.js$/, "");
+          const name =
+            separatorPos === -1
+              ? identifier
+              : identifier.substring(separatorPos + 1);
+
+          return `• ${chalkStderr.gray(`${path}:`)}${name}`;
+        });
+
+      const availableFunctionsMessage =
+        functionNames.length > 0
+          ? `Available functions:\n${functionNames.join("\n")}`
+          : "No functions found.";
+
+      return await ctx.crash({
+        exitCode: 1,
+        errorType: "invalid filesystem data",
+        printedMessage: `Failed to run function "${args.functionName}":\n${chalkStderr.red(errorMessage)}\n\n${availableFunctionsMessage}`,
+      });
+    }
+
     return await ctx.crash({
       exitCode: 1,
       errorType: "invalid filesystem or env vars",
-      printedMessage: `Failed to run function "${args.functionName}":\n${chalk.red((err as Error).toString().trim())}`,
+      printedMessage: `Failed to run function "${args.functionName}":\n${chalkStderr.red(errorMessage)}`,
     });
   }
 
@@ -68,7 +123,7 @@ export async function runFunctionAndLog(
 
   // `null` is the default return type
   if (result !== null) {
-    logOutput(ctx, formatValue(result));
+    logOutput(formatValue(result));
   }
 }
 
@@ -80,7 +135,7 @@ async function getFakeIdentity(ctx: Context, identityString: string) {
     return await ctx.crash({
       exitCode: 1,
       errorType: "fatal",
-      printedMessage: `Failed to parse identity as JSON: "${identityString}"\n${chalk.red((err as Error).toString().trim())}`,
+      printedMessage: `Failed to parse identity as JSON: "${identityString}"\n${chalkStderr.red((err as Error).toString().trim())}`,
     });
   }
   const subject = identity.subject ?? "" + simpleHash(JSON.stringify(identity));
@@ -103,7 +158,7 @@ export async function parseArgs(ctx: Context, argsString: string) {
     return await ctx.crash({
       exitCode: 1,
       errorType: "invalid filesystem or env vars",
-      printedMessage: `Failed to parse arguments as JSON: "${argsString}"\n${chalk.red((err as Error).toString().trim())}`,
+      printedMessage: `Failed to parse arguments as JSON: "${argsString}"\n${chalkStderr.red((err as Error).toString().trim())}`,
     });
   }
 }
@@ -282,7 +337,7 @@ export async function subscribeAndLog(
     adminKey: string;
     functionName: string;
     argsString: string;
-    identityString?: string;
+    identityString?: string | undefined;
     componentPath: string | undefined;
   },
 ) {
@@ -308,35 +363,36 @@ export async function subscribeAndLog(
     callbacks: {
       onStart() {
         logFinishedStep(
-          ctx,
           `Watching query ${args.functionName} on ${args.deploymentUrl}...`,
         );
       },
       onChange(result) {
-        logOutput(ctx, formatValue(result));
+        logOutput(formatValue(result));
       },
       onStop() {
-        logMessage(ctx, `Closing connection to ${args.deploymentUrl}...`);
+        logMessage(`Closing connection to ${args.deploymentUrl}...`);
       },
     },
   });
 }
 
 export async function subscribe(
-  ctx: Context,
+  _ctx: Context,
   args: {
     deploymentUrl: string;
     adminKey: string;
-    identity?: UserIdentityAttributes;
+    identity?: UserIdentityAttributes | undefined;
     parsedFunctionName: string;
     parsedFunctionArgs: Record<string, Value>;
     componentPath: string | undefined;
     until: Promise<unknown>;
-    callbacks?: {
-      onStart?: () => void;
-      onChange?: (result: Value) => void;
-      onStop?: () => void;
-    };
+    callbacks?:
+      | {
+          onStart?: () => void;
+          onChange?: (result: Value) => void;
+          onStop?: () => void;
+        }
+      | undefined;
   },
 ) {
   const client = new BaseConvexClient(
@@ -399,7 +455,7 @@ export async function runInDeployment(
     deploymentName: string | null;
     functionName: string;
     argsString: string;
-    identityString?: string;
+    identityString?: string | undefined;
     push: boolean;
     watch: boolean;
     typecheck: "enable" | "try" | "disable";
@@ -409,31 +465,57 @@ export async function runInDeployment(
     liveComponentSources: boolean;
   },
 ) {
-  if (args.push) {
-    await watchAndPush(
-      ctx,
-      {
-        url: args.deploymentUrl,
-        adminKey: args.adminKey,
-        deploymentName: args.deploymentName,
-        verbose: false,
-        dryRun: false,
-        typecheck: args.typecheck,
-        typecheckComponents: args.typecheckComponents,
-        debug: false,
-        codegen: args.codegen,
-        liveComponentSources: args.liveComponentSources,
-      },
-      {
-        once: true,
-        traceEvents: false,
-        untilSuccess: true,
-      },
-    );
-  }
+  if (args.push) await pushToDeployment(ctx, args);
 
   if (args.watch) {
     return await subscribeAndLog(ctx, args);
   }
   return await runFunctionAndLog(ctx, args);
+}
+
+export async function pushToDeployment(
+  ctx: OneoffCtx,
+  args: {
+    deploymentUrl: string;
+    adminKey: string;
+    deploymentName: string | null;
+    typecheck: "enable" | "try" | "disable";
+    typecheckComponents: boolean;
+    codegen: boolean;
+    liveComponentSources: boolean;
+  },
+) {
+  await watchAndPush(
+    ctx,
+    {
+      url: args.deploymentUrl,
+      adminKey: args.adminKey,
+      deploymentName: args.deploymentName,
+      verbose: false,
+      dryRun: false,
+      typecheck: args.typecheck,
+      typecheckComponents: args.typecheckComponents,
+      debug: false,
+      debugNodeApis: false,
+      codegen: args.codegen,
+      liveComponentSources: args.liveComponentSources,
+      pushAllModules: false,
+      largeIndexDeletionCheck: "no verification", // `convex run` can’t push to prod
+      message: null,
+    },
+    {
+      once: true,
+      traceEvents: false,
+      untilSuccess: true,
+    },
+  );
+}
+
+function instantiateStderrLogger(): Logger {
+  const logger = new DefaultLogger({ verbose: false });
+  logger.addLogLineListener((_level, ...args) => {
+    // eslint-disable-next-line no-console
+    console.error(...args);
+  });
+  return logger;
 }

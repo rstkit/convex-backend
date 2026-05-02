@@ -16,23 +16,32 @@ use common::{
         UnixTimestamp,
     },
     sync::spsc,
+    try_anyhow,
 };
 use deno_core::{
     serde_v8,
-    v8,
+    v8::{
+        self,
+        callback_scope,
+    },
 };
 use encoding_rs::Decoder;
 use errors::{
     ErrorMetadata,
     ErrorMetadataAnyhowExt,
 };
+use rand::Rng as _;
 use value::heap_size::{
     HeapSize,
     WithHeapSize,
 };
 
 use crate::{
-    concurrency_limiter::ConcurrencyPermit,
+    context_local_state::GetContextSlot,
+    convert_v8::{
+        JsException,
+        ToV8 as _,
+    },
     environment::{
         IsolateEnvironment,
         UncatchableDeveloperError,
@@ -57,16 +66,13 @@ use crate::{
     ops::{
         run_op,
         start_async_op,
-        CryptoOps,
     },
     strings,
     termination::{
+        ContextId,
+        ContextTerminationReason,
         IsolateHandle,
-        TerminationReason,
-    },
-    timeout::{
-        FunctionExecutionTime,
-        Timeout,
+        IsolateTerminationReason,
     },
 };
 
@@ -74,11 +80,11 @@ use crate::{
 /// that's set up with our `RequestState` and `ModuleMap`. This scope lasts for
 /// the entirety of a request, where executing code may enter into potentially
 /// nested [`ExecutionScope`]s.
-pub struct RequestScope<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> {
+pub struct RequestScope<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> {
     // NB: The default type parameter to `HandleScope` indicates that it has a `Context`, so
     // this scope is attached to our request's context. The `v8::HandleScope<()>`, on
     // the other hand, does not have a currently executing context.
-    pub(crate) scope: &'a mut v8::HandleScope<'b>,
+    pub(crate) scope: &'a mut v8::PinScope<'s, 'i>,
     pub(crate) handle: IsolateHandle,
     pub(crate) _pd: PhantomData<(RT, E)>,
 }
@@ -88,11 +94,9 @@ pub struct RequestScope<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> {
 /// they can be fetched without needing the environment type E.
 pub struct RequestState<RT: Runtime, E: IsolateEnvironment<RT>> {
     pub rt: RT,
-    pub timeout: Timeout<RT>,
-    pub permit: Option<ConcurrencyPermit>,
     pub environment: E,
+    pub context_id: ContextId,
 
-    pub blob_parts: WithHeapSize<BTreeMap<uuid::Uuid, bytes::Bytes>>,
     pub streams: WithHeapSize<BTreeMap<uuid::Uuid, anyhow::Result<ReadableStream>>>,
     pub stream_listeners: WithHeapSize<BTreeMap<uuid::Uuid, StreamListener>>,
     /// Tracks bytes read in HTTP action requests
@@ -101,6 +105,21 @@ pub struct RequestState<RT: Runtime, E: IsolateEnvironment<RT>> {
     // This is not wrapped in `WithHeapSize` so we can return `&mut TextDecoderStream`.
     // Additionally, `TextDecoderResource` should have a fairly small heap size.
     pub text_decoders: BTreeMap<uuid::Uuid, TextDecoderResource>,
+}
+
+impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
+    pub fn new(rt: RT, environment: E, context_id: ContextId) -> Self {
+        RequestState {
+            rt,
+            environment,
+            context_id,
+            streams: WithHeapSize::default(),
+            stream_listeners: WithHeapSize::default(),
+            request_stream_state: None,
+            console_timers: WithHeapSize::default(),
+            text_decoders: BTreeMap::new(),
+        }
+    }
 }
 
 pub struct RequestStreamState {
@@ -136,7 +155,7 @@ pub struct TextDecoderResource {
 
 #[derive(Debug, Default)]
 pub struct ReadableStream {
-    pub parts: WithHeapSize<VecDeque<uuid::Uuid>>,
+    pub parts: WithHeapSize<VecDeque<bytes::Bytes>>,
     pub done: bool,
 }
 
@@ -159,16 +178,8 @@ impl HeapSize for StreamListener {
 }
 
 impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
-    pub fn create_blob_part(&mut self, bytes: bytes::Bytes) -> anyhow::Result<uuid::Uuid> {
-        let rng = self.environment.rng()?;
-        let uuid = CryptoOps::random_uuid(rng)?;
-        self.blob_parts.insert(uuid, bytes);
-        Ok(uuid)
-    }
-
     pub fn create_stream(&mut self) -> anyhow::Result<uuid::Uuid> {
-        let rng = self.environment.rng()?;
-        let uuid = CryptoOps::random_uuid(rng)?;
+        let uuid = uuid::Builder::from_random_bytes(self.environment.rng()?.random()).into_uuid();
         self.streams.insert(uuid, Ok(ReadableStream::default()));
         Ok(uuid)
     }
@@ -183,8 +194,7 @@ impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
         &mut self,
         decoder: TextDecoderResource,
     ) -> anyhow::Result<uuid::Uuid> {
-        let rng = self.environment.rng()?;
-        let uuid = CryptoOps::random_uuid(rng)?;
+        let uuid = uuid::Builder::from_random_bytes(self.environment.rng()?.random()).into_uuid();
         self.text_decoders.insert(uuid, decoder);
         Ok(uuid)
     }
@@ -211,14 +221,6 @@ impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
         Ok(decoder)
     }
 
-    #[allow(unused)]
-    pub fn read_part(&self, id: uuid::Uuid) -> anyhow::Result<bytes::Bytes> {
-        self.blob_parts
-            .get(&id)
-            .ok_or_else(|| anyhow::anyhow!("unrecognized blob id {id}"))
-            .cloned()
-    }
-
     /// As the name implies, the time returned by this function would be a
     /// source of non-determinism, so should not be externalized to
     /// functions. An example of a safe use of this function is `console.time`
@@ -229,10 +231,10 @@ impl<RT: Runtime, E: IsolateEnvironment<RT>> RequestState<RT, E> {
     }
 }
 
-impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT, E> {
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 's, 'i, RT, E> {
     #[fastrace::trace]
     pub async fn new(
-        scope: &'a mut v8::HandleScope<'b>,
+        scope: &'a mut v8::PinScope<'s, 'i>,
         handle: IsolateHandle,
         state: RequestState<RT, E>,
         allow_dynamic_imports: bool,
@@ -260,19 +262,17 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
     }
 
     pub(crate) fn setup_context(
-        scope: &mut v8::HandleScope,
+        scope: &mut v8::PinScope<'_, '_>,
         state: RequestState<RT, E>,
         allow_dynamic_imports: bool,
     ) -> anyhow::Result<()> {
         let context = scope.get_current_context();
         let global = context.global(scope);
 
-        // TODO: this uses isolate-global slots, ideally it should use context-keyed
-        // slots
-        assert!(scope.set_slot(state));
-        assert!(scope.set_slot(ModuleMap::new()));
-        assert!(scope.set_slot(PendingUnhandledPromiseRejections::new()));
-        assert!(scope.set_slot(PendingDynamicImports::new(allow_dynamic_imports)));
+        assert!(context.set_context_slot(scope, state));
+        assert!(context.set_context_slot(scope, ModuleMap::new()));
+        assert!(context.set_context_slot(scope, PendingUnhandledPromiseRejections::new()));
+        assert!(context.set_context_slot(scope, PendingDynamicImports::new(allow_dynamic_imports)));
 
         let syscall_template = v8::FunctionTemplate::new(scope, Self::syscall);
         let syscall_value = syscall_template
@@ -321,7 +321,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
     }
 
     pub(crate) fn op(
-        scope: &mut v8::HandleScope,
+        scope: &mut v8::PinScope,
         args: v8::FunctionCallbackArguments,
         rv: v8::ReturnValue,
     ) {
@@ -332,7 +332,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
     }
 
     pub(crate) fn async_op(
-        scope: &mut v8::HandleScope,
+        scope: &mut v8::PinScope,
         args: v8::FunctionCallbackArguments,
         rv: v8::ReturnValue,
     ) {
@@ -343,7 +343,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
     }
 
     pub(crate) fn syscall(
-        scope: &mut v8::HandleScope,
+        scope: &mut v8::PinScope,
         args: v8::FunctionCallbackArguments,
         rv: v8::ReturnValue,
     ) {
@@ -354,7 +354,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
     }
 
     pub(crate) fn async_syscall(
-        scope: &mut v8::HandleScope,
+        scope: &mut v8::PinScope,
         args: v8::FunctionCallbackArguments,
         rv: v8::ReturnValue,
     ) {
@@ -366,17 +366,29 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
 
     fn handle_syscall_or_op_error(scope: &mut ExecutionScope<RT, E>, err: anyhow::Error) {
         if let Some(uncatchable_error) = err.downcast_ref::<UncatchableDeveloperError>() {
-            scope
-                .handle()
-                .terminate(TerminationReason::UncatchableDeveloperError(
+            scope.handle().terminate(
+                ContextTerminationReason::UncatchableDeveloperError(
                     uncatchable_error.js_error.clone(),
-                ));
+                )
+                .into(),
+            );
             let message = uncatchable_error.js_error.message.to_string();
             let message_v8 = v8::String::new(scope, &message[..]).unwrap();
             let exception = v8::Exception::error(scope, message_v8);
             scope.throw_exception(exception);
             return;
         }
+
+        let err = match err.downcast::<JsException>() {
+            Ok(js_exception) => match js_exception.to_v8(scope) {
+                Ok(e) => {
+                    scope.throw_exception(e);
+                    return;
+                },
+                Err(e) => e,
+            },
+            Err(e) => e,
+        };
 
         if err.is_deterministic_user_error() {
             let message = err.user_facing_message();
@@ -390,7 +402,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
         // on the UDF context and and forcibly abort the isolate.
         scope
             .handle()
-            .terminate(TerminationReason::SystemError(Some(err)));
+            .terminate(IsolateTerminationReason::SystemError(Some(err)).into());
         // It turns out that `terminate_execution` doesn't, well, terminate execution
         // immediately [1]. So, throw an exception in case the rest of
         // `convex/server`'s syscall handler still runs after this call.
@@ -410,12 +422,14 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
         scope.throw_exception(exception);
     }
 
-    pub fn scope(&mut self) -> v8::HandleScope {
-        v8::HandleScope::new(self.scope)
+    pub fn scope(&mut self) -> &mut v8::PinScope<'s, 'i> {
+        self.scope
     }
 
     /// Begin executing code within a single isolate's scope.
-    pub fn enter<'c, 'd>(v8_scope: &'c mut v8::HandleScope<'d>) -> ExecutionScope<'c, 'd, RT, E> {
+    pub fn enter<'c, 's2>(
+        v8_scope: &'c mut v8::PinScope<'s2, 'i>,
+    ) -> ExecutionScope<'c, 's2, 'i, RT, E> {
         ExecutionScope::new(v8_scope)
     }
 
@@ -425,29 +439,30 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
     }
 
     pub(crate) fn take_state(&mut self) -> Option<RequestState<RT, E>> {
-        self.scope.remove_slot()
+        let context = self.scope.get_current_context();
+        context.remove_context_slot(self.scope)
     }
 
     pub(crate) fn take_module_map(&mut self) -> Option<ModuleMap> {
-        self.scope.remove_slot()
+        let context = self.scope.get_current_context();
+        context.remove_context_slot(self.scope)
     }
 
     pub(crate) fn take_pending_unhandled_promise_rejections(
         &mut self,
     ) -> Option<PendingUnhandledPromiseRejections> {
-        self.scope.remove_slot()
+        let context = self.scope.get_current_context();
+        context.remove_context_slot(self.scope)
     }
 
     pub fn take_pending_dynamic_imports(&mut self) -> Option<PendingDynamicImports> {
-        self.scope.remove_slot()
+        let context = self.scope.get_current_context();
+        context.remove_context_slot(self.scope)
     }
 
-    pub fn take_environment(mut self) -> (E, FunctionExecutionTime) {
+    pub fn take_environment(mut self) -> E {
         let state = self.take_state().expect("Lost ContextState?");
-        (
-            state.environment,
-            state.timeout.get_function_execution_time(),
-        )
+        state.environment
     }
 
     #[allow(unused)]
@@ -487,7 +502,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
     }
 
     extern "C" fn promise_reject_callback(message: v8::PromiseRejectMessage) {
-        let scope = &mut unsafe { v8::CallbackScope::new(&message) };
+        callback_scope!(unsafe let scope, &message);
 
         match message.get_event() {
             v8::PromiseRejectEvent::PromiseRejectWithNoHandler => {
@@ -527,14 +542,14 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
         }
     }
 
-    fn dynamic_import_callback<'s>(
-        scope: &mut v8::HandleScope<'s>,
-        _host_defined_options: v8::Local<'s, v8::Data>,
-        resource_name: v8::Local<'s, v8::Value>,
-        specifier: v8::Local<'s, v8::String>,
-        _import_assertions: v8::Local<'s, v8::FixedArray>,
-    ) -> Option<v8::Local<'s, v8::Promise>> {
-        let r: anyhow::Result<_> = try {
+    fn dynamic_import_callback<'s2>(
+        scope: &mut v8::PinScope<'s2, '_>,
+        _host_defined_options: v8::Local<'s2, v8::Data>,
+        resource_name: v8::Local<'s2, v8::Value>,
+        specifier: v8::Local<'s2, v8::String>,
+        _import_assertions: v8::Local<'s2, v8::FixedArray>,
+    ) -> Option<v8::Local<'s2, v8::Promise>> {
+        let r: anyhow::Result<_> = try_anyhow!({
             let promise_resolver = v8::PromiseResolver::new(scope)
                 .ok_or_else(|| anyhow::anyhow!("Failed to create v8::PromiseResolver"))?;
             let promise = promise_resolver.get_promise(scope);
@@ -556,7 +571,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
             dynamic_imports.push(resolved_specifier, promise_resolver);
 
             promise
-        };
+        });
         match r {
             Ok(promise) => Some(promise),
             Err(e) => {
@@ -568,7 +583,9 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> RequestScope<'a, 'b, RT
     }
 }
 
-impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> Drop for RequestScope<'a, 'b, RT, E> {
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> Drop
+    for RequestScope<'a, 's, 'i, RT, E>
+{
     fn drop(&mut self) {
         // Remove state from slot to stop Timeouts.
         self.take_state();

@@ -1,23 +1,36 @@
-import type { Meta, StoryObj } from "@storybook/react";
+import type { Meta, StoryObj } from "@storybook/nextjs";
+import { fn } from "storybook/test";
 import { SpendingLimitsForm } from "./SpendingLimits";
+import { Sheet } from "@ui/Sheet";
 
 const currentSpending = {
   totalCents: 0,
   nextBillingPeriodStart: "2025-09-25",
 } as const;
 
-const meta: Meta<typeof SpendingLimitsForm> = {
+const meta = {
   component: SpendingLimitsForm,
-  args: {},
-};
+  args: {
+    onSubmit: fn(),
+    onCancel: fn(),
+    currentSpending,
+  },
+  decorators: [
+    (Story) => (
+      <Sheet>
+        <Story />
+      </Sheet>
+    ),
+  ],
+} satisfies Meta<typeof SpendingLimitsForm>;
 
 export default meta;
-type Story = StoryObj<typeof SpendingLimitsForm>;
+type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {
   args: {
     defaultValue: {
-      spendingLimitWarningThresholdUsd: undefined,
+      spendingLimitWarningThresholdUsd: "",
       spendingLimitDisableThresholdUsd: null,
     },
   },
@@ -35,8 +48,8 @@ export const BothThresholdsDisabled: Story = {
 export const BothThresholdsEmpty: Story = {
   args: {
     defaultValue: {
-      spendingLimitWarningThresholdUsd: undefined,
-      spendingLimitDisableThresholdUsd: undefined,
+      spendingLimitWarningThresholdUsd: "",
+      spendingLimitDisableThresholdUsd: "",
     },
   },
 };
@@ -63,7 +76,7 @@ export const HighCurrentSpending: Story = {
   args: {
     defaultValue: {
       spendingLimitWarningThresholdUsd: null,
-      spendingLimitDisableThresholdUsd: undefined,
+      spendingLimitDisableThresholdUsd: "",
     },
     currentSpending: {
       ...currentSpending,

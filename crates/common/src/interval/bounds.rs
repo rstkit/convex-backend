@@ -1,13 +1,15 @@
 //! Subset of `std::ops::Bound` specialized for our restricted forms of
 //! intervals.
-use std::borrow::Borrow;
+use std::{
+    borrow::Borrow,
+    iter,
+};
 
 use value::heap_size::HeapSize;
 
 use super::key::BinaryKey;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct StartIncluded(pub BinaryKey);
 
 impl Borrow<[u8]> for StartIncluded {
@@ -31,7 +33,6 @@ impl HeapSize for StartIncluded {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum End {
     Excluded(BinaryKey),
     Unbounded,
@@ -45,26 +46,39 @@ impl End {
         }
     }
 
+    pub fn included(key: &BinaryKey) -> Self {
+        // `key + [0]`
+        Self::Excluded(BinaryKey::from(
+            key.iter().copied().chain(iter::once(0)).collect::<Vec<_>>(),
+        ))
+    }
+
     /// Is the interval `(-inf, end)` disjoint with `[start, +inf)`?
     pub fn is_disjoint(&self, start: &StartIncluded) -> bool {
         match (self, start) {
             (End::Unbounded, _) => false,
-            (End::Excluded(ref s), StartIncluded(ref t)) => s <= t,
+            (End::Excluded(s), StartIncluded(t)) => s <= t,
         }
     }
 
     pub fn is_adjacent(&self, start: &StartIncluded) -> bool {
         match (self, start) {
             (End::Unbounded, _) => false,
-            (End::Excluded(ref s), StartIncluded(ref t)) => s[..].eq(&t[..]),
+            (End::Excluded(s), StartIncluded(t)) => s[..].eq(&t[..]),
         }
     }
 
+    #[inline]
     pub const fn as_ref(&self) -> EndRef<'_> {
         match self {
             End::Excluded(binary_key) => EndRef::Excluded(binary_key.as_slice()),
             End::Unbounded => EndRef::Unbounded,
         }
+    }
+
+    #[inline]
+    pub fn greater_than(&self, key: &[u8]) -> bool {
+        self.as_ref().greater_than(key)
     }
 }
 
@@ -90,26 +104,12 @@ impl EndRef<'_> {
             EndRef::Unbounded => End::Unbounded,
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-
-    use super::{
-        super::key::BinaryKey,
-        End,
-    };
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_end_ordering(key in any::<BinaryKey>()) {
-            assert!(End::Excluded(key) < End::Unbounded);
+    #[inline]
+    pub fn greater_than(&self, key: &[u8]) -> bool {
+        match *self {
+            EndRef::Excluded(end) => key < end,
+            EndRef::Unbounded => true,
         }
     }
 }

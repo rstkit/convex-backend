@@ -1,12 +1,12 @@
+import { Context } from "../../bundler/context.js";
 import {
-  Context,
   logFailure,
   logFinishedStep,
   logMessage,
   logVerbose,
   logWarning,
-} from "../../bundler/context.js";
-import chalk from "chalk";
+} from "../../bundler/log.js";
+import { chalkStderr } from "chalk";
 import * as net from "net";
 import * as dns from "dns";
 import * as crypto from "crypto";
@@ -18,7 +18,7 @@ import {
 } from "./utils/utils.js";
 import ws from "ws";
 import { BaseConvexClient } from "../../browser/index.js";
-import { Logger } from "../../browser/logging.js";
+import { DefaultLogger } from "../../browser/logging.js";
 const ipFamilyNumbers = { ipv4: 4, ipv6: 6, auto: 0 } as const;
 const ipFamilyNames = { 4: "ipv4", 6: "ipv6", 0: "auto" } as const;
 
@@ -52,7 +52,7 @@ export async function runNetworkTestOnUrl(
     await checkEcho(ctx, url, 64 * 1024 * 1024);
   }
 
-  logFinishedStep(ctx, "Network test passed.");
+  logFinishedStep("Network test passed.");
 }
 
 async function checkDns(ctx: Context, url: string) {
@@ -70,8 +70,7 @@ async function checkDns(ctx: Context, url: string) {
       });
     });
     logMessage(
-      ctx,
-      `${chalk.green(`✔`)} OK: DNS lookup => ${result.address}:${
+      `${chalkStderr.green(`✔`)} OK: DNS lookup => ${result.address}:${
         ipFamilyNames[result.family as keyof typeof ipFamilyNames]
       } (${formatDuration(result.duration)})`,
     );
@@ -126,16 +125,22 @@ async function checkTcpHostPort(
       socket.on("error", (e) => reject(e));
     });
     logMessage(
-      ctx,
-      `${chalk.green(`✔`)} OK: ${tcpString} connect (${formatDuration(
+      `${chalkStderr.green(`✔`)} OK: ${tcpString} connect (${formatDuration(
         duration,
       )})`,
     );
   } catch (e: any) {
+    let errorMessage = `${e}`;
+    if (e instanceof AggregateError) {
+      const individualErrors = e.errors
+        .map((err, i) => `  ${i + 1}. ${err}`)
+        .join("\n");
+      errorMessage = `AggregateError with ${e.errors.length} errors:\n${individualErrors}`;
+    }
     return ctx.crash({
       exitCode: 1,
       errorType: "transient",
-      printedMessage: `FAIL: ${tcpString} connect (${e})`,
+      printedMessage: `FAIL: ${tcpString} connect (${errorMessage})`,
     });
   }
 }
@@ -190,8 +195,7 @@ async function checkHttpOnce(
   }
   const duration = performance.now() - start;
   logMessage(
-    ctx,
-    `${chalk.green(`✔`)} OK: ${name} check (${formatDuration(duration)})`,
+    `${chalkStderr.green(`✔`)} OK: ${name} check (${formatDuration(duration)})`,
   );
 }
 
@@ -200,34 +204,31 @@ async function checkWs(
   { url, adminKey }: { url: string; adminKey: string | null },
 ) {
   if (adminKey === null) {
-    logWarning(
-      ctx,
-      "Skipping WebSocket check because no admin key was provided.",
-    );
+    logWarning("Skipping WebSocket check because no admin key was provided.");
     return;
   }
   let queryPromiseResolver: ((value: string) => void) | null = null;
   const queryPromise = new Promise<string | null>((resolve) => {
     queryPromiseResolver = resolve;
   });
-  const logger = new Logger({
+  const logger = new DefaultLogger({
     verbose: process.env.CONVEX_VERBOSE !== undefined,
   });
   logger.addLogLineListener((level, ...args) => {
     switch (level) {
       case "debug":
-        logVerbose(ctx, ...args);
+        logVerbose(...args);
         break;
       case "info":
-        logVerbose(ctx, ...args);
+        logVerbose(...args);
         break;
       case "warn":
-        logWarning(ctx, ...args);
+        logWarning(...args);
         break;
       case "error":
         // TODO: logFailure is a little hard to use here because it also interacts
         // with the spinner and requires a string.
-        logWarning(ctx, ...args);
+        logWarning(...args);
         break;
     }
   });
@@ -263,8 +264,7 @@ async function checkWs(
     });
   } else {
     logMessage(
-      ctx,
-      `${chalk.green(`✔`)} OK: WebSocket connection established.`,
+      `${chalkStderr.green(`✔`)} OK: WebSocket connection established.`,
     );
   }
 }
@@ -276,8 +276,9 @@ async function checkEcho(ctx: Context, url: string, size: number) {
       deploymentUrl: url,
       onError: (err) => {
         logFailure(
-          ctx,
-          chalk.red(`FAIL: echo ${formatSize(size)} (${err}), retrying...`),
+          chalkStderr.red(
+            `FAIL: echo ${formatSize(size)} (${err}), retrying...`,
+          ),
         );
       },
     });
@@ -299,8 +300,7 @@ async function checkEcho(ctx: Context, url: string, size: number) {
     const duration = performance.now() - start;
     const bytesPerSecond = size / (duration / 1000);
     logMessage(
-      ctx,
-      `${chalk.green(`✔`)} OK: echo ${formatSize(size)} (${formatDuration(
+      `${chalkStderr.green(`✔`)} OK: echo ${formatSize(size)} (${formatDuration(
         duration,
       )}, ${formatSize(bytesPerSecond)}/s)`,
     );

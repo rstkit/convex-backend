@@ -1,18 +1,11 @@
 ---
 title: AI Code Generation
 hide_table_of_contents: true
+description: "How to use AI code generation effectively with Convex"
 ---
 
-<CardLink
-  className="convex-hero-card"
-  item={{
-    href: "https://chef.convex.dev",
-    label: "Prompt to build an app with Convex Chef",
-  }}
-/>
-
 Convex is designed around a small set of composable abstractions with strong
-guarantees that result in code that is not only faster to write, it’s easier to
+guarantees that result in code that is not only faster to write, but easier to
 read and maintain, whether written by a team member or an LLM. Key features make
 sure you get bug-free AI generated code:
 
@@ -21,7 +14,7 @@ sure you get bug-free AI generated code:
    generate database code using the large training set of TypeScript code
    without switching to SQL.
 1. **Less Code for the Same Work** Since so much infrastructure and boiler plate
-   is automatically manged by Convex there is less code to write, and thus less
+   is automatically managed by Convex there is less code to write, and thus less
    code to get wrong.
 1. **Automatic Reactivity** The reactive system automatically tracks data
    dependencies and updates your UI. AI doesn't need to manually manage
@@ -56,7 +49,73 @@ We're constantly working on improving the quality of these rules for Convex by
 using rigorous evals. You can help by
 [contributing to our evals repo](https://github.com/get-convex/convex-evals).
 
+## Convex AI files
+
+The Convex CLI can install and maintain AI helper files in your project:
+
+- `convex/_generated/ai/guidelines.md`
+- Managed sections in `AGENTS.md` and `CLAUDE.md`
+- Agent skills installed via `npx skills`
+
+Use these commands to manage AI files:
+
+- `npx convex ai-files install` - Install or refresh AI files
+- `npx convex ai-files update` - Update to latest available AI files
+- `npx convex ai-files status` - Show what is installed and what is stale
+- `npx convex ai-files disable` - Suppress install and staleness messages in
+  `npx convex dev`
+- `npx convex ai-files enable` - Re-enable install and staleness messages
+- `npx convex ai-files remove` - Remove Convex-managed AI files
+
+The message preference and target agents are controlled in `convex.json` with:
+
+```json title="convex.json"
+{
+  "aiFiles": {
+    "enabled": false,
+    "skills": {
+      "agents": ["claude-code", "codex", "cursor"]
+    }
+  }
+}
+```
+
+By default, `aiFiles.skills.agents` targets `["claude-code", "codex"]`. You can
+override this to target other agents supported by `npx skills`, such as `cursor`
+see https://github.com/vercel-labs/skills?tab=readme-ov-file#supported-agents
+for a full list.
+
+## Using Convex with Background Agents
+
+Remote cloud-based coding agents like Jules, Devin, Codex, and Cursor background
+agents can use Convex deployments when the CLI is in
+[Agent Mode](/cli/background-agents.mdx). This limits the permissions necessary
+for these remote dev environments while letting agents run codegen, iterate on
+code, run tests, run one-off functions.
+
+A good setup script for e.g. ChatGPT Codex might include
+
+```sh
+npm i
+CONVEX_AGENT_MODE=anonymous npx convex dev --once
+```
+
+or
+
+```sh
+bun i
+CONVEX_AGENT_MODE=anonymous bun x convex dev --once
+```
+
+This command requires "full" internet access to download the binary.
+
 ## Convex MCP Server
 
 [Setup the Convex MCP server](/ai/convex-mcp-server.mdx) to give your AI coding
 agent access to your Convex deployment to query and optimize your project.
+
+## Agent Skills
+
+[Agent Skills](/ai/agent-skills.mdx) are portable packages of instructions and
+workflows that teach AI coding agents how to perform specialized Convex tasks
+like setting up auth, designing a schema, and running migrations.

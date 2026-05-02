@@ -1,13 +1,9 @@
 import { z } from "zod";
 import { ConvexTool } from "./index.js";
 import { loadSelectedDeploymentCredentials } from "../../api.js";
-import {
-  envSetInDeployment,
-  envRemoveInDeployment,
-  EnvVar,
-} from "../../env.js";
+import { deploymentEnvBackend, envSet, envRemove, EnvVar } from "../../env.js";
 import { runSystemQuery } from "../../run.js";
-import { getDeploymentSelection } from "../../deploymentSelection.js";
+import { getMcpDeploymentSelection } from "../requestContext.js";
 
 // List Environment Variables
 const envListInputSchema = z.object({
@@ -40,11 +36,13 @@ export const EnvListTool: ConvexTool<
       args.deploymentSelector,
     );
     process.chdir(projectDir);
-    const deploymentSelection = await getDeploymentSelection(ctx, ctx.options);
+    const deploymentSelection = await getMcpDeploymentSelection(
+      ctx,
+      deployment,
+    );
     const credentials = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      deployment,
     );
     const variables = (await runSystemQuery(ctx, {
       deploymentUrl: credentials.url,
@@ -87,11 +85,13 @@ export const EnvGetTool: ConvexTool<
       args.deploymentSelector,
     );
     process.chdir(projectDir);
-    const deploymentSelection = await getDeploymentSelection(ctx, ctx.options);
+    const deploymentSelection = await getMcpDeploymentSelection(
+      ctx,
+      deployment,
+    );
     const credentials = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      deployment,
     );
     const envVar = (await runSystemQuery(ctx, {
       deploymentUrl: credentials.url,
@@ -132,18 +132,21 @@ export const EnvSetTool: ConvexTool<
       args.deploymentSelector,
     );
     process.chdir(projectDir);
-    const deploymentSelection = await getDeploymentSelection(ctx, ctx.options);
+    const deploymentSelection = await getMcpDeploymentSelection(
+      ctx,
+      deployment,
+    );
     const credentials = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      deployment,
     );
     const deploymentInfo = {
       deploymentUrl: credentials.url,
       adminKey: credentials.adminKey,
       deploymentNotice: "",
     };
-    await envSetInDeployment(ctx, deploymentInfo, args.name, args.value);
+    const backend = deploymentEnvBackend(ctx, deploymentInfo);
+    await envSet(ctx, backend, args.name, args.value);
     return { success: true };
   },
 };
@@ -175,18 +178,21 @@ export const EnvRemoveTool: ConvexTool<
       args.deploymentSelector,
     );
     process.chdir(projectDir);
-    const deploymentSelection = await getDeploymentSelection(ctx, ctx.options);
+    const deploymentSelection = await getMcpDeploymentSelection(
+      ctx,
+      deployment,
+    );
     const credentials = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      deployment,
     );
     const deploymentInfo = {
       deploymentUrl: credentials.url,
       adminKey: credentials.adminKey,
       deploymentNotice: "",
     };
-    await envRemoveInDeployment(ctx, deploymentInfo, args.name);
+    const backend = deploymentEnvBackend(ctx, deploymentInfo);
+    await envRemove(ctx, backend, args.name);
     return { success: true };
   },
 };

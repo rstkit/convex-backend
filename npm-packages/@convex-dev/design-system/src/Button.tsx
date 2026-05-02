@@ -7,16 +7,18 @@ import { Spinner } from "@ui/Spinner";
 import classNames from "classnames";
 
 export type ButtonProps = {
+  id?: string;
   children?: React.ReactNode;
   variant?: "primary" | "danger" | "neutral" | "unstyled";
   inline?: boolean;
-  size?: "xs" | "sm" | "md" | "lg";
+  size?: ButtonSize;
   focused?: boolean;
   icon?: React.ReactNode;
   className?: string;
   disabled?: boolean;
   tip?: React.ReactNode;
   tipSide?: TooltipSide;
+  tipDisableHoverableContent?: boolean;
   loading?: boolean;
 } & Pick<
   React.HTMLProps<HTMLElement>,
@@ -48,8 +50,11 @@ export type ButtonProps = {
       }
   );
 
+export type ButtonSize = "xs" | "sm" | "md" | "lg";
+
 export const Button = forwardRef<HTMLElement, ButtonProps>(function Button(
   {
+    id,
     children,
     inline = false,
     variant = "primary",
@@ -60,6 +65,7 @@ export const Button = forwardRef<HTMLElement, ButtonProps>(function Button(
     icon,
     tip,
     tipSide,
+    tipDisableHoverableContent,
     loading = false,
     ...props
   },
@@ -85,7 +91,12 @@ export const Button = forwardRef<HTMLElement, ButtonProps>(function Button(
         });
   if (href !== undefined && !disabled) {
     return (
-      <Tooltip tip={tip} side={tipSide} wrapsButton>
+      <Tooltip
+        tip={tip}
+        side={tipSide}
+        disableHoverableContent={tipDisableHoverableContent}
+        asChild
+      >
         <Link
           passHref
           href={href}
@@ -106,10 +117,16 @@ export const Button = forwardRef<HTMLElement, ButtonProps>(function Button(
     );
   }
   return (
-    <Tooltip tip={tip} side={tipSide} wrapsButton>
+    <Tooltip
+      tip={tip}
+      side={tipSide}
+      disableHoverableContent={tipDisableHoverableContent}
+      asChild
+    >
       {/* we're allowed to use button here. It's the Button component */}
       {/* eslint-disable-next-line react/forbid-elements */}
       <button
+        id={id}
         // eslint-disable-next-line react/button-has-type
         type={type ?? "button"}
         tabIndex={0}
@@ -121,10 +138,10 @@ export const Button = forwardRef<HTMLElement, ButtonProps>(function Button(
         ref={ref as any}
         {...htmlProps}
       >
-        {/* This needs to be wrapped in a dom element to 
+        {/* This needs to be wrapped in a dom element to
           fix an issue with the google translate extension
           throwing errors when the icon switches between different icons.
-          The negative margin is added when the icon doesn't exist 
+          The negative margin is added when the icon doesn't exist
           to not render the flex gap.
           https://github.com/facebook/react/issues/11538#issuecomment-390386520
        */}
@@ -154,7 +171,7 @@ export const Button = forwardRef<HTMLElement, ButtonProps>(function Button(
 });
 
 const button = tv({
-  base: "animate-fadeInToVar relative inline-flex select-none items-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:border focus-visible:border-border-selected focus-visible:outline-none",
+  base: "animate-fadeInToVar relative inline-flex items-center rounded-md text-sm font-medium whitespace-nowrap transition-colors select-none focus-visible:border focus-visible:border-border-selected focus-visible:outline-hidden",
   variants: {
     variant: {
       primary: "border-white/30 bg-util-accent text-white",
@@ -244,8 +261,7 @@ const button = tv({
     {
       variant: "danger",
       accent: "none",
-      class:
-        "border-background-error border-content-error/30 bg-background-error",
+      class: "border-content-error/30 bg-background-error",
     },
     {
       variant: "danger",

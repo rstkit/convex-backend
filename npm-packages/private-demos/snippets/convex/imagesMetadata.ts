@@ -7,11 +7,12 @@ export const getMetadata = query({
     storageId: v.id("_storage"),
   },
   handler: async (ctx, args) => {
-    return await ctx.db.system.get(args.storageId);
+    return await ctx.db.system.get("_storage", args.storageId);
   },
 });
 
 export const listAllFiles = query({
+  args: {},
   handler: async (ctx) => {
     // You can use .paginate() as well
     return await ctx.db.system.query("_storage").collect();

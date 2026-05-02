@@ -21,6 +21,7 @@ const AUDIT_LOG_ACTIONS = [
   "deleteProjectEnvironmentVariable",
   "createDeployment",
   "deleteDeployment",
+  "updateDeployment",
   "inviteMember",
   "cancelMemberInvitation",
   "updateMemberRole",
@@ -37,6 +38,12 @@ const AUDIT_LOG_ACTIONS = [
   "createTeamAccessToken",
   "updateTeamAccessToken",
   "deleteTeamAccessToken",
+  "createProjectAccessToken",
+  "updateProjectAccessToken",
+  "deleteProjectAccessToken",
+  "createDeploymentAccessToken",
+  "updateDeploymentAccessToken",
+  "deleteDeploymentAccessToken",
   "startManualCloudBackup",
   "deleteCloudBackup",
   "restoreFromCloudBackup",
@@ -63,6 +70,7 @@ export function AuditLogToolbar({
   selectedEndDay,
   members,
   setDate,
+  auditLogRetentionDays,
 }: {
   selectedMember: string;
   setSelectedMember: (member: string) => void;
@@ -72,8 +80,17 @@ export function AuditLogToolbar({
   selectedEndDay: Date;
   members: MemberResponse[];
   setDate: (date: DateRange) => void;
+  auditLogRetentionDays: number;
 }) {
-  const minStartDate = startOfDay(new Date("2024-06-05"));
+  const minStartDate = startOfDay(
+    auditLogRetentionDays === -1
+      ? new Date(2024, 5, 5)
+      : Date.now() - auditLogRetentionDays * 24 * 60 * 60 * 1000,
+  );
+  const beforeMinDateTooltip =
+    auditLogRetentionDays === -1
+      ? null
+      : `Deployment history is preserved for ${auditLogRetentionDays} days.`;
   const maxEndDate = endOfToday();
 
   const startDate =
@@ -86,6 +103,7 @@ export function AuditLogToolbar({
         maxDate={maxEndDate}
         date={{ from: startDate, to: selectedEndDay }}
         setDate={setDate}
+        beforeMinDateTooltip={beforeMinDateTooltip}
       />
       <Combobox
         options={[
@@ -98,6 +116,7 @@ export function AuditLogToolbar({
             [(option) => option.label.toLowerCase()],
           ),
         ]}
+        optionsWidth="fit"
         allowCustomValue
         selectedOption={selectedMember}
         setSelectedOption={(o) =>

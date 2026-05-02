@@ -17,7 +17,7 @@ impl StaticString {
 
     pub fn create<'s>(
         &'static self,
-        scope: &mut v8::HandleScope<'s, ()>,
+        scope: &v8::PinScope<'s, '_, ()>,
     ) -> anyhow::Result<v8::Local<'s, v8::String>> {
         v8::String::new_from_onebyte_const(scope, &self.v8)
             .ok_or_else(|| anyhow::anyhow!("Failed to create static string for {:?}", self.string))
@@ -31,12 +31,12 @@ impl StaticString {
 macro_rules! declare_strings {
     ($s:ident $(,)?) => {
         #[allow(non_upper_case_globals)]
-        pub const $s: StaticString = StaticString::new(stringify!($s));
+        pub(crate) const $s: StaticString = StaticString::new(stringify!($s));
     };
 
     ($name:ident => $s:expr $(,)?) => {
         #[allow(non_upper_case_globals)]
-        pub const $name: StaticString = StaticString::new($s);
+        pub(crate) const $name: StaticString = StaticString::new($s);
     };
 
     ($s:ident , $($rest:tt)*) => {
@@ -55,6 +55,7 @@ macro_rules! declare_strings {
 // identifier as a string, or explicitly name the string with the `$name =>
 // $string` syntax.
 declare_strings!(
+    __frameData,
     _handler,
     _onInitCallbacks,
     Convex,
@@ -62,6 +63,7 @@ declare_strings!(
     asyncSyscall,
     data,
     default,
+    DOMException,
     dynamic_import_unsupported => "dynamic module import unsupported",
     empty => "",
     export,
@@ -78,11 +80,22 @@ declare_strings!(
     isPublic,
     isQuery,
     isRouter,
-    json_stringify => "JSON.stringify",
     lookup,
     op,
     path,
     runRequest,
     setup,
+    stack,
     syscall,
+
+    // crypto
+    CryptoKey,
+    publicKey,
+    privateKey,
+    public,
+    r#type => "type",
+    extractable,
+    algorithm,
+    usages,
+    name,
 );

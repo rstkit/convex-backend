@@ -1,5 +1,5 @@
-import classNames from "classnames";
 import { useEffect, useRef } from "react";
+import { cn } from "./cn";
 
 export function Checkbox({
   checked,
@@ -30,10 +30,12 @@ export function Checkbox({
       ref={inputRef}
       tabIndex={0}
       type="checkbox"
-      className={classNames(
-        "size-3.5 form-checkbox enabled:cursor-pointer rounded disabled:opacity-50 enabled:hover:text-content-link enabled:hover:outline enabled:hover:outline-content-primary",
-        "focus:outline-0 focus:ring-0",
-        "bg-background-secondary ring-offset-background-secondary checked:bg-util-accent text-util-accent",
+      className={cn(
+        "form-checkbox size-3.5 rounded-sm enabled:cursor-pointer enabled:hover:outline enabled:hover:outline-content-primary disabled:cursor-not-allowed disabled:opacity-50",
+        "focus:ring-0 focus:ring-offset-0 focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-border-selected focus-visible:outline-solid",
+        "bg-background-secondary text-util-accent ring-offset-background-secondary checked:bg-util-accent",
+        // eslint-disable-next-line no-restricted-syntax -- using text-content-link the enabled hover color
+        "enabled:hover:text-content-link",
         className,
       )}
       onChange={onChange}
@@ -46,7 +48,7 @@ export function Checkbox({
       }}
       disabled={disabled ?? false}
       checked={checkedBool}
-      aria-checked={checkedBool}
+      aria-checked={checked === "indeterminate" ? "mixed" : checkedBool}
       aria-label="Selected"
     />
   );

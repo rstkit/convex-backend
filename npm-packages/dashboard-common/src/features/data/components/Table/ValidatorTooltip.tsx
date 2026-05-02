@@ -25,10 +25,10 @@ export function ValidatorTooltip({
     : 0;
   const validatorTooltip = validatorText ? (
     <div className="min-w-fit animate-fadeInFromLoading p-2 text-left">
-      <p className="mb-1 whitespace-nowrap text-xs font-semibold">
+      <p className="mb-1 text-xs font-semibold whitespace-nowrap">
         Schema for {columnName}:
       </p>
-      <div style={{ width: maxLineWidth * 8 }}>
+      <div style={{ width: maxLineWidth * 9 }}>
         <ReadonlyCode
           disableLineNumbers
           code={validatorText}

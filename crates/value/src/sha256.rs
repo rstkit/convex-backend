@@ -17,7 +17,6 @@ use sha2::Digest;
 use crate::ConvexValue;
 
 #[must_use]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Clone, Eq, PartialEq)]
 pub struct Sha256Digest([u8; 32]);
 
@@ -100,6 +99,12 @@ impl SetDigest {
         // This is not cryptographically strong because the parameters are very small.
         for (i, x) in digest.iter().enumerate() {
             self.0[i] = self.0[i].wrapping_add(*x);
+        }
+    }
+
+    pub fn remove(&mut self, digest: &Sha256Digest) {
+        for (i, x) in digest.iter().enumerate() {
+            self.0[i] = self.0[i].wrapping_sub(*x);
         }
     }
 }

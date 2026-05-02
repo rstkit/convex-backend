@@ -188,7 +188,7 @@ macro_rules! val {
     };
 
     ([]) => {
-        $crate::ConvexValue::Array(ConvexArray::empty())
+        $crate::ConvexValue::Array($crate::ConvexArray::empty())
     };
 
     ([ $($tt:tt)+ ]) => {
@@ -249,30 +249,5 @@ macro_rules! obj {
         let mut object = std::collections::BTreeMap::new();
         val!(@object object () ($($tt)+) ($($tt)+));
         $crate::ConvexObject::try_from(object)
-    });
-}
-
-#[cfg(any(test, feature = "testing"))]
-#[macro_export(local_inner_macros)]
-macro_rules! assert_val {
-    ( $($tt:tt)+ ) => ({
-        let r: anyhow::Result<_> = try {
-            val!( $($tt)+ )
-        };
-        r.unwrap()
-    });
-}
-
-#[cfg(any(test, feature = "testing"))]
-#[macro_export(local_inner_macros)]
-macro_rules! assert_obj {
-    () => ({
-        $crate::ConvexObject::empty()
-    });
-    ( $($tt:tt)+ ) => ({
-        let r: anyhow::Result<_> = try {
-            obj!( $($tt)+ )?
-        };
-        r.unwrap()
     });
 }

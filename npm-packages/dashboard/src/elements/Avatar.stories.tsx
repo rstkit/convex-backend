@@ -1,16 +1,13 @@
-import { StoryObj } from "@storybook/react";
+import { Meta, StoryObj } from "@storybook/nextjs";
 import { Avatar } from "./Avatar";
 
-export default { component: Avatar };
+const meta = { component: Avatar } satisfies Meta<typeof Avatar>;
 
-export const Initials: StoryObj<typeof Avatar> = {
+export default meta;
+type Story = StoryObj<typeof Avatar>;
+
+export const Initials: Story = {
   args: {
     name: "Zepp Williams",
   },
 };
-
-// export const Image = Template.bind({});
-// Image.args = {
-// name: "Zepp Williams",
-// imageUrl: "https://i.pravatar.cc/200",
-// };

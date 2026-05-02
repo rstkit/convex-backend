@@ -36,7 +36,6 @@ export function Snippet({
   prefix,
   suffix,
   highlightPatterns,
-  showLanguageSelector,
   replacements = [],
 }: {
   source: string;
@@ -47,7 +46,6 @@ export function Snippet({
   prefix?: string;
   suffix?: string;
   highlightPatterns?: string[];
-  showLanguageSelector?: boolean;
   replacements?: [RegExp | string, string][];
 }) {
   const lines = source.split("\n");
@@ -77,7 +75,6 @@ export function Snippet({
       if (pieces.length < 4) {
         throw new Error(`Invalid snippet line: ${trimmed}`);
       }
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const [_comment, _snippet, command, name] = pieces;
       if (command === "start") {
         if (allSpans.has(name) || openSpans.has(name)) {
@@ -153,7 +150,6 @@ export function Snippet({
   return (
     <CodeBlock
       className={"language-" + language}
-      showLanguageSelector={showLanguageSelector === true}
       // CodeBlock is wrongly typed
       title={combinedTitle as unknown as string}
     >

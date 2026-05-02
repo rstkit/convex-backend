@@ -1,5 +1,3 @@
-#[cfg(any(test, feature = "testing"))]
-use std::fmt::Debug;
 use std::{
     collections::{
         BTreeMap,
@@ -44,7 +42,6 @@ use common::{
         TEXT_INDEX_SIZE_HARD_LIMIT,
         VECTOR_INDEX_SIZE_HARD_LIMIT,
     },
-    persistence::RetentionValidator,
     query::{
         CursorPosition,
         Order,
@@ -53,12 +50,10 @@ use common::{
     },
     runtime::Runtime,
     schemas::DatabaseSchema,
-    sync::split_rw_lock::Reader,
     types::{
         GenericIndexName,
         IndexId,
         IndexName,
-        PersistenceVersion,
         RepeatableTimestamp,
         StableIndexName,
         TableName,
@@ -73,18 +68,21 @@ use common::{
         Size,
         TableMapping,
     },
-    version::Version,
     virtual_system_mapping::VirtualSystemMapping,
 };
 use errors::ErrorMetadata;
-use imbl::OrdMap;
-use indexing::backend_in_memory_indexes::RangeRequest;
+use indexing::backend_in_memory_indexes::{
+    RangeRequest,
+    TimestampedIndexCache,
+};
 use keybroker::{
     Identity,
     UserIdentityAttributes,
 };
-use maplit::btreemap;
-use search::CandidateRevision;
+use search::{
+    metrics::SearchType,
+    CandidateRevision,
+};
 use sync_types::{
     AuthenticationToken,
     Timestamp,
@@ -106,8 +104,14 @@ use crate::{
         },
     },
     committer::table_dependency_sort_key,
-    execution_size::FunctionExecutionSize,
-    metrics,
+    execution_size::{
+        FunctionExecutionSize,
+        ScheduledFunctionsSize,
+    },
+    metrics::{
+        self,
+        log_index_too_large_blocking_writes,
+    },
     patch::PatchValue,
     preloaded::PreloadedIndexRange,
     query::{
@@ -116,10 +120,7 @@ use crate::{
     },
     reads::TransactionReadSet,
     schema_registry::SchemaRegistry,
-    snapshot_manager::{
-        Snapshot,
-        SnapshotManager,
-    },
+    snapshot_manager::Snapshot,
     table_summary::table_summary_bootstrapping_error,
     token::Token,
     transaction_id_generator::TransactionIdGenerator,
@@ -128,7 +129,6 @@ use crate::{
     writes::{
         NestedWriteToken,
         NestedWrites,
-        TransactionWriteSize,
         Writes,
     },
     ComponentRegistry,
@@ -138,6 +138,7 @@ use crate::{
     SystemMetadataModel,
     TableModel,
     TableRegistry,
+    TransactionReadSize,
     SCHEMAS_TABLE,
 };
 
@@ -153,7 +154,7 @@ pub struct Transaction<RT: Runtime> {
     pub(crate) next_creation_time: CreationTime,
 
     // Size of any functions scheduled from this transaction.
-    pub scheduled_size: TransactionWriteSize,
+    pub scheduled_size: ScheduledFunctionsSize,
 
     pub(crate) reads: TransactionReadSet,
     pub(crate) writes: NestedWrites<Writes>,
@@ -170,22 +171,11 @@ pub struct Transaction<RT: Runtime> {
 
     pub(crate) stats: BTreeMap<TabletId, TableStats>,
 
-    pub(crate) retention_validator: Arc<dyn RetentionValidator>,
-
     pub(crate) runtime: RT,
 
     pub usage_tracker: FunctionUsageTracker,
     pub(crate) virtual_system_mapping: VirtualSystemMapping,
 
-    #[cfg(any(test, feature = "testing"))]
-    index_size_override: Option<usize>,
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl<RT: Runtime> Debug for Transaction<RT> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Transaction").finish()
-    }
 }
 
 #[async_trait]
@@ -215,7 +205,6 @@ impl<RT: Runtime> Transaction<RT> {
         count: Arc<dyn TableCountSnapshot>,
         runtime: RT,
         usage_tracker: FunctionUsageTracker,
-        retention_validator: Arc<dyn RetentionValidator>,
         virtual_system_mapping: VirtualSystemMapping,
     ) -> Self {
         Self {
@@ -224,7 +213,7 @@ impl<RT: Runtime> Transaction<RT> {
             writes: NestedWrites::new(Writes::new()),
             id_generator,
             next_creation_time: creation_time,
-            scheduled_size: TransactionWriteSize::default(),
+            scheduled_size: ScheduledFunctionsSize::default(),
             index: NestedWrites::new(index),
             metadata: NestedWrites::new(metadata),
             schema_registry: NestedWrites::new(schema_registry),
@@ -233,16 +222,9 @@ impl<RT: Runtime> Transaction<RT> {
             table_count_deltas: BTreeMap::new(),
             stats: BTreeMap::new(),
             runtime,
-            retention_validator,
             usage_tracker,
             virtual_system_mapping,
-            #[cfg(any(test, feature = "testing"))]
-            index_size_override: None,
         }
-    }
-
-    pub fn persistence_version(&self) -> PersistenceVersion {
-        self.index.index_registry().persistence_version()
     }
 
     pub fn table_mapping(&mut self) -> &TableMapping {
@@ -274,7 +256,9 @@ impl<RT: Runtime> Transaction<RT> {
         let virtual_system_mapping = self.virtual_system_mapping().clone();
         move |number| {
             let name = table_mapping.number_to_name()(number)?;
-            if let Some(virtual_name) = virtual_system_mapping.system_to_virtual_table(&name) {
+            if let Some(virtual_name) =
+                virtual_system_mapping.primary_system_to_virtual_table(&name)
+            {
                 Ok(virtual_name.clone())
             } else {
                 match table_filter {
@@ -389,8 +373,11 @@ impl<RT: Runtime> Transaction<RT> {
         let mut biggest_document_id = None;
         let mut max_nesting = 0;
         let mut most_nested_document_id = None;
-        for (document_id, DocumentUpdateWithPrevTs { new_document, .. }) in
-            self.writes.coalesced_writes()
+        for DocumentUpdateWithPrevTs {
+            id: document_id,
+            new_document,
+            ..
+        } in self.writes.coalesced_writes()
         {
             let (size, nesting) = new_document
                 .as_ref()
@@ -426,6 +413,10 @@ impl<RT: Runtime> Transaction<RT> {
         }
     }
 
+    pub fn user_tx_read_size(&self) -> &TransactionReadSize {
+        self.reads.user_tx_size()
+    }
+
     /// Applies the reads and writes from FunctionRunner to the Transaction.
     #[fastrace::trace]
     pub fn apply_function_runner_tx(
@@ -435,7 +426,7 @@ impl<RT: Runtime> Transaction<RT> {
         num_intervals: usize,
         user_tx_size: crate::reads::TransactionReadSize,
         system_tx_size: crate::reads::TransactionReadSize,
-        updates: OrdMap<ResolvedDocumentId, DocumentUpdateWithPrevTs>,
+        updates: Vec<DocumentUpdateWithPrevTs>,
         rows_read_by_tablet: BTreeMap<TabletId, u64>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -462,27 +453,29 @@ impl<RT: Runtime> Transaction<RT> {
     // In most scenarios this transaction will have no writes.
     pub fn merge_writes(
         &mut self,
-        updates: OrdMap<ResolvedDocumentId, DocumentUpdateWithPrevTs>,
+        updates: impl IntoIterator<Item = DocumentUpdateWithPrevTs>,
     ) -> anyhow::Result<()> {
         let existing_updates = self.writes().as_flat()?.clone().into_updates();
 
         let mut updates = updates.into_iter().collect::<Vec<_>>();
-        updates.sort_by_key(|(id, update)| {
+        let bootstrap_tables = self.bootstrap_tables();
+        updates.sort_by_cached_key(|update| {
             table_dependency_sort_key(
-                self.bootstrap_tables(),
-                (*id).into(),
+                bootstrap_tables,
+                update.id.into(),
                 update.new_document.as_ref(),
             )
         });
 
         let mut preserved_update_count = 0;
-        for (id, update) in updates {
+        for update in updates {
+            let id = update.id;
             // Ensure that the existing update matches, and that
             // that the merged-in writes didn't otherwise modify documents
             // already written to in this transaction.
             if let Some(existing_update) = existing_updates.get(&id) {
                 anyhow::ensure!(
-                    *existing_update == update,
+                    **existing_update == update,
                     "Conflicting updates for document {id}"
                 );
                 preserved_update_count += 1;
@@ -559,11 +552,12 @@ impl<RT: Runtime> Transaction<RT> {
                 ))?;
 
         let new_document = {
-            let patched_value = value
-                .clone()
-                .apply(old_document.value().clone().into_value())?;
+            let patched_value = value.apply(old_document.value().clone().into_value())?;
             old_document.replace_value(patched_value)?
         };
+        if new_document == old_document {
+            return Ok(new_document);
+        }
         SchemaModel::new(self, namespace)
             .enforce(&new_document)
             .await?;
@@ -574,10 +568,7 @@ impl<RT: Runtime> Transaction<RT> {
 
     pub fn is_system(&mut self, namespace: TableNamespace, table_number: TableNumber) -> bool {
         let tablet_id =
-            match self.table_mapping().namespace(namespace).number_to_tablet()(table_number) {
-                Err(_) => None,
-                Ok(id) => Some(id),
-            };
+            self.table_mapping().namespace(namespace).number_to_tablet()(table_number).ok();
         tablet_id.is_some_and(|id| self.table_mapping().is_system_tablet(id))
     }
 
@@ -601,6 +592,9 @@ impl<RT: Runtime> Transaction<RT> {
 
         // Replace document.
         let new_document = old_document.replace_value(value)?;
+        if new_document == old_document {
+            return Ok(new_document);
+        }
 
         SchemaModel::new(self, namespace)
             .enforce(&new_document)
@@ -668,12 +662,19 @@ impl<RT: Runtime> Transaction<RT> {
     }
 
     pub fn into_token(self) -> anyhow::Result<Token> {
-        if !self.is_readonly() {
-            anyhow::bail!("Transaction isn't readonly");
-        }
+        anyhow::ensure!(self.is_readonly(), "Transaction isn't readonly");
         metrics::log_read_tx(&self);
         let ts = *self.begin_timestamp();
         Ok(Token::new(Arc::new(self.reads.into_read_set()), ts))
+    }
+
+    pub fn into_token_and_index_cache(self) -> anyhow::Result<(Token, TimestampedIndexCache)> {
+        anyhow::ensure!(self.is_readonly(), "Transaction isn't readonly");
+        metrics::log_read_tx(&self);
+        let ts = self.begin_timestamp();
+        let token = Token::new(Arc::new(self.reads.into_read_set()), *ts);
+        let cache = self.index.into_flat()?.into_cache();
+        Ok((token, TimestampedIndexCache { cache, ts }))
     }
 
     pub fn take_stats(&mut self) -> BTreeMap<TableName, TableStats> {
@@ -708,7 +709,7 @@ impl<RT: Runtime> Transaction<RT> {
         &self.stats
     }
 
-    fn take_table_mapping_dep(&mut self) {
+    pub(crate) fn take_table_mapping_dep(&mut self) {
         let tables_by_id = TabletIndexName::by_id(
             self.metadata
                 .table_mapping()
@@ -772,17 +773,6 @@ impl<RT: Runtime> Transaction<RT> {
     }
 
     // XXX move to table model?
-    #[cfg(any(test, feature = "testing"))]
-    pub async fn create_system_table_testing(
-        &mut self,
-        namespace: TableNamespace,
-        table_name: &TableName,
-        default_table_number: Option<TableNumber>,
-    ) -> anyhow::Result<bool> {
-        self.create_system_table(namespace, table_name, default_table_number)
-            .await
-    }
-
     async fn table_number_for_system_table(
         &mut self,
         namespace: TableNamespace,
@@ -896,7 +886,7 @@ impl<RT: Runtime> Transaction<RT> {
         let index_name = TabletIndexName::by_id(id.tablet_id);
         let printable_index_name = IndexName::by_id(table_name.clone());
         let index_key = IndexKey::new(vec![], id.into());
-        let interval = Interval::prefix(index_key.to_bytes().into());
+        let interval = Interval::singleton(index_key.to_bytes().into());
         let range_request = RangeRequest {
             index_name: index_name.clone(),
             printable_index_name,
@@ -906,16 +896,18 @@ impl<RT: Runtime> Transaction<RT> {
             max_size: 2,
         };
 
-        let mut results = self
+        let [result] = self
             .index
-            .range_batch(&mut self.reads, btreemap! { 0 => range_request })
-            .await;
+            .range_batch(&[&range_request])
+            .await
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("expected result"))?;
         self.reads
             .record_indexed_directly(index_name, IndexedFields::by_id(), interval)?;
         let IndexRangeResponse {
             page: range_results,
             cursor,
-        } = results.remove(&0).context("expected result")??;
+        } = result?;
         if range_results.len() > 1 {
             Err(anyhow::anyhow!("Got multiple values for id {id:?}"))?;
         }
@@ -926,7 +918,6 @@ impl<RT: Runtime> Transaction<RT> {
         }
         let result = match range_results.into_iter().next() {
             Some((_, doc, timestamp)) => {
-                let is_virtual_table = self.virtual_system_mapping().is_virtual_table(&table_name);
                 let component_path = self
                     .component_path_for_document_id(doc.id())?
                     .unwrap_or_default();
@@ -935,10 +926,10 @@ impl<RT: Runtime> Transaction<RT> {
                     table_name,
                     doc.size(),
                     &self.usage_tracker,
-                    is_virtual_table,
+                    &self.virtual_system_mapping,
                 )?;
 
-                Some((doc, timestamp))
+                Some((doc.unpack(), timestamp))
             },
             None => None,
         };
@@ -1038,19 +1029,46 @@ impl<RT: Runtime> Transaction<RT> {
         Ok(document_id)
     }
 
-    pub async fn search(
+    pub async fn text_search(
         &mut self,
         stable_index_name: &StableIndexName,
-        search: &Search,
+        search: Search,
         version: SearchVersion,
     ) -> anyhow::Result<Vec<(CandidateRevision, IndexKeyBytes)>> {
         let Some(tablet_index_name) = stable_index_name.tablet_index_name() else {
             return Ok(vec![]);
         };
-        let search = search.clone().to_internal(tablet_index_name.clone())?;
-        self.index
+        // Short-circuit and return no results if the search query is just an empty
+        // string. Skip usage tracking.
+        if search.is_empty()? {
+            return Ok(vec![]);
+        }
+        let tablet_id = tablet_index_name.table();
+        let table_namespace = self.table_mapping().tablet_namespace(*tablet_id)?;
+        let component_path = self.must_component_path(table_namespace.into())?;
+        let index_name = search.index_name.clone();
+        let search = search.to_internal(tablet_index_name.clone())?;
+
+        // Get index metadata before performing the search
+        let index = self
+            .index
+            .index_registry()
+            .require_enabled(tablet_index_name, &search.printable_index_name()?)?;
+        let index_size = index.metadata().config.estimate_pricing_size_bytes()?;
+        let table_name = search.table_name.clone();
+
+        let results = self
+            .index
             .search(&mut self.reads, &search, tablet_index_name.clone(), version)
-            .await
+            .await?;
+
+        self.usage_tracker.track_text_query(
+            component_path,
+            table_name.to_string(),
+            index_name,
+            index_size,
+        );
+        Ok(results)
     }
 
     // TODO(lee) Make this private.
@@ -1062,7 +1080,6 @@ impl<RT: Runtime> Transaction<RT> {
         document: &ResolvedDocument,
         table_name: &TableName,
     ) -> anyhow::Result<()> {
-        let is_virtual_table = self.virtual_system_mapping().is_virtual_table(table_name);
         let component_path = self
             .component_path_for_document_id(document.id())?
             .unwrap_or_default();
@@ -1071,7 +1088,7 @@ impl<RT: Runtime> Transaction<RT> {
             table_name.clone(),
             document.size(),
             &self.usage_tracker,
-            is_virtual_table,
+            &self.virtual_system_mapping,
         )
     }
 
@@ -1106,17 +1123,44 @@ impl<RT: Runtime> Transaction<RT> {
             .await
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    pub fn set_index_size_hard_limit(&mut self, size: usize) {
-        self.index_size_override = Some(size);
+    pub fn finalize(self) -> anyhow::Result<FinalTransaction> {
+        FinalTransaction::new(self)
     }
 
-    pub async fn finalize(
-        self,
-        snapshot_reader: Reader<SnapshotManager>,
-    ) -> anyhow::Result<FinalTransaction> {
-        FinalTransaction::new(self, snapshot_reader).await
+    /// Clone the transaction to use for a snapshot query.
+    pub fn clone_for_snapshot_query(&self) -> anyhow::Result<Transaction<RT>> {
+        Ok(Transaction {
+            identity: self.identity.clone(),
+            id_generator: self.id_generator.clone_for_snapshot_query(),
+            next_creation_time: self.next_creation_time,
+            scheduled_size: self.scheduled_size.clone(),
+            // Don't clone the read set because it is expensive and doesn't matter in a snapshot
+            // query
+            reads: TransactionReadSet::new(),
+            // Reset the write set because the query should observe a snapshot of the database from
+            // the start of the transaction
+            writes: NestedWrites::new(Writes::new()),
+            // Reset pending writes
+            index: NestedWrites::new(self.index.clone_for_snapshot_query()),
+            // TODO(ENG-10621): to be absolutely safe, we should reset changes to metadata,
+            // schema_registry, and component_registry. Metadata may contain newly
+            // created tables, but the tables will appear empty to snapshot query. It is
+            // only correct to clone schema_registry and component_registry if
+            // there were no writes to those tables
+            metadata: self.metadata.clone(),
+            schema_registry: self.schema_registry.clone(),
+            component_registry: self.component_registry.clone(),
+            count_snapshot: self.count_snapshot.clone(),
+            // Also reset table_count_deltas
+            table_count_deltas: BTreeMap::new(),
+            stats: self.stats.clone(),
+            runtime: self.runtime.clone(),
+            usage_tracker: self.usage_tracker.clone(),
+            virtual_system_mapping: self.virtual_system_mapping.clone(),
+
+        })
     }
+
 }
 
 #[derive(Debug)]
@@ -1125,7 +1169,6 @@ pub struct IndexRangeRequest {
     pub interval: Interval,
     pub order: Order,
     pub max_rows: usize,
-    pub version: Option<Version>,
 }
 
 /// FinalTransaction is a finalized Transaction.
@@ -1141,6 +1184,7 @@ pub struct FinalTransaction {
     pub(crate) writes: Writes,
 
     pub(crate) usage_tracker: FunctionUsageTracker,
+
 }
 
 impl FinalTransaction {
@@ -1148,71 +1192,50 @@ impl FinalTransaction {
         self.writes.is_empty()
     }
 
-    pub async fn new<RT: Runtime>(
-        mut transaction: Transaction<RT>,
-        snapshot_reader: Reader<SnapshotManager>,
-    ) -> anyhow::Result<Self> {
+    fn new<RT: Runtime>(transaction: Transaction<RT>) -> anyhow::Result<Self> {
         // All subtransactions must have committed or rolled back.
         transaction.require_not_nested()?;
 
         let begin_timestamp = transaction.begin_timestamp();
-        let table_mapping = transaction.table_mapping().clone();
-        let component_registry = transaction.component_registry.deref().clone();
-        // Note that we do a best effort validation for memory index sizes. We
-        // use the latest snapshot instead of the transaction base snapshot. This
-        // is both more accurate and also avoids pedant hitting transient errors.
-        let latest_snapshot = snapshot_reader.lock().latest_snapshot();
-        Self::validate_memory_index_sizes(&table_mapping, &transaction, &latest_snapshot)?;
         Ok(Self {
             begin_timestamp,
-            table_mapping,
-            component_registry,
+            table_mapping: transaction.metadata.into_flat()?.table_mapping().clone(),
+            component_registry: transaction.component_registry.into_flat()?,
             reads: transaction.reads,
             writes: transaction.writes.into_flat()?,
-            usage_tracker: transaction.usage_tracker.clone(),
+            usage_tracker: transaction.usage_tracker,
+
         })
     }
 
-    fn validate_memory_index_sizes<RT: Runtime>(
-        table_mapping: &TableMapping,
-        transaction: &Transaction<RT>,
+    pub(crate) fn validate_memory_index_sizes(
+        &self,
         base_snapshot: &Snapshot,
     ) -> anyhow::Result<()> {
         #[allow(unused_mut)]
         let mut vector_size_limit = *VECTOR_INDEX_SIZE_HARD_LIMIT;
-        #[cfg(any(test, feature = "testing"))]
-        if let Some(size) = transaction.index_size_override {
-            vector_size_limit = size;
-        }
-
         #[allow(unused_mut)]
         let mut search_size_limit = *TEXT_INDEX_SIZE_HARD_LIMIT;
-        #[cfg(any(test, feature = "testing"))]
-        if let Some(size) = transaction.index_size_override {
-            search_size_limit = size;
-        }
-
-        let modified_tables: BTreeSet<_> = transaction
+        let modified_tables: BTreeSet<_> = self
             .writes
-            .as_flat()?
             .coalesced_writes()
-            .map(|(id, _)| id.tablet_id)
+            .map(|update| update.id.tablet_id)
             .collect();
         Self::validate_memory_index_size(
-            table_mapping,
+            &self.table_mapping,
             base_snapshot,
             &modified_tables,
             base_snapshot.text_indexes.in_memory_sizes().into_iter(),
             search_size_limit,
-            "Search",
+            SearchType::Text,
         )?;
         Self::validate_memory_index_size(
-            table_mapping,
+            &self.table_mapping,
             base_snapshot,
             &modified_tables,
             base_snapshot.vector_indexes.in_memory_sizes().into_iter(),
             vector_size_limit,
-            "Vector",
+            SearchType::Vector,
         )?;
         Ok(())
     }
@@ -1223,7 +1246,7 @@ impl FinalTransaction {
         modified_tables: &BTreeSet<TabletId>,
         iterator: impl Iterator<Item = (IndexId, usize)>,
         hard_limit: usize,
-        index_type: &'static str,
+        index_type: SearchType,
     ) -> anyhow::Result<()> {
         for (index_id, size) in iterator {
             if size < hard_limit {
@@ -1236,6 +1259,11 @@ impl FinalTransaction {
             let index = base_snapshot
                 .index_registry
                 .enabled_index_by_index_id(&index_id)
+                .or_else(|| {
+                    base_snapshot
+                        .index_registry
+                        .pending_index_by_index_id(&index_id)
+                })
                 .cloned()
                 .with_context(|| anyhow::anyhow!("failed to find index id {index_id}"))?
                 .name();
@@ -1246,11 +1274,15 @@ impl FinalTransaction {
                 // modification if we are over the limit.
                 continue;
             }
-
+            tracing::error!(
+                "Index size for index_id {index_id} is {size}, limit for {} is {hard_limit}",
+                index_type.as_ref()
+            );
+            log_index_too_large_blocking_writes(index_type);
             anyhow::bail!(ErrorMetadata::overloaded(
-                format!("{}IndexTooLarge", index_type),
+                format!("{}IndexTooLarge", index_type.as_ref()),
                 format!(
-                    "Too many writes to {}, backoff and try again",
+                    "Too many writes to {}. Spread your writes out over time or throttle them to avoid errors. If you’re importing data into a new application, consider removing the index and adding it again after the import (you can re-add the index as a staged index to avoid blocking your pushes: https://docs.convex.dev/database/reading-data/indexes/#staged-indexes).",
                     index.map_table(&table_mapping.tablet_to_name())?
                 )
             ))

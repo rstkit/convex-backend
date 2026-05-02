@@ -18,6 +18,9 @@ import { FunctionNameOption } from "@common/elements/FunctionNameOption";
 import { functionIdentifierValue } from "@common/lib/functions/generateFileTree";
 import { Menu, MenuItem } from "@ui/Menu";
 import { ConfirmationDialog } from "@ui/ConfirmationDialog";
+import { useQuery } from "convex/react";
+import udfs from "@common/udfs";
+import { Id } from "system-udfs/convex/_generated/dataModel";
 
 type JobItemProps = {
   data: { jobs: ScheduledJob[] };
@@ -57,6 +60,7 @@ function JobItemImpl({
     _id,
     udfPath,
     component: componentPath,
+    argsId,
   } = job;
   const { nents } = useNents();
   const componentId = componentPath
@@ -67,23 +71,30 @@ function JobItemImpl({
   const [showArgs, setShowArgs] = useState(false);
   const { selectedNent } = useNents();
   const cancelJob = useCancelJob();
-  const { useCurrentDeployment, useHasProjectAdminPermissions } = useContext(
-    DeploymentInfoContext,
-  );
+  const {
+    useCurrentDeployment,
+    useHasProjectAdminPermissions,
+    useIsOperationAllowed,
+  } = useContext(DeploymentInfoContext);
   const deployment = useCurrentDeployment();
   const hasAdminPermissions = useHasProjectAdminPermissions(
     deployment?.projectId,
   );
+  const canWriteData = useIsOperationAllowed("WriteData");
   const canCancelJobs =
-    deployment?.deploymentType !== "prod" || hasAdminPermissions;
+    (deployment?.deploymentType !== "prod" || hasAdminPermissions) &&
+    canWriteData;
+  const { showScheduledJobArgsInComponents } = useContext(
+    DeploymentInfoContext,
+  );
+  const isComponentJob = componentId !== null;
+  const canViewArgs =
+    !isComponentJob || !argsId || showScheduledJobArgsInComponents;
 
   if (nextTs === null) {
     throw new Error("Could not find timestamp to run scheduled job at");
   }
   const date = new Date(Number(nextTs / BigInt(1000000))).toLocaleString();
-  const udfArgsParsed: JSONValue[] = JSON.parse(
-    Buffer.from(udfArgs).toString("utf8"),
-  );
   if (_id === null) {
     throw new Error("Scheduled job id is null");
   }
@@ -93,25 +104,16 @@ function JobItemImpl({
 
   return (
     <div style={style} className="border-b transition-all last:border-b-0">
-      {showArgs && (
-        <DetailPanel
-          onClose={() => setShowArgs(false)}
-          header="Arguments for scheduled function"
-          content={
-            <div className="h-full rounded p-4">
-              <ReadonlyCode
-                disableLineNumbers
-                path="scheduling"
-                code={`${prettier(`
-                          [${udfArgsParsed
-                            .map((arg) => stringifyValue(jsonToConvex(arg)))
-                            .join(",")}]`).slice(0, -1)} 
-                          `}
-              />
-            </div>
-          }
-        />
-      )}
+      {showArgs &&
+        (udfArgs ? (
+          <ShowArgsPanelWithArgs udfArgs={udfArgs} setShowArgs={setShowArgs} />
+        ) : argsId ? (
+          <ShowArgsPanel
+            argsId={argsId}
+            setShowArgs={setShowArgs}
+            componentId={selectedNent?.id ?? null}
+          />
+        ) : null)}
       <div className="flex items-center gap-4 p-2 text-sm">
         {/* eslint-disable-next-line react/forbid-elements */}
         <button
@@ -147,13 +149,22 @@ function JobItemImpl({
               variant: "neutral",
             }}
           >
-            <MenuItem action={() => setShowArgs(true)}>View Arguments</MenuItem>
+            <MenuItem
+              action={() => setShowArgs(true)}
+              disabled={!canViewArgs}
+              tip={
+                !canViewArgs &&
+                "Cannot currently show arguments for scheduled jobs in a component. Please try again later."
+              }
+            >
+              View Arguments
+            </MenuItem>
             <MenuItem
               action={() => setShowDeleteModal(true)}
               disabled={currentlyRunning || !canCancelJobs}
               tip={
                 !canCancelJobs &&
-                "You do not have permission to cancel scheduled runs in production."
+                "You do not have permission to cancel scheduled runs in this deployment."
               }
               variant="danger"
             >
@@ -176,5 +187,58 @@ function JobItemImpl({
         )}
       </div>
     </div>
+  );
+}
+
+function ShowArgsPanel({
+  argsId,
+  setShowArgs,
+  componentId,
+}: {
+  argsId: Id<"_scheduled_job_args">;
+  setShowArgs: React.Dispatch<React.SetStateAction<boolean>>;
+  componentId: string | null;
+}) {
+  const args = useQuery(udfs.scheduler.getArgs, { argsId, componentId });
+  const udfArgs = args?.args;
+  return udfArgs ? (
+    <ShowArgsPanelWithArgs udfArgs={udfArgs} setShowArgs={setShowArgs} />
+  ) : (
+    <DetailPanel
+      onClose={() => setShowArgs(false)}
+      header="Arguments for scheduled function"
+      content={undefined}
+    />
+  );
+}
+
+function ShowArgsPanelWithArgs({
+  udfArgs,
+  setShowArgs,
+}: {
+  udfArgs: ArrayBuffer;
+  setShowArgs: React.Dispatch<React.SetStateAction<boolean>>;
+}) {
+  const udfArgsParsed: JSONValue[] = JSON.parse(
+    Buffer.from(udfArgs).toString("utf8"),
+  );
+  return (
+    <DetailPanel
+      onClose={() => setShowArgs(false)}
+      header="Arguments for scheduled function"
+      content={
+        <div className="h-full rounded-sm p-4">
+          <ReadonlyCode
+            disableLineNumbers
+            path="scheduling"
+            code={`${prettier(`
+                    [${udfArgsParsed
+                      .map((arg) => stringifyValue(jsonToConvex(arg)))
+                      .join(",")}]`).slice(0, -1)}
+                    `}
+          />
+        </div>
+      }
+    />
   );
 }

@@ -1,4 +1,7 @@
-use common::pool_stats::ConnectionPoolStats;
+use common::{
+    persistence::PersistenceGlobalKey,
+    pool_stats::ConnectionPoolStats,
+};
 use metrics::{
     log_counter_with_labels,
     log_distribution,
@@ -14,21 +17,32 @@ use metrics::{
     Timer,
     STATUS_LABEL,
 };
-use mysql_async::Row;
+use mysql_async::{
+    Row,
+    Value,
+};
 use prometheus::VMHistogramVec;
 
 fn cluster_name_label(cluster_name: &str) -> StaticMetricLabel {
     StaticMetricLabel::new("cluster_name", cluster_name.to_owned())
 }
 
+fn persistence_global_key_label(key: PersistenceGlobalKey) -> StaticMetricLabel {
+    StaticMetricLabel::new("key", String::from(key))
+}
+
 register_convex_histogram!(
     MYSQL_WRITE_PERSISTENCE_GLOBAL_SECONDS,
     "Time to write persistence global",
-    &[STATUS_LABEL[0], "cluster_name"]
+    &[STATUS_LABEL[0], "cluster_name", "key"]
 );
-pub fn write_persistence_global_timer(cluster_name: &str) -> StatusTimer {
+pub fn write_persistence_global_timer(
+    cluster_name: &str,
+    key: PersistenceGlobalKey,
+) -> StatusTimer {
     let mut timer = StatusTimer::new(&MYSQL_WRITE_PERSISTENCE_GLOBAL_SECONDS);
     timer.add_label(cluster_name_label(cluster_name));
+    timer.add_label(persistence_global_key_label(key));
     timer
 }
 
@@ -41,19 +55,6 @@ pub fn load_documents_timer(cluster_name: &str) -> StatusTimer {
     let mut timer = StatusTimer::new(&MYSQL_LOAD_DOCUMENTS_SECONDS);
     timer.add_label(cluster_name_label(cluster_name));
     timer
-}
-
-register_convex_histogram!(
-    MYSQL_LOAD_DOCUMENTS_SKIPPED_WRONG_TABLE_TOTAL,
-    "Number of documents skipped in memory because they belong to the wrong table",
-    &["cluster_name"]
-);
-pub fn mysql_load_documents_skipped_wrong_table(num_skipped: usize, cluster_name: &str) {
-    log_distribution_with_labels(
-        &MYSQL_LOAD_DOCUMENTS_SKIPPED_WRONG_TABLE_TOTAL,
-        num_skipped as f64,
-        vec![cluster_name_label(cluster_name)],
-    )
 }
 
 register_convex_counter!(
@@ -341,6 +342,17 @@ pub fn query_index_sql_execute_timer(cluster_name: &str) -> StatusTimer {
 }
 
 register_convex_histogram!(
+    MYSQL_QUERY_INDEX_POINT_SQL_EXECUTE_SECONDS,
+    "Time to execute index point query SQL",
+    &[STATUS_LABEL[0], "cluster_name"]
+);
+pub fn query_index_point_sql_execute_timer(cluster_name: &str) -> StatusTimer {
+    let mut timer = StatusTimer::new(&MYSQL_QUERY_INDEX_POINT_SQL_EXECUTE_SECONDS);
+    timer.add_label(cluster_name_label(cluster_name));
+    timer
+}
+
+register_convex_histogram!(
     MYSQL_RETENTION_VALIDATE_SECONDS,
     "Time to validate retention",
     &[STATUS_LABEL[0], "cluster_name"]
@@ -376,6 +388,14 @@ pub fn insert_index_chunk_timer(cluster_name: &str) -> StatusTimer {
 register_convex_histogram!(MYSQL_WRITE_BYTES, "Number of bytes written in MySQL writes");
 pub fn log_write_bytes(size: usize) {
     log_distribution(&MYSQL_WRITE_BYTES, size as f64);
+}
+
+register_convex_histogram!(
+    MYSQL_INDEX_WRITE_BYTES,
+    "Number of bytes written in MySQL index writes"
+);
+pub fn log_index_write_bytes(size: usize) {
+    log_distribution(&MYSQL_INDEX_WRITE_BYTES, size as f64);
 }
 
 register_convex_histogram!(
@@ -439,19 +459,42 @@ register_convex_counter!(
     &["name", "cluster_name"]
 );
 
-pub fn log_query_result(row: &Row, labels: Vec<StaticMetricLabel>) {
-    log_counter_with_labels(&MYSQL_QUERY_RESULT_TOTAL, 1, labels.clone());
-    let mut total_data_size = 0;
-    for i in 0..row.len() {
-        // Only counts size from BLOBs because the interface doesn't allow
-        // generic parsing. All JsonValues are BLOBs though so this is almost
-        // everything.
-        let col_bytes: Option<Result<Vec<u8>, _>> = row.get_opt(i);
-        if let Some(Ok(col_bytes)) = col_bytes {
-            total_data_size += col_bytes.len();
+pub fn log_query_result(labels: Vec<StaticMetricLabel>) -> LogQueryResult {
+    LogQueryResult {
+        labels,
+        rows: 0,
+        data_size: 0,
+    }
+}
+
+pub struct LogQueryResult {
+    labels: Vec<StaticMetricLabel>,
+    rows: u64,
+    data_size: u64,
+}
+
+impl LogQueryResult {
+    pub fn add_row(&mut self, row: &Row) {
+        self.rows += 1;
+        for i in 0..row.len() {
+            // Only counts size from BLOBs because the interface doesn't allow
+            // generic parsing. All JsonValues are BLOBs though so this is almost
+            // everything.
+            if let Some(Value::Bytes(col)) = row.as_ref(i) {
+                self.data_size += col.len() as u64;
+            }
         }
     }
-    log_counter_with_labels(&MYSQL_QUERY_RESULT_BYTES, total_data_size as u64, labels);
+}
+impl Drop for LogQueryResult {
+    fn drop(&mut self) {
+        log_counter_with_labels(&MYSQL_QUERY_RESULT_TOTAL, self.rows, self.labels.clone());
+        log_counter_with_labels(
+            &MYSQL_QUERY_RESULT_BYTES,
+            self.data_size,
+            self.labels.clone(),
+        );
+    }
 }
 
 register_convex_counter!(

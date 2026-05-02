@@ -1,13 +1,13 @@
 ---
 title: "Reading Data"
 sidebar_position: 3
+description: "Query and read data from Convex database tables"
 ---
 
 import getExample from "!!raw-loader!@site/../private-demos/snippets/convex/readingDataDbGet.ts";
 import queryExample from "!!raw-loader!@site/../private-demos/snippets/convex/readingDataDbQuery.ts";
 import averageExample from "!!raw-loader!@site/../private-demos/snippets/convex/readingDataAverage.ts";
-import groupByExampleTS from "!!raw-loader!@site/../private-demos/snippets/convex/readingDataGroupByTS.ts";
-import groupByExampleJS from "!!raw-loader!@site/../private-demos/snippets/convex/readingDataGroupByJS.js";
+import groupByExample from "!!raw-loader!@site/../private-demos/snippets/convex/readingDataGroupByTS.ts";
 import joinExample from "!!raw-loader!@site/../private-demos/snippets/convex/readingDataJoin.ts";
 
 [Query](/functions/query-functions.mdx) and
@@ -19,10 +19,9 @@ database tables using _document ids_ and _document queries_.
 Given a single document's id you can read its data with the
 [`db.get`](/api/interfaces/server.GenericDatabaseReader#get) method:
 
-<TSAndJSSnippet
+<Snippet
   title="convex/tasks.ts"
-  sourceTS={getExample}
-  sourceJS={getExample}
+  source={getExample}
   highlightPatterns={["db.get"]}
 />
 
@@ -34,10 +33,9 @@ sure you are not exposing data from tables other than the ones you intended.
 Document queries always begin by choosing the table to query with the
 [`db.query`](/api/interfaces/server.GenericDatabaseReader#query) method:
 
-<TSAndJSSnippet
+<Snippet
   title="convex/tasks.ts"
-  sourceTS={queryExample}
-  sourceJS={queryExample}
+  source={queryExample}
   highlightPatterns={["db.query"]}
 />
 
@@ -133,7 +131,7 @@ const messages = await ctx.db.query("messages").order("desc").collect();
 
 If you need to sort on a field other than `_creationTime` and your document
 query returns a small number of documents (on the order of hundreds rather than
-thousands of documents), consider sorting in Javascript:
+thousands of documents), consider sorting in JavaScript:
 
 ```ts
 // Get top 10 most liked messages, assuming messages is a fairly small table:
@@ -227,47 +225,51 @@ Convex prefers to have a few, simple ways to walk through and select documents
 from tables. In Convex, there is no specific query language for complex logic
 like a join, an aggregation, or a group by.
 
-Instead, you can write the complex logic in Javascript! Convex guarantees that
+Instead, you can write the complex logic in JavaScript! Convex guarantees that
 the results will be consistent.
 
 ### Join
 
 Table join might look like:
 
-<TSAndJSSnippet
-  title="convex/events.ts"
-  sourceTS={joinExample}
-  sourceJS={joinExample}
-/>
+<Snippet title="convex/events.ts" source={joinExample} />
+
+Note: by using Promise.all, the user documents will be fetched from the database
+in parallel, making join patterns like this very fast.
 
 ### Aggregation
 
 Here's an example of computing an average:
 
-<TSAndJSSnippet
-  title="convex/purchases.ts"
-  sourceTS={averageExample}
-  sourceJS={averageExample}
-/>
+<Snippet title="convex/grades.ts" source={averageExample} />
 
-> If you need more scalable aggregate options (for example to handle frequent
-> updates or large tables), consider using the
-> [Sharded Counter](https://www.convex.dev/components/sharded-counter) or
-> [Aggregate](https://www.convex.dev/components/aggregate) components. These
-> components can help you handle high-throughput counters, sums, or computations
-> without looping through the whole table.
+<Admonition type="info" title="Computing aggregates over large sets of values">
+
+Note: Convex enforces [limits](/production/state/limits) on how many documents
+can be read in one query or mutation, in order to keep your app fast and the
+database happy. If you need more scalable aggregate options (for example to
+handle frequent updates or large tables), consider using the
+[Sharded Counter](https://www.convex.dev/components/sharded-counter) or
+[Aggregate](https://www.convex.dev/components/aggregate) components. These
+components can help you handle high-throughput counters, sums, or computations
+without looping through the whole table.
+
+</Admonition>
 
 ### Group by
 
 Here's an example of grouping and counting:
 
-<TSAndJSSnippet
-  title="convex/purchases.ts"
-  sourceTS={groupByExampleTS}
-  sourceJS={groupByExampleJS}
-/>
+<Snippet title="convex/grades.ts" source={groupByExample} />
+
+As with the previous example, we use `.collect()` with the assumption that a
+given student won't have more grades than we can fetch in one query. See
+[transaction limits](/production/state/limits)) and these
+[tools for constraining bandwidth usage](/database/writing-data#write-performance-and-limits).
 
 ## Explore the syntax on the dashboard
 
 You can try out the syntax described above directly from the dashboard by
-[writing a custom test query](/dashboard/deployments/data.md#writing-custom-queries).
+[writing a custom test query](/dashboard/deployments/data.mdx#writing-custom-queries).
+
+<StackPosts query="streams sql query data" />

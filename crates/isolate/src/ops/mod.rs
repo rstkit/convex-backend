@@ -3,7 +3,6 @@
 //! environment, but the environment may decide not to implement their
 //! functionality, causing a runtime error.
 
-mod blob;
 mod console;
 mod crypto;
 mod database;
@@ -14,6 +13,7 @@ mod random;
 mod storage;
 mod stream;
 mod structured_clone;
+mod subtle_crypto;
 mod text;
 mod time;
 mod validate_args;
@@ -21,7 +21,7 @@ mod validate_returns;
 
 use std::{
     collections::BTreeMap,
-    ops::DerefMut,
+    time::Duration,
 };
 
 use ::errors::ErrorMetadata;
@@ -38,10 +38,6 @@ use common::{
         EnvVarValue,
     },
 };
-use crypto::{
-    op_crypto_decrypt,
-    op_crypto_encrypt,
-};
 use deno_core::{
     v8,
     ModuleSpecifier,
@@ -57,11 +53,6 @@ use value::{
 };
 
 use self::{
-    blob::{
-        op_blob_create_part,
-        op_blob_read_part,
-        op_blob_slice_part,
-    },
     console::{
         op_console_message,
         op_console_time_end,
@@ -70,29 +61,8 @@ use self::{
         op_console_trace,
     },
     crypto::{
-        op_crypto_base64_url_decode,
-        op_crypto_base64_url_encode,
-        op_crypto_derive_bits,
-        op_crypto_digest,
-        op_crypto_export_key,
-        op_crypto_export_pkcs8_ed25519,
-        op_crypto_export_pkcs8_x25519,
-        op_crypto_export_spki_ed25519,
-        op_crypto_export_spki_x25519,
-        op_crypto_generate_key_bytes,
-        op_crypto_generate_keypair,
         op_crypto_get_random_values,
-        op_crypto_import_key,
-        op_crypto_import_pkcs8_ed25519,
-        op_crypto_import_pkcs8_x25519,
-        op_crypto_import_spki_ed25519,
-        op_crypto_import_spki_x25519,
-        op_crypto_jwk_x_ed25519,
         op_crypto_random_uuid,
-        op_crypto_sign,
-        op_crypto_sign_ed25519,
-        op_crypto_verify,
-        op_crypto_verify_ed25519,
     },
     database::op_get_table_mapping,
     environment_variables::op_environment_variables_get,
@@ -110,6 +80,7 @@ use self::{
         op_url_stringify_url_search_params,
         op_url_update_url_info,
     },
+    random::op_random,
     storage::{
         async_op_storage_get,
         async_op_storage_store,
@@ -133,12 +104,10 @@ use self::{
     time::{
         async_op_sleep,
         op_now,
+        op_performance_now,
+        op_performance_time_origin,
     },
     validate_args::op_validate_args,
-};
-pub use self::{
-    crypto::CryptoOps,
-    random::op_random,
 };
 use crate::{
     environment::{
@@ -159,7 +128,7 @@ use crate::{
 pub trait OpProvider<'b> {
     fn rng(&mut self) -> anyhow::Result<&mut ChaCha12Rng>;
     fn crypto_rng(&mut self) -> anyhow::Result<CryptoRng>;
-    fn scope(&mut self) -> &mut v8::HandleScope<'b>;
+    fn scope(&mut self) -> v8::PinScope<'_, 'b>;
     fn lookup_source_map(
         &mut self,
         specifier: &ModuleSpecifier,
@@ -170,15 +139,14 @@ pub trait OpProvider<'b> {
     ) -> anyhow::Result<&mut WithHeapSize<BTreeMap<String, UnixTimestamp>>>;
     fn unix_timestamp(&mut self) -> anyhow::Result<UnixTimestamp>;
     fn unix_timestamp_non_deterministic(&mut self) -> anyhow::Result<UnixTimestamp>;
+    fn performance_now(&mut self) -> anyhow::Result<Duration>;
+    fn performance_time_origin(&mut self) -> anyhow::Result<UnixTimestamp>;
 
     fn start_async_op(
         &mut self,
         request: AsyncOpRequest,
         resolver: v8::Global<v8::PromiseResolver>,
     ) -> anyhow::Result<()>;
-
-    fn create_blob_part(&mut self, bytes: Bytes) -> anyhow::Result<Uuid>;
-    fn get_blob_part(&mut self, uuid: &Uuid) -> anyhow::Result<Option<Bytes>>;
 
     fn create_stream(&mut self) -> anyhow::Result<Uuid>;
     fn extend_stream(
@@ -203,8 +171,8 @@ pub trait OpProvider<'b> {
     fn get_all_table_mappings(&mut self) -> anyhow::Result<NamespacedTableMapping>;
 }
 
-impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> OpProvider<'b>
-    for ExecutionScope<'a, 'b, RT, E>
+impl<'a, 's: 'a, 'i, RT: Runtime, E: IsolateEnvironment<RT>> OpProvider<'i>
+    for ExecutionScope<'a, 's, 'i, RT, E>
 {
     fn rng(&mut self) -> anyhow::Result<&mut ChaCha12Rng> {
         let state = self.state_mut()?;
@@ -223,8 +191,8 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> OpProvider<'b>
         ExecutionScope::lookup_source_map(self, specifier)
     }
 
-    fn scope(&mut self) -> &mut v8::HandleScope<'b> {
-        self.deref_mut()
+    fn scope(&mut self) -> v8::PinScope<'_, 'i> {
+        self.as_mut_ref()
     }
 
     fn trace(&mut self, level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
@@ -250,6 +218,16 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> OpProvider<'b>
         Ok(state.unix_timestamp_non_deterministic())
     }
 
+    fn performance_now(&mut self) -> anyhow::Result<Duration> {
+        let state = self.state_mut()?;
+        state.environment.performance_now()
+    }
+
+    fn performance_time_origin(&mut self) -> anyhow::Result<UnixTimestamp> {
+        let state = self.state_mut()?;
+        state.environment.performance_time_origin()
+    }
+
     fn start_async_op(
         &mut self,
         request: AsyncOpRequest,
@@ -257,16 +235,6 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> OpProvider<'b>
     ) -> anyhow::Result<()> {
         let state = self.state_mut()?;
         state.environment.start_async_op(request, resolver)
-    }
-
-    fn create_blob_part(&mut self, bytes: Bytes) -> anyhow::Result<Uuid> {
-        let state = self.state_mut()?;
-        state.create_blob_part(bytes)
-    }
-
-    fn get_blob_part(&mut self, uuid: &Uuid) -> anyhow::Result<Option<Bytes>> {
-        let state = self.state_mut()?;
-        Ok(state.blob_parts.get(uuid).cloned())
     }
 
     fn create_stream(&mut self) -> anyhow::Result<Uuid> {
@@ -280,17 +248,12 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> OpProvider<'b>
         new_done: bool,
     ) -> anyhow::Result<()> {
         let state = self.state_mut()?;
-        let new_part_id = match bytes {
-            Some(bytes) => {
-                if let Some(request_stream_state) = state.request_stream_state.as_mut()
-                    && request_stream_state.stream_id() == id
-                {
-                    request_stream_state.track_bytes_read(bytes.len());
-                }
-                Some(state.create_blob_part(bytes)?)
-            },
-            None => None,
-        };
+        if let Some(bytes) = &bytes
+            && let Some(request_stream_state) = state.request_stream_state.as_mut()
+            && request_stream_state.stream_id() == id
+        {
+            request_stream_state.track_bytes_read(bytes.len());
+        }
         state.streams.mutate(&id, |stream| -> anyhow::Result<()> {
             let Some(Ok(ReadableStream { parts, done })) = stream else {
                 anyhow::bail!("unrecognized stream id {id}");
@@ -298,8 +261,8 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> OpProvider<'b>
             if *done {
                 anyhow::bail!("stream {id} is already done");
             }
-            if let Some(new_part_id) = new_part_id {
-                parts.push_back(new_part_id);
+            if let Some(bytes) = bytes {
+                parts.push_back(bytes);
             }
             if new_done {
                 *done = true;
@@ -362,7 +325,7 @@ pub fn run_op<'b, P: OpProvider<'b>>(
         anyhow::bail!("op(op_name, ...) takes at least one argument");
     }
     let op_name: v8::Local<v8::String> = args.get(0).try_into()?;
-    let op_name = to_rust_string(provider.scope(), &op_name)?;
+    let op_name = to_rust_string(&provider.scope(), &op_name)?;
 
     let timer = metrics::op_timer(&op_name);
     match &op_name[..] {
@@ -377,13 +340,12 @@ pub fn run_op<'b, P: OpProvider<'b>>(
         "error/stack" => op_error_stack(provider, args, rv)?,
         "random" => op_random(provider, args, rv)?,
         "now" => op_now(provider, args, rv)?,
+        "performance_now" => op_performance_now(provider, args, rv)?,
+        "performance_time_origin" => op_performance_time_origin(provider, args, rv)?,
         "url/getUrlInfo" => op_url_get_url_info(provider, args, rv)?,
         "url/getUrlSearchParamPairs" => op_url_get_url_search_param_pairs(provider, args, rv)?,
         "url/stringifyUrlSearchParams" => op_url_stringify_url_search_params(provider, args, rv)?,
         "url/updateUrlInfo" => op_url_update_url_info(provider, args, rv)?,
-        "blob/createPart" => op_blob_create_part(provider, args, rv)?,
-        "blob/slicePart" => op_blob_slice_part(provider, args, rv)?,
-        "blob/readPart" => op_blob_read_part(provider, args, rv)?,
         "headers/getMimeType" => op_headers_get_mime_type(provider, args, rv)?,
         "headers/normalizeName" => op_headers_normalize_name(provider, args, rv)?,
         "stream/create" => op_stream_create(provider, args, rv)?,
@@ -405,29 +367,30 @@ pub fn run_op<'b, P: OpProvider<'b>>(
 
         "crypto/randomUUID" => op_crypto_random_uuid(provider, args, rv)?,
         "crypto/getRandomValues" => op_crypto_get_random_values(provider, args, rv)?,
-        "crypto/sign" => op_crypto_sign(provider, args, rv)?,
-        "crypto/signEd25519" => op_crypto_sign_ed25519(provider, args, rv)?,
-        "crypto/verify" => op_crypto_verify(provider, args, rv)?,
-        "crypto/verifyEd25519" => op_crypto_verify_ed25519(provider, args, rv)?,
-        "crypto/deriveBits" => op_crypto_derive_bits(provider, args, rv)?,
-        "crypto/digest" => op_crypto_digest(provider, args, rv)?,
-        "crypto/encrypt" => op_crypto_encrypt(provider, args, rv)?,
-        "crypto/decrypt" => op_crypto_decrypt(provider, args, rv)?,
-        "crypto/importKey" => op_crypto_import_key(provider, args, rv)?,
-        "crypto/importSpkiEd25519" => op_crypto_import_spki_ed25519(provider, args, rv)?,
-        "crypto/importPkcs8Ed25519" => op_crypto_import_pkcs8_ed25519(provider, args, rv)?,
-        "crypto/importSpkiX25519" => op_crypto_import_spki_x25519(provider, args, rv)?,
-        "crypto/importPkcs8X25519" => op_crypto_import_pkcs8_x25519(provider, args, rv)?,
-        "crypto/base64UrlEncode" => op_crypto_base64_url_encode(provider, args, rv)?,
-        "crypto/base64UrlDecode" => op_crypto_base64_url_decode(provider, args, rv)?,
-        "crypto/exportKey" => op_crypto_export_key(provider, args, rv)?,
-        "crypto/exportSpkiEd25519" => op_crypto_export_spki_ed25519(provider, args, rv)?,
-        "crypto/exportPkcs8Ed25519" => op_crypto_export_pkcs8_ed25519(provider, args, rv)?,
-        "crypto/JwkXEd25519" => op_crypto_jwk_x_ed25519(provider, args, rv)?,
-        "crypto/exportSpkiX25519" => op_crypto_export_spki_x25519(provider, args, rv)?,
-        "crypto/exportPkcs8X25519" => op_crypto_export_pkcs8_x25519(provider, args, rv)?,
-        "crypto/generateKeyPair" => op_crypto_generate_keypair(provider, args, rv)?,
-        "crypto/generateKeyBytes" => op_crypto_generate_key_bytes(provider, args, rv)?,
+        "crypto/subtle/decrypt" => subtle_crypto::op_crypto_subtle_decrypt(provider, args, rv)?,
+        "crypto/subtle/deriveBits" => {
+            subtle_crypto::op_crypto_subtle_derive_bits(provider, args, rv)?
+        },
+        "crypto/subtle/deriveKey" => {
+            subtle_crypto::op_crypto_subtle_derive_key(provider, args, rv)?
+        },
+        "crypto/subtle/digest" => subtle_crypto::op_crypto_subtle_digest(provider, args, rv)?,
+        "crypto/subtle/encrypt" => subtle_crypto::op_crypto_subtle_encrypt(provider, args, rv)?,
+        "crypto/subtle/exportKey" => {
+            subtle_crypto::op_crypto_subtle_export_key(provider, args, rv)?
+        },
+        "crypto/subtle/generateKey" => {
+            subtle_crypto::op_crypto_subtle_generate_key(provider, args, rv)?
+        },
+        "crypto/subtle/importKey" => {
+            subtle_crypto::op_crypto_subtle_import_key(provider, args, rv)?
+        },
+        "crypto/subtle/sign" => subtle_crypto::op_crypto_subtle_sign(provider, args, rv)?,
+        "crypto/subtle/unwrapKey" => {
+            subtle_crypto::op_crypto_subtle_unwrap_key(provider, args, rv)?
+        },
+        "crypto/subtle/verify" => subtle_crypto::op_crypto_subtle_verify(provider, args, rv)?,
+        "crypto/subtle/wrapKey" => subtle_crypto::op_crypto_subtle_wrap_key(provider, args, rv)?,
         _ => {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "UnknownOperation",
@@ -447,21 +410,21 @@ pub fn start_async_op<'b, P: OpProvider<'b>>(
     if args.length() < 1 {
         anyhow::bail!("asyncOp(op, ...args) takes at least one argument");
     }
+    let scope = provider.scope();
     let op_name: v8::Local<v8::String> = args.get(0).try_into()?;
-    let op_name = to_rust_string(provider.scope(), &op_name)?;
+    let op_name = to_rust_string(&scope, &op_name)?;
 
-    let resolver = v8::PromiseResolver::new(provider.scope())
+    let resolver = v8::PromiseResolver::new(&scope)
         .ok_or_else(|| anyhow!("Failed to create PromiseResolver"))?;
-    let promise = resolver.get_promise(provider.scope());
-    let resolver = v8::Global::new(provider.scope(), resolver);
+    let resolver = v8::Global::new(&scope, resolver);
 
     match &op_name[..] {
-        "fetch" => async_op_fetch(provider, args, resolver)?,
-        "form/parseMultiPart" => async_op_parse_multi_part(provider, args, resolver)?,
-        "sleep" => async_op_sleep(provider, args, resolver)?,
-        "storage/store" => async_op_storage_store(provider, args, resolver)?,
-        "storage/get" => async_op_storage_get(provider, args, resolver)?,
-        "stream/readPart" => async_op_stream_read_part(provider, args, resolver)?,
+        "fetch" => async_op_fetch(provider, args, resolver.clone())?,
+        "form/parseMultiPart" => async_op_parse_multi_part(provider, args, resolver.clone())?,
+        "sleep" => async_op_sleep(provider, args, resolver.clone())?,
+        "storage/store" => async_op_storage_store(provider, args, resolver.clone())?,
+        "storage/get" => async_op_storage_get(provider, args, resolver.clone())?,
+        "stream/readPart" => async_op_stream_read_part(provider, args, resolver.clone())?,
         _ => {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "UnknownAsyncOperation",
@@ -470,6 +433,10 @@ pub fn start_async_op<'b, P: OpProvider<'b>>(
         },
     };
 
+    // TODO: ideally we should not need to clone `resolver`, but
+    // `OpProvider::scope` returns a scope with a restricted lifetime
+    let scope = provider.scope();
+    let promise = v8::Local::new(&scope, resolver).get_promise(&scope);
     rv.set(promise.into());
     Ok(())
 }

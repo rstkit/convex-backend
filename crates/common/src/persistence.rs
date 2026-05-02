@@ -36,12 +36,12 @@ use crate::{
     },
     interval::Interval,
     knobs::DEFAULT_DOCUMENTS_PAGE_SIZE,
-    metrics::static_repeatable_ts_timer,
     persistence_helpers::RevisionPair,
     query::Order,
     runtime::Runtime,
     types::{
         DatabaseIndexUpdate,
+        DatabaseIndexValue,
         IndexId,
         PersistenceVersion,
         RepeatableReason,
@@ -56,6 +56,51 @@ pub struct DocumentLogEntry {
     pub id: InternalDocumentId,
     pub value: Option<ResolvedDocument>,
     pub prev_ts: Option<Timestamp>,
+}
+
+impl DocumentLogEntry {
+    pub fn size(&self) -> u64 {
+        let mut size = self.ts.size() + self.id.size();
+        if let Some(ref value) = self.value {
+            size += value.size();
+        }
+        if let Some(prev_ts) = self.prev_ts {
+            size += prev_ts.size();
+        }
+        size as u64
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PersistenceIndexEntry {
+    pub ts: Timestamp,
+    pub index_id: IndexId,
+    pub key: IndexKeyBytes,
+    pub value: Option<InternalDocumentId>,
+}
+
+impl PersistenceIndexEntry {
+    pub fn from_index_update(ts: Timestamp, update: &DatabaseIndexUpdate) -> Self {
+        Self {
+            ts,
+            index_id: update.index_id,
+            key: update.key.to_bytes(),
+            value: match update.value {
+                DatabaseIndexValue::Deleted => None,
+                DatabaseIndexValue::NonClustered(id) => {
+                    Some(InternalDocumentId::new(id.tablet_id, id.internal_id()))
+                },
+            },
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        let mut size = self.ts.size() + self.index_id.size() + self.key.0.len();
+        if let Some(value) = self.value {
+            size += value.size();
+        }
+        size as u64
+    }
 }
 
 pub type DocumentStream<'a> = BoxStream<'a, anyhow::Result<DocumentLogEntry>>;
@@ -88,17 +133,16 @@ pub enum ConflictStrategy {
 
 // When adding a new persistence global, make sure it's copied
 // or computed in migrate_db_cluster/text_index_worker.
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Sequence)]
 pub enum PersistenceGlobalKey {
-    /// Minimum snapshot that is retained. Data in earlier snapshots may have
-    /// been deleted.
-    RetentionMinSnapshotTimestamp,
+    /// Minimum snapshot that is retained for indexes. Data in earlier snapshots
+    /// may have been deleted.
+    IndexRetentionMinSnapshotTimestamp,
 
-    /// Timestamp for a snapshot that has been deleted by retention.
+    /// Timestamp for a snapshot that has been deleted by index retention.
     /// This is used as a cursor by retention, bumped after retention deletes
     /// entries at the snapshot.
-    RetentionConfirmedDeletedTimestamp,
+    IndexRetentionConfirmedDeletedTimestamp,
 
     /// Minimum timestamp for valid write-ahead log
     DocumentRetentionMinSnapshotTimestamp,
@@ -128,8 +172,10 @@ pub enum PersistenceGlobalKey {
 impl From<PersistenceGlobalKey> for String {
     fn from(key: PersistenceGlobalKey) -> Self {
         match key {
-            PersistenceGlobalKey::RetentionMinSnapshotTimestamp => "min_snapshot_ts".to_string(),
-            PersistenceGlobalKey::RetentionConfirmedDeletedTimestamp => {
+            PersistenceGlobalKey::IndexRetentionMinSnapshotTimestamp => {
+                "min_snapshot_ts".to_string()
+            },
+            PersistenceGlobalKey::IndexRetentionConfirmedDeletedTimestamp => {
                 "confirmed_deleted_ts".to_string()
             },
             PersistenceGlobalKey::DocumentRetentionMinSnapshotTimestamp => {
@@ -153,8 +199,8 @@ impl FromStr for PersistenceGlobalKey {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "min_snapshot_ts" => Ok(Self::RetentionMinSnapshotTimestamp),
-            "confirmed_deleted_ts" => Ok(Self::RetentionConfirmedDeletedTimestamp),
+            "min_snapshot_ts" => Ok(Self::IndexRetentionMinSnapshotTimestamp),
+            "confirmed_deleted_ts" => Ok(Self::IndexRetentionConfirmedDeletedTimestamp),
             "document_min_snapshot_ts" => Ok(Self::DocumentRetentionMinSnapshotTimestamp),
             "document_confirmed_deleted_ts" => Ok(Self::DocumentRetentionConfirmedDeletedTimestamp),
             "max_repeatable_ts" => Ok(Self::MaxRepeatableTimestamp),
@@ -182,14 +228,12 @@ pub trait Persistence: Sync + Send + 'static {
     fn reader(&self) -> Arc<dyn PersistenceReader>;
 
     /// Writes documents and the respective derived indexes.
-    async fn write(
+    async fn write<'a>(
         &self,
-        documents: Vec<DocumentLogEntry>,
-        indexes: BTreeSet<(Timestamp, DatabaseIndexUpdate)>,
+        documents: &'a [DocumentLogEntry],
+        indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
     ) -> anyhow::Result<()>;
-
-    async fn set_read_only(&self, read_only: bool) -> anyhow::Result<()>;
 
     /// Writes global key-value data for the whole persistence.
     /// This is expected to be small data that does not make sense in a
@@ -214,83 +258,129 @@ pub trait Persistence: Sync + Send + 'static {
         documents: Vec<(Timestamp, InternalDocumentId)>,
     ) -> anyhow::Result<usize>;
 
+    async fn delete_tablet_documents(
+        &self,
+        tablet_id: TabletId,
+        chunk_size: usize,
+    ) -> anyhow::Result<usize>;
+
     // No-op by default. Persistence implementation can override.
     async fn shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn import_documents_batch(
+        &self,
+        mut documents: BoxStream<'_, Vec<DocumentLogEntry>>,
+    ) -> anyhow::Result<()> {
+        while let Some(chunk) = documents.next().await {
+            self.write(&chunk, &[], ConflictStrategy::Error).await?;
+        }
+        Ok(())
+    }
+
+    async fn import_indexes_batch(
+        &self,
+        mut indexes: BoxStream<'_, Vec<PersistenceIndexEntry>>,
+    ) -> anyhow::Result<()> {
+        while let Some(chunk) = indexes.next().await {
+            self.write(&[], &chunk, ConflictStrategy::Error).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_loading(&self) -> anyhow::Result<()> {
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct TimestampRange {
-    start_bound: Bound<Timestamp>,
-    end_bound: Bound<Timestamp>,
+    start_inclusive: Timestamp,
+    end_inclusive: Timestamp,
 }
 
 impl TimestampRange {
-    pub fn new<T: RangeBounds<Timestamp>>(range: T) -> anyhow::Result<Self> {
-        // Bounds check.
-        Self::min_inclusive(&range.start_bound().cloned())?;
-        Self::max_exclusive(&range.end_bound().cloned())?;
-        Ok(Self {
-            start_bound: range.start_bound().cloned(),
-            end_bound: range.end_bound().cloned(),
-        })
-    }
-
-    pub fn snapshot(ts: Timestamp) -> Self {
-        Self {
-            start_bound: Bound::Unbounded,
-            end_bound: Bound::Included(ts),
-        }
-    }
-
-    pub fn all() -> Self {
-        Self {
-            start_bound: Bound::Unbounded,
-            end_bound: Bound::Unbounded,
-        }
-    }
-
-    pub fn at(ts: Timestamp) -> Self {
-        Self {
-            start_bound: Bound::Included(ts),
-            end_bound: Bound::Included(ts),
-        }
-    }
-
-    pub fn greater_than(t: Timestamp) -> Self {
-        Self {
-            start_bound: Bound::Excluded(t),
-            end_bound: Bound::Unbounded,
-        }
-    }
-
-    fn min_inclusive(start_bound: &Bound<Timestamp>) -> anyhow::Result<Timestamp> {
-        Ok(match start_bound {
+    #[inline]
+    pub fn new<T: RangeBounds<Timestamp>>(range: T) -> Self {
+        let start_inclusive = match range.start_bound() {
             Bound::Included(t) => *t,
-            Bound::Excluded(t) => t.succ()?,
+            Bound::Excluded(t) => {
+                if let Some(succ) = t.succ_opt() {
+                    succ
+                } else {
+                    return Self::empty();
+                }
+            },
             Bound::Unbounded => Timestamp::MIN,
-        })
-    }
-
-    pub fn min_timestamp_inclusive(&self) -> Timestamp {
-        Self::min_inclusive(&self.start_bound).unwrap()
-    }
-
-    fn max_exclusive(end_bound: &Bound<Timestamp>) -> anyhow::Result<Timestamp> {
-        Ok(match end_bound {
-            Bound::Included(t) => t.succ()?,
-            Bound::Excluded(t) => *t,
+        };
+        let end_inclusive = match range.end_bound() {
+            Bound::Included(t) => *t,
+            Bound::Excluded(t) => {
+                if let Some(pred) = t.pred_opt() {
+                    pred
+                } else {
+                    return Self::empty();
+                }
+            },
             Bound::Unbounded => Timestamp::MAX,
-        })
+        };
+        Self {
+            start_inclusive,
+            end_inclusive,
+        }
     }
 
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            start_inclusive: Timestamp::MAX,
+            end_inclusive: Timestamp::MIN,
+        }
+    }
+
+    #[inline]
+    pub fn snapshot(ts: Timestamp) -> Self {
+        Self::new(..=ts)
+    }
+
+    #[inline]
+    pub fn all() -> Self {
+        Self::new(..)
+    }
+
+    #[inline]
+    pub fn at(ts: Timestamp) -> Self {
+        Self::new(ts..=ts)
+    }
+
+    #[inline]
+    pub fn greater_than(t: Timestamp) -> Self {
+        Self::new((Bound::Excluded(t), Bound::Unbounded))
+    }
+
+    #[inline]
+    pub fn min_timestamp_inclusive(&self) -> Timestamp {
+        self.start_inclusive
+    }
+
+    #[inline]
     pub fn max_timestamp_exclusive(&self) -> Timestamp {
-        Self::max_exclusive(&self.end_bound).unwrap()
+        // assumes that Timestamp::MAX never actually exists
+        self.end_inclusive.succ_opt().unwrap_or(Timestamp::MAX)
     }
 
+    #[inline]
     pub fn contains(&self, ts: Timestamp) -> bool {
-        self.min_timestamp_inclusive() <= ts && ts < self.max_timestamp_exclusive()
+        self.start_inclusive <= ts && ts <= self.end_inclusive
+    }
+
+    #[inline]
+    pub fn intersect(&self, other: Self) -> Self {
+        Self {
+            start_inclusive: self.start_inclusive.max(other.start_inclusive),
+            end_inclusive: self.end_inclusive.min(other.end_inclusive),
+        }
     }
 }
 
@@ -308,8 +398,6 @@ pub trait RetentionValidator: Sync + Send {
     async fn validate_document_snapshot(&self, ts: Timestamp) -> anyhow::Result<()>;
     async fn min_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp>;
     async fn min_document_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp>;
-
-    fn fail_if_falling_behind(&self) -> anyhow::Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -352,6 +440,36 @@ pub trait PersistenceReader: Send + Sync + 'static {
         self.load_documents(range, order, page_size, retention_validator)
             .try_filter(move |doc| future::ready(doc.id.table() == tablet_id))
             .boxed()
+    }
+
+    /// Loads revision pairs from the document log in the given timestamp range.
+    ///
+    /// If a tablet id is provided, the results are filtered to a single table.
+    fn load_revision_pairs(
+        &self,
+        tablet_id: Option<TabletId>,
+        range: TimestampRange,
+        order: Order,
+        page_size: u32,
+        retention_validator: Arc<dyn RetentionValidator>,
+    ) -> DocumentRevisionStream<'_> {
+        let stream = if let Some(tablet_id) = tablet_id {
+            self.load_documents_from_table(
+                tablet_id,
+                range,
+                order,
+                page_size,
+                retention_validator.clone(),
+            )
+        } else {
+            self.load_documents(range, order, page_size, retention_validator.clone())
+        };
+        crate::persistence_helpers::persistence_reader_stream_revision_pairs(
+            stream,
+            self,
+            retention_validator,
+        )
+        .boxed()
     }
 
     /// Look up the previous revision of `(id, ts)`, returning a map where for
@@ -445,7 +563,7 @@ pub trait PersistenceReader: Send + Sync + 'static {
             // We don't know the ID of the most recent document, so we
             // need to scan the entire timestamp range to find it
             // (this may include looking at the `documents` log outside of the retention window)
-            Arc::new(NoopRetentionValidator),
+            Arc::new(NoopRetentionValidator) as Arc<_>,
         );
         let max_repeatable =
             self.get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp);
@@ -462,22 +580,6 @@ pub trait PersistenceReader: Send + Sync + 'static {
         Ok(vec![])
     }
 
-    /// Returns all timestamps and documents in ascending (ts, tablet_id, id)
-    /// order. Only should be used for testing
-    #[cfg(any(test, feature = "testing"))]
-    fn load_all_documents(&self) -> DocumentStream {
-        self.load_documents(
-            TimestampRange::all(),
-            Order::Asc,
-            *DEFAULT_DOCUMENTS_PAGE_SIZE,
-            Arc::new(NoopRetentionValidator),
-        )
-    }
-}
-
-pub fn now_ts<RT: Runtime>(max_ts: Timestamp, rt: &RT) -> anyhow::Result<Timestamp> {
-    let ts = cmp::max(rt.generate_timestamp()?, max_ts);
-    Ok(ts)
 }
 
 /// Timestamp that is repeatable because the caller is holding the lease and
@@ -491,7 +593,7 @@ pub async fn new_idle_repeatable_ts<RT: Runtime>(
 ) -> anyhow::Result<RepeatableTimestamp> {
     let reader = persistence.reader();
     let max_ts = reader.max_ts().await?.unwrap_or(Timestamp::MIN);
-    let now = now_ts(max_ts, rt)?;
+    let now = cmp::max(max_ts, rt.generate_timestamp()?);
     // Enforce that all subsequent commits are > now by writing to MaxRepeatableTs.
     persistence
         .write_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp, now.into())
@@ -529,52 +631,49 @@ impl RepeatablePersistence {
         self.upper_bound
     }
 
-    /// Same as [`Persistence::load_documents`] but only including documents in
-    /// the snapshot range.
+    /// Same as [`PersistenceReader::load_documents`] but only including
+    /// documents in the snapshot range.
     pub fn load_documents(&self, range: TimestampRange, order: Order) -> DocumentStream<'_> {
-        let stream = self.reader.load_documents(
-            range,
+        self.reader.load_documents(
+            range.intersect(TimestampRange::snapshot(*self.upper_bound)),
             order,
             *DEFAULT_DOCUMENTS_PAGE_SIZE,
             self.retention_validator.clone(),
-        );
-        Box::pin(stream.try_filter(|entry| future::ready(entry.ts <= *self.upper_bound)))
+        )
     }
 
-    /// Same as [`Persistence::load_documents_from_table`] but only including
-    /// documents in the snapshot range.
+    /// Same as [`PersistenceReader::load_documents_from_table`] but only
+    /// including documents in the snapshot range.
     pub fn load_documents_from_table(
         &self,
         tablet_id: TabletId,
         range: TimestampRange,
         order: Order,
     ) -> DocumentStream<'_> {
-        let stream = self.reader.load_documents_from_table(
+        self.reader.load_documents_from_table(
             tablet_id,
-            range,
+            range.intersect(TimestampRange::snapshot(*self.upper_bound)),
             order,
             *DEFAULT_DOCUMENTS_PAGE_SIZE,
             self.retention_validator.clone(),
-        );
-        Box::pin(stream.try_filter(|entry| future::ready(entry.ts <= *self.upper_bound)))
+        )
     }
 
-    /// Same as `load_documents` but doesn't use the `RetentionValidator` from
-    /// this `RepeatablePersistence`. Instead, the caller can choose its
-    /// own validator.
-    pub fn load_documents_with_retention_validator(
+    /// Same as [`PersistenceReader::load_revision_pairs`] but only including
+    /// revisions in the snapshot range.
+    pub fn load_revision_pairs(
         &self,
+        tablet_id: Option<TabletId>,
         range: TimestampRange,
         order: Order,
-        retention_validator: Arc<dyn RetentionValidator>,
-    ) -> DocumentStream<'_> {
-        let stream = self.reader.load_documents(
-            range,
+    ) -> DocumentRevisionStream<'_> {
+        self.reader.load_revision_pairs(
+            tablet_id,
+            range.intersect(TimestampRange::snapshot(*self.upper_bound)),
             order,
             *DEFAULT_DOCUMENTS_PAGE_SIZE,
-            retention_validator,
-        );
-        Box::pin(stream.try_filter(|entry| future::ready(entry.ts <= *self.upper_bound)))
+            self.retention_validator.clone(),
+        )
     }
 
     pub async fn previous_revisions(
@@ -587,21 +686,6 @@ impl RepeatablePersistence {
         }
         self.reader
             .previous_revisions(ids, self.retention_validator.clone())
-            .await
-    }
-
-    /// Allows a retention validator to be explicitly passed in
-    pub async fn previous_revisions_with_validator(
-        &self,
-        ids: BTreeSet<(InternalDocumentId, Timestamp)>,
-        retention_validator: Arc<dyn RetentionValidator>,
-    ) -> anyhow::Result<BTreeMap<(InternalDocumentId, Timestamp), DocumentLogEntry>> {
-        for (_, ts) in &ids {
-            // Reading documents <ts, so ts-1 needs to be repeatable.
-            anyhow::ensure!(*ts <= self.upper_bound.succ()?);
-        }
-        self.reader
-            .previous_revisions(ids, retention_validator.clone())
             .await
     }
 
@@ -633,15 +717,6 @@ impl RepeatablePersistence {
     }
 }
 
-async fn read_max_repeatable_ts(
-    reader: &dyn PersistenceReader,
-) -> anyhow::Result<Option<Timestamp>> {
-    let value = reader
-        .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
-        .await?;
-    value.map(Timestamp::try_from).transpose()
-}
-
 /// This timestamp is determined to be repeatable by reading max_repeatable_ts
 /// from persistence. It may be lagging a few minutes behind live writes.
 /// It is expected only to be called from background tasks that don't need to
@@ -649,11 +724,13 @@ async fn read_max_repeatable_ts(
 pub async fn new_static_repeatable_recent(
     reader: &dyn PersistenceReader,
 ) -> anyhow::Result<RepeatableTimestamp> {
-    let _timer = static_repeatable_ts_timer(true);
-    match read_max_repeatable_ts(reader).await? {
+    match reader
+        .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
+        .await?
+    {
         None => Ok(RepeatableTimestamp::MIN),
-        Some(ts) => Ok(RepeatableTimestamp::new_validated(
-            ts,
+        Some(value) => Ok(RepeatableTimestamp::new_validated(
+            Timestamp::try_from(value)?,
             RepeatableReason::MaxRepeatableTsPersistence,
         )),
     }
@@ -746,67 +823,6 @@ impl RetentionValidator for NoopRetentionValidator {
     async fn min_document_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
         Ok(RepeatableTimestamp::MIN)
     }
-
-    fn fail_if_falling_behind(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-pub mod fake_retention_validator {
-    use async_trait::async_trait;
-    use sync_types::Timestamp;
-
-    use super::RetentionValidator;
-    use crate::types::{
-        unchecked_repeatable_ts,
-        RepeatableTimestamp,
-    };
-
-    #[derive(Clone, Copy)]
-    pub struct FakeRetentionValidator {
-        pub min_index_ts: RepeatableTimestamp,
-        pub min_document_ts: RepeatableTimestamp,
-    }
-
-    impl FakeRetentionValidator {
-        pub fn new(min_index_ts: Timestamp, min_document_ts: Timestamp) -> Self {
-            Self {
-                min_index_ts: unchecked_repeatable_ts(min_index_ts),
-                min_document_ts: unchecked_repeatable_ts(min_document_ts),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl RetentionValidator for FakeRetentionValidator {
-        fn optimistic_validate_snapshot(&self, ts: Timestamp) -> anyhow::Result<()> {
-            anyhow::ensure!(ts >= self.min_index_ts);
-            Ok(())
-        }
-
-        async fn validate_snapshot(&self, ts: Timestamp) -> anyhow::Result<()> {
-            anyhow::ensure!(ts >= self.min_index_ts);
-            Ok(())
-        }
-
-        async fn validate_document_snapshot(&self, ts: Timestamp) -> anyhow::Result<()> {
-            anyhow::ensure!(ts >= self.min_document_ts);
-            Ok(())
-        }
-
-        async fn min_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
-            Ok(self.min_index_ts)
-        }
-
-        async fn min_document_snapshot_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
-            Ok(self.min_document_ts)
-        }
-
-        fn fail_if_falling_behind(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -815,24 +831,5 @@ pub struct PersistenceTableSize {
     pub table_name: String,
     pub data_bytes: u64,
     pub index_bytes: u64,
-    pub row_count: u64,
-}
-
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-
-    use super::*;
-
-    proptest! {
-        #![proptest_config(ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, .. ProptestConfig::default() })]
-
-        #[test]
-        fn test_persistence_global_roundtrips(key in any::<PersistenceGlobalKey>()) {
-            let s: String = key.into();
-            let parse_key = s.parse().unwrap();
-            assert_eq!(key, parse_key);
-        }
-    }
+    pub row_count: Option<u64>,
 }

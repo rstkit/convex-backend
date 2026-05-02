@@ -1,10 +1,9 @@
 import * as Sentry from "@sentry/node";
-import chalk from "chalk";
-import ora, { Ora } from "ora";
+import { Ora } from "ora";
 import { Filesystem, nodeFs } from "./fs.js";
-import { format } from "util";
-import ProgressBar from "progress";
 import { initializeBigBrainAuth } from "../cli/lib/deploymentSelection.js";
+import { detectSuspiciousEnvironmentVariables } from "../cli/lib/envvars.js";
+import { logFailure, logVerbose } from "./log.js";
 // How the error should be handled when running `npx convex dev`.
 export type ErrorType =
   // The error was likely caused by the state of the developer's local
@@ -30,6 +29,9 @@ export type ErrorType =
   // The error was some transient issue (e.g. a network
   // error). This will then cause a retry after an exponential backoff.
   | "transient"
+  // This error was caught, handled, and now all that needs to happen
+  // is for the proces to restart. No error is logged or reported.
+  | "already handled"
   // This error is truly permanent. Exit `npx convex dev` because the
   // developer will need to take a manual commandline action.
   | "fatal";
@@ -40,6 +42,10 @@ export type BigBrainAuth = {
   | {
       kind: "projectKey";
       projectKey: string;
+    }
+  | {
+      kind: "deploymentKey";
+      deploymentKey: string;
     }
   | {
       kind: "previewDeployKey";
@@ -54,7 +60,6 @@ export type BigBrainAuth = {
 export interface Context {
   fs: Filesystem;
   deprecationMessagePrinted: boolean;
-  spinner: Ora | undefined;
   // Reports to Sentry and either throws FatalError or exits the process.
   // Prints the `printedMessage` if provided
   crash(args: {
@@ -108,25 +113,25 @@ class OneoffContextImpl {
     printedMessage: string | null;
   }) => {
     if (args.printedMessage !== null) {
-      logFailure(this, args.printedMessage);
+      logFailure(args.printedMessage);
     }
     return await this.flushAndExit(args.exitCode, args.errForSentry);
   };
   flushAndExit = async (exitCode: number, err?: any) => {
-    logVerbose(this, "Flushing and exiting, error:", err);
+    logVerbose("Flushing and exiting, error:", err);
     if (err) {
-      logVerbose(this, err.stack);
+      logVerbose(err.stack);
     }
     const cleanupFns = this._cleanupFns;
     // Clear the cleanup functions so that there's no risk of running them twice
     // if this somehow gets triggered twice.
     this._cleanupFns = {};
     const fns = Object.values(cleanupFns);
-    logVerbose(this, `Running ${fns.length} cleanup functions`);
+    logVerbose(`Running ${fns.length} cleanup functions`);
     for (const fn of fns) {
       await fn(exitCode, err);
     }
-    logVerbose(this, "All cleanup functions ran");
+    logVerbose("All cleanup functions ran");
     return flushAndExit(exitCode, err);
   };
   registerCleanup(fn: (exitCode: number, err?: any) => Promise<void>) {
@@ -143,17 +148,54 @@ class OneoffContextImpl {
     return this._bigBrainAuth;
   }
   _updateBigBrainAuth(auth: BigBrainAuth | null): void {
-    logVerbose(this, `Updating big brain auth to ${auth?.kind ?? "null"}`);
+    logVerbose(`Updating big brain auth to ${auth?.kind ?? "null"}`);
     this._bigBrainAuth = auth;
   }
 }
 
+/**
+ * Install a SIGINT handler that gracefully exits via ctx.flushAndExit.
+ *
+ * `bun run` and `npm run` can deliver a duplicate SIGINT to the child
+ * process immediately while the first handler is still starting cleanup:
+ *   bun:  https://github.com/oven-sh/bun/issues/14799
+ *         https://github.com/oven-sh/bun/issues/11400
+ *   npm:  https://github.com/npm/cli/issues/5021
+ *         https://github.com/npm/cli/issues/8164
+ *         https://github.com/npm/cli/issues/7693
+ * We ignore a second signal within 500ms of the first to avoid
+ * double-cleanup, but treat a later Ctrl+C as a force-exit escape hatch.
+ */
+export function installSigintHandler(ctx: OneoffCtx) {
+  const DUPLICATE_GRACE_MS = 500;
+  let cleanupStartTime: number | null = null;
+  process.on("SIGINT", async () => {
+    if (cleanupStartTime !== null) {
+      if (Date.now() - cleanupStartTime < DUPLICATE_GRACE_MS) {
+        logVerbose(
+          "Received SIGINT during cleanup, ignoring duplicate signal...",
+        );
+        return;
+      }
+      logVerbose("Received SIGINT during cleanup, exiting immediately...");
+      process.exit(130);
+    }
+    cleanupStartTime = Date.now();
+    logVerbose("Received SIGINT, cleaning up...");
+    await ctx.flushAndExit(130);
+  });
+}
+
 export const oneoffContext: (args: {
-  url?: string;
-  adminKey?: string;
-  envFile?: string;
+  url?: string | undefined;
+  adminKey?: string | undefined;
+  envFile?: string | undefined;
 }) => Promise<OneoffCtx> = async (args) => {
   const ctx = new OneoffContextImpl();
+  await detectSuspiciousEnvironmentVariables(
+    ctx,
+    !!process.env.CONVEX_IGNORE_SUSPICIOUS_ENV_VARS,
+  );
   await initializeBigBrainAuth(ctx, {
     url: args.url,
     adminKey: args.adminKey,
@@ -161,123 +203,3 @@ export const oneoffContext: (args: {
   });
   return ctx;
 };
-// console.error before it started being red by default in Node v20
-function logToStderr(...args: unknown[]) {
-  process.stderr.write(`${format(...args)}\n`);
-}
-
-// Handles clearing spinner so that it doesn't get messed up
-export function logError(ctx: Context, message: string) {
-  ctx.spinner?.clear();
-  logToStderr(message);
-}
-
-// Handles clearing spinner so that it doesn't get messed up
-export function logWarning(ctx: Context, ...logged: any) {
-  ctx.spinner?.clear();
-  logToStderr(...logged);
-}
-
-// Handles clearing spinner so that it doesn't get messed up
-export function logMessage(ctx: Context, ...logged: any) {
-  ctx.spinner?.clear();
-  logToStderr(...logged);
-}
-
-// For the rare case writing output to stdout. Status and error messages
-// (logMesage, logWarning, etc.) should be written to stderr.
-export function logOutput(ctx: Context, ...logged: any) {
-  ctx.spinner?.clear();
-  // the one spot where we can console.log
-  // eslint-disable-next-line no-console
-  console.log(...logged);
-}
-
-export function logVerbose(ctx: Context, ...logged: any) {
-  if (process.env.CONVEX_VERBOSE) {
-    logMessage(ctx, `[verbose] ${new Date().toISOString()}`, ...logged);
-  }
-}
-
-/**
- * Returns a ProgressBar instance, and also handles clearing the spinner if necessary.
- *
- * The caller is responsible for calling `progressBar.tick()` and terminating the `progressBar`
- * when it's done.
- */
-export function startLogProgress(
-  ctx: Context,
-  format: string,
-  progressBarOptions: ProgressBar.ProgressBarOptions,
-): ProgressBar {
-  ctx.spinner?.clear();
-  return new ProgressBar(format, progressBarOptions);
-}
-
-// Start a spinner.
-// To change its message use changeSpinner.
-// To print warnings/errors while it's running use logError or logWarning.
-// To stop it due to an error use logFailure.
-// To stop it due to success use logFinishedStep.
-export function showSpinner(ctx: Context, message: string) {
-  ctx.spinner?.stop();
-  ctx.spinner = ora({
-    // Add newline to prevent clobbering when a message
-    // we can't pipe through `logMessage` et al gets printed
-    text: message + "\n",
-    stream: process.stderr,
-    // hideCursor: true doesn't work with `tsx`.
-    // see https://github.com/tapjs/signal-exit/issues/49#issuecomment-1459408082
-    // See CX-6822 for an issue to bring back cursor hiding, probably by upgrading libraries.
-    hideCursor: process.env.CONVEX_RUNNING_LIVE_IN_MONOREPO ? false : true,
-  }).start();
-}
-
-export function changeSpinner(ctx: Context, message: string) {
-  if (ctx.spinner) {
-    // Add newline to prevent clobbering
-    ctx.spinner.text = message + "\n";
-  } else {
-    logToStderr(message);
-  }
-}
-
-export function logFailure(ctx: Context, message: string) {
-  if (ctx.spinner) {
-    ctx.spinner.fail(message);
-    ctx.spinner = undefined;
-  } else {
-    logToStderr(`${chalk.red(`✖`)} ${message}`);
-  }
-}
-
-// Stops and removes spinner if one is active
-export function logFinishedStep(ctx: Context, message: string) {
-  if (ctx.spinner) {
-    ctx.spinner.succeed(message);
-    ctx.spinner = undefined;
-  } else {
-    logToStderr(`${chalk.green(`✔`)} ${message}`);
-  }
-}
-
-export function stopSpinner(ctx: Context) {
-  if (ctx.spinner) {
-    ctx.spinner.stop();
-    ctx.spinner = undefined;
-  }
-}
-
-// Only shows the spinner if the async `fn` takes longer than `delayMs`
-export async function showSpinnerIfSlow(
-  ctx: Context,
-  message: string,
-  delayMs: number,
-  fn: () => Promise<any>,
-) {
-  const timeout = setTimeout(() => {
-    showSpinner(ctx, message);
-  }, delayMs);
-  await fn();
-  clearTimeout(timeout);
-}

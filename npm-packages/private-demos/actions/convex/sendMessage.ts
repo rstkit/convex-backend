@@ -11,6 +11,7 @@ export default mutation({
       extras,
     }: { format: "text" | "giphy"; body: string; author: string; extras?: any },
   ) => {
+    console.log("running sendMessage mutation");
     const message = {
       body,
       author,
@@ -26,7 +27,7 @@ export const clearMessages = mutation({
 
   handler: async (ctx) => {
     for (const message of await ctx.db.query("messages").collect()) {
-      await ctx.db.delete(message._id);
+      await ctx.db.delete("messages", message._id);
     }
   },
 });

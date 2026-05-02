@@ -4,7 +4,13 @@ use std::{
         btree_map::Entry,
         BTreeMap,
     },
-    fmt,
+    error::Error,
+    fmt::{
+        self,
+        Debug,
+        Display,
+    },
+    mem,
     sync::LazyLock,
 };
 
@@ -31,6 +37,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use sourcemap::SourceMap;
 use url::Url;
+use uuid::Uuid;
 use value::{
     heap_size::{
         HeapSize,
@@ -39,11 +46,18 @@ use value::{
     ConvexValue,
 };
 
-use crate::metrics::log_errors_reported_total;
+use crate::{
+    knobs::SHOW_PII_IN_ERRORS,
+    metrics::log_errors_reported_total,
+};
 
-// Regex to match emails from https://emailregex.com/
+// Regex to match emails from https://colinhacks.com/essays/reasonable-email-regex
+// This regex doesn’t match all valid email addresses (e.g. it skips emails
+// in IP addresses) in order to avoid false positives for pnpm module paths.
+// The negative lookaheads were removed because the `regex` crate doesn’t
+// support them, which makes the regex less strict about the position of `.`s.
 pub static EMAIL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])"#).unwrap()
+    Regex::new(r#"([a-z0-9_'+\-\.]*)[a-z0-9_+-]@([a-z0-9][a-z0-9\-]*\.)+[a-z]{2,}"#).unwrap()
 });
 
 /// Replacers for PII in errors before reporting to thirdparty services
@@ -57,6 +71,9 @@ static PII_REPLACEMENTS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(||
     ]
 });
 
+/// Limit error messages originating from user code to 64KiB
+const MAX_ERROR_MESSAGE_LENGTH: usize = 1 << 16;
+
 /// Return Result<(), MainError> from main functions to report returned errors
 /// to Sentry.
 pub struct MainError(anyhow::Error);
@@ -68,7 +85,7 @@ impl<T: Into<anyhow::Error>> From<T> for MainError {
     }
 }
 
-impl std::fmt::Debug for MainError {
+impl Debug for MainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Just print the `Display` of the error rather than `Debug`, as `report_error`
         // above will already print the stack trace when `RUST_BACKTRACE` is set.
@@ -77,6 +94,9 @@ impl std::fmt::Debug for MainError {
 }
 
 fn strip_pii(err: &mut anyhow::Error) {
+    if *SHOW_PII_IN_ERRORS {
+        return;
+    }
     if let Some(error_metadata) = err.downcast_mut::<ErrorMetadata>() {
         for (regex, replacement) in PII_REPLACEMENTS.iter() {
             match regex.replace_all(&error_metadata.msg, *replacement) {
@@ -92,16 +112,33 @@ fn strip_pii(err: &mut anyhow::Error) {
         transformed = regex.replace_all(&transformed, *replacement).to_string();
     }
     if s != transformed {
-        // How to get the backtrace properly into the anyhow? This is not what we want,
-        // but works.
-        let em = err.downcast_mut::<ErrorMetadata>().cloned();
-        if let Some(em) = em {
-            *err = anyhow::anyhow!(err.backtrace().to_string())
-                .context(transformed)
-                .context(em);
-        } else {
-            *err = anyhow::anyhow!(err.backtrace().to_string()).context(transformed);
+        struct WithBacktrace(String, anyhow::Error);
+        impl Error for WithBacktrace {
+            fn provide<'a>(&'a self, request: &mut std::error::Request<'a>) {
+                request.provide_ref(self.1.backtrace());
+            }
         }
+        impl Display for WithBacktrace {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl Debug for WithBacktrace {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        let em = err.downcast_ref::<ErrorMetadata>().cloned();
+        let mut transformed_error = anyhow::Error::new(WithBacktrace(
+            transformed,
+            // this is not ideal as the anyhow! itself takes a backtrace that we
+            // then throw away
+            mem::replace(err, anyhow::anyhow!("")),
+        ));
+        if let Some(em) = em {
+            transformed_error = transformed_error.context(em);
+        }
+        *err = transformed_error;
     }
 }
 
@@ -109,29 +146,46 @@ fn strip_pii(err: &mut anyhow::Error) {
 /// This is the one point where we call into Sentry.
 ///
 /// Other parts of codebase should not use the `sentry_anyhow` crate directly!
-pub async fn report_error(err: &mut anyhow::Error) {
+pub async fn report_error(err: &mut anyhow::Error) -> Option<Uuid> {
+    // Trace error before yield - since during shutdown, we won't be back.
+    trace_error(err);
+
     // Yield in case this is during shutdown - at which point, errors being reported
     // explicitly aren't useful. Yielding allows tokio to complete a cancellation.
     tokio::task::yield_now().await;
 
-    report_error_sync(err);
+    report_error_sync_no_tracing(err)
 }
 
 /// Use the `pub async fn report_error` above if possible to log an error to
 /// sentry. This is a synchronous version for use in sync contexts.
-pub fn report_error_sync(err: &mut anyhow::Error) {
+pub fn report_error_sync(err: &mut anyhow::Error) -> Option<Uuid> {
+    trace_error(err);
+    report_error_sync_no_tracing(err)
+}
+
+fn trace_error(err: &mut anyhow::Error) {
     strip_pii(err);
     if let Some(label) = err.metric_server_error_label() {
         log_errors_reported_total(label);
     }
 
+    let label = err.metric_status_label_value();
     let err_for_tracing = format!("{err:#}").replace("\n", "\\n");
-    tracing::error!(
-        "Caught error (RUST_BACKTRACE=1 RUST_LOG=info,{}=debug for full trace): {err_for_tracing}",
-        module_path!(),
+    let full_msg = format!(
+        "Caught {label} error (RUST_BACKTRACE=1 RUST_LOG=info,{}=debug for full trace): \
+         {err_for_tracing}",
+        module_path!()
     );
+    if err.metric_server_error_label().is_some() {
+        tracing::error!("{full_msg}");
+    } else {
+        tracing::warn!("{full_msg}");
+    }
     tracing::debug!("{err:?}");
+}
 
+fn report_error_sync_no_tracing(err: &mut anyhow::Error) -> Option<Uuid> {
     if let Some(e) = err.downcast_mut::<ErrorMetadata>() {
         if let Some(counter) = e.custom_metric() {
             log_counter(counter, 1);
@@ -142,7 +196,7 @@ pub fn report_error_sync(err: &mut anyhow::Error) {
         match &e.source {
             Some(source) => {
                 tracing::debug!("Not reporting above error: already reported by {source}");
-                return;
+                return None;
             },
             None => {
                 e.source = Some(SERVICE_NAME.clone());
@@ -152,19 +206,19 @@ pub fn report_error_sync(err: &mut anyhow::Error) {
 
     let Some(sentry_client) = sentry::Hub::current().client() else {
         tracing::error!("Not reporting above error: Sentry is not configured");
-        return;
+        return None;
     };
     if let Some((level, prob)) = err.should_report_to_sentry() {
         if let Some(prob) = prob
             && rand::rng().random::<f64>() > prob
         {
             tracing::debug!("Not reporting above error to sentry - due to sampling.");
-            return;
+            return None;
         }
 
         if !sentry_client.is_enabled() {
             tracing::debug!("Not reporting above error: SENTRY_DSN not set.");
-            return;
+            return None;
         }
 
         let mut event = event_from_error(err);
@@ -180,8 +234,10 @@ pub fn report_error_sync(err: &mut anyhow::Error) {
             "Reporting above error to sentry with event_id {}",
             event_id.simple()
         );
+        Some(event_id)
     } else {
         tracing::debug!("Not reporting above error to sentry.");
+        None
     }
 }
 
@@ -217,9 +273,9 @@ fn event_from_error(err: &anyhow::Error) -> sentry::protocol::Event<'static> {
 /// be part of the new error.
 ///
 /// See https://docs.rs/anyhow/latest/anyhow/struct.Error.html#display-representations
-pub fn recapture_stacktrace(mut err: anyhow::Error) -> anyhow::Error {
+pub async fn recapture_stacktrace(mut err: anyhow::Error) -> anyhow::Error {
     let new_error = recapture_stacktrace_noreport(&err);
-    report_error_sync(&mut err); // report original error, mutating it to strip pii
+    report_error(&mut err).await; // report original error, mutating it to strip pii
     new_error
 }
 
@@ -233,7 +289,6 @@ pub fn recapture_stacktrace_noreport(err: &anyhow::Error) -> anyhow::Error {
 
 #[derive(Clone, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct FrameData {
     pub type_name: Option<String>,
     pub function_name: Option<String>,
@@ -404,24 +459,24 @@ impl fmt::Display for FrameData {
         if self.is_async {
             write!(f, "async ")?;
         }
-        if self.is_promise_all {
-            if let Some(promise_index) = self.promise_index {
-                write!(f, "Promise.all (index {promise_index})")?;
-            }
+        if self.is_promise_all
+            && let Some(promise_index) = self.promise_index
+        {
+            write!(f, "Promise.all (index {promise_index})")?;
         }
         let is_method_call = !(self.is_top_level == Some(true) || self.is_constructor);
         if is_method_call {
             if let Some(ref function_name) = self.function_name {
-                if let Some(ref type_name) = self.type_name {
-                    if function_name.starts_with(type_name) {
-                        write!(f, "{type_name}.")?;
-                    }
+                if let Some(ref type_name) = self.type_name
+                    && function_name.starts_with(type_name)
+                {
+                    write!(f, "{type_name}.")?;
                 }
                 write!(f, "{function_name}")?;
-                if let Some(ref method_name) = self.method_name {
-                    if function_name.ends_with(method_name) {
-                        write!(f, " [as {method_name}]")?;
-                    }
+                if let Some(ref method_name) = self.method_name
+                    && function_name.ends_with(method_name)
+                {
+                    write!(f, " [as {method_name}]")?;
                 }
             } else {
                 if let Some(ref type_name) = self.type_name {
@@ -455,10 +510,6 @@ impl fmt::Display for FrameData {
 
 /// An Error emitted from a Convex Function execution.
 #[derive(Clone)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(proptest_derive::Arbitrary, PartialEq)
-)]
 pub struct JsError {
     pub message: String,
     pub custom_data: Option<ConvexValue>,
@@ -523,10 +574,6 @@ impl HeapSize for JsError {
 }
 
 #[derive(Clone)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(proptest_derive::Arbitrary, PartialEq)
-)]
 pub struct JsFrames(pub WithHeapSize<Vec<MappedFrame>>);
 
 impl From<JsFrames> for JsFramesProto {
@@ -585,7 +632,7 @@ impl JsError {
     }
 
     pub fn from_frames(
-        message: String,
+        mut message: String,
         frame_data: Vec<FrameData>,
         custom_data: Option<ConvexValue>,
         mut lookup_source_map: impl FnMut(&Url) -> anyhow::Result<Option<SourceMap>>,
@@ -655,6 +702,8 @@ impl JsError {
             mapped_frames.pop();
         }
 
+        message.truncate(message.floor_char_boundary(MAX_ERROR_MESSAGE_LENGTH));
+
         JsError {
             message,
             custom_data,
@@ -662,17 +711,6 @@ impl JsError {
         }
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    pub fn from_frames_for_test(message: &str, frames: Vec<&str>) -> Self {
-        let frame_data = frames
-            .into_iter()
-            .map(|filename| FrameData {
-                file_name: Some(filename.to_string()),
-                ..Default::default()
-            })
-            .collect();
-        Self::from_frames(message.to_string(), frame_data, None, |_| Ok(None))
-    }
 }
 
 // Based on deno's `02_error.js:formatLocation`.
@@ -683,10 +721,10 @@ fn format_location(f: &mut fmt::Formatter<'_>, frame: &MappedFrame) -> fmt::Resu
     if let Some(ref file_name) = frame.file_name {
         write!(f, "{file_name}")?;
     } else {
-        if frame.is_eval {
-            if let Some(ref eval_origin) = frame.eval_origin {
-                write!(f, "{eval_origin}, ")?;
-            }
+        if frame.is_eval
+            && let Some(ref eval_origin) = frame.eval_origin
+        {
+            write!(f, "{eval_origin}, ")?;
         }
         write!(f, "<anonymous>")?;
     }
@@ -738,214 +776,21 @@ pub fn lease_lost_error() -> anyhow::Error {
     anyhow::anyhow!(LeaseLostError).context(ErrorMetadata::operational_internal_server_error())
 }
 
+#[derive(thiserror::Error, Debug)]
+#[error("Database Timeout ({0})")]
+pub struct DatabaseTimeoutError(&'static str);
+pub fn database_timeout_error(db_type: &'static str) -> anyhow::Error {
+    anyhow::anyhow!(DatabaseTimeoutError(db_type))
+        .context(ErrorMetadata::operational_internal_server_error())
+}
+
+#[derive(thiserror::Error, Debug)]
+#[error(transparent)]
+pub struct DatabaseOperationalError(anyhow::Error);
+pub fn database_operational_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(DatabaseOperationalError(error))
+        .context(ErrorMetadata::operational_internal_server_error())
+}
+
 pub const AUTH_ERROR: &str = "AuthError";
 pub const TIMEOUT_ERROR_MESSAGE: &str = "Your request timed out.";
-
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use errors::{
-        ErrorMetadata,
-        ErrorMetadataAnyhowExt,
-    };
-    use maplit::btreemap;
-    use proptest::prelude::*;
-    use sync_types::testing::assert_roundtrips;
-    use value::obj;
-
-    use super::{
-        strip_pii,
-        FrameDataProto,
-        JsError,
-        JsErrorProto,
-    };
-    use crate::{
-        errors::{
-            event_from_error,
-            FrameData,
-        },
-        schemas::{
-            validator::{
-                ValidationContext,
-                ValidationError,
-            },
-            SchemaEnforcementError,
-        },
-    };
-
-    #[test]
-    fn test_js_error_conversion_into_anyhow() -> anyhow::Result<()> {
-        let js_error = JsError::from_message("Big Error".into());
-        let err: anyhow::Error = js_error.into();
-        assert_eq!(err.to_string(), "Big Error\n");
-        assert_eq!(err.downcast_ref::<JsError>().unwrap().message, "Big Error");
-        assert_eq!(err.downcast::<ErrorMetadata>().unwrap().short_msg, "Error");
-        Ok(())
-    }
-
-    #[test]
-    fn test_strip_pii_obj() -> anyhow::Result<()> {
-        let object = obj!("foo" => "bar")?;
-        let validation_error = ValidationError::ExtraField {
-            object: object.clone(),
-            field_name: "field".parse()?,
-            object_validator: crate::schemas::validator::ObjectValidator(btreemap! {}),
-            context: ValidationContext::new(),
-        };
-        let schema_enforcement_error = SchemaEnforcementError::Document {
-            validation_error,
-            table_name: "table".parse()?,
-        };
-        let error_metadata: ErrorMetadata = schema_enforcement_error.to_error_metadata();
-        let mut anyhow_err: anyhow::Error = error_metadata.into();
-        assert!(anyhow_err.is_bad_request());
-        let err_string = anyhow_err.to_string();
-        assert!(err_string.contains(&object.to_string()));
-        assert!(err_string.contains("Object contains extra field"));
-        strip_pii(&mut anyhow_err);
-        assert!(anyhow_err.is_bad_request());
-        let err_string = anyhow_err.to_string();
-        assert!(!err_string.contains(&object.to_string()));
-        assert!(err_string.contains("Object contains extra field"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_strip_pii_email() -> anyhow::Result<()> {
-        let mut e = anyhow::anyhow!(ErrorMetadata::bad_request(
-            "DIY",
-            "Need DIY advice? Email totally-not-james@convex.dev"
-        ));
-        strip_pii(&mut e);
-        assert_eq!(e.to_string(), "Need DIY advice? Email *****@*****.***");
-        Ok(())
-    }
-
-    #[test]
-    fn test_strip_pii_wrap_error_message() -> anyhow::Result<()> {
-        let mut e = anyhow::anyhow!(ErrorMetadata::bad_request(
-            "DIY",
-            "Need DIY advice? Email totally-not-james@convex.dev"
-        ))
-        .wrap_error_message(|m| format!("Wrapped: {m}"));
-
-        strip_pii(&mut e);
-        assert!(!format!("{e:?}").contains("totally-not-james"));
-        assert!(e.is_bad_request());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_strip_pii_outside_and_inside_error_metadata() -> anyhow::Result<()> {
-        let mut e = anyhow::anyhow!("Contact totally-not-jamwt@convex.dev if we get here").context(
-            ErrorMetadata::bad_request(
-                "DIY",
-                "Need DIY advice? Email totally-not-james@convex.dev",
-            ),
-        );
-
-        strip_pii(&mut e);
-        assert!(!format!("{e:?}").contains("totally-not-james"));
-        assert!(!format!("{e:?}").contains("totally-not-jamwt"));
-        assert!(e.is_bad_request());
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_strip_pii_weird_email() -> anyhow::Result<()> {
-        let test = "receipts+memo+====@site.com";
-        let mut e = anyhow::anyhow!(ErrorMetadata::bad_request(
-            "DIY",
-            format!("Need DIY advice? Email {test}"),
-        ));
-        strip_pii(&mut e);
-        assert_eq!(e.to_string(), "Need DIY advice? Email *****@*****.***");
-        Ok(())
-    }
-
-    #[test]
-    fn test_strip_pii_without_error_metadata() -> anyhow::Result<()> {
-        let test = "receipts+memo+====@site.com";
-        let mut e = anyhow::anyhow!("Need DIY advice? Email {test}");
-        strip_pii(&mut e);
-        assert_eq!(e.to_string(), "Need DIY advice? Email *****@*****.***");
-        Ok(())
-    }
-
-    #[test]
-    fn test_dont_mess_with_non_pii() -> anyhow::Result<()> {
-        let mut e = anyhow::anyhow!("Need DIY advice?").context("You're on your own");
-        strip_pii(&mut e);
-        assert_eq!(format!("{e:#}"), "You're on your own: Need DIY advice?");
-        Ok(())
-    }
-
-    #[test]
-    fn test_js_error_conversion_anyhow_macro() -> anyhow::Result<()> {
-        let js_error = JsError::from_message("Big Error".into());
-        let err = anyhow::anyhow!(js_error);
-        assert_eq!(err.to_string(), "Big Error\n");
-        assert_eq!(err.downcast_ref::<JsError>().unwrap().message, "Big Error");
-        assert_eq!(err.downcast::<ErrorMetadata>().unwrap().short_msg, "Error");
-        Ok(())
-    }
-
-    #[test]
-    fn test_event_from_error_non_root_cause() {
-        let error = anyhow::anyhow!("message").context(ErrorMetadata::bad_request(
-            "ShortMsg",
-            "user visible message",
-        ));
-        let event = event_from_error(&error);
-        let exceptions: Vec<_> = event
-            .exception
-            .iter()
-            .map(|ex| (ex.ty.as_str(), ex.value.as_deref()))
-            .collect();
-        assert_eq!(
-            exceptions,
-            vec![
-                ("Error", Some("message")),
-                ("ShortMsg", Some("user visible message")),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_event_from_error_root_cause() {
-        let error = anyhow::anyhow!(ErrorMetadata::bad_request(
-            "ShortMsg",
-            "user visible message",
-        ))
-        .context("contextual message");
-        let event = event_from_error(&error);
-        let exceptions: Vec<_> = event
-            .exception
-            .iter()
-            .map(|ex| (ex.ty.as_str(), ex.value.as_deref()))
-            .collect();
-        assert_eq!(
-            exceptions,
-            vec![
-                ("ShortMsg", Some("user visible message")),
-                ("Error", Some("contextual message")),
-            ]
-        );
-    }
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-        #[test]
-        fn js_error_proto_roundtrips(js_error in any::<JsError>()) {
-            assert_roundtrips::<JsError, JsErrorProto>(js_error);
-        }
-        #[test]
-        fn frame_data_proto_roundtrips(left in any::<FrameData>()) {
-            assert_roundtrips::<FrameData, FrameDataProto>(left);
-        }
-    }
-}

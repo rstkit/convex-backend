@@ -7,7 +7,11 @@ import {
 } from "@radix-ui/react-icons";
 import { useContext, useMemo } from "react";
 import { Infer } from "convex/values";
-import { Disclosure } from "@headlessui/react";
+import {
+  Disclosure,
+  DisclosureButton,
+  DisclosurePanel,
+} from "@headlessui/react";
 import {
   authDiff,
   componentDiff,
@@ -22,6 +26,9 @@ import { Button } from "@ui/Button";
 import { ReadonlyCodeDiff } from "@common/elements/ReadonlyCode";
 import { NentNameOption } from "@common/elements/NentSwitcher";
 import { NENT_APP_PLACEHOLDER } from "@common/lib/useNents";
+import { Tooltip } from "@ui/Tooltip";
+import { CopyButton } from "@common/elements/CopyButton";
+import { cn } from "@ui/cn";
 
 function useSchemaCode(schema: null | string): string {
   return useMemo(() => {
@@ -33,8 +40,10 @@ function useSchemaCode(schema: null | string): string {
 
 export function DeploymentEventContent({
   event,
+  inPanel = false,
 }: {
   event: DeploymentAuditLogEvent;
+  inPanel?: boolean;
 }) {
   const { TeamMemberLink } = useContext(DeploymentInfoContext);
   let body;
@@ -51,6 +60,11 @@ export function DeploymentEventContent({
     case "push_config_with_components":
       body = (
         <>
+          {event.metadata.message && (
+            <p className="mb-2 text-content-primary italic">
+              &ldquo;{event.metadata.message}&rdquo;
+            </p>
+          )}
           {event.metadata.component_diffs.map(
             ({ component_path, component_diff }) => {
               const auth =
@@ -80,7 +94,27 @@ export function DeploymentEventContent({
     case "update_canonical_url":
     case "delete_canonical_url":
     case "change_deployment_state":
+    case "pause_deployment":
+    case "unpause_deployment":
+    case "change_system_stop_state":
     case "clear_tables":
+    case "delete_scheduled_jobs_table":
+    case "delete_tables":
+    case "delete_component":
+    case "cancel_all_scheduled_functions":
+    case "cancel_scheduled_function":
+    case "request_export":
+    case "cancel_export":
+    case "set_export_expiration":
+    case "create_integration":
+    case "update_integration":
+    case "delete_integration":
+    case "add_documents":
+    case "delete_documents":
+    case "update_documents":
+    case "create_table":
+    case "delete_files":
+    case "generate_upload_url":
     default:
       body = null;
   }
@@ -88,14 +122,14 @@ export function DeploymentEventContent({
   return (
     <div className="flex flex-col gap-2 text-sm">
       <div className="flex items-center justify-between">
-        <div className="flex h-6 flex-wrap items-center gap-1">
+        <span className={cn(!inPanel && "leading-6")}>
           <TeamMemberLink
             memberId={Number(event.member_id)}
             name={event.memberName}
-          />
+          />{" "}
           <ActionText event={event} />
-        </div>
-        <TimestampDistance date={new Date(event._creationTime)} />
+        </span>
+        {!inPanel && <TimestampDistance date={new Date(event._creationTime)} />}
       </div>
       {body && <div className="ml-4 rounded-md border px-3 py-2.5">{body}</div>}
     </div>
@@ -186,9 +220,29 @@ export function ActionText({ event }: { event: DeploymentAuditLogEvent }) {
           return <span>resumed the deployment</span>;
         case "disabled":
           return <span>disabled the deployment</span>;
+        case "suspended":
+          return <span>suspended the deployment</span>;
         default:
-          // eslint-disable-next-line @typescript-eslint/no-unused-vars, no-case-declarations
-          const _: never = event.metadata.new_state;
+          event.metadata.new_state satisfies never;
+          return null;
+      }
+
+    case "pause_deployment":
+      return <span>paused the deployment</span>;
+
+    case "unpause_deployment":
+      return <span>unpaused the deployment</span>;
+
+    case "change_system_stop_state":
+      switch (event.metadata.new_state) {
+        case "suspended":
+          return <span>suspended the deployment</span>;
+        case "disabled":
+          return <span>disabled the deployment</span>;
+        case "none":
+          return <span>unblocked the deployment</span>;
+        default:
+          event.metadata.new_state satisfies never;
           return null;
       }
 
@@ -220,18 +274,382 @@ export function ActionText({ event }: { event: DeploymentAuditLogEvent }) {
           format = "ZIP";
           break;
         default:
-          // eslint-disable-next-line @typescript-eslint/no-unused-vars, no-case-declarations
-          const _: never = event.metadata.import_format;
+          event.metadata.import_format satisfies never;
           return null;
       }
       return <span>imported a snapshot from a {format} file</span>;
     }
 
+    case "delete_scheduled_jobs_table":
+      return (
+        <>
+          <span>deleted the </span>
+          <span className="font-mono font-semibold">_scheduled_functions</span>
+          <span> table</span>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+
+    case "delete_tables": {
+      const { table_names } = event.metadata;
+      return (
+        <>
+          <span>deleted </span>
+          {table_names.length === 1 ? (
+            <span>
+              table{" "}
+              <span className="font-mono font-semibold">{table_names[0]}</span>
+            </span>
+          ) : (
+            <ItemCount items={table_names} singular="table" plural="tables" />
+          )}
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+    }
+
+    case "delete_component":
+      return (
+        <>
+          <span>deleted component </span>
+          {event.metadata.component ? (
+            <ComponentName
+              component={event.metadata.component}
+              componentId={event.metadata.component_id}
+            />
+          ) : (
+            <span className="font-mono font-semibold">
+              {event.metadata.component_id}
+            </span>
+          )}
+        </>
+      );
+
+    case "cancel_all_scheduled_functions":
+      return (
+        <>
+          <span>canceled all scheduled functions</span>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+
+    case "cancel_scheduled_function":
+      return (
+        <>
+          <span>canceled </span>
+          <Tooltip
+            tip={
+              <span className="font-mono">
+                {event.metadata.scheduled_function_id}
+              </span>
+            }
+            maxWidthClassName="max-w-md"
+          >
+            <span className="underline decoration-dotted">
+              scheduled function
+            </span>
+          </Tooltip>
+          {event.metadata.function_path && (
+            <>
+              <span> </span>
+              <span className="font-mono font-semibold">
+                {event.metadata.function_path}
+              </span>
+            </>
+          )}
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+
+    case "request_export":
+      return (
+        <>
+          <span>requested a </span>
+          <span className="font-mono font-semibold">
+            {event.metadata.format}
+          </span>
+          <span> </span>
+          <Tooltip
+            tip={<span className="font-mono">{event.metadata.id}</span>}
+            maxWidthClassName="max-w-md"
+          >
+            <span className="underline decoration-dotted">export</span>
+          </Tooltip>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+
+    case "cancel_export":
+      return (
+        <>
+          <span>canceled </span>
+          <Tooltip
+            tip={<span className="font-mono">{event.metadata.id}</span>}
+            maxWidthClassName="max-w-md"
+          >
+            <span className="underline decoration-dotted">an export</span>
+          </Tooltip>
+        </>
+      );
+
+    case "set_export_expiration":
+      return (
+        <>
+          <span>set expiration on </span>
+          <Tooltip
+            tip={<span className="font-mono">{event.metadata.id}</span>}
+            maxWidthClassName="max-w-md"
+          >
+            <span className="underline decoration-dotted">an export</span>
+          </Tooltip>
+          <span>
+            {" "}
+            to{" "}
+            {new Date(Number(event.metadata.expiration_ts_ms)).toLocaleString()}
+          </span>
+        </>
+      );
+
+    case "create_integration":
+      return (
+        <>
+          <span>created a </span>
+          <span className="font-mono font-semibold">{event.metadata.type}</span>
+          <span> integration</span>
+        </>
+      );
+
+    case "update_integration":
+      return (
+        <>
+          <span>updated a </span>
+          <span className="font-mono font-semibold">{event.metadata.type}</span>
+          <span> integration</span>
+        </>
+      );
+
+    case "delete_integration":
+      return (
+        <>
+          <span>deleted a </span>
+          <span className="font-mono font-semibold">{event.metadata.type}</span>
+          <span> integration</span>
+        </>
+      );
+
+    case "add_documents": {
+      const { document_ids } = event.metadata;
+      return (
+        <>
+          <span>added </span>
+          <ItemCount
+            items={document_ids}
+            singular="document"
+            plural="documents"
+          />
+          <span> to </span>
+          <span className="font-mono font-semibold">
+            {event.metadata.table}
+          </span>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+    }
+
+    case "delete_documents": {
+      const { document_ids, table } = event.metadata;
+      return (
+        <>
+          <span>deleted </span>
+          <ItemCount
+            items={document_ids}
+            singular="document"
+            plural="documents"
+          />
+          <span> from </span>
+          <span className="font-mono font-semibold">{table}</span>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+    }
+
+    case "update_documents": {
+      const { document_ids, table } = event.metadata;
+      return (
+        <>
+          <span>updated </span>
+          <ItemCount
+            items={document_ids}
+            singular="document"
+            plural="documents"
+          />
+          <span> in </span>
+          <span className="font-mono font-semibold">{table}</span>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+    }
+
+    case "create_table":
+      return (
+        <>
+          <span>created table </span>
+          <span className="font-mono font-semibold">
+            {event.metadata.table}
+          </span>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+
+    case "delete_files": {
+      const { storage_ids } = event.metadata;
+      return (
+        <>
+          <span>deleted </span>
+          <Tooltip
+            tip={<ItemListTooltip items={storage_ids} />}
+            maxWidthClassName="max-w-md"
+          >
+            <span className="underline decoration-dotted">
+              {storage_ids.length === 1
+                ? "a file"
+                : `${storage_ids.length} files`}
+            </span>
+          </Tooltip>
+          <span> from storage</span>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+    }
+
+    case "generate_upload_url":
+      return (
+        <>
+          <span>generated a file upload URL</span>
+          <ComponentSuffix
+            component={event.metadata.component}
+            componentId={event.metadata.component_id}
+          />
+        </>
+      );
+
     default:
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars, no-case-declarations
-      const _: never = event;
+      event satisfies never;
       return null;
   }
+}
+
+function ItemListTooltip({ items }: { items: string[] }) {
+  return (
+    <div className="relative text-left">
+      <div className="absolute top-0 right-0">
+        <CopyButton text={items.join("\n")} size="xs" inline />
+      </div>
+      <div className="scrollbar flex max-h-48 flex-col gap-0.5 overflow-y-auto pr-8 font-mono">
+        {items.map((item) => (
+          <span key={item}>{item}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ItemCount({
+  items,
+  singular,
+  plural,
+}: {
+  items: string[];
+  singular: string;
+  plural: string;
+}) {
+  if (items.length === 1) {
+    return (
+      <Tooltip
+        tip={<span className="font-mono">{items[0]}</span>}
+        maxWidthClassName="max-w-md"
+      >
+        <span className="underline decoration-dotted">a {singular}</span>
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip
+      tip={<ItemListTooltip items={items} />}
+      maxWidthClassName="max-w-md"
+    >
+      <span className="underline decoration-dotted">
+        {items.length} {plural}
+      </span>
+    </Tooltip>
+  );
+}
+
+function ComponentName({
+  component,
+  componentId,
+}: {
+  component: string;
+  componentId: string | null;
+}) {
+  if (componentId) {
+    return (
+      <Tooltip tip={<span className="font-mono">{componentId}</span>}>
+        <span className="font-mono font-semibold underline decoration-dotted">
+          {component}
+        </span>
+      </Tooltip>
+    );
+  }
+  return <span className="font-mono font-semibold">{component}</span>;
+}
+
+function ComponentSuffix({
+  component,
+  componentId,
+}: {
+  component: string | null;
+  componentId: string | null;
+}) {
+  if (component === null) {
+    return null;
+  }
+  return (
+    <>
+      <span> in component </span>
+      <ComponentName component={component} componentId={componentId} />
+    </>
+  );
 }
 
 function Variable({ variableName }: { variableName: string }) {
@@ -278,12 +696,17 @@ function CronElement({ cronDiff }: { cronDiff: Infer<typeof cronDiffType> }) {
         <>
           <div className="flex items-center gap-1.5">
             <span>Updated cron jobs</span>
-            <Disclosure.Button as={Button} inline variant="neutral">
+            <DisclosureButton
+              as={Button}
+              inline
+              variant="neutral"
+              aria-label={open ? "Hide details" : "Show details"}
+            >
               {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
-            </Disclosure.Button>
+            </DisclosureButton>
           </div>
 
-          <Disclosure.Panel className="ps-4">{cronElement}</Disclosure.Panel>
+          <DisclosurePanel className="ps-4">{cronElement}</DisclosurePanel>
         </>
       )}
     </Disclosure>
@@ -316,9 +739,14 @@ function SchemaElement(diff: Infer<typeof schemaDiffType>) {
         <>
           <div className="flex items-center gap-1.5">
             <span>Updated the schema</span>
-            <Disclosure.Button as={Button} inline variant="neutral">
+            <DisclosureButton
+              as={Button}
+              inline
+              variant="neutral"
+              aria-label={open ? "Hide details" : "Show details"}
+            >
               {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
-            </Disclosure.Button>
+            </DisclosureButton>
           </div>
 
           <Disclosure.Panel className="ps-4">
@@ -363,9 +791,14 @@ function AuthElement({ diff }: { diff: Infer<typeof authDiff> }) {
         <>
           <div className="flex items-center gap-1.5">
             <span>Updated auth providers</span>
-            <Disclosure.Button as={Button} inline variant="neutral">
+            <DisclosureButton
+              as={Button}
+              inline
+              variant="neutral"
+              aria-label={open ? "Hide details" : "Show details"}
+            >
               {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
-            </Disclosure.Button>
+            </DisclosureButton>
           </div>
 
           <Disclosure.Panel className="ps-4">{authElement}</Disclosure.Panel>
@@ -434,8 +867,7 @@ function PushContentForComponents({
       pastTenseDiff = "Remounted";
       break;
     default:
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars, no-case-declarations
-      const _: never = diffType.type;
+      diffType.type satisfies never;
   }
   const authElement = auth ? AuthElement({ diff: auth }) : null;
   return (
@@ -568,8 +1000,7 @@ function SnapshotImportIntoTable({
       break;
     default:
       console.error(`Unexpected import_mode ${import_mode}`);
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars, no-case-declarations
-      const _: never = import_mode;
+      import_mode satisfies never;
       return null;
   }
 

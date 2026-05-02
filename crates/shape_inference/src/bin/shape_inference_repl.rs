@@ -9,14 +9,11 @@ use std::{
 use serde_json::Value as JsonValue;
 use shape_inference::{
     CountedShape,
-    ProdConfigWithOptionalFields,
+    ProdConfig,
     Shape,
     ShapeConfig,
 };
 use value::ConvexValue;
-#[cfg(feature = "testing")]
-use value::IdentifierFieldName;
-
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum SmallConfig {}
 
@@ -25,22 +22,9 @@ impl ShapeConfig for SmallConfig {
     const MAX_UNION_LENGTH: usize = 4;
 
     fn is_valid_string_literal(s: &str) -> bool {
-        ProdConfigWithOptionalFields::is_valid_string_literal(s)
+        ProdConfig::is_valid_string_literal(s)
     }
 
-    fn allow_optional_object_fields() -> bool {
-        ProdConfigWithOptionalFields::allow_optional_object_fields()
-    }
-
-    #[cfg(feature = "testing")]
-    fn string_literal_strategy() -> proptest::strategy::BoxedStrategy<String> {
-        ProdConfigWithOptionalFields::string_literal_strategy()
-    }
-
-    #[cfg(feature = "testing")]
-    fn object_field_strategy() -> proptest::strategy::BoxedStrategy<IdentifierFieldName> {
-        ProdConfigWithOptionalFields::object_field_strategy()
-    }
 }
 
 fn repl<C: ShapeConfig>() -> anyhow::Result<()> {
@@ -89,6 +73,6 @@ fn main() -> anyhow::Result<()> {
     if env::args().nth(1).unwrap_or_default() == "small" {
         repl::<SmallConfig>()
     } else {
-        repl::<ProdConfigWithOptionalFields>()
+        repl::<ProdConfig>()
     }
 }

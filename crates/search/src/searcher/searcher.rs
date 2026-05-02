@@ -3,7 +3,6 @@ use std::{
     collections::{
         BTreeMap,
         BTreeSet,
-        BinaryHeap,
     },
     ops::{
         Add,
@@ -25,8 +24,10 @@ use common::{
     bounded_thread_pool::BoundedThreadPool,
     document::CreationTime,
     runtime::Runtime,
+    try_anyhow,
     types::{
         ObjectKey,
+        SearchIndexMetricLabels,
         Timestamp,
         WriteTimestamp,
     },
@@ -67,6 +68,7 @@ use text_search::tracker::StaticDeletionTracker;
 use value::InternalId;
 use vector::{
     qdrant_segments::UntarredVectorDiskSegmentPaths,
+    result_merger::merge_vector_results_stream,
     CompiledVectorSearch,
     QdrantSchema,
     VectorIndexType,
@@ -144,6 +146,7 @@ pub trait Searcher: VectorSearcher + Send + Sync + 'static {
         storage_keys: FragmentedTextStorageKeys,
         queries: Vec<TokenQuery>,
         max_results: usize,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<Vec<TokenMatch>>;
 
     async fn query_bm25_stats(
@@ -151,6 +154,7 @@ pub trait Searcher: VectorSearcher + Send + Sync + 'static {
         search_storage: Arc<dyn Storage>,
         storage_keys: FragmentedTextStorageKeys,
         terms: Vec<Term>,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<Bm25Stats>;
 
     async fn query_posting_lists(
@@ -158,12 +162,14 @@ pub trait Searcher: VectorSearcher + Send + Sync + 'static {
         search_storage: Arc<dyn Storage>,
         storage_keys: FragmentedTextStorageKeys,
         query: PostingListQuery,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<Vec<PostingListMatch>>;
 
     async fn execute_text_compaction(
         &self,
         search_storage: Arc<dyn Storage>,
         segments: Vec<FragmentedTextStorageKeys>,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<FragmentedTextSegment>;
 }
 
@@ -210,6 +216,7 @@ pub trait SegmentTermMetadataFetcher: Send + Sync + 'static {
         search_storage: Arc<dyn Storage>,
         segment: ObjectKey,
         field_to_term_values: BTreeMap<Field, Vec<TermValue>>,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<BTreeMap<Field, Vec<TermOrdinal>>>;
 }
 
@@ -232,7 +239,7 @@ pub struct SearcherImpl<RT: Runtime> {
 }
 
 impl<RT: Runtime> SearcherImpl<RT> {
-    pub async fn new<P: AsRef<Path>>(
+    pub fn new<P: AsRef<Path>>(
         local_storage_path: P,
         max_disk_cache_size: u64,
         slow_vector_query_threshold_millis: u64,
@@ -255,8 +262,7 @@ impl<RT: Runtime> SearcherImpl<RT> {
             // maximum bound.
             *MAX_CONCURRENT_SEGMENT_FETCHES,
             runtime.clone(),
-        )
-        .await?;
+        )?;
         let vector_search_pool = BoundedThreadPool::new(
             runtime.clone(),
             *MAX_CONCURRENT_VECTOR_SEARCHES * *QUEUE_SIZE_MULTIPLIER,
@@ -314,13 +320,14 @@ impl<RT: Runtime> SearcherImpl<RT> {
         &self,
         search_storage: Arc<dyn Storage>,
         paths: Vec<FragmentedVectorSegmentPaths>,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<()> {
         let paths: Vec<FragmentedSegmentStorageKeys> = paths
             .into_iter()
             .map(|paths| paths.try_into())
             .try_collect()?;
         self.fragmented_segment_prefetcher
-            .queue_prefetch(search_storage, paths)
+            .queue_prefetch(search_storage, paths, labels)
     }
 
     /// A blocking prefetch for compaction where we explicitly want to stop the
@@ -333,6 +340,7 @@ impl<RT: Runtime> SearcherImpl<RT> {
         &self,
         search_storage: Arc<dyn Storage>,
         segment: common::bootstrap_model::index::vector_index::FragmentedVectorSegment,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<()> {
         let timer = vector_compaction_prefetch_timer();
         let paths = FragmentedSegmentStorageKeys {
@@ -341,7 +349,7 @@ impl<RT: Runtime> SearcherImpl<RT> {
             deleted_bitset: segment.deleted_bitset_key,
         };
         self.fragmented_segment_fetcher
-            .stream_fetch_fragmented_segments(search_storage, vec![paths])
+            .stream_fetch_fragmented_segments(search_storage, vec![paths], labels)
             .try_collect::<Vec<_>>()
             .await?;
         timer.finish();
@@ -399,24 +407,32 @@ impl<RT: Runtime> SearcherImpl<RT> {
             deleted_terms_table,
             alive_bitset,
         }: FragmentedTextStorageKeys,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<TextDiskSegmentPaths> {
         let (index_path, alive_bitset_path, deleted_term_path, id_tracker_path) = try_join!(
-            self.archive_cache
-                .get(storage.clone(), &segment, SearchFileType::Text),
+            self.archive_cache.get(
+                storage.clone(),
+                &segment,
+                SearchFileType::Text,
+                labels.clone(),
+            ),
             self.archive_cache.get_single_file(
                 storage.clone(),
                 &alive_bitset,
-                SearchFileType::TextAliveBitset
+                SearchFileType::TextAliveBitset,
+                labels.clone(),
             ),
             self.archive_cache.get_single_file(
                 storage.clone(),
                 &deleted_terms_table,
-                SearchFileType::TextDeletedTerms
+                SearchFileType::TextDeletedTerms,
+                labels.clone(),
             ),
             self.archive_cache.get_single_file(
                 storage.clone(),
                 &id_tracker,
-                SearchFileType::TextIdTracker
+                SearchFileType::TextIdTracker,
+                labels,
             )
         )?;
         Ok(TextDiskSegmentPaths {
@@ -431,9 +447,10 @@ impl<RT: Runtime> SearcherImpl<RT> {
         &self,
         storage: Arc<dyn Storage>,
         text_storage_keys: FragmentedTextStorageKeys,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<Arc<TextSegment>> {
         let paths = self
-            .load_text_segment_paths(storage, text_storage_keys)
+            .load_text_segment_paths(storage, text_storage_keys, labels)
             .await?;
         self.text_segment_cache.get(paths).await
     }
@@ -448,9 +465,12 @@ impl<RT: Runtime> Searcher for SearcherImpl<RT> {
         storage_keys: FragmentedTextStorageKeys,
         queries: Vec<TokenQuery>,
         max_results: usize,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<Vec<TokenMatch>> {
         let timer = text_query_tokens_searcher_latency_seconds();
-        let text_segment = self.load_text_segment(search_storage, storage_keys).await?;
+        let text_segment = self
+            .load_text_segment(search_storage, storage_keys, labels)
+            .await?;
         let query = move || Self::query_tokens_impl(text_segment, queries, max_results);
         let resp = self.text_search_pool.execute(query).await??;
         timer.finish();
@@ -463,9 +483,12 @@ impl<RT: Runtime> Searcher for SearcherImpl<RT> {
         search_storage: Arc<dyn Storage>,
         storage_keys: FragmentedTextStorageKeys,
         terms: Vec<Term>,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<Bm25Stats> {
         let timer = text_query_bm25_searcher_latency_seconds();
-        let text_segment = self.load_text_segment(search_storage, storage_keys).await?;
+        let text_segment = self
+            .load_text_segment(search_storage, storage_keys, labels)
+            .await?;
         let query = move || Self::query_bm25_stats_impl(text_segment, terms);
         let resp = self.text_search_pool.execute(query).await??;
         timer.finish();
@@ -478,9 +501,12 @@ impl<RT: Runtime> Searcher for SearcherImpl<RT> {
         search_storage: Arc<dyn Storage>,
         storage_keys: FragmentedTextStorageKeys,
         query: PostingListQuery,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<Vec<PostingListMatch>> {
         let timer = text_query_posting_lists_searcher_latency_seconds();
-        let text_segment = self.load_text_segment(search_storage, storage_keys).await?;
+        let text_segment = self
+            .load_text_segment(search_storage, storage_keys, labels)
+            .await?;
         let query = move || Self::query_posting_lists_impl(text_segment, query);
         let resp = self.text_search_pool.execute(query).await??;
         timer.finish();
@@ -492,6 +518,7 @@ impl<RT: Runtime> Searcher for SearcherImpl<RT> {
         &self,
         search_storage: Arc<dyn Storage>,
         segments: Vec<FragmentedTextStorageKeys>,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<FragmentedTextSegment> {
         let timer = text_compaction_searcher_latency_seconds();
         let result = fetch_compact_and_upload_text_segment(
@@ -500,6 +527,7 @@ impl<RT: Runtime> Searcher for SearcherImpl<RT> {
             self.archive_cache.clone(),
             self.text_search_pool.clone(),
             segments,
+            labels,
         )
         .await;
         timer.finish();
@@ -515,11 +543,12 @@ impl<RT: Runtime> SegmentTermMetadataFetcher for SearcherImpl<RT> {
         search_storage: Arc<dyn Storage>,
         segment: ObjectKey,
         field_to_term_values: BTreeMap<Field, Vec<TermValue>>,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<BTreeMap<Field, Vec<TermOrdinal>>> {
         let timer = text_query_term_ordinals_searcher_timer();
         let segment_path = self
             .archive_cache
-            .get(search_storage, &segment, SearchFileType::Text)
+            .get(search_storage, &segment, SearchFileType::Text, labels)
             .await?;
         let reader = index_reader_for_directory(segment_path).await?;
         let searcher = reader.searcher();
@@ -556,17 +585,19 @@ impl<RT: Runtime> VectorSearcher for SearcherImpl<RT> {
         schema: QdrantSchema,
         query: CompiledVectorSearch,
         overfetch_delta: u32,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<Vec<VectorSearchQueryResult>> {
         let timer = metrics::vector_query_timer(VectorIndexType::MultiSegment);
-        let results: anyhow::Result<Vec<VectorSearchQueryResult>> = try {
+        let results: anyhow::Result<Vec<VectorSearchQueryResult>> = try_anyhow!({
             let total_segments = fragments.len();
             let query_capacity = (query.limit + overfetch_delta) as usize;
 
-            // Store results in a min-heap to avoid storing all intermediate
-            // results from parallel segment fetches in-memory
-            let results_pq = self
+            // Use shared result merger to merge results from all segments using
+            // a min-heap approach. This avoids storing all intermediate results
+            // from parallel segment fetches in-memory.
+            let results_stream = self
                 .fragmented_segment_fetcher
-                .stream_fetch_fragmented_segments(search_storage, fragments)
+                .stream_fetch_fragmented_segments(search_storage, fragments, labels)
                 .and_then(|paths| self.load_fragmented_segment(paths))
                 .and_then(|segment| {
                     self.vector_query_segment(
@@ -575,36 +606,9 @@ impl<RT: Runtime> VectorSearcher for SearcherImpl<RT> {
                         overfetch_delta,
                         segment,
                     )
-                })
-                .try_fold(
-                    BinaryHeap::with_capacity(query_capacity + 1),
-                    |mut acc_pq, results| async {
-                        for result in results {
-                            // Store Reverse(result) in the heap so that the heap becomes a min-heap
-                            // instead of the default max-heap. This way, we can evict the smallest
-                            // element in the heap efficiently once we've
-                            // reached query_capacity, leaving us with the top K
-                            // results.
-                            acc_pq.push(std::cmp::Reverse(result));
-                            if acc_pq.len() > query_capacity {
-                                acc_pq.pop();
-                            }
-                        }
-                        Ok(acc_pq)
-                    },
-                )
-                .await?;
-
-            // BinaryHeap::into_sorted_vec returns results in ascending order of score,
-            // but this is a Vec<Reverse<_>>, so the order is already descending, as
-            // desired.
-            // Note: this already contains at most query_capacity = query.limit +
-            // overfetch_delta results, so no more filtering required.
-            let results: Vec<VectorSearchQueryResult> = results_pq
-                .into_sorted_vec()
-                .into_iter()
-                .map(|v| v.0)
-                .collect();
+                });
+            let results: Vec<VectorSearchQueryResult> =
+                merge_vector_results_stream(results_stream, query_capacity).await?;
             tracing::debug!(
                 "Finished querying {} vectors from {total_segments} segment(s) to get {} limit + \
                  overfetch results",
@@ -612,7 +616,7 @@ impl<RT: Runtime> VectorSearcher for SearcherImpl<RT> {
                 query.limit + overfetch_delta
             );
             results
-        };
+        });
 
         timer.finish(results.is_ok());
         results
@@ -623,13 +627,15 @@ impl<RT: Runtime> VectorSearcher for SearcherImpl<RT> {
         search_storage: Arc<dyn Storage>,
         segments: Vec<FragmentedVectorSegmentPaths>,
         dimension: usize,
+        labels: SearchIndexMetricLabels<'_>,
     ) -> anyhow::Result<common::bootstrap_model::index::vector_index::FragmentedVectorSegment> {
+        let labels = labels.to_owned();
         let segment = self
             .fragmented_segment_compactor
-            .compact(segments, dimension, search_storage.clone())
+            .compact(segments, dimension, search_storage.clone(), labels.clone())
             .await?;
 
-        self.prefetch_segment(search_storage, segment.clone())
+        self.prefetch_segment(search_storage, segment.clone(), labels)
             .await?;
         Ok(segment)
     }
@@ -979,7 +985,7 @@ impl Bm25StatisticsProvider for StatsProvider {
 
     fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
         self.doc_frequencies.get(term).copied().ok_or_else(|| {
-            tantivy::TantivyError::InvalidArgument(format!("Term not found: {:?}", term))
+            tantivy::TantivyError::InvalidArgument(format!("Term not found: {term:?}"))
         })
     }
 }
@@ -1412,642 +1418,6 @@ impl TryFrom<PostingListMatch> for pb::searchlight::PostingListMatch {
             },
             creation_time: Some(value.creation_time.into()),
             bm25_score: Some(value.bm25_score),
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        cmp,
-        collections::{
-            BTreeMap,
-            BTreeSet,
-        },
-        env,
-        io::{
-            BufRead,
-            BufReader,
-        },
-        path::{
-            Path,
-            PathBuf,
-        },
-        sync::{
-            Arc,
-            LazyLock,
-        },
-    };
-
-    use common::{
-        bootstrap_model::index::text_index::DeveloperTextIndexConfig,
-        document::{
-            CreationTime,
-            ResolvedDocument,
-        },
-        id_tracker::StaticIdTracker,
-        persistence_helpers::{
-            DocumentRevision,
-            RevisionPair,
-        },
-        testing::TestIdGenerator,
-        types::Timestamp,
-    };
-    use futures::StreamExt;
-    use runtime::testing::TestRuntime;
-    use storage::{
-        LocalDirStorage,
-        Storage,
-    };
-    use tantivy::{
-        Index,
-        Term,
-    };
-    use tempfile::TempDir;
-    use text_search::tracker::{
-        load_alive_bitset,
-        StaticDeletionTracker,
-    };
-    use value::{
-        assert_obj,
-        DeveloperDocumentId,
-        FieldPath,
-        InternalId,
-        ResolvedDocumentId,
-        TabletIdAndTableNumber,
-    };
-
-    use super::PostingListMatch;
-    use crate::{
-        convex_query::OrTerm,
-        disk_index::index_reader_for_directory,
-        incremental_index::{
-            build_new_segment,
-            merge_segments,
-            PreviousTextSegments,
-            SearchSegmentForMerge,
-            ALIVE_BITSET_PATH,
-            DELETED_TERMS_PATH,
-            ID_TRACKER_PATH,
-        },
-        searcher::{
-            searcher::{
-                PostingListQuery,
-                TokenQuery,
-            },
-            segment_cache::TextSegment,
-            InProcessSearcher,
-            SearcherImpl,
-        },
-        TantivySearchIndexSchema,
-        TextSegmentPaths,
-        EXACT_SEARCH_MAX_WORD_LENGTH,
-        SINGLE_TYPO_SEARCH_MAX_WORD_LENGTH,
-    };
-
-    static TEST_TABLE: LazyLock<TabletIdAndTableNumber> = LazyLock::new(|| {
-        let mut id_generator = TestIdGenerator::new();
-        let table_name = "test".parse().unwrap();
-        id_generator.user_table_id(&table_name)
-    });
-
-    #[convex_macro::test_runtime]
-    #[ignore]
-    async fn test_incremental_search(rt: TestRuntime) -> anyhow::Result<()> {
-        let start = std::time::Instant::now();
-        let test_dir = TempDir::new()?;
-
-        let dataset_path = std::env::var("DATASET")?;
-        let query = std::env::var("QUERY")?;
-        let max_terms = env::var("MAX_TERMS")?.parse()?;
-        let max_results = env::var("MAX_RESULTS")?.parse()?;
-
-        let mut id_generator = TestIdGenerator::new();
-        let field_path: FieldPath = "mySearchField".parse()?;
-        let schema = TantivySearchIndexSchema::new(&DeveloperTextIndexConfig {
-            search_field: field_path.clone(),
-            filter_fields: BTreeSet::new(),
-        });
-
-        #[derive(serde::Deserialize)]
-        struct SearchDocument {
-            text: String,
-        }
-        let f = std::fs::File::open(&dataset_path)?;
-        let f = BufReader::new(f);
-        let mut strings = vec![];
-        for line in f.lines() {
-            let d: SearchDocument = serde_json::from_str(&line?)?;
-            strings.push(d.text);
-        }
-
-        let mut strings_by_id = BTreeMap::new();
-        let revisions = strings.into_iter().map(|s| {
-            let id = ResolvedDocumentId::new(
-                TEST_TABLE.tablet_id,
-                DeveloperDocumentId::new(TEST_TABLE.table_number, id_generator.generate_internal()),
-            );
-            strings_by_id.insert(id, s.clone());
-            let creation_time = CreationTime::try_from(10.)?;
-            let new_doc =
-                ResolvedDocument::new(id, creation_time, assert_obj!("mySearchField" => s))?;
-            let revision_pair = RevisionPair {
-                id: id.into(),
-                rev: DocumentRevision {
-                    ts: Timestamp::MIN.succ().unwrap(),
-                    document: Some(new_doc),
-                },
-                prev_rev: None,
-            };
-            Ok(revision_pair)
-        });
-        let revision_stream = futures::stream::iter(revisions).boxed();
-        let mut previous_segments = PreviousTextSegments::default();
-        let storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::new(rt.clone())?);
-        let segment_term_metadata_fetcher = Arc::new(InProcessSearcher::new(rt.clone()).await?);
-
-        let new_segment = build_new_segment(
-            revision_stream,
-            schema.clone(),
-            test_dir.path(),
-            &mut previous_segments,
-            segment_term_metadata_fetcher,
-            storage,
-            None,
-        )
-        .await?
-        .unwrap();
-        assert!(previous_segments.0.is_empty());
-        println!("Indexed {dataset_path} in {:?}", start.elapsed());
-
-        let index_reader = index_reader_for_directory(new_segment.paths.index_path).await?;
-        let searcher = index_reader.searcher();
-
-        let mut token_stream = schema.analyzer.token_stream(&query);
-        let mut tokens = vec![];
-        while let Some(token) = token_stream.next() {
-            tokens.push(token.text.clone());
-        }
-        let num_tokens = tokens.len();
-        let mut token_queries = vec![];
-        for (i, token) in tokens.into_iter().enumerate() {
-            let char_count = token.chars().count();
-            let max_distance = if char_count <= EXACT_SEARCH_MAX_WORD_LENGTH {
-                0
-            } else if char_count <= SINGLE_TYPO_SEARCH_MAX_WORD_LENGTH {
-                1
-            } else {
-                2
-            };
-            let term = Term::from_field_text(schema.search_field, &token);
-            let query = TokenQuery {
-                term,
-                max_distance,
-                prefix: i == num_tokens - 1,
-            };
-            token_queries.push(query);
-        }
-
-        anyhow::ensure!(searcher.segment_readers().len() == 1);
-        let alive_bitset_path = test_dir.path().join(ALIVE_BITSET_PATH);
-        let alive_bitset = load_alive_bitset(&alive_bitset_path)?;
-        let deleted_terms_path = test_dir.path().join(DELETED_TERMS_PATH);
-        let deletion_tracker = StaticDeletionTracker::load(alive_bitset, &deleted_terms_path)?;
-        let id_tracker_path = test_dir.path().join(ID_TRACKER_PATH);
-        let id_tracker = StaticIdTracker::load_from_path(id_tracker_path)?;
-        let start = std::time::Instant::now();
-        let text_segment = Arc::new(TextSegment::Segment {
-            searcher: searcher.clone(),
-            deletion_tracker,
-            id_tracker,
-            segment_ord: 0,
-        });
-        let results = SearcherImpl::<TestRuntime>::query_tokens_impl(
-            text_segment.clone(),
-            token_queries,
-            max_terms,
-        )?;
-
-        if results.is_empty() {
-            println!("No results found");
-            return Ok(());
-        }
-
-        println!("{} term results ({:?}):", results.len(), start.elapsed());
-        for result in &results {
-            println!(
-                "{:?}: dist {}, prefix? {}",
-                result.term, result.distance, result.prefix
-            );
-        }
-
-        let start = std::time::Instant::now();
-        let terms = results.iter().map(|r| r.term.clone()).collect();
-        let stats =
-            SearcherImpl::<TestRuntime>::query_bm25_stats_impl(text_segment.clone(), terms)?;
-        println!("\nBM25 stats ({:?}): {stats:?}", start.elapsed());
-
-        let mut results_by_term = BTreeMap::new();
-        for result in results {
-            let sort_key = (result.distance, result.prefix, result.token_ord);
-            let existing_key = results_by_term.entry(result.term).or_insert(sort_key);
-            *existing_key = cmp::min(*existing_key, sort_key);
-        }
-
-        let mut or_terms = vec![];
-        for (term, (distance, prefix, _)) in results_by_term {
-            let doc_frequency = stats.doc_frequencies[&term];
-            // TODO: Come up with a smarter way to boost scores based on edit distance.
-            let mut boost = 1. / (1. + distance as f32);
-            if prefix {
-                boost *= 0.5;
-            }
-            let or_term = OrTerm {
-                term,
-                doc_frequency,
-                bm25_boost: boost,
-            };
-            or_terms.push(or_term);
-        }
-
-        let start = std::time::Instant::now();
-        let query = PostingListQuery {
-            deleted_internal_ids: BTreeSet::new(),
-            or_terms,
-            and_terms: vec![],
-            num_terms_by_field: stats.num_terms_by_field,
-            num_documents: stats.num_documents,
-            max_results,
-        };
-        let posting_list_matches =
-            SearcherImpl::<TestRuntime>::query_posting_lists_impl(text_segment, query)?;
-        println!(
-            "\n{} posting list results ({:?}):",
-            posting_list_matches.len(),
-            start.elapsed()
-        );
-        for result in &posting_list_matches {
-            println!("{:?} @ {}", result.internal_id, result.bm25_score);
-            let id = ResolvedDocumentId::new(
-                TEST_TABLE.tablet_id,
-                DeveloperDocumentId::new(TEST_TABLE.table_number, result.internal_id),
-            );
-            println!("  {}", strings_by_id[&id]);
-        }
-
-        Ok(())
-    }
-
-    fn test_schema() -> TantivySearchIndexSchema {
-        let field_path: FieldPath = "mySearchField".parse().unwrap();
-        TantivySearchIndexSchema::new(&DeveloperTextIndexConfig {
-            search_field: field_path.clone(),
-            filter_fields: BTreeSet::new(),
-        })
-    }
-
-    #[derive(Clone)]
-    struct TestIndex {
-        /// Only used for printing debug info.
-        strings_by_id: BTreeMap<ResolvedDocumentId, Option<String>>,
-        /// Note - this is only the latest segment.  This struct and tests don't
-        /// support querying multiple segments within an index.
-        segment_paths: Option<TextSegmentPaths>,
-        _previous_segment_dirs: Vec<PathBuf>,
-    }
-
-    async fn build_test_index(
-        rt: TestRuntime,
-        revisions: StringRevisions,
-        index_dir: &Path,
-    ) -> anyhow::Result<TestIndex> {
-        let mut strings_by_id = BTreeMap::new();
-        let revisions = revisions.0.into_iter().map(
-            |StringRevision {
-                 id,
-                 prev_str,
-                 new_str,
-             }| {
-                let id = ResolvedDocumentId::new(
-                    TEST_TABLE.tablet_id,
-                    DeveloperDocumentId::new(TEST_TABLE.table_number, id),
-                );
-                strings_by_id.entry(id).or_insert(new_str.clone());
-                let creation_time = CreationTime::try_from(10.)?;
-                let old_doc = prev_str
-                    .map(|s| {
-                        ResolvedDocument::new(id, creation_time, assert_obj!("mySearchField" => s))
-                    })
-                    .transpose()?;
-                let new_doc = new_str
-                    .map(|s| {
-                        ResolvedDocument::new(id, creation_time, assert_obj!("mySearchField" => s))
-                    })
-                    .transpose()?;
-                let revision_pair = RevisionPair {
-                    id: id.into(),
-                    rev: DocumentRevision {
-                        ts: Timestamp::MIN.succ().unwrap(),
-                        document: new_doc,
-                    },
-                    prev_rev: old_doc.map(|d| DocumentRevision {
-                        ts: Timestamp::MIN.succ().unwrap(),
-                        document: Some(d),
-                    }),
-                };
-                Ok(revision_pair)
-            },
-        );
-        let revision_stream = futures::stream::iter(revisions).boxed();
-        let schema = test_schema();
-        // This storage and segment_term_metadata_fetcher won't work correctly in these
-        // tests because they don't use the same directory that the indexes are stored
-        // in, which means we must use empty PreviousTextSegments in these tests.
-        let storage: Arc<dyn Storage> = Arc::new(LocalDirStorage::new(rt.clone())?);
-        let segment_term_metadata_fetcher = Arc::new(InProcessSearcher::new(rt.clone()).await?);
-        let mut previous_segments = PreviousTextSegments::default();
-        let new_segment = build_new_segment(
-            revision_stream,
-            schema.clone(),
-            index_dir,
-            &mut previous_segments,
-            segment_term_metadata_fetcher,
-            storage,
-            Some(Timestamp::MIN),
-        )
-        .await?;
-        let previous_segment_dir = index_dir.join("previous_segments");
-        std::fs::create_dir(&previous_segment_dir)?;
-        let mut previous_segment_dirs = vec![];
-        for (object_key, updated_text_segment) in previous_segments.0.into_iter() {
-            let dir = previous_segment_dir.join(object_key.to_string());
-            std::fs::create_dir(&dir)?;
-            updated_text_segment
-                .deletion_tracker
-                .write_to_path(dir.join(ALIVE_BITSET_PATH), dir.join(DELETED_TERMS_PATH))?;
-            previous_segment_dirs.push(dir);
-        }
-        Ok(TestIndex {
-            strings_by_id,
-            segment_paths: new_segment.map(|segment| segment.paths),
-            _previous_segment_dirs: previous_segment_dirs,
-        })
-    }
-
-    struct StringRevision {
-        id: InternalId,
-        prev_str: Option<String>,
-        new_str: Option<String>,
-    }
-    impl From<(InternalId, Option<&str>, Option<&str>)> for StringRevision {
-        fn from(
-            (id, prev_str, new_str): (InternalId, Option<&str>, Option<&str>),
-        ) -> StringRevision {
-            StringRevision {
-                id,
-                prev_str: prev_str.map(|s| s.to_string()),
-                new_str: new_str.map(|s| s.to_string()),
-            }
-        }
-    }
-
-    pub struct StringRevisions(Vec<StringRevision>);
-    impl From<Vec<(InternalId, Option<&str>, Option<&str>)>> for StringRevisions {
-        fn from(revisions: Vec<(InternalId, Option<&str>, Option<&str>)>) -> StringRevisions {
-            let string_revisions = revisions.into_iter().map(StringRevision::from).collect();
-            StringRevisions(string_revisions)
-        }
-    }
-
-    async fn incremental_search_with_deletions_helper(
-        query: &str,
-        test_index: TestIndex,
-    ) -> anyhow::Result<Vec<(PostingListMatch, String)>> {
-        let segment_paths = test_index.segment_paths;
-        let Some(segment_paths) = segment_paths else {
-            println!("Empty segment!");
-            return Ok(vec![]);
-        };
-
-        let index_reader = index_reader_for_directory(&segment_paths.index_path).await?;
-        let searcher = index_reader.searcher();
-
-        let schema = test_schema();
-        let mut token_stream = schema.analyzer.token_stream(query);
-        let mut tokens = vec![];
-        while let Some(token) = token_stream.next() {
-            tokens.push(token.text.clone());
-        }
-        let num_tokens = tokens.len();
-        let mut token_queries = vec![];
-        for (i, token) in tokens.into_iter().enumerate() {
-            let char_count = token.chars().count();
-            let max_distance = if char_count <= EXACT_SEARCH_MAX_WORD_LENGTH {
-                0
-            } else if char_count <= SINGLE_TYPO_SEARCH_MAX_WORD_LENGTH {
-                1
-            } else {
-                2
-            };
-            let term = Term::from_field_text(schema.search_field, &token);
-            let query = TokenQuery {
-                term,
-                max_distance,
-                prefix: i == num_tokens - 1,
-            };
-            token_queries.push(query);
-        }
-
-        anyhow::ensure!(searcher.segment_readers().len() == 1);
-        let alive_bitset = load_alive_bitset(&segment_paths.alive_bit_set_path)?;
-        let deletion_tracker =
-            StaticDeletionTracker::load(alive_bitset, &segment_paths.deleted_terms_path)?;
-        let id_tracker = StaticIdTracker::load_from_path(segment_paths.id_tracker_path)?;
-        let start = std::time::Instant::now();
-        let text_segment = Arc::new(TextSegment::Segment {
-            searcher: searcher.clone(),
-            deletion_tracker,
-            id_tracker,
-            segment_ord: 0,
-        });
-        let results = SearcherImpl::<TestRuntime>::query_tokens_impl(
-            text_segment.clone(),
-            token_queries,
-            16,
-        )?;
-
-        if results.is_empty() {
-            println!("No results found");
-            return Ok(vec![]);
-        }
-
-        println!("{} term results ({:?}):", results.len(), start.elapsed());
-        for result in &results {
-            println!(
-                "{:?}: dist {}, prefix? {}",
-                result.term, result.distance, result.prefix
-            );
-        }
-
-        let start = std::time::Instant::now();
-        let terms = results.iter().map(|r| r.term.clone()).collect();
-        let stats =
-            SearcherImpl::<TestRuntime>::query_bm25_stats_impl(text_segment.clone(), terms)?;
-        println!("\nBM25 stats ({:?}): {stats:?}", start.elapsed());
-
-        let mut results_by_term = BTreeMap::new();
-        for result in results {
-            let sort_key = (result.distance, result.prefix, result.token_ord);
-            let existing_key = results_by_term.entry(result.term).or_insert(sort_key);
-            *existing_key = cmp::min(*existing_key, sort_key);
-        }
-
-        let mut or_terms = vec![];
-        for (term, (distance, prefix, _)) in results_by_term {
-            let doc_frequency = stats.doc_frequencies[&term];
-            // TODO: Come up with a smarter way to boost scores based on edit distance.
-            let mut boost = 1. / (1. + distance as f32);
-            if prefix {
-                boost *= 0.5;
-            }
-            let or_term = OrTerm {
-                term,
-                doc_frequency,
-                bm25_boost: boost,
-            };
-            or_terms.push(or_term);
-        }
-
-        let start = std::time::Instant::now();
-        let max_results = 10;
-        let query = PostingListQuery {
-            deleted_internal_ids: BTreeSet::new(),
-            or_terms,
-            and_terms: vec![],
-            num_terms_by_field: stats.num_terms_by_field,
-            num_documents: stats.num_documents,
-            max_results,
-        };
-        let posting_list_matches =
-            SearcherImpl::<TestRuntime>::query_posting_lists_impl(text_segment, query)?;
-        println!(
-            "\n{} posting list results ({:?}):",
-            posting_list_matches.len(),
-            start.elapsed()
-        );
-        let mut posting_list_matches_and_strings = vec![];
-        for result in posting_list_matches {
-            println!("{:?} @ {}", result.internal_id, result.bm25_score);
-            let id = ResolvedDocumentId::new(
-                TEST_TABLE.tablet_id,
-                DeveloperDocumentId::new(TEST_TABLE.table_number, result.internal_id),
-            );
-            let s = test_index.strings_by_id[&id].as_ref().unwrap();
-            println!("  {s}",);
-            posting_list_matches_and_strings.push((result, s.clone()));
-        }
-        Ok(posting_list_matches_and_strings)
-    }
-
-    #[convex_macro::test_runtime]
-    async fn test_incremental_search_with_deletion(rt: TestRuntime) -> anyhow::Result<()> {
-        let query = "emma";
-        let mut id_generator = TestIdGenerator::new();
-        let id1 = id_generator.generate_internal();
-        let id2 = id_generator.generate_internal();
-        let revisions = vec![
-            (id1, Some("emma works at convex"), None), // Delete
-            (id2, None, Some("sujay lives in ny")),
-            (id1, None, Some("emma works at convex")),
-        ];
-        let test_dir = TempDir::new()?;
-        let test_index = build_test_index(rt, revisions.into(), test_dir.path()).await?;
-        let posting_list_matches =
-            incremental_search_with_deletions_helper(query, test_index).await?;
-        assert!(posting_list_matches.is_empty());
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn test_incremental_search_with_replace(rt: TestRuntime) -> anyhow::Result<()> {
-        let query = "emma";
-        let mut id_generator = TestIdGenerator::new();
-        let id = id_generator.generate_internal();
-        let revisions = vec![
-            (id, Some("emma is awesome!"), Some("emma is gr8")), // Replace
-            (id, None, Some("emma is awesome!")),
-        ];
-        let test_dir = TempDir::new()?;
-        let test_index = build_test_index(rt, revisions.into(), test_dir.path()).await?;
-        let posting_list_matches =
-            incremental_search_with_deletions_helper(query, test_index).await?;
-        assert_eq!(posting_list_matches.len(), 1);
-        let (posting_list_match, s) = posting_list_matches.first().unwrap();
-        assert_eq!(posting_list_match.internal_id, id);
-        assert_eq!(s, "emma is gr8");
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn test_merge_tantivy_segments(rt: TestRuntime) -> anyhow::Result<()> {
-        let query = "emma";
-        let mut id_generator = TestIdGenerator::new();
-        let id1 = id_generator.generate_internal();
-        let revisions = vec![(id1, None, Some("emma is gr8"))];
-        let test_dir_1 = TempDir::new()?;
-        let test_index_1 =
-            build_test_index(rt.clone(), revisions.into(), test_dir_1.path()).await?;
-        let posting_list_matches =
-            incremental_search_with_deletions_helper(query, test_index_1.clone()).await?;
-        assert_eq!(posting_list_matches.len(), 1);
-        let (posting_list_match, s) = posting_list_matches.first().unwrap();
-        assert_eq!(posting_list_match.internal_id, id1);
-        assert_eq!(s, "emma is gr8");
-        let id2 = id_generator.generate_internal();
-        let revisions = vec![(id2, None, Some("emma is awesome!"))];
-        let test_dir_2 = TempDir::new()?;
-        let test_index_2 =
-            build_test_index(rt.clone(), revisions.into(), test_dir_2.path()).await?;
-        let posting_list_matches =
-            incremental_search_with_deletions_helper(query, test_index_2.clone()).await?;
-        assert_eq!(posting_list_matches.len(), 1);
-        let (posting_list_match, s) = posting_list_matches.first().unwrap();
-        assert_eq!(posting_list_match.internal_id, id2);
-        assert_eq!(s, "emma is awesome!");
-
-        let segments = vec![
-            search_segment_from_path(&test_index_1.segment_paths.unwrap())?,
-            search_segment_from_path(&test_index_2.segment_paths.unwrap())?,
-        ];
-
-        let merged_dir = TempDir::new()?;
-        let merged_paths = merge_segments(segments, merged_dir.path()).await?;
-
-        let mut merged_strings_by_id = test_index_1.strings_by_id.clone();
-        merged_strings_by_id.append(&mut test_index_2.strings_by_id.clone());
-        let merged_index = TestIndex {
-            strings_by_id: merged_strings_by_id,
-            segment_paths: Some(merged_paths.paths),
-            _previous_segment_dirs: vec![],
-        };
-        let mut posting_list_matches =
-            incremental_search_with_deletions_helper(query, merged_index).await?;
-        assert_eq!(posting_list_matches.len(), 2);
-        let (posting_list_match, s) = posting_list_matches.pop().unwrap();
-        assert_eq!(posting_list_match.internal_id, id1);
-        assert_eq!(s, "emma is gr8");
-        let (posting_list_match, s) = posting_list_matches.pop().unwrap();
-        assert_eq!(posting_list_match.internal_id, id2);
-        assert_eq!(s, "emma is awesome!");
-
-        Ok(())
-    }
-
-    fn search_segment_from_path(paths: &TextSegmentPaths) -> anyhow::Result<SearchSegmentForMerge> {
-        Ok(SearchSegmentForMerge {
-            segment: Index::open_in_dir(&paths.index_path)?,
-            alive_bitset: load_alive_bitset(&paths.alive_bit_set_path)?,
-            id_tracker: StaticIdTracker::load_from_path(paths.id_tracker_path.clone())?,
         })
     }
 }

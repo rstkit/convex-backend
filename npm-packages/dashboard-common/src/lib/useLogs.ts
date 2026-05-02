@@ -5,6 +5,7 @@ import {
   FunctionExecutionCompletion,
   LogLine,
   LogLevel,
+  UsageStats,
 } from "system-udfs/convex/_system/frontend/common";
 import uniqueId from "lodash/uniqueId";
 import {
@@ -59,6 +60,13 @@ export type UdfLogOutcome = {
   cachedResult?: boolean;
   kind: "outcome";
   error?: string;
+  usageStats?: UsageStats;
+  returnBytes?: number;
+  caller: string;
+  environment: "isolate" | "node";
+  identityType: string;
+  parentExecutionId: string | null;
+  executionTimestamp?: number;
 };
 
 export type UdfLog = UdfLogCommon &
@@ -73,7 +81,7 @@ export function entryOutcome(entry: FunctionExecutionCompletion): LogOutcome {
       };
     }
     const httpStatusCode = entry.success?.status
-      ? parseInt(entry.success!!.status)
+      ? parseInt(entry.success!.status)
       : null;
     const isSuccess =
       httpStatusCode !== null && httpStatusCode >= 200 && httpStatusCode <= 299;
@@ -170,6 +178,15 @@ export function processLogs(rawLogs: FunctionExecution[]): UdfLog[] {
         executionTimeMs: entry.executionTime * 1000,
         cachedResult: entry.cachedResult,
         kind: "outcome",
+        usageStats: entry.usageStats,
+        returnBytes: entry.returnBytes,
+        caller: entry.caller,
+        environment: entry.environment as "isolate" | "node",
+        identityType: entry.identityType,
+        parentExecutionId: entry.parentExecutionId,
+        executionTimestamp: entry.executionTimestamp
+          ? entry.executionTimestamp * 1000
+          : undefined,
         timestamp: entry.timestamp * 1000,
         localizedTimestamp: formatDateTime(new Date(entry.timestamp * 1000)),
         id: uniqueId(),

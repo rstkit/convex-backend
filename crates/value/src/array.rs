@@ -8,18 +8,16 @@ use std::{
 };
 
 use errors::ErrorMetadata;
+use sync_types::types::SerializedArgs;
 
 use super::size::Size;
 use crate::{
-    heap_size::{
-        HeapSize,
-        WithHeapSize,
-    },
     size::{
         check_nesting,
         check_system_size,
     },
     utils::display_sequence,
+    walk::ConvexValueType,
     ConvexValue,
 };
 
@@ -33,7 +31,7 @@ pub struct ConvexArray {
     // Precomputed `1 + max(nesting(v1), ..., nesting(vN))`.
     nesting: usize,
 
-    items: WithHeapSize<Vec<ConvexValue>>,
+    items: Vec<ConvexValue>,
 }
 
 impl ConvexArray {
@@ -41,8 +39,15 @@ impl ConvexArray {
         Self {
             size: 2,
             nesting: 1,
-            items: WithHeapSize::default(),
+            items: vec![],
         }
+    }
+
+    pub fn into_serialized_args(&self) -> anyhow::Result<SerializedArgs> {
+        let serialized = serde_json::value::to_raw_value(&crate::json_value::SerializeValue::new(
+            ConvexValueType::<&ConvexValue>::Array(self),
+        ))?;
+        Ok(SerializedArgs::from_raw(serialized))
     }
 }
 
@@ -84,14 +89,14 @@ impl TryFrom<Vec<ConvexValue>> for ConvexArray {
         Ok(Self {
             size,
             nesting,
-            items: items.into(),
+            items,
         })
     }
 }
 
 impl From<ConvexArray> for Vec<ConvexValue> {
     fn from(array: ConvexArray) -> Self {
-        array.items.into()
+        array.items
     }
 }
 
@@ -145,27 +150,6 @@ impl Size for ConvexArray {
 
     fn nesting(&self) -> usize {
         self.nesting
-    }
-}
-
-impl HeapSize for ConvexArray {
-    fn heap_size(&self) -> usize {
-        self.items.heap_size()
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for ConvexArray {
-    type Parameters = proptest::collection::SizeRange;
-
-    type Strategy = impl proptest::strategy::Strategy<Value = ConvexArray>;
-
-    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        prop::collection::vec(any::<ConvexValue>(), args)
-            .prop_filter_map("Vec wasn't a valid Convex value", |s| {
-                Self::try_from(s).ok()
-            })
     }
 }
 

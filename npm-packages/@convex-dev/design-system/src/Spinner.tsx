@@ -5,9 +5,10 @@ export function Spinner({ className }: { className?: string }) {
     <svg
       role="status"
       className={cn(
-        "ml-auto h-4 w-4 text-content-primary/70 animate-rotate",
+        "ml-auto h-4 w-4 animate-rotate text-content-primary/70",
         className,
       )}
+      style={{ animationDuration: "0.8s, 1.5s" }}
       viewBox="0 0 100 100"
       fill="none"
       xmlns="http://www.w3.org/2000/svg"

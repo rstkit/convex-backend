@@ -34,7 +34,7 @@ export function ConfirmationDialog({
     try {
       await onConfirm();
       onClose();
-    } catch (e) {
+    } catch {
       // Do nothing on error. HTTP errors get handled by the useMutation hook.
     } finally {
       setIsConfirming(false);
@@ -43,8 +43,8 @@ export function ConfirmationDialog({
 
   const disabled =
     disableConfirm || isConfirming || validationText
-      ? validation.trimStart().trimEnd() !==
-        validationText?.trimStart().trimEnd()
+      ? validation.trimStart().trimEnd().toLowerCase() !==
+        validationText?.trimStart().trimEnd().toLowerCase()
       : false;
 
   return (
@@ -55,7 +55,7 @@ export function ConfirmationDialog({
           <>
             <div className="mt-4 text-sm">
               Type{" "}
-              <code className="rounded bg-background-tertiary p-1 text-sm text-content-primary">
+              <code className="rounded-sm bg-background-tertiary p-1 text-sm text-content-primary">
                 {validationText}
               </code>{" "}
               in the box below to confirm.

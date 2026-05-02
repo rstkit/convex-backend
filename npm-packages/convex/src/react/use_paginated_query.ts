@@ -153,13 +153,7 @@ const completeSplitQuery =
  * @param args - The arguments object for the query function, excluding
  * the `paginationOpts` property. That property is injected by this hook.
  * @param options - An object specifying the `initialNumItems` to be loaded in
- * the first page, and the `latestPageSize` to use.
- * @param options.latestPageSize controls how the latest page (the first page
- * until another page is loaded) size grows. With "fixed", the page size will
- * stay at the size specified by `initialNumItems` / `loadMore`. With "grow",
- * the page size will grow as new items are added within the range of the initial
- * page. Once multiple pages are loaded, all but the last page will grow, in
- * order to provide seamless pagination. See the docs for more details.
+ * the first page.
  * @returns A {@link UsePaginatedQueryResult} that includes the currently loaded
  * items, the status of the pagination, and a `loadMore` function.
  *
@@ -168,11 +162,46 @@ const completeSplitQuery =
 export function usePaginatedQuery<Query extends PaginatedQueryReference>(
   query: Query,
   args: PaginatedQueryArgs<Query> | "skip",
+  options: { initialNumItems: number },
+): UsePaginatedQueryReturnType<Query>;
+
+export function usePaginatedQuery<Query extends PaginatedQueryReference>(
+  query: Query,
+  args: PaginatedQueryArgs<Query> | "skip",
+  options: { initialNumItems: number },
+): UsePaginatedQueryReturnType<Query> {
+  const { user: positionalResult } = usePaginatedQueryInternal(
+    query,
+    args,
+    options,
+    true,
+  );
+  return positionalResult as unknown as UsePaginatedQueryReturnType<Query>;
+}
+
+/** @internal */
+export const includePage = Symbol("includePageKeys");
+
+/** @internal */
+export const page = Symbol("page");
+
+/**
+ * @internal
+ */
+export function usePaginatedQueryInternal<
+  Query extends PaginatedQueryReference,
+>(
+  query: Query,
+  args: PaginatedQueryArgs<Query> | "skip",
   options: {
     initialNumItems: number;
-    latestPageSize?: "grow" | "fixed";
+    [includePage]?: boolean;
   },
-): UsePaginatedQueryReturnType<Query> {
+  throwOnError: boolean = true,
+): {
+  user: UsePaginatedQueryInternalResult<PaginatedQueryItem<Query>>;
+  internal: { state: UsePaginatedQueryState };
+} {
   if (
     typeof options?.initialNumItems !== "number" ||
     options.initialNumItems < 0
@@ -243,13 +272,15 @@ export function usePaginatedQuery<Query extends PaginatedQueryReference>(
 
   const resultsObject = useQueries(currState.queries);
 
-  const [results, maybeLastResult]: [
+  const isIncludingPageKeys = options[includePage] ?? false;
+  const [results, maybeLastResult, maybeError]: [
     Value[],
     undefined | PaginationResult<Value>,
+    undefined | Error,
   ] = useMemo(() => {
-    let currResult: PaginationResult<Value> | undefined = undefined;
+    let currResult = undefined;
 
-    const allItems: Value[] = [];
+    const allItems = [];
     for (const pageKey of currState.pageKeys) {
       currResult = resultsObject[pageKey];
       if (currResult === undefined) {
@@ -276,9 +307,12 @@ export function usePaginatedQuery<Query extends PaginatedQueryReference>(
               currResult.message,
           );
           setState(createInitialState);
-          return [[], undefined];
+          return [[], undefined, undefined];
         } else {
-          throw currResult;
+          if (throwOnError) {
+            throw currResult;
+          }
+          return [allItems, undefined, currResult];
         }
       }
       const ongoingSplit = currState.ongoingSplits[pageKey];
@@ -310,11 +344,18 @@ export function usePaginatedQuery<Query extends PaginatedQueryReference>(
         // If pageStatus is 'SplitRequired', it means the server was not able to
         // fetch the full page. So we stop results before the incomplete
         // page and return 'LoadingMore' while the page is splitting.
-        return [allItems, undefined];
+        return [allItems, undefined, undefined];
       }
-      allItems.push(...currResult.page);
+      allItems.push(
+        ...(isIncludingPageKeys
+          ? currResult.page.map((i: any) => ({
+              ...i,
+              [page]: pageKey.toString(),
+            }))
+          : currResult.page),
+      );
     }
-    return [allItems, currResult];
+    return [allItems, currResult, undefined];
   }, [
     resultsObject,
     currState.pageKeys,
@@ -322,15 +363,27 @@ export function usePaginatedQuery<Query extends PaginatedQueryReference>(
     options.initialNumItems,
     createInitialState,
     logger,
+    isIncludingPageKeys,
+    throwOnError,
   ]);
 
   const statusObject = useMemo(() => {
+    if (maybeError !== undefined) {
+      return {
+        status: "Error",
+        isLoading: false,
+        error: maybeError,
+        loadMore: () => {
+          // Intentional noop.
+        },
+      } as const;
+    }
     if (maybeLastResult === undefined) {
       if (currState.nextPageKey === 1) {
         return {
           status: "LoadingFirstPage",
           isLoading: true,
-          loadMore: (_numItems: number) => {
+          loadMore: () => {
             // Intentional noop.
           },
         } as const;
@@ -362,33 +415,9 @@ export function usePaginatedQuery<Query extends PaginatedQueryReference>(
         if (!alreadyLoadingMore) {
           alreadyLoadingMore = true;
           setState((prevState) => {
-            let nextPageKey = prevState.nextPageKey;
+            const pageKeys = [...prevState.pageKeys, prevState.nextPageKey];
             const queries = { ...prevState.queries };
-            let ongoingSplits = prevState.ongoingSplits;
-            let pageKeys = prevState.pageKeys;
-            if (options.latestPageSize === "fixed") {
-              const lastPageKey = prevState.pageKeys.at(-1)!;
-              const boundLastPageKey = nextPageKey;
-              queries[boundLastPageKey] = {
-                query: prevState.query,
-                args: {
-                  ...prevState.args,
-                  paginationOpts: {
-                    ...(queries[lastPageKey]!.args
-                      .paginationOpts as unknown as PaginationOptions),
-                    endCursor: continueCursor,
-                  },
-                },
-              };
-              nextPageKey++;
-              ongoingSplits = {
-                ...ongoingSplits,
-                [lastPageKey]: [boundLastPageKey, nextPageKey],
-              };
-            } else {
-              pageKeys = [...prevState.pageKeys, nextPageKey];
-            }
-            queries[nextPageKey] = {
+            queries[prevState.nextPageKey] = {
               query: prevState.query,
               args: {
                 ...prevState.args,
@@ -399,23 +428,24 @@ export function usePaginatedQuery<Query extends PaginatedQueryReference>(
                 },
               },
             };
-            nextPageKey++;
             return {
               ...prevState,
+              nextPageKey: prevState.nextPageKey + 1,
               pageKeys,
-              nextPageKey,
               queries,
-              ongoingSplits,
             };
           });
         }
       },
     } as const;
-  }, [maybeLastResult, currState.nextPageKey, options.latestPageSize]);
+  }, [maybeError, maybeLastResult, currState.nextPageKey]);
 
   return {
-    results,
-    ...statusObject,
+    user: {
+      results,
+      ...statusObject,
+    },
+    internal: { state: currState },
   };
 }
 
@@ -494,6 +524,19 @@ export type UsePaginatedQueryResult<Item> = {
       isLoading: false;
     }
 );
+
+/**
+ * @internal
+ */
+export type UsePaginatedQueryInternalResult<Item> =
+  | UsePaginatedQueryResult<Item>
+  | {
+      results: Item[];
+      status: "Error";
+      isLoading: false;
+      error: Error;
+      loadMore: (numItems: number) => void;
+    };
 
 /**
  * The possible pagination statuses in {@link UsePaginatedQueryResult}.

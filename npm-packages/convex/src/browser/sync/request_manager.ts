@@ -1,6 +1,6 @@
 import { jsonToConvex } from "../../values/index.js";
 import { logForFunction, Logger } from "../logging.js";
-import { Long } from "../long.js";
+import { Long } from "../../vendor/long.js";
 import { FunctionResult } from "./function_result.js";
 import {
   ActionRequest,
@@ -35,7 +35,10 @@ export class RequestManager {
   private requestsOlderThanRestart: Set<RequestId>;
   private inflightMutationsCount: number = 0;
   private inflightActionsCount: number = 0;
-  constructor(private readonly logger: Logger) {
+  constructor(
+    private readonly logger: Logger,
+    private readonly markConnectionStateDirty: () => void,
+  ) {
     this.inflightRequests = new Map();
     this.requestsOlderThanRestart = new Set();
   }
@@ -58,6 +61,7 @@ export class RequestManager {
       }
     });
 
+    this.markConnectionStateDirty();
     return result;
   }
 
@@ -145,6 +149,7 @@ export class RequestManager {
         this.inflightMutationsCount--;
       }
 
+      this.markConnectionStateDirty();
       return { requestId: response.requestId, result };
     }
 
@@ -178,6 +183,9 @@ export class RequestManager {
         this.inflightRequests.delete(requestId);
         this.requestsOlderThanRestart.delete(requestId);
       }
+    }
+    if (completeRequests.size > 0) {
+      this.markConnectionStateDirty();
     }
     return completeRequests;
   }
@@ -217,6 +225,7 @@ export class RequestManager {
         });
       }
     }
+    this.markConnectionStateDirty();
     return allMessages;
   }
 

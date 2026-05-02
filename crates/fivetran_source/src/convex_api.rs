@@ -6,16 +6,12 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
-use convex_fivetran_common::config::Config;
-use convex_fivetran_source::api_types::{
-    DocumentDeltasArgs,
-    ListSnapshotArgs,
-};
 use derive_more::{
     Display,
     From,
     Into,
 };
+use fivetran_common::config::Config;
 use headers::{
     HeaderName,
     HeaderValue,
@@ -27,8 +23,17 @@ use serde::{
 };
 
 use crate::api_types::{
+    selection::{
+        Selection,
+        DEFAULT_FIVETRAN_SCHEMA_NAME,
+    },
+    DocumentDeltasArgs,
     DocumentDeltasResponse,
+    DocumentDeltasValue,
+    ListSnapshotArgs,
     ListSnapshotResponse,
+    ListSnapshotValue,
+    SelectionArg,
 };
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -51,16 +56,21 @@ pub trait Source: Display + Send {
         &self,
         snapshot: Option<i64>,
         cursor: Option<ListSnapshotCursor>,
+        selection: Selection,
     ) -> anyhow::Result<ListSnapshotResponse>;
 
     /// See https://docs.convex.dev/http-api/#get-apidocument_deltas
     async fn document_deltas(
         &self,
         cursor: DocumentDeltasCursor,
+        selection: Selection,
     ) -> anyhow::Result<DocumentDeltasResponse>;
 
-    /// Get a list of columns for each table on the Convex backend.
-    async fn get_tables_and_columns(&self) -> anyhow::Result<BTreeMap<TableName, Vec<FieldName>>>;
+    /// Get a list of columns for each table and component on the Convex
+    /// backend.
+    async fn get_table_column_names(
+        &self,
+    ) -> anyhow::Result<BTreeMap<ComponentPath, BTreeMap<TableName, Vec<FieldName>>>>;
 }
 
 /// Implementation of [`Source`] accessing a real Convex deployment over HTTP.
@@ -141,14 +151,17 @@ impl ConvexApi {
                 .await
                 .context("Failed to deserialize query result")?),
             Ok(resp) => {
+                let status = resp.status().as_str().to_string();
                 if let Ok(text) = resp.text().await {
                     anyhow::bail!(
-                        "Call to {endpoint} on {} returned an unsuccessful response: {text}",
+                        "Call to {endpoint} on {} returned an unsuccessful response ({status}): \
+                         {text}",
                         self.config.deploy_url
                     )
                 } else {
                     anyhow::bail!(
-                        "Call to {endpoint} on {} returned no response",
+                        "Call to {endpoint} on {} returned an unsuccessful response with no \
+                         content ({status})",
                         self.config.deploy_url
                     )
                 }
@@ -168,14 +181,14 @@ impl Source for ConvexApi {
         &self,
         snapshot: Option<i64>,
         cursor: Option<ListSnapshotCursor>,
+        selection: Selection,
     ) -> anyhow::Result<ListSnapshotResponse> {
         self.post(
             "list_snapshot",
             ListSnapshotArgs {
                 snapshot,
                 cursor: cursor.map(|c| c.into()),
-                table_name: None,
-                component: None,
+                selection: SelectionArg::Exact { selection },
                 format: Some("convex_encoded_json".to_string()),
             },
         )
@@ -185,37 +198,43 @@ impl Source for ConvexApi {
     async fn document_deltas(
         &self,
         cursor: DocumentDeltasCursor,
+        selection: Selection,
     ) -> anyhow::Result<DocumentDeltasResponse> {
         self.post(
             "document_deltas",
             DocumentDeltasArgs {
                 cursor: Some(cursor.into()),
-                table_name: None,
-                component: None,
+                selection: SelectionArg::Exact { selection },
                 format: Some("convex_encoded_json".to_string()),
             },
         )
         .await
     }
 
-    async fn get_tables_and_columns(&self) -> anyhow::Result<BTreeMap<TableName, Vec<FieldName>>> {
-        let tables_to_columns: BTreeMap<TableName, Vec<String>> =
-            self.get("get_tables_and_columns").await?;
+    async fn get_table_column_names(
+        &self,
+    ) -> anyhow::Result<BTreeMap<ComponentPath, BTreeMap<TableName, Vec<FieldName>>>> {
+        let response: GetTableColumnNamesResponse = self.get("get_table_column_names").await?;
 
-        tables_to_columns
+        let by_component = response
+            .by_component
             .into_iter()
-            .map(|(table_name, all_columns)| {
-                let system_columns = ["_id", "_creationTime"].into_iter().map(String::from);
-                let user_columns: Vec<_> = all_columns
-                    .into_iter()
-                    .filter(|key| !key.starts_with('_'))
-                    .collect();
-
-                let columns = system_columns.chain(user_columns).map(FieldName).collect();
-
-                Ok((table_name, columns))
+            .map(|(component_path, tables)| {
+                (
+                    ComponentPath(component_path),
+                    tables
+                        .into_iter()
+                        .map(|table| {
+                            let columns: Vec<_> =
+                                table.columns.into_iter().map(FieldName).collect();
+                            (TableName(table.name), columns)
+                        })
+                        .collect(),
+                )
             })
-            .try_collect()
+            .collect();
+
+        Ok(by_component)
     }
 }
 
@@ -226,70 +245,70 @@ impl Display for ConvexApi {
 }
 
 #[derive(Display, Serialize, Deserialize, Debug, PartialEq, Eq, Clone, From, Into)]
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub struct ListSnapshotCursor(pub String);
 
 #[derive(Display, Serialize, Deserialize, Debug, PartialEq, Eq, Clone, From, Into, Copy)]
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub struct DocumentDeltasCursor(pub i64);
 
-#[derive(Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
+#[derive(Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Display, Debug)]
 pub struct TableName(pub String);
 
-#[cfg(test)]
-impl From<&str> for TableName {
-    fn from(value: &str) -> Self {
-        TableName(value.to_string())
+#[derive(Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Display, Clone, Debug)]
+pub struct ComponentPath(pub String);
+
+#[derive(Display, Debug)]
+pub struct FieldName(pub String);
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTableColumnNamesResponse {
+    pub by_component: BTreeMap<String, Vec<GetTableColumnNameTable>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTableColumnNameTable {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+pub trait SnapshotValue {
+    fn table(&self) -> &String;
+    fn component(&self) -> &String;
+
+    /// The full path of the table, including the component name,
+    /// in the format used for `tables_seen` in [`State`].
+    fn table_path_for_state(&self) -> String {
+        match self.component().as_str() {
+            "" => self.table().clone(),
+            _ => format!("{}/{}", self.component(), self.table()),
+        }
+    }
+
+    fn fivetran_schema_name(&self) -> String {
+        match self.component().as_str() {
+            "" => DEFAULT_FIVETRAN_SCHEMA_NAME.to_string(),
+            _ => self.component().clone(),
+        }
     }
 }
 
-#[derive(Display)]
-pub struct FieldName(pub String);
+impl SnapshotValue for ListSnapshotValue {
+    fn table(&self) -> &String {
+        &self.table
+    }
 
-#[cfg(test)]
-mod tests {
-    use core::panic;
+    fn component(&self) -> &String {
+        &self.component
+    }
+}
 
-    use schemars::schema::Schema;
-    use serde_json::json;
+impl SnapshotValue for DocumentDeltasValue {
+    fn table(&self) -> &String {
+        &self.table
+    }
 
-    use super::*;
-
-    #[derive(Deserialize)]
-    pub struct DatabaseSchema(pub BTreeMap<TableName, Schema>);
-
-    #[test]
-    fn can_deserialize_schema() {
-        let json = json!({
-            "emptyTable": false,
-            "table": json!({
-                "type": "object",
-                "properties": json!({
-                    "_creationTime": json!({ "type": "number" }),
-                    "_id": json!({
-                        "$description": "Id(messages)",
-                        "type": "string"
-                    }),
-                    "author": json!({ "type": "string" }),
-                    "body": json!({ "type": "string" }),
-                    "_table": json!({ "type": "string" }),
-                    "_ts": json!({ "type": "integer" }),
-                    "_deleted": json!({ "type": "boolean" }),
-                }),
-                "additionalProperties": false,
-                "required": vec!["_creationTime", "_id", "author", "body"],
-                "$schema": "http://json-schema.org/draft-07/schema#",
-            }),
-        });
-
-        let schema: DatabaseSchema = serde_json::from_value(json).unwrap();
-
-        let Schema::Bool(_) = schema.0.get(&"emptyTable".into()).unwrap() else {
-            panic!();
-        };
-        let Schema::Object(schema_object) = schema.0.get(&"table".into()).unwrap() else {
-            panic!();
-        };
-        assert!(schema_object.object.is_some());
+    fn component(&self) -> &String {
+        &self.component
     }
 }

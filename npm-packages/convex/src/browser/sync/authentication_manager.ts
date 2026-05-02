@@ -1,7 +1,7 @@
 import { Logger } from "../logging.js";
 import { LocalSyncState } from "./local_state.js";
 import { AuthError, IdentityVersion, Transition } from "./protocol.js";
-import { jwtDecode } from "jwt-decode";
+import { jwtDecode } from "../../vendor/jwt-decode/index.js";
 
 // setTimout uses 32 bit integer, so it can only
 // schedule about 24 days in the future.
@@ -10,11 +10,13 @@ const MAXIMUM_REFRESH_DELAY = 20 * 24 * 60 * 60 * 1000; // 20 days
 const MAX_TOKEN_CONFIRMATION_ATTEMPTS = 2;
 
 /**
- * An async function returning the JWT-encoded OpenID Connect Identity Token
- * if available.
+ * An async function returning a JWT. Depending on the auth providers
+ * configured in convex/auth.config.ts, this may be a JWT-encoded OpenID
+ * Connect Identity Token or a traditional JWT.
  *
  * `forceRefreshToken` is `true` if the server rejected a previously
- * returned token, and the client should try to fetch a new one.
+ * returned token or the token is anticipated to expiring soon
+ * based on its `exp` time.
  *
  * See {@link ConvexReactClient.setAuth}.
  *
@@ -171,6 +173,14 @@ export class AuthenticationManager {
       // This transition did not change auth - it is not a response to Authenticate.
       return;
     }
+
+    this._logVerbose(
+      `auth state is ${this.authState.state} when handling transition`,
+    );
+
+    // This transition advanced the auth version, which means the token used was valid
+    // and the client and server auth states are in sync.
+    this.syncState.markAuthCompletion();
 
     if (this.authState.state === "waitingForServerConfirmationOfCachedToken") {
       this._logVerbose("server confirmed auth token is valid");
@@ -449,15 +459,12 @@ export class AuthenticationManager {
       case "initialRefetch":
         break;
       default: {
-        const _typeCheck: never = newAuth;
+        newAuth satisfies never;
       }
     }
     if (this.authState.state === "waitingForScheduledRefetch") {
+      // TODO: this side-effect would be better situated with scheduling refetch
       clearTimeout(this.authState.refetchTokenTimeoutId);
-
-      // The waitingForScheduledRefetch state is the most quiesced authed state.
-      // Let the syncState know that auth is in a good state, so it can reset failure backoffs
-      this.syncState.markAuthCompletion();
     }
     this.authState = newAuth;
   }

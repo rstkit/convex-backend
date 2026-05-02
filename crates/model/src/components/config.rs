@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use anyhow::Context;
 use common::{
@@ -28,6 +31,7 @@ use database::{
     IndexModel,
     SchemaDiff,
     SchemaModel,
+    SchemaValidationProgressTable,
     SchemasTable,
     SerializedSchemaDiff,
     SystemMetadataModel,
@@ -272,6 +276,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
 
         let mut allocated_component_ids = BTreeMap::new();
         let mut schema_ids = BTreeMap::new();
+        let mut index_diffs = BTreeMap::new();
 
         let existing_root = existing_components_by_parent.get(&None);
         let mut stack = vec![(ComponentPath::root(), existing_root, Some(app))];
@@ -304,7 +309,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
                     .get(&new_node.definition_path)
                     .context("Missing definition for component")?;
                 let schema_id = if let Some(ref schema) = definition.schema {
-                    IndexModel::new(self.tx)
+                    let index_diff = IndexModel::new(self.tx)
                         .prepare_new_and_mutated_indexes(namespace, schema)
                         .await?;
 
@@ -319,6 +324,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
                             );
                         },
                     };
+                    index_diffs.insert(path.clone(), index_diff.into());
                     Some(schema_id.into())
                 } else {
                     None
@@ -338,6 +344,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
         Ok(SchemaChange {
             allocated_component_ids,
             schema_ids,
+            index_diffs,
         })
     }
 
@@ -365,6 +372,13 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
         initialize_application_system_table(
             self.tx,
             &SchemasTable,
+            component_id.into(),
+            &DEFAULT_TABLE_NUMBERS,
+        )
+        .await?;
+        initialize_application_system_table(
+            self.tx,
+            &SchemaValidationProgressTable,
             component_id.into(),
             &DEFAULT_TABLE_NUMBERS,
         )
@@ -446,6 +460,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
                         definition_id,
                         component_type,
                         state: ComponentState::Active,
+                        http_prefix: new_node.http_prefix.clone(),
                     })
                 })
                 .transpose()?;
@@ -695,7 +710,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
         let Some(component) = component else {
             anyhow::bail!(ErrorMetadata::not_found(
                 "ComponentNotFound",
-                format!("Component with ID {:?} not found", component_id)
+                format!("Component with ID {component_id:?} not found")
             ));
         };
         let mut stack = vec![component];
@@ -730,7 +745,9 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
             // then delete all tables, including system tables and hidden tables
             let namespaced_table_mapping = self.tx.table_mapping().namespace(namespace);
             for (tablet_id, ..) in namespaced_table_mapping.iter() {
-                TableModel::new(self.tx).delete_table(tablet_id).await?;
+                TableModel::new(self.tx)
+                    .delete_table_by_id_bypassing_schema_enforcement(tablet_id)
+                    .await?;
             }
         }
 
@@ -764,6 +781,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
                             definition_type: ComponentDefinitionType::App,
                             child_components: Vec::new(),
                             http_mounts: BTreeMap::new(),
+                            http_prefix: None,
                             exports: BTreeMap::new(),
                         },
                     )
@@ -782,7 +800,7 @@ impl<'a, RT: Runtime> ComponentConfigModel<'a, RT> {
 fn tree_diff_children<'a>(
     existing_components_by_parent: &'a BTreeMap<
         Option<(DeveloperDocumentId, ComponentName)>,
-        ParsedDocument<ComponentMetadata>,
+        Arc<ParsedDocument<ComponentMetadata>>,
     >,
     new_node: Option<&'a CheckedComponent>,
     internal_id: DeveloperDocumentId,
@@ -828,15 +846,11 @@ fn tree_diff_children<'a>(
 
 struct TreeDiffChild<'a> {
     name: ComponentName,
-    existing: Option<&'a ParsedDocument<ComponentMetadata>>,
+    existing: Option<&'a Arc<ParsedDocument<ComponentMetadata>>>,
     new: Option<&'a CheckedComponent>,
 }
 
 #[derive(Debug, Clone, AsRefStr)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(proptest_derive::Arbitrary, PartialEq)
-)]
 pub enum ComponentDiffType {
     Create,
     Modify,
@@ -845,10 +859,6 @@ pub enum ComponentDiffType {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(proptest_derive::Arbitrary, PartialEq)
-)]
 pub struct ComponentDiff {
     pub diff_type: ComponentDiffType,
     pub module_diff: ModuleDiff,
@@ -913,7 +923,7 @@ impl TryFrom<ComponentDiff> for SerializedComponentDiff {
             module_diff: value.module_diff,
             udf_config_diff: value.udf_config_diff,
             cron_diff: value.cron_diff,
-            index_diff: Some(value.index_diff.try_into()?),
+            index_diff: Some(value.index_diff.into()),
             schema_diff: value.schema_diff.map(|diff| diff.try_into()).transpose()?,
         })
     }
@@ -941,6 +951,7 @@ impl TryFrom<SerializedComponentDiff> for ComponentDiff {
 pub struct SchemaChange {
     pub allocated_component_ids: BTreeMap<ComponentPath, DeveloperDocumentId>,
     pub schema_ids: BTreeMap<ComponentPath, Option<InternalDocumentId>>,
+    pub index_diffs: BTreeMap<ComponentPath, AuditLogIndexDiff>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -948,6 +959,8 @@ pub struct SchemaChange {
 pub struct SerializedSchemaChange {
     allocated_component_ids: BTreeMap<String, String>,
     schema_ids: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    index_diffs: BTreeMap<String, SerializedIndexDiff>,
 }
 
 impl TryFrom<SchemaChange> for SerializedSchemaChange {
@@ -964,6 +977,11 @@ impl TryFrom<SchemaChange> for SerializedSchemaChange {
                 .schema_ids
                 .into_iter()
                 .map(|(k, v)| (String::from(k), v.map(String::from)))
+                .collect(),
+            index_diffs: value
+                .index_diffs
+                .into_iter()
+                .map(|(k, v)| (String::from(k), v.into()))
                 .collect(),
         })
     }
@@ -983,6 +1001,11 @@ impl TryFrom<SerializedSchemaChange> for SchemaChange {
                 .schema_ids
                 .into_iter()
                 .map(|(k, v)| Ok((k.parse()?, v.map(|v| v.parse()).transpose()?)))
+                .collect::<anyhow::Result<_>>()?,
+            index_diffs: value
+                .index_diffs
+                .into_iter()
+                .map(|(k, v)| Ok((k.parse()?, v.try_into()?)))
                 .collect::<anyhow::Result<_>>()?,
         })
     }

@@ -1,6 +1,6 @@
 import { ValidatorJSON, Value } from "convex/values";
 import isPlainObject from "lodash/isPlainObject";
-import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/patchDocumentsFields";
+import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/lib/values";
 import * as IdEncoding from "id-encoding";
 
 export const isValidValue = (
@@ -82,7 +82,7 @@ export const isValidValue = (
         isValidValue(v, value, shallow),
       );
     default: {
-      const _typeCheck: never = validator;
+      validator satisfies never;
       return false;
     }
   }

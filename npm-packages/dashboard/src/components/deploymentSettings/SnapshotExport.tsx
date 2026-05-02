@@ -1,4 +1,5 @@
 import { DownloadIcon, EnvelopeClosedIcon } from "@radix-ui/react-icons";
+import { Link } from "@ui/Link";
 import { Button } from "@ui/Button";
 import { Spinner } from "@ui/Spinner";
 import { Callout } from "@ui/Callout";
@@ -52,7 +53,7 @@ function LatestSnapshot({
           <div className="flex w-full">
             <div className="flex w-full gap-x-4 overflow-hidden rounded-b-md md:grid-cols-[minmax(auto,calc(100%-10rem))_10rem]">
               <Fragment key={existingExport.zip_object_key}>
-                <div className="flex items-center truncate whitespace-nowrap px-4 text-sm">
+                <div className="flex items-center truncate px-4 text-sm whitespace-nowrap">
                   <div className="truncate">{filename}</div>
                 </div>
                 <div className="ml-auto flex items-center p-2 text-right text-sm font-medium">
@@ -93,13 +94,10 @@ export function SnapshotExport() {
             <Callout variant="error">
               <div>
                 Latest snapshot export failed. Please try again or contact us at{" "}
-                <a
-                  href="mailto:support@convex.dev"
-                  className="items-center text-content-link"
-                >
+                <Link href="mailto:support@convex.dev" className="items-center">
                   <EnvelopeClosedIcon className="mr-0.5 inline" />
                   support@convex.dev
-                </a>
+                </Link>
               </div>
             </Callout>
           ) : existingExport.state === "completed" &&

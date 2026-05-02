@@ -1,14 +1,3 @@
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod index_diff_tests;
-#[cfg(test)]
-mod index_limits_tests;
-#[cfg(test)]
-pub mod index_test_utils;
-#[cfg(test)]
-mod index_tests;
 pub mod module_loader;
 pub mod types;
 
@@ -23,7 +12,6 @@ use common::{
 use database::{
     unauthorized_error,
     IndexModel,
-    LegacyIndexDiff,
     SchemaModel,
     Transaction,
 };
@@ -118,7 +106,7 @@ impl<'a, RT: Runtime> ConfigModel<'a, RT> {
             // TODO(CX-3851): Consider logging the mutated indexes separately.
             // This now includes added, mutated and dropped indexes. Mutated
             // indexes are shown both in 'added' and in 'dropped'
-            index_diff: LegacyIndexDiff::from(index_diff).into(),
+            index_diff: index_diff.into(),
             schema_diff,
         };
 
@@ -156,7 +144,7 @@ impl<'a, RT: Runtime> ConfigModel<'a, RT> {
         let udf_config = UdfConfigModel::new(self.tx, self.component.into())
             .get()
             .await?
-            .map(|u| u.into_value());
+            .map(|u| (**u).clone());
         Ok((config, modules, udf_config))
     }
 
@@ -192,7 +180,7 @@ impl<'a, RT: Runtime> ConfigModel<'a, RT> {
         let udf_config = UdfConfigModel::new(self.tx, self.component.into())
             .get()
             .await?
-            .map(|u| u.into_value());
+            .map(|u| (**u).clone());
         Ok((config, modules, udf_config))
     }
 }

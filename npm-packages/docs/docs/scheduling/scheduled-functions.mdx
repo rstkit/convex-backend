@@ -1,6 +1,7 @@
 ---
 title: Scheduled Functions
 sidebar_position: 1
+description: "Schedule functions to run in the future"
 ---
 
 import Example from "!!raw-loader!@site/../private-demos/snippets/convex/messages.ts";
@@ -32,10 +33,9 @@ The rest of the arguments are the path to the function and its arguments,
 similar to invoking a function from the client. For example, here is how to send
 a message that self-destructs in five seconds.
 
-<TSAndJSSnippet
+<Snippet
   title="convex/messages.ts"
-  sourceTS={Example}
-  sourceJS={Example}
+  source={Example}
   snippet="scheduling-runAfter"
   highlightPatterns={["scheduler", "runAfter"]}
 />
@@ -54,11 +54,11 @@ scheduling call.
 
 ### Scheduling from actions
 
-Unlike mutations, [actions](//docs/functions/actions.mdx) don't execute as a
-single database transaction and can have side effects. Thus, scheduling from
-actions does not depend on the outcome of the function. This means that an
-action might succeed to schedule some functions and later fail due to transient
-error or a timeout. The scheduled functions will still be executed.
+Unlike mutations, [actions](/functions/actions.mdx) don't execute as a single
+database transaction and can have side effects. Thus, scheduling from actions
+does not depend on the outcome of the function. This means that an action might
+succeed to schedule some functions and later fail due to transient error or a
+timeout. The scheduled functions will still be executed.
 
 ### Scheduling immediately
 
@@ -81,10 +81,9 @@ of scheduled function. You can read data from system tables using the
 `db.system.get` and `db.system.query` methods, which work the same as the
 standard `db.get` and `db.query` methods.
 
-<TSAndJSSnippet
+<Snippet
   title="convex/messages.ts"
-  sourceTS={Example}
-  sourceJS={Example}
+  source={Example}
   snippet="scheduling-status"
   highlightPatterns={["system"]}
 />
@@ -132,10 +131,9 @@ You can cancel a previously scheduled function with
 [scheduler](/api/interfaces/server.Scheduler) provided in the respective
 function context.
 
-<TSAndJSSnippet
+<Snippet
   title="convex/messages.ts"
-  sourceTS={Example}
-  sourceJS={Example}
+  source={Example}
   snippet="scheduling-cancel"
   highlightPatterns={["scheduler.cancel"]}
 />

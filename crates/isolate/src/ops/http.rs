@@ -1,6 +1,5 @@
 use std::str::FromStr;
 
-use anyhow::Context;
 use common::sync::spsc;
 use deno_core::{
     serde_v8,
@@ -8,15 +7,10 @@ use deno_core::{
         self,
     },
 };
-use errors::ErrorMetadata;
 use headers::HeaderName;
 use serde::{
     Deserialize,
     Serialize,
-};
-use serde_json::{
-    json,
-    Value as JsonValue,
 };
 use url::{
     form_urlencoded,
@@ -26,6 +20,7 @@ use url::{
 
 use super::OpProvider;
 use crate::{
+    convert_v8::TypeError,
     environment::{
         helpers::with_argument_error,
         AsyncOpRequest,
@@ -39,7 +34,7 @@ pub fn async_op_fetch<'b, P: OpProvider<'b>>(
     args: v8::FunctionCallbackArguments,
     resolver: v8::Global<v8::PromiseResolver>,
 ) -> anyhow::Result<()> {
-    let arg: HttpRequestV8 = serde_v8::from_v8(provider.scope(), args.get(1))?;
+    let arg: HttpRequestV8 = serde_v8::from_v8(&mut provider.scope(), args.get(1))?;
 
     let request = with_argument_error("fetch", || HttpRequestV8::into_stream(arg, provider))?;
     let response_body_stream_id = provider.create_stream()?;
@@ -57,8 +52,8 @@ pub fn async_op_parse_multi_part<'b, P: OpProvider<'b>>(
     args: v8::FunctionCallbackArguments,
     resolver: v8::Global<v8::PromiseResolver>,
 ) -> anyhow::Result<()> {
-    let content_type: String = serde_v8::from_v8(provider.scope(), args.get(1))?;
-    let request_stream_id: uuid::Uuid = serde_v8::from_v8(provider.scope(), args.get(2))?;
+    let content_type: String = serde_v8::from_v8(&mut provider.scope(), args.get(1))?;
+    let request_stream_id: uuid::Uuid = serde_v8::from_v8(&mut provider.scope(), args.get(2))?;
     let (request_sender, request_receiver) = spsc::unbounded_channel();
     provider.new_stream_listener(
         request_stream_id,
@@ -79,11 +74,11 @@ pub fn op_url_get_url_info<'b, P: OpProvider<'b>>(
     provider: &mut P,
     url: String,
     base: Option<String>,
-) -> anyhow::Result<JsonValue> {
+) -> anyhow::Result<UrlInfo> {
     let base_url = match base {
         Some(b) => match Url::parse(&b) {
             Ok(url) => Some(url),
-            Err(_) => return Ok(json!({"kind": "error", "errorType": "InvalidURL"})),
+            Err(_) => anyhow::bail!(TypeError::new(format!("Invalid URL: '{b}'"))),
         },
         None => None,
     };
@@ -91,18 +86,10 @@ pub fn op_url_get_url_info<'b, P: OpProvider<'b>>(
     let parsed_url = match Url::options().base_url(base_url.as_ref()).parse(&url) {
         Ok(u) => u,
         // The URL spec (https://url.spec.whatwg.org/) dictates that JS
-        // throw a TypeError when the URL is invalid, so we return `null`
-        // and throw the error on the JS side instead of having this error
-        // turn into a JsError
-        Err(_) => return Ok(json!({"kind": "error", "errorType": "InvalidURL"})),
+        // throw a TypeError when the URL is invalid.
+        Err(_) => anyhow::bail!(TypeError::new(format!("Invalid URL: '{url}'"))),
     };
-    match UrlInfo::try_from(parsed_url) {
-        Ok(url_info) => Ok(json!({"kind": "success", "urlInfo": serde_json::to_value(url_info)?})),
-        // This is a valid URL, but not one we support
-        Err(e) => {
-            Ok(json!({"kind": "error", "errorType": "UnsupportedURL", "message": e.to_string()}))
-        },
-    }
+    Ok(UrlInfo::from(parsed_url))
 }
 
 #[convex_macro::v8_op]
@@ -131,32 +118,30 @@ pub fn op_url_stringify_url_search_params<'b, P: OpProvider<'b>>(
     Ok(search)
 }
 
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+enum UrlInfoUpdate {
+    Hash(Option<String>),
+    Hostname(Option<String>),
+    Href(String),
+    Protocol(String),
+    Port(String),
+    Pathname(String),
+    Search(Option<String>),
+    SearchParams(Vec<(String, String)>),
+}
+
 #[convex_macro::v8_op]
 pub fn op_url_update_url_info<'b, P: OpProvider<'b>>(
     provider: &mut P,
     original_url: String,
-    update: JsonValue,
-) -> anyhow::Result<JsonValue> {
-    #[derive(Deserialize, Debug, Clone)]
-    #[serde(rename_all = "camelCase")]
-    #[serde(tag = "type")]
-    enum Update {
-        Hash { value: Option<String> },
-        Hostname { value: Option<String> },
-        Href { value: String },
-        Protocol { value: String },
-        Port { value: Option<String> },
-        Pathname { value: String },
-        Search { value: Option<String> },
-        SearchParams { value: Vec<(String, String)> },
-    }
-
-    let update: Update = serde_json::from_value(update)?;
+    update: UrlInfoUpdate,
+) -> anyhow::Result<UrlInfo> {
     let mut parsed_url = Url::parse(&original_url)?;
 
     match update {
-        Update::Hash { value } => parsed_url.set_fragment(value.as_deref()),
-        Update::SearchParams { value } => {
+        UrlInfoUpdate::Hash(value) => parsed_url.set_fragment(value.as_deref()),
+        UrlInfoUpdate::SearchParams(value) => {
             if value.is_empty() {
                 parsed_url.set_query(None)
             } else {
@@ -167,37 +152,28 @@ pub fn op_url_update_url_info<'b, P: OpProvider<'b>>(
                     .finish();
             }
         },
-        Update::Hostname { value } => parsed_url.set_host(value.as_deref())?,
-        Update::Href { value } => {
-            parsed_url = Url::parse(&value).context(ErrorMetadata::bad_request(
-                "BadUrl",
-                format!("Could not parse URL: {original_url}"),
-            ))?;
+        UrlInfoUpdate::Hostname(value) => parsed_url.set_host(value.as_deref())?,
+        UrlInfoUpdate::Href(value) => {
+            parsed_url = Url::parse(&value)
+                .map_err(|_| TypeError::new(format!("Could not parse URL: {original_url}")))?;
         },
-        Update::Protocol { value } => {
-            if value != "http" && value != "https" {
-                parsed_url
-                    .set_scheme(&value)
-                    .map_err(|_e| anyhow::anyhow!("Failed to set scheme"))?
+        UrlInfoUpdate::Protocol(value) => {
+            // ignore errors
+            _ = parsed_url.set_scheme(&value);
+        },
+        UrlInfoUpdate::Port(port_str) => {
+            // ignore errors
+            if port_str.is_empty() {
+                _ = parsed_url.set_port(None);
+            } else if let Ok(port) = port_str.parse::<u16>() {
+                _ = parsed_url.set_port(Some(port));
             }
         },
-        Update::Port { value } => match value {
-            Some(port_str) => match port_str.parse::<u16>() {
-                Ok(port_number) => parsed_url
-                    .set_port(Some(port_number))
-                    .map_err(|_e| anyhow::anyhow!("Failed to set port"))?,
-                Err(_) => (),
-            },
-            None => parsed_url
-                .set_port(None)
-                .map_err(|_e| anyhow::anyhow!("Failed to set port"))?,
-        },
-        Update::Pathname { value } => parsed_url.set_path(&value),
-        Update::Search { value } => parsed_url.set_query(value.as_deref()),
+        UrlInfoUpdate::Pathname(value) => parsed_url.set_path(&value),
+        UrlInfoUpdate::Search(value) => parsed_url.set_query(value.as_deref()),
     }
 
-    let url_info: UrlInfo = parsed_url.try_into()?;
-    Ok(serde_json::to_value(url_info)?)
+    Ok(UrlInfo::from(parsed_url))
 }
 
 #[convex_macro::v8_op]
@@ -246,11 +222,9 @@ struct UrlInfo {
     password: String,
 }
 
-impl TryFrom<Url> for UrlInfo {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Url) -> Result<Self, Self::Error> {
-        let url_info = UrlInfo {
+impl From<Url> for UrlInfo {
+    fn from(value: Url) -> Self {
+        UrlInfo {
             scheme: value.scheme().to_string(),
             hash: value[Position::BeforeFragment..Position::AfterFragment].to_string(),
             host: value[Position::BeforeHost..Position::BeforePath].to_string(),
@@ -261,8 +235,7 @@ impl TryFrom<Url> for UrlInfo {
             search: value[Position::BeforeQuery..Position::AfterQuery].to_string(),
             username: value.username().to_owned(),
             password: value.password().unwrap_or_default().to_owned(),
-        };
-        Ok(url_info)
+        }
     }
 }
 

@@ -3,6 +3,7 @@ use std::{
     sync::LazyLock,
 };
 
+use async_trait::async_trait;
 use common::{
     document::{
         DeveloperDocument,
@@ -13,6 +14,7 @@ use common::{
         ID_FIELD,
     },
     virtual_system_mapping::{
+        GetDocument,
         VirtualSystemDocMapper,
         VirtualSystemMapping,
     },
@@ -41,9 +43,11 @@ static MIN_NPM_VERSION_FILE_STORAGE_V2: LazyLock<Version> =
 
 pub struct FileStorageDocMapper;
 
+#[async_trait]
 impl VirtualSystemDocMapper for FileStorageDocMapper {
-    fn system_to_virtual_doc(
+    async fn system_to_virtual_doc(
         &self,
+        _tx: &mut dyn GetDocument,
         virtual_system_mapping: &VirtualSystemMapping,
         doc: ResolvedDocument,
         table_mapping: &TableMapping,
@@ -92,7 +96,6 @@ impl VirtualSystemDocMapper for FileStorageDocMapper {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 struct PublicFileMetadata {
     sha256: String,               // Hex-encoded Sha256 of contents
     size: f64,                    // Size of file in storage

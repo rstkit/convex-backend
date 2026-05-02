@@ -7,12 +7,11 @@ use std::{
     },
 };
 
-use anyhow::Context;
 use async_trait::async_trait;
 use common::{
     bootstrap_model::index::{
         database_index::{
-            DeveloperDatabaseIndexConfig,
+            DatabaseIndexSpec,
             IndexedFields,
         },
         IndexConfig,
@@ -35,6 +34,7 @@ use common::{
         SearchVersion,
     },
     runtime,
+    try_anyhow,
     types::{
         DatabaseIndexUpdate,
         DatabaseIndexValue,
@@ -47,9 +47,8 @@ use common::{
 use imbl::OrdMap;
 use indexing::{
     backend_in_memory_indexes::{
-        index_not_a_database_index_error,
-        BatchKey,
         DatabaseIndexSnapshot,
+        DatabaseIndexSnapshotCache,
         LazyDocument,
         RangeRequest,
     },
@@ -58,7 +57,6 @@ use indexing::{
         IndexRegistry,
     },
 };
-use maplit::btreemap;
 use search::{
     query::RevisionWithKeys,
     CandidateRevision,
@@ -128,47 +126,113 @@ impl TransactionIndex {
         &self.index_registry
     }
 
+    fn pending_iter_for_request<'a>(
+        index_registry: &IndexRegistry,
+        database_index_updates: &'a OrdMap<IndexId, TransactionIndexMap>,
+        range_request: &'a RangeRequest,
+    ) -> Result<
+        impl DoubleEndedIterator<Item = (IndexKeyBytes, Option<PackedDocument>)> + 'a,
+        anyhow::Error,
+    > {
+        let iter = match index_registry.require_enabled(
+            &range_request.index_name,
+            &range_request.printable_index_name,
+        ) {
+            Ok(index) => database_index_updates.get(&index.id()),
+            // Range queries on missing tables are allowed for system provided indexes.
+            Err(_) if range_request.index_name.is_by_id_or_creation_time() => None,
+            Err(e) => return Err(e),
+        }
+        .map(|pending| pending.range(&range_request.interval))
+        .into_iter()
+        .flatten();
+        Ok(iter)
+    }
+
     /// Range over a index including pending updates.
     /// `max_size` provides an estimate of the number of rows to be
     /// streamed from the database.
-    /// The returned vec may be larger or smaller than `max_size` depending on
+    /// The returned vecs may be larger or smaller than `max_size` depending on
     /// pending writes.
-    async fn range_no_deps(
+    pub(crate) async fn range_no_deps(
         &mut self,
-        ranges: &BTreeMap<BatchKey, RangeRequest>,
-    ) -> BTreeMap<
-        BatchKey,
+        ranges: &[&RangeRequest],
+    ) -> Vec<
         anyhow::Result<(
             Vec<(IndexKeyBytes, LazyDocument, WriteTimestamp)>,
             CursorPosition,
         )>,
     > {
-        let snapshot = &mut self.database_index_snapshot;
-        let mut snapshot_results = snapshot.range_batch(ranges).await;
-
         let batch_size = ranges.len();
-        let mut results = BTreeMap::new();
 
-        for (&batch_key, range_request) in ranges {
-            let item_result: anyhow::Result<_> = try {
-                let (snapshot_result_vec, cursor) = snapshot_results
-                    .remove(&batch_key)
-                    .context("batch_key missing")??;
-                let mut snapshot_it = snapshot_result_vec.into_iter();
-                let index_registry = &self.index_registry;
-                let database_index_updates = &self.database_index_updates;
-                let pending_it = match index_registry.require_enabled(
-                    &range_request.index_name,
-                    &range_request.printable_index_name,
-                ) {
-                    Ok(index) => database_index_updates.get(&index.id()),
-                    // Range queries on missing tables are allowed for system provided indexes.
-                    Err(_) if range_request.index_name.is_by_id_or_creation_time() => None,
-                    Err(e) => Err(e)?,
+        // Resolve singleton ranges that have pending writes without
+        // hitting persistence.
+        let mut pre_resolved = Vec::with_capacity(batch_size);
+        let mut persistence_ranges: Vec<&RangeRequest> = Vec::new();
+
+        for &range_request in ranges.iter() {
+            if range_request.interval.is_singleton().is_some() {
+                let pending_result = Self::pending_iter_for_request(
+                    &self.index_registry,
+                    &self.database_index_updates,
+                    range_request,
+                );
+                match pending_result {
+                    Ok(mut pending_it) => {
+                        if let Some((key, maybe_doc)) = pending_it.next() {
+                            if pending_it.next().is_some() {
+                                pre_resolved.push(Some(Err(anyhow::anyhow!(
+                                    "Expected singleton range to have at most one result"
+                                ))));
+                                continue;
+                            }
+                            let mut range_results = Vec::new();
+                            if let Some(doc) = maybe_doc {
+                                range_results.push((key, doc.into(), WriteTimestamp::Pending));
+                            }
+                            pre_resolved.push(Some(Ok((range_results, CursorPosition::End))));
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        pre_resolved.push(Some(Err(e)));
+                        continue;
+                    },
                 }
-                .map(|pending| pending.range(&range_request.interval))
-                .into_iter()
-                .flatten();
+            }
+
+            pre_resolved.push(None);
+            persistence_ranges.push(range_request);
+        }
+
+        // Fetch only the ranges that weren't resolved from pending writes.
+        let snapshot_results = self
+            .database_index_snapshot
+            .range_batch(&persistence_ranges)
+            .await;
+
+        let mut persistence_iter = snapshot_results.into_iter();
+
+        let mut results = Vec::with_capacity(batch_size);
+        for (&range_request, resolved) in ranges.iter().zip(pre_resolved) {
+            // We need to preserve the order of the ranges.
+            if let Some(resolved) = resolved {
+                results.push(resolved);
+                continue;
+            }
+
+            let snapshot_result = persistence_iter
+                .next()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("fewer persistence results than expected")));
+
+            let result = try_anyhow!({
+                let (snapshot_result_vec, cursor) = snapshot_result?;
+                let mut snapshot_it = snapshot_result_vec.into_iter();
+                let pending_it = Self::pending_iter_for_request(
+                    &self.index_registry,
+                    &self.database_index_updates,
+                    range_request,
+                )?;
                 let mut pending_it = range_request.order.apply(pending_it);
 
                 let mut snapshot_next = snapshot_it.next();
@@ -250,8 +314,8 @@ impl TransactionIndex {
                     ))?;
                 }
                 (range_results, cursor)
-            };
-            assert!(results.insert(batch_key, item_result).is_none());
+            });
+            results.push(result);
         }
         assert_eq!(results.len(), batch_size);
         results
@@ -289,14 +353,11 @@ impl TransactionIndex {
             .index_registry
             .require_enabled(&index_name, &query.printable_index_name()?)?;
         let empty = vec![];
-        let pending_updates = self.text_index_updates.get(&index.id).unwrap_or(&empty);
+        let pending_updates = self.text_index_updates.get(&index.id()).unwrap_or(&empty);
         let results = self
             .text_index_snapshot
             .search(&index, query, version, pending_updates)
             .await?;
-
-        // TODO: figure out if we want to charge database bandwidth for reading search
-        // index metadata once search is no longer beta
 
         // Record the query results in the read set.
         reads.record_search(index_name.clone(), results.reads);
@@ -311,54 +372,14 @@ impl TransactionIndex {
     /// Callers must call `record_indexed_directly` when consuming the results.
     pub async fn range_batch(
         &mut self,
-        reads: &mut TransactionReadSet,
-        ranges: BTreeMap<BatchKey, RangeRequest>,
-    ) -> BTreeMap<BatchKey, anyhow::Result<IndexRangeResponse>> {
+        ranges: &[&RangeRequest],
+    ) -> Vec<anyhow::Result<IndexRangeResponse>> {
         let batch_size = ranges.len();
-        let mut results = BTreeMap::new();
-        let mut ranges_to_fetch = BTreeMap::new();
+        let mut results = Vec::with_capacity(batch_size);
 
-        let mut indexed_fields_by_key = BTreeMap::new();
-        for (batch_key, range_request) in ranges {
-            let RangeRequest {
-                index_name,
-                printable_index_name,
-                ..
-            } = &range_request;
-            let result: anyhow::Result<_> = try {
-                let indexed_fields =
-                    match self.require_enabled(reads, index_name, printable_index_name) {
-                        Ok(index) => match index.metadata().config.clone() {
-                            IndexConfig::Database {
-                                developer_config: DeveloperDatabaseIndexConfig { fields },
-                                ..
-                            } => fields,
-                            _ => Err(index_not_a_database_index_error(printable_index_name))?,
-                        },
-                        // Range queries on missing system indexes are allowed.
-                        Err(_) if index_name.is_by_id() => IndexedFields::by_id(),
-                        Err(_) if index_name.is_creation_time() => IndexedFields::creation_time(),
-                        Err(e) => Err(e)?,
-                    };
-                indexed_fields_by_key.insert(batch_key, indexed_fields);
-            };
-            if let Err(e) = result {
-                assert!(results.insert(batch_key, Err(e)).is_none());
-            } else {
-                ranges_to_fetch.insert(batch_key, range_request);
-            }
-        }
-
-        let mut fetch_results = self
-            .range_no_deps(
-                // We use max_rows as size hint. We might receive more or less
-                // due to pending deletes or inserts in the transaction.
-                &ranges_to_fetch,
-            )
-            .await;
+        let fetch_results = self.range_no_deps(ranges).await;
 
         for (
-            batch_key,
             RangeRequest {
                 index_name: _,
                 printable_index_name: _,
@@ -366,18 +387,17 @@ impl TransactionIndex {
                 order: _,
                 max_size,
             },
-        ) in ranges_to_fetch
+            fetch_result,
+        ) in ranges.iter().zip(fetch_results)
         {
-            let result: anyhow::Result<_> = try {
-                let (documents, fetch_cursor) = fetch_results
-                    .remove(&batch_key)
-                    .context("batch item missing")??;
+            let result: anyhow::Result<_> = try_anyhow!({
+                let (documents, fetch_cursor) = fetch_result?;
                 let mut total_bytes = 0;
                 let mut within_bytes_limit = true;
                 let out: Vec<_> = documents
                     .into_iter()
-                    .map(|(key, doc, ts)| (key, doc.unpack(), ts))
-                    .take(max_size)
+                    .map(|(key, doc, ts)| (key, doc.pack(), ts))
+                    .take(*max_size)
                     .take_while(|(_, document, _)| {
                         within_bytes_limit = total_bytes < *TRANSACTION_MAX_READ_SIZE_BYTES;
                         // Allow the query to exceed the limit by one document so the query
@@ -390,7 +410,7 @@ impl TransactionIndex {
                     .collect();
 
                 let cursor = if let Some((last_key, ..)) = out.last()
-                    && (out.len() >= max_size || !within_bytes_limit)
+                    && (out.len() >= *max_size || !within_bytes_limit)
                 {
                     // We hit an early termination condition within this page.
                     CursorPosition::After(last_key.clone())
@@ -405,29 +425,11 @@ impl TransactionIndex {
                     ))?;
                 }
                 IndexRangeResponse { page: out, cursor }
-            };
-            assert!(results.insert(batch_key, result).is_none());
+            });
+            results.push(result);
         }
         assert_eq!(results.len(), batch_size);
         results
-    }
-
-    /// Returns the next page from the index range.
-    /// NOTE: the caller must call reads.record_read_document for any
-    /// documents yielded from the index scan and
-    /// `reads.record_indexed_directly` for the interval actually read.
-    /// Returns the remaining interval that was skipped because of max_size or
-    /// transaction size limits.
-    #[cfg(any(test, feature = "testing"))]
-    pub async fn range(
-        &mut self,
-        reads: &mut TransactionReadSet,
-        range_request: RangeRequest,
-    ) -> anyhow::Result<IndexRangeResponse> {
-        self.range_batch(reads, btreemap! {0 => range_request})
-            .await
-            .remove(&0)
-            .context("batch_key missing")?
     }
 
     #[fastrace::trace]
@@ -440,7 +442,7 @@ impl TransactionIndex {
     ) -> anyhow::Result<PreloadedIndexRange> {
         let index = self.require_enabled(reads, tablet_index_name, printable_index_name)?;
         let IndexConfig::Database {
-            developer_config: DeveloperDatabaseIndexConfig { ref fields, .. },
+            spec: DatabaseIndexSpec { ref fields, .. },
             ..
         } = index.metadata().config
         else {
@@ -452,17 +454,18 @@ impl TransactionIndex {
         let mut remaining_interval = interval.clone();
         let mut preloaded = BTreeMap::new();
         while !remaining_interval.is_empty() {
-            let (documents, cursor) = self
-                .range_no_deps(&btreemap! { 0 => RangeRequest {
+            let [result] = self
+                .range_no_deps(&[&RangeRequest {
                     index_name: tablet_index_name.clone(),
                     printable_index_name: printable_index_name.clone(),
                     interval: remaining_interval,
                     order: Order::Asc,
                     max_size: DEFAULT_PAGE_SIZE,
-                }})
+                }])
                 .await
-                .remove(&0)
-                .context("batch_key missing")??;
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("wrong number of results"))?;
+            let (documents, cursor) = result?;
             (_, remaining_interval) = interval.split(cursor, Order::Asc);
             for (_, document, _) in documents {
                 let document = document.unpack();
@@ -550,7 +553,7 @@ impl TransactionIndex {
             // Add the update to all affected text search indexes.
             for index in self.index_registry.text_indexes_by_table(id.tablet_id) {
                 self.text_index_updates
-                    .entry(index.id)
+                    .entry(index.id())
                     .or_default()
                     .push(DocumentUpdate {
                         id,
@@ -636,6 +639,21 @@ impl TransactionIndex {
     pub fn base_snapshot_mut(&mut self) -> &mut DatabaseIndexSnapshot {
         &mut self.database_index_snapshot
     }
+
+    pub fn clone_for_snapshot_query(&self) -> Self {
+        Self {
+            index_registry: self.index_registry.clone(),
+            index_registry_updated: false,
+            database_index_snapshot: self.database_index_snapshot.clone(),
+            database_index_updates: OrdMap::new(),
+            text_index_snapshot: self.text_index_snapshot.clone(),
+            text_index_updates: OrdMap::new(),
+        }
+    }
+
+    pub fn into_cache(self) -> DatabaseIndexSnapshotCache {
+        self.database_index_snapshot.into_cache()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -657,10 +675,10 @@ impl TransactionIndexMap {
     pub fn range(
         &self,
         interval: &Interval,
-    ) -> impl DoubleEndedIterator<Item = (IndexKeyBytes, Option<ResolvedDocument>)> + '_ {
+    ) -> impl DoubleEndedIterator<Item = (IndexKeyBytes, Option<PackedDocument>)> + use<'_> {
         self.inner
             .range(interval)
-            .map(|(k, v)| (IndexKeyBytes(k.clone()), v.as_ref().map(|v| v.unpack())))
+            .map(|(k, v)| (IndexKeyBytes(k.clone()), v.clone()))
     }
 
     pub fn insert(&mut self, k: IndexKeyBytes, v: Option<&ResolvedDocument>) {
@@ -767,7 +785,7 @@ impl TextIndexManagerSnapshot {
     }
 
     #[fastrace::trace]
-    pub async fn search_with_compiled_query(
+    pub async fn text_search(
         &self,
         index: &Index,
         printable_index_name: &IndexName,
@@ -777,7 +795,7 @@ impl TextIndexManagerSnapshot {
         let text_indexes_snapshot =
             runtime::block_in_place(|| self.snapshot_with_updates(pending_updates))?;
         text_indexes_snapshot
-            .search_with_compiled_query(
+            .text_search(
                 index,
                 printable_index_name,
                 query,
@@ -810,700 +828,17 @@ impl TransactionTextSnapshot for TextIndexManagerSnapshot {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::BTreeMap,
-        str::FromStr,
-        sync::{
-            Arc,
-            OnceLock,
-        },
-    };
+pub struct SearchNotEnabled;
 
-    use common::{
-        bootstrap_model::index::{
-            database_index::IndexedFields,
-            IndexMetadata,
-            TabletIndexMetadata,
-            INDEX_TABLE,
-        },
-        document::{
-            CreationTime,
-            ResolvedDocument,
-        },
-        index::IndexKey,
-        interval::Interval,
-        persistence::{
-            now_ts,
-            ConflictStrategy,
-            DocumentLogEntry,
-            Persistence,
-            RepeatablePersistence,
-        },
-        query::{
-            CursorPosition,
-            Order,
-        },
-        testing::{
-            TestIdGenerator,
-            TestPersistence,
-        },
-        types::{
-            unchecked_repeatable_ts,
-            IndexDescriptor,
-            IndexName,
-            PersistenceVersion,
-            TableName,
-            TabletIndexName,
-            Timestamp,
-            WriteTimestamp,
-        },
-        value::ResolvedDocumentId,
-    };
-    use indexing::{
-        backend_in_memory_indexes::{
-            BackendInMemoryIndexes,
-            DatabaseIndexSnapshot,
-            RangeRequest,
-        },
-        index_registry::IndexRegistry,
-    };
-    use runtime::prod::ProdRuntime;
-    use search::{
-        searcher::InProcessSearcher,
-        TextIndexManager,
-        TextIndexManagerState,
-    };
-    use storage::{
-        LocalDirStorage,
-        Storage,
-    };
-    use value::assert_obj;
-
-    use super::TextIndexManagerSnapshot;
-    use crate::{
-        query::IndexRangeResponse,
-        reads::TransactionReadSet,
-        transaction_index::TransactionIndex,
-        FollowerRetentionManager,
-    };
-
-    fn next_document_id(
-        id_generator: &mut TestIdGenerator,
-        table_name: &str,
-    ) -> anyhow::Result<ResolvedDocumentId> {
-        Ok(id_generator.user_generate(&TableName::from_str(table_name)?))
-    }
-
-    fn gen_index_document(
-        id_generator: &mut TestIdGenerator,
-        metadata: TabletIndexMetadata,
-    ) -> anyhow::Result<ResolvedDocument> {
-        let index_id = id_generator.system_generate(&INDEX_TABLE);
-        ResolvedDocument::new(index_id, CreationTime::ONE, metadata.try_into()?)
-    }
-
-    async fn bootstrap_index(
-        id_generator: &mut TestIdGenerator,
-        mut indexes: Vec<TabletIndexMetadata>,
-        persistence: RepeatablePersistence,
-    ) -> anyhow::Result<(
-        IndexRegistry,
-        BackendInMemoryIndexes,
-        TextIndexManager,
-        BTreeMap<TabletIndexName, ResolvedDocumentId>,
-    )> {
-        let mut index_id_by_name = BTreeMap::new();
-        let mut index_documents = BTreeMap::new();
-
-        let index_table = id_generator.system_table_id(&INDEX_TABLE).tablet_id;
-        // Add the _index.by_id index.
-        indexes.push(IndexMetadata::new_enabled(
-            TabletIndexName::by_id(index_table),
-            IndexedFields::by_id(),
-        ));
-        let ts = Timestamp::MIN;
-        for metadata in indexes {
-            let doc = gen_index_document(id_generator, metadata.clone())?;
-            index_id_by_name.insert(metadata.name.clone(), doc.id());
-            index_documents.insert(doc.id(), (ts, doc));
-        }
-
-        let index_registry = IndexRegistry::bootstrap(
-            id_generator,
-            index_documents.values().map(|(_, d)| d.clone()),
-            PersistenceVersion::default(),
-        )?;
-        let index = BackendInMemoryIndexes::bootstrap(&index_registry, index_documents, ts)?;
-
-        let search =
-            TextIndexManager::new(TextIndexManagerState::Bootstrapping, persistence.version());
-
-        Ok((index_registry, index, search, index_id_by_name))
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_transaction_index_missing_index(rt: ProdRuntime) -> anyhow::Result<()> {
-        let mut id_generator = TestIdGenerator::new();
-
-        let persistence = Arc::new(TestPersistence::new());
-        let retention_manager =
-            Arc::new(FollowerRetentionManager::new(rt.clone(), persistence.clone()).await?);
-
-        // Create a transactions with `by_name` index missing before the transaction
-        // started.
-        let rp = RepeatablePersistence::new(
-            Arc::new(TestPersistence::new()),
-            unchecked_repeatable_ts(Timestamp::must(1000)),
-            retention_manager,
-        );
-        let ps = rp.read_snapshot(unchecked_repeatable_ts(Timestamp::must(1000)))?;
-
-        let table_id = id_generator.user_table_id(&"messages".parse()?).tablet_id;
-        let messages_by_name = TabletIndexName::new(table_id, IndexDescriptor::new("by_name")?)?;
-        let printable_messages_by_name =
-            IndexName::new("messages".parse()?, IndexDescriptor::new("by_name")?)?;
-        let (index_registry, inner, search, _) = bootstrap_index(
-            &mut id_generator,
-            vec![IndexMetadata::new_enabled(
-                TabletIndexName::by_id(table_id),
-                IndexedFields::by_id(),
-            )],
-            rp,
-        )
-        .await?;
-
-        let mut reads = TransactionReadSet::new();
-        let searcher = Arc::new(InProcessSearcher::new(rt.clone()).await?);
-        let search_storage = Arc::new(LocalDirStorage::new(rt)?);
-        let mut index = TransactionIndex::new(
-            index_registry.clone(),
-            DatabaseIndexSnapshot::new(
-                index_registry.clone(),
-                Arc::new(inner),
-                id_generator.clone(),
-                ps,
-            ),
-            Arc::new(TextIndexManagerSnapshot::new(
-                index_registry.clone(),
-                search,
-                searcher.clone(),
-                Arc::new(OnceLock::from(search_storage as Arc<dyn Storage>)),
-            )),
-        );
-
-        // Query the missing index. It should return an error because index is missing.
-        {
-            let result = index
-                .range(
-                    &mut reads,
-                    RangeRequest {
-                        index_name: messages_by_name.clone(),
-                        printable_index_name: printable_messages_by_name.clone(),
-                        interval: Interval::all(),
-                        order: Order::Asc,
-                        max_size: 100,
-                    },
-                )
-                .await;
-            assert!(result.is_err());
-            match result {
-                Ok(_) => panic!("Should have failed!"),
-                Err(ref err) => {
-                    assert!(
-                        format!("{:?}", err).contains("Index messages.by_name not found."),
-                        "Actual: {err:?}"
-                    )
-                },
-            };
-        }
-
-        // Add the index. It should start returning errors since the index was not
-        // backfilled at the snapshot.
-        let by_name_metadata = IndexMetadata::new_backfilling(
-            Timestamp::must(1000),
-            messages_by_name.clone(),
-            vec!["name".parse()?].try_into()?,
-        );
-        let by_name = gen_index_document(&mut id_generator, by_name_metadata)?;
-        index.begin_update(None, Some(by_name))?.apply();
-
-        let result = index
-            .range(
-                &mut reads,
-                RangeRequest {
-                    index_name: messages_by_name,
-                    printable_index_name: printable_messages_by_name,
-                    interval: Interval::all(),
-                    order: Order::Asc,
-                    max_size: 100,
-                },
-            )
-            .await;
-        assert!(result.is_err());
-        match result {
-            Ok(_) => panic!("Should have failed!"),
-            Err(ref err) => {
-                assert!(
-                    format!("{:?}", err)
-                        .contains("Index messages.by_name is currently backfilling"),
-                    "Actual: {err:?}"
-                )
-            },
-        };
-
-        Ok(())
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_transaction_index_missing_table(rt: ProdRuntime) -> anyhow::Result<()> {
-        let mut id_generator = TestIdGenerator::new();
-        let table_id = id_generator.user_table_id(&"messages".parse()?).tablet_id;
-        let by_id = TabletIndexName::by_id(table_id);
-        let printable_by_id = IndexName::by_id("messages".parse()?);
-        let by_name = TabletIndexName::new(table_id, IndexDescriptor::new("by_name")?)?;
-        let printable_by_name =
-            IndexName::new("messages".parse()?, IndexDescriptor::new("by_name")?)?;
-
-        // Create a transactions with table missing before the transaction started.
-        let persistence = Arc::new(TestPersistence::new());
-        let persistence_version = persistence.reader().version();
-        let retention_manager =
-            Arc::new(FollowerRetentionManager::new(rt.clone(), persistence.clone()).await?);
-        let rp = RepeatablePersistence::new(
-            persistence,
-            unchecked_repeatable_ts(Timestamp::must(1000)),
-            retention_manager,
-        );
-        let ps = rp.read_snapshot(unchecked_repeatable_ts(Timestamp::must(1000)))?;
-
-        let (index_registry, inner, search, _) =
-            bootstrap_index(&mut id_generator, vec![], rp).await?;
-
-        let mut reads = TransactionReadSet::new();
-        let searcher = Arc::new(InProcessSearcher::new(rt.clone()).await?);
-        let search_storage = Arc::new(LocalDirStorage::new(rt)?);
-        let mut index = TransactionIndex::new(
-            index_registry.clone(),
-            DatabaseIndexSnapshot::new(
-                index_registry.clone(),
-                Arc::new(inner),
-                id_generator.clone(),
-                ps,
-            ),
-            Arc::new(TextIndexManagerSnapshot::new(
-                index_registry.clone(),
-                search,
-                searcher.clone(),
-                Arc::new(OnceLock::from(search_storage as Arc<dyn Storage>)),
-            )),
-        );
-
-        // Query the missing table using table scan index. It should return no results.
-        let IndexRangeResponse {
-            page: results,
-            cursor,
-        } = index
-            .range(
-                &mut reads,
-                RangeRequest {
-                    index_name: by_id.clone(),
-                    printable_index_name: printable_by_id.clone(),
-                    interval: Interval::all(),
-                    order: Order::Asc,
-                    max_size: 100,
-                },
-            )
-            .await?;
-        assert!(matches!(cursor, CursorPosition::End));
-        assert!(results.is_empty());
-
-        // Query by any other index should return an error.
-        {
-            let result = index
-                .range(
-                    &mut reads,
-                    RangeRequest {
-                        index_name: by_name,
-                        printable_index_name: printable_by_name,
-                        interval: Interval::all(),
-                        order: Order::Asc,
-                        max_size: 100,
-                    },
-                )
-                .await;
-            assert!(result.is_err());
-            match result {
-                Ok(_) => panic!("Should have failed!"),
-                Err(ref err) => {
-                    assert!(format!("{:?}", err).contains("Index messages.by_name not found."),)
-                },
-            };
-        }
-
-        // Add the table scan index. It should still give no results.
-        let metadata = IndexMetadata::new_enabled(by_id.clone(), IndexedFields::by_id());
-        let by_id_index = gen_index_document(&mut id_generator, metadata.clone())?;
-        index.begin_update(None, Some(by_id_index))?.apply();
-
-        let IndexRangeResponse {
-            page: results,
-            cursor,
-        } = index
-            .range(
-                &mut reads,
-                RangeRequest {
-                    index_name: by_id.clone(),
-                    printable_index_name: printable_by_id.clone(),
-                    interval: Interval::all(),
-                    order: Order::Asc,
-                    max_size: 100,
-                },
-            )
-            .await?;
-        assert!(matches!(cursor, CursorPosition::End));
-        assert!(results.is_empty());
-
-        // Add a document and make sure we see it.
-        let doc = ResolvedDocument::new(
-            next_document_id(&mut id_generator, "messages")?,
-            CreationTime::ONE,
-            assert_obj!(
-                "content" => "hello there!",
-            ),
-        )?;
-        index.begin_update(None, Some(doc.clone()))?.apply();
-        let IndexRangeResponse {
-            page: result,
-            cursor,
-        } = index
-            .range(
-                &mut reads,
-                RangeRequest {
-                    index_name: by_id,
-                    printable_index_name: printable_by_id,
-                    interval: Interval::all(),
-                    order: Order::Asc,
-                    max_size: 100,
-                },
-            )
-            .await?;
-        assert_eq!(
-            result,
-            vec![(
-                doc.index_key(&IndexedFields::by_id()[..], persistence_version)
-                    .to_bytes(),
-                doc,
-                WriteTimestamp::Pending
-            )],
-        );
-        assert!(matches!(cursor, CursorPosition::End));
-
-        Ok(())
-    }
-
-    #[convex_macro::prod_rt_test]
-    async fn test_transaction_index_merge(rt: ProdRuntime) -> anyhow::Result<()> {
-        let mut id_generator = TestIdGenerator::new();
-        let by_id_fields = vec![];
-        let by_name_fields = vec!["name".parse()?];
-        let now0 = now_ts(Timestamp::MIN, &rt)?;
-        let ps = Arc::new(TestPersistence::new());
-        let persistence_version = ps.reader().version();
-        let retention_manager =
-            Arc::new(FollowerRetentionManager::new(rt.clone(), ps.clone()).await?);
-        let rp = RepeatablePersistence::new(
-            ps.reader(),
-            unchecked_repeatable_ts(now0),
-            retention_manager.clone(),
-        );
-        let index_table_id = id_generator.system_table_id(&"_index".parse()?).tablet_id;
-        let table: TableName = "users".parse()?;
-        let table_id = id_generator.user_table_id(&table).tablet_id;
-        let by_id = TabletIndexName::by_id(table_id);
-        let printable_by_id = IndexName::by_id(table.clone());
-        let by_name = TabletIndexName::new(table_id, IndexDescriptor::new("by_name")?)?;
-        let printable_by_name = IndexName::new(table.clone(), IndexDescriptor::new("by_name")?)?;
-        let (mut index_registry, mut index, search, index_ids) = bootstrap_index(
-            &mut id_generator,
-            vec![
-                IndexMetadata::new_enabled(by_id.clone(), by_id_fields.clone().try_into()?),
-                IndexMetadata::new_enabled(by_name.clone(), by_name_fields.clone().try_into()?),
-            ],
-            rp,
-        )
-        .await?;
-
-        async fn add(
-            index_registry: &mut IndexRegistry,
-            index: &mut BackendInMemoryIndexes,
-            ps: &TestPersistence,
-            ts: Timestamp,
-            doc: ResolvedDocument,
-        ) -> anyhow::Result<()> {
-            index_registry.update(None, Some(&doc))?;
-            let index_updates = index.update(index_registry, ts, None, Some(doc.clone()));
-            ps.write(
-                vec![
-                    (DocumentLogEntry {
-                        ts,
-                        id: doc.id_with_table_id(),
-                        value: Some(doc.clone()),
-                        prev_ts: None,
-                    }),
-                ],
-                index_updates.into_iter().map(|u| (ts, u)).collect(),
-                ConflictStrategy::Error,
-            )
-            .await?;
-            Ok(())
-        }
-
-        // Add "Alice", "Bob" and "Zack"
-        let alice = ResolvedDocument::new(
-            next_document_id(&mut id_generator, "users")?,
-            CreationTime::ONE,
-            assert_obj!(
-                "name" => "alice",
-            ),
-        )?;
-        let now1 = now0.succ()?;
-        add(&mut index_registry, &mut index, &ps, now1, alice.clone()).await?;
-        let bob = ResolvedDocument::new(
-            next_document_id(&mut id_generator, "users")?,
-            CreationTime::ONE,
-            assert_obj!(
-                "name" => "bob",
-            ),
-        )?;
-        let now2 = now1.succ()?;
-        add(&mut index_registry, &mut index, &ps, now2, bob.clone()).await?;
-        let zack = ResolvedDocument::new(
-            next_document_id(&mut id_generator, "users")?,
-            CreationTime::ONE,
-            assert_obj!(
-                "name" => "zack",
-            ),
-        )?;
-        let now3 = now2.succ()?;
-        add(&mut index_registry, &mut index, &ps, now3, zack.clone()).await?;
-
-        let by_id_index = *(index_ids.get(&by_id).unwrap());
-        id_generator.write_tables(ps.clone()).await?;
-
-        let now4 = now3.succ()?;
-        // Start a transaction, add "David" and delete "Bob"
-        let ps = RepeatablePersistence::new(ps, unchecked_repeatable_ts(now4), retention_manager)
-            .read_snapshot(unchecked_repeatable_ts(now4))?;
-
-        let mut reads = TransactionReadSet::new();
-        let searcher = Arc::new(InProcessSearcher::new(rt.clone()).await?);
-        let search_storage = Arc::new(LocalDirStorage::new(rt.clone())?);
-        let mut index = TransactionIndex::new(
-            index_registry.clone(),
-            DatabaseIndexSnapshot::new(
-                index_registry.clone(),
-                Arc::new(index),
-                id_generator.clone(),
-                ps,
-            ),
-            Arc::new(TextIndexManagerSnapshot::new(
-                index_registry.clone(),
-                search,
-                searcher.clone(),
-                Arc::new(OnceLock::from(search_storage as Arc<dyn Storage>)),
-            )),
-        );
-        let david = ResolvedDocument::new(
-            next_document_id(&mut id_generator, "users")?,
-            CreationTime::ONE,
-            assert_obj!("name" => "david"),
-        )?;
-        index.begin_update(None, Some(david.clone()))?.apply();
-        index.begin_update(Some(bob), None)?.apply();
-
-        // Query by id
-        let IndexRangeResponse {
-            page: results,
-            cursor,
-        } = index
-            .range(
-                &mut reads,
-                RangeRequest {
-                    index_name: by_id.clone(),
-                    printable_index_name: printable_by_id,
-                    interval: Interval::all(),
-                    order: Order::Asc,
-                    max_size: 100,
-                },
-            )
-            .await?;
-        assert!(matches!(cursor, CursorPosition::End));
-        assert_eq!(
-            results,
-            vec![
-                (
-                    alice
-                        .index_key(&by_id_fields[..], persistence_version)
-                        .to_bytes(),
-                    alice.clone(),
-                    WriteTimestamp::Committed(now1)
-                ),
-                (
-                    zack.index_key(&by_id_fields[..], persistence_version)
-                        .to_bytes(),
-                    zack.clone(),
-                    WriteTimestamp::Committed(now3)
-                ),
-                (
-                    david
-                        .index_key(&by_id_fields[..], persistence_version)
-                        .to_bytes(),
-                    david.clone(),
-                    WriteTimestamp::Pending
-                ),
-            ]
-        );
-        let mut expected_reads = TransactionReadSet::new();
-        expected_reads.record_indexed_derived(
-            TabletIndexName::by_id(index_table_id),
-            IndexedFields::by_id(),
-            Interval::prefix(IndexKey::new(vec![], by_id_index.into()).to_bytes().into()),
-        );
-        // Note: We do not expect the reads to include the range from this query, since
-        // that will be tracked later when the query results are consumed
-        assert_eq!(reads, expected_reads);
-        // Query by name in ascending order
-        let IndexRangeResponse {
-            page: results,
-            cursor,
-        } = index
-            .range(
-                &mut reads,
-                RangeRequest {
-                    index_name: by_name.clone(),
-                    printable_index_name: printable_by_name.clone(),
-                    interval: Interval::all(),
-                    order: Order::Asc,
-                    max_size: 100,
-                },
-            )
-            .await?;
-        assert!(matches!(cursor, CursorPosition::End));
-        assert_eq!(
-            results,
-            vec![
-                (
-                    alice
-                        .index_key(&by_name_fields[..], persistence_version)
-                        .to_bytes(),
-                    alice.clone(),
-                    WriteTimestamp::Committed(now1)
-                ),
-                (
-                    david
-                        .index_key(&by_name_fields[..], persistence_version)
-                        .to_bytes(),
-                    david.clone(),
-                    WriteTimestamp::Pending
-                ),
-                (
-                    zack.index_key(&by_name_fields[..], persistence_version)
-                        .to_bytes(),
-                    zack.clone(),
-                    WriteTimestamp::Committed(now3)
-                ),
-            ]
-        );
-        // Query by name in ascending order with limit=2.
-        // Returned cursor should be After("david").
-        let IndexRangeResponse {
-            page: results,
-            cursor,
-        } = index
-            .range(
-                &mut reads,
-                RangeRequest {
-                    index_name: by_name.clone(),
-                    printable_index_name: printable_by_name.clone(),
-                    interval: Interval::all(),
-                    order: Order::Asc,
-                    max_size: 2,
-                },
-            )
-            .await?;
-        assert_eq!(
-            cursor,
-            CursorPosition::After(
-                david
-                    .index_key(&by_name_fields[..], persistence_version)
-                    .to_bytes()
-            )
-        );
-        assert_eq!(
-            results,
-            vec![
-                (
-                    alice
-                        .index_key(&by_name_fields[..], persistence_version)
-                        .to_bytes(),
-                    alice.clone(),
-                    WriteTimestamp::Committed(now1)
-                ),
-                (
-                    david
-                        .index_key(&by_name_fields[..], persistence_version)
-                        .to_bytes(),
-                    david.clone(),
-                    WriteTimestamp::Pending
-                ),
-            ]
-        );
-
-        // Query by name in descending order
-        let IndexRangeResponse {
-            page: result,
-            cursor,
-        } = index
-            .range(
-                &mut reads,
-                RangeRequest {
-                    index_name: by_name,
-                    printable_index_name: printable_by_name,
-                    interval: Interval::all(),
-                    order: Order::Desc,
-                    max_size: 100,
-                },
-            )
-            .await?;
-        assert!(matches!(cursor, CursorPosition::End));
-        assert_eq!(
-            result,
-            vec![
-                (
-                    zack.index_key(&by_name_fields[..], persistence_version)
-                        .to_bytes(),
-                    zack,
-                    WriteTimestamp::Committed(now3)
-                ),
-                (
-                    david
-                        .index_key(&by_name_fields[..], persistence_version)
-                        .to_bytes(),
-                    david,
-                    WriteTimestamp::Pending
-                ),
-                (
-                    alice
-                        .index_key(&by_name_fields[..], persistence_version)
-                        .to_bytes(),
-                    alice,
-                    WriteTimestamp::Committed(now1)
-                ),
-            ]
-        );
-
-        Ok(())
+#[async_trait]
+impl TransactionTextSnapshot for SearchNotEnabled {
+    async fn search(
+        &self,
+        _index: &Index,
+        _search: &InternalSearch,
+        _version: SearchVersion,
+        _pending_updates: &Vec<DocumentUpdate>,
+    ) -> anyhow::Result<QueryResults> {
+        anyhow::bail!("search not implemented in db-info")
     }
 }

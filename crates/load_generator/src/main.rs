@@ -1,5 +1,4 @@
 #![feature(exit_status_error)]
-#![feature(let_chains)]
 #![feature(try_blocks)]
 #![feature(error_iter)]
 use std::{
@@ -22,14 +21,7 @@ use ::metrics::{
 };
 use anyhow::Context;
 use axum::{
-    extract::{
-        ws::{
-            Message,
-            WebSocket,
-        },
-        State,
-        WebSocketUpgrade,
-    },
+    extract::State,
     response::IntoResponse,
     routing::get,
     Router,
@@ -48,10 +40,16 @@ use common::{
         MainError,
     },
     http::{
+        websocket::{
+            Message,
+            WebSocket,
+            WebSocketUpgrade,
+        },
         ConvexHttpService,
         HttpResponseError,
         NoopRouteMapper,
     },
+    sentry::set_sentry_tags,
 };
 use event_receiver::Event;
 use futures::{
@@ -81,9 +79,6 @@ mod event_receiver;
 mod metrics;
 mod setup;
 mod stats;
-#[cfg(test)]
-mod tests;
-
 use crate::{
     event_receiver::EventProcessor,
     stats::Stats,
@@ -128,13 +123,32 @@ enum FunctionType {
 #[derive(Deserialize, Serialize, Debug, Clone, Display)]
 #[serde(tag = "name")]
 enum Scenario {
-    RunFunction { path: String, fn_type: FunctionType },
-    ObserveInsert { search_indexes: bool },
+    RunFunction {
+        path: String,
+        fn_type: FunctionType,
+    },
+    ObserveInsert {
+        search_indexes: bool,
+    },
     Search,
     VectorSearch,
     SnapshotExport,
+    ManyIntersections {
+        num_subscriptions: i32,
+    },
+    HoldSubscriptions {
+        num_subscriptions: i32,
+        hold_duration_secs: f64,
+        #[serde(default)]
+        invalidation_interval_secs: Option<f64>,
+        #[serde(default)]
+        num_invalidations: Option<i32>,
+    },
     CloudBackup,
-    RunHttpAction { path: String, method: String },
+    RunHttpAction {
+        path: String,
+        method: String,
+    },
 }
 
 impl Scenario {
@@ -151,6 +165,8 @@ impl Scenario {
             | Scenario::SnapshotExport
             | Scenario::CloudBackup
             | Scenario::RunHttpAction { .. } => false,
+            Scenario::ManyIntersections { .. } => false,
+            Scenario::HoldSubscriptions { .. } => false,
         }
     }
 
@@ -175,7 +191,7 @@ enum Mode {
 
 fn parse_workload_config(path: &str) -> anyhow::Result<Workload> {
     let s = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read workload config file at {}", path))?;
+        .with_context(|| format!("Failed to read workload config file at {path}"))?;
     let workload = serde_json::from_str(&s)?;
     Ok(workload)
 }
@@ -289,10 +305,9 @@ async fn run(config: &Config) -> anyhow::Result<()> {
         );
         tracing::info!("Deleting the convex/actions folder");
         if let Err(e) = tokio::fs::remove_dir_all(SCENARIO_RUNNER_PATH.join("convex/actions")).await
+            && e.kind() != ErrorKind::NotFound
         {
-            if e.kind() != ErrorKind::NotFound {
-                return Err(e.into());
-            }
+            return Err(e.into());
         };
     };
     loop {
@@ -432,7 +447,7 @@ async fn run_preview_deployment_workload(
 }
 
 fn main() -> Result<(), MainError> {
-    config_service();
+    let _guard = config_service();
     tracing::info!("starting up");
     let sentry = sentry::init(sentry::ClientOptions {
         release: Some(format!("load-generator@{}", *SERVER_VERSION_STR).into()),
@@ -440,6 +455,9 @@ fn main() -> Result<(), MainError> {
     });
     if sentry.is_enabled() {
         tracing::info!("Sentry is enabled! Check the load-generator project for errors: https://sentry.io/organizations/convex-dev/projects/load-generator/?project=6505624");
+        sentry::configure_scope(|scope| {
+            set_sentry_tags(scope);
+        });
     } else {
         tracing::info!("Sentry is not enabled.")
     }
@@ -703,7 +721,7 @@ impl From<ScenarioConfig> for ScenarioMessage {
         };
 
         Self {
-            scenario: scenario.clone(),
+            scenario,
             rate,
             threads,
         }

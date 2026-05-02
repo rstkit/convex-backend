@@ -6,28 +6,28 @@ use application::function_log::{
     FunctionExecutionPart,
     UdfParams,
 };
-use axum::{
-    extract::State,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     http::{
         extract::{
             Json,
+            MtState,
             Query,
         },
         ExtractClientVersion,
         HttpResponseError,
+    },
+    log_streaming::{
+        FunctionExecutionJson,
+        StreamFunctionLogs,
+        StreamUdfExecutionQueryArgs,
+        StreamUdfExecutionResponse,
     },
     version::ClientType,
     RequestId,
 };
 use errors::ErrorMetadata;
 use futures::FutureExt;
-use serde::{
-    Deserialize,
-    Serialize,
-};
 use serde_json::Value as JsonValue;
 
 use crate::{
@@ -35,59 +35,17 @@ use crate::{
     LocalAppState,
 };
 
-#[derive(Deserialize)]
-pub struct StreamUdfExecutionQueryArgs {
-    cursor: f64,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "kind")]
-pub enum FunctionExecutionJson {
-    #[serde(rename_all = "camelCase")]
-    Completion {
-        udf_type: String,
-        component_path: Option<String>,
-        identifier: String,
-        log_lines: Vec<JsonValue>,
-        timestamp: f64,
-        cached_result: bool,
-        execution_time: f64,
-        success: Option<JsonValue>,
-        error: Option<String>,
-        request_id: String,
-        execution_id: String,
-    },
-    #[serde(rename_all = "camelCase")]
-    Progress {
-        udf_type: String,
-        component_path: Option<String>,
-        identifier: String,
-        timestamp: f64,
-        log_lines: Vec<JsonValue>,
-        request_id: String,
-        execution_id: String,
-    },
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StreamUdfExecutionResponse {
-    entries: Vec<FunctionExecutionJson>,
-    new_cursor: f64,
-}
-
 pub async fn stream_udf_execution(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Query(query_args): Query<StreamUdfExecutionQueryArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    let entries_future = st
-        .application
-        .stream_udf_execution(identity, query_args.cursor);
+    let function_log = st.application.function_log(&identity)?;
+    let entries_future = function_log.stream(query_args.cursor);
     let mut zombify_rx = st.zombify_rx.clone();
     futures::select_biased! {
-        entries_future_r = entries_future.fuse() => {
-            let (log_entries, new_cursor) = entries_future_r?;
+        entries_result = entries_future.fuse() => {
+            let (log_entries, new_cursor) = entries_result;
             let entries = log_entries
                 .into_iter()
                 .map(|e| execution_to_json(e, false))
@@ -112,20 +70,6 @@ pub async fn stream_udf_execution(
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StreamFunctionLogsResponse {
-    entries: Vec<FunctionExecutionJson>,
-    new_cursor: f64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StreamFunctionLogs {
-    cursor: f64,
-    session_id: Option<String>,
-    client_request_counter: Option<u32>,
-}
 // Streams log lines + function completion events.
 // Log lines can either appear in the completion (mutations, queries) or as
 // separate messages (actions, HTTP actions), but will only appear once.
@@ -133,14 +77,13 @@ pub struct StreamFunctionLogs {
 // If (session_id, client_request_counter) is provided, the results will be
 // filtered to events from the root execution of the corresponding request.
 pub async fn stream_function_logs(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     ExtractClientVersion(client_version): ExtractClientVersion,
     Query(query_args): Query<StreamFunctionLogs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    let entries_future = st
-        .application
-        .stream_function_logs(identity, query_args.cursor);
+    let function_log = st.application.function_log(&identity)?;
+    let entries_future = function_log.stream_parts(query_args.cursor);
     let mut zombify_rx = st.zombify_rx.clone();
     let request_id = match (query_args.session_id, query_args.client_request_counter) {
         (Some(session_id), Some(client_request_counter)) => Some(RequestId::new_for_ws_session(
@@ -159,6 +102,7 @@ pub async fn stream_function_logs(
         | ClientType::Actions
         | ClientType::Python
         | ClientType::Rust
+        | ClientType::CreateConvex
         | ClientType::StreamingImport
         | ClientType::AirbyteExport
         | ClientType::FivetranImport
@@ -168,8 +112,8 @@ pub async fn stream_function_logs(
         | ClientType::Unrecognized(_) => false,
     };
     futures::select_biased! {
-        entries_future_r = entries_future.fuse() => {
-            let (log_entries, new_cursor) = entries_future_r?;
+        entries_result = entries_future.fuse() => {
+            let (log_entries, new_cursor) = entries_result;
             let entries = log_entries
                 .into_iter()
                 .filter(|e| {
@@ -193,7 +137,7 @@ pub async fn stream_function_logs(
                         },
                         FunctionExecutionPart::Progress(c) => {
                             FunctionExecutionJson::Progress {
-                                udf_type: c.event_source.udf_type.to_string(),
+                                udf_type: c.event_source.udf_type.into(),
                                 component_path: c.event_source.component_path.serialize(),
                                 identifier: c.event_source.udf_path,
                                 timestamp: c.function_start_timestamp.as_secs_f64(),
@@ -230,16 +174,48 @@ pub async fn stream_function_logs(
     }
 }
 
+fn usage_stats_to_json(
+    stats: &usage_tracking::AggregatedFunctionUsageStats,
+    memory_used_mb: u64,
+) -> common::log_streaming::UsageStatsJson {
+    common::log_streaming::UsageStatsJson {
+        database_read_bytes: stats.database_read_bytes,
+        database_write_bytes: stats.database_write_bytes,
+        database_io_read_bytes: stats.database_io_read_bytes,
+        database_io_write_bytes: stats.database_io_write_bytes,
+        database_read_documents: stats.database_read_documents,
+        storage_read_bytes: stats.storage_read_bytes,
+        storage_write_bytes: stats.storage_write_bytes,
+        vector_index_read_bytes: stats.vector_index_read_bytes,
+        vector_index_write_bytes: stats.vector_index_write_bytes,
+        text_index_query_bytes: stats.text_index_query_bytes,
+        text_index_write_query_bytes: stats.text_index_write_query_bytes,
+        vector_index_read_query_bytes: stats.vector_index_read_query_bytes,
+        vector_index_write_query_bytes: stats.vector_index_write_query_bytes,
+        network_egress_bytes: stats.network_egress_bytes,
+        memory_used_mb,
+    }
+}
+
 fn execution_to_json(
     execution: FunctionExecution,
     supports_structured_log_lines: bool,
 ) -> anyhow::Result<FunctionExecutionJson> {
+    let usage_stats_json = usage_stats_to_json(&execution.usage_stats, execution.memory_used_mb);
+    let occ_info_json = execution
+        .occ_info
+        .map(common::log_streaming::OccInfoJson::from);
+    let will_retry = execution.will_retry;
+    let identity_type = execution.identity.tag().value.to_string();
+    let environment = execution.environment.to_string();
+    let execution_timestamp = execution.execution_timestamp.as_secs_f64();
+    let user_execution_time = execution.user_execution_time.map(|d| d.as_secs_f64());
     let json = match execution.params {
         UdfParams::Function { error, identifier } => {
             let component_path = identifier.component.serialize();
             let identifier: String = identifier.udf_path.strip().into();
             FunctionExecutionJson::Completion {
-                udf_type: execution.udf_type.to_string(),
+                udf_type: execution.udf_type.into(),
                 component_path,
                 identifier,
                 log_lines: execution
@@ -248,10 +224,23 @@ fn execution_to_json(
                 timestamp: execution.unix_timestamp.as_secs_f64(),
                 cached_result: execution.cached_result,
                 execution_time: execution.execution_time,
+                user_execution_time,
                 success: None,
                 error: error.map(|e| e.to_string()),
                 request_id: execution.context.request_id.to_string(),
+                caller: execution.caller.to_string(),
+                parent_execution_id: execution
+                    .caller
+                    .parent_execution_id()
+                    .map(|id| id.to_string()),
                 execution_id: execution.context.execution_id.to_string(),
+                usage_stats: usage_stats_json,
+                return_bytes: execution.return_bytes.map(|bytes| bytes as f64),
+                occ_info: occ_info_json,
+                will_retry,
+                execution_timestamp,
+                identity_type,
+                environment,
             }
         },
         UdfParams::Http { result, identifier } => {
@@ -261,7 +250,7 @@ fn execution_to_json(
                 Err(e) => (None, Some(e)),
             };
             FunctionExecutionJson::Completion {
-                udf_type: execution.udf_type.to_string(),
+                udf_type: execution.udf_type.into(),
                 component_path: None,
                 identifier,
                 log_lines: execution
@@ -270,10 +259,23 @@ fn execution_to_json(
                 timestamp: execution.unix_timestamp.as_secs_f64(),
                 cached_result: execution.cached_result,
                 execution_time: execution.execution_time,
+                user_execution_time,
+                caller: execution.caller.to_string(),
+                parent_execution_id: execution
+                    .caller
+                    .parent_execution_id()
+                    .map(|id| id.to_string()),
                 success,
                 error: error.map(|e| e.to_string()),
                 request_id: execution.context.request_id.to_string(),
                 execution_id: execution.context.execution_id.to_string(),
+                usage_stats: usage_stats_json,
+                return_bytes: None, // Not supported in HTTP actions
+                occ_info: occ_info_json,
+                will_retry,
+                execution_timestamp,
+                identity_type,
+                environment,
             }
         },
     };

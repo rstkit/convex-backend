@@ -16,16 +16,13 @@
 //! allow. Linux's `procfs` is an inspiration here, where it's useful to present
 //! system data as regular files, but most mutations don't make much sense.
 
-#![feature(assert_matches)]
 #![feature(coroutines)]
-#![feature(result_flattening)]
 #![feature(iter_advance_by)]
 #![feature(type_alias_impl_trait)]
-#![feature(let_chains)]
 #![feature(iterator_try_collect)]
 #![feature(never_type)]
 #![feature(try_blocks)]
-#![feature(trait_upcasting)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(iter_from_coroutine)]
 #![feature(duration_constructors)]
@@ -38,6 +35,10 @@ use std::{
     sync::LazyLock,
 };
 
+use audit_log_config::{
+    AuditLogConfigTable,
+    AUDIT_LOG_CONFIG_TABLE,
+};
 use auth::AUTH_TABLE;
 use aws_lambda_versions::{
     AwsLambdaVersionsTable,
@@ -67,7 +68,10 @@ use common::{
         IndexName,
         TabletIndexName,
     },
-    virtual_system_mapping::VirtualSystemMapping,
+    virtual_system_mapping::{
+        AssociatedVirtualTable,
+        VirtualSystemMapping,
+    },
 };
 use components::handles::{
     FunctionHandlesTable,
@@ -95,20 +99,26 @@ use database::{
     ComponentDefinitionsTable,
     ComponentsTable,
     Database,
+    IndexBackfillTable,
     IndexModel,
     IndexTable,
     IndexWorkerMetadataTable,
+    SchemaValidationProgressTable,
     SchemasTable,
     TablesTable,
     Transaction,
     COMPONENTS_BY_PARENT_INDEX,
     COMPONENTS_TABLE,
     COMPONENT_DEFINITIONS_TABLE,
+    INDEX_BACKFILLS_BY_INDEX_ID,
+    INDEX_BACKFILLS_TABLE,
     INDEX_DOC_ID_INDEX,
     INDEX_WORKER_METADATA_TABLE,
     NUM_RESERVED_LEGACY_TABLE_NUMBERS,
     SCHEMAS_STATE_INDEX,
     SCHEMAS_TABLE,
+    SCHEMA_VALIDATION_PROGRESS_BY_SCHEMA_ID,
+    SCHEMA_VALIDATION_PROGRESS_TABLE,
     TABLES_BY_NAME_INDEX,
 };
 use database_globals::{
@@ -196,9 +206,14 @@ use crate::{
     exports::ExportsTable,
     external_packages::EXTERNAL_PACKAGES_TABLE,
     log_sinks::LOG_SINKS_TABLE,
+    scheduled_jobs::args::{
+        ScheduledJobArgsTable,
+        SCHEDULED_JOBS_ARGS_TABLE,
+    },
 };
 
 pub mod airbyte_import;
+pub mod audit_log_config;
 pub mod auth;
 pub mod aws_lambda_versions;
 pub mod backend_info;
@@ -223,9 +238,6 @@ pub mod session_requests;
 pub mod snapshot_imports;
 pub mod source_packages;
 pub mod udf_config;
-
-#[cfg(any(test, feature = "testing"))]
-pub mod test_helpers;
 
 /// Default best effort table number when creating the table. If it is taken
 /// already, another number is selected. Legacy deployments don't
@@ -261,9 +273,13 @@ enum DefaultTableNumber {
     FunctionHandlesTable = 33,
     CanonicalUrls = 34,
     CronNextRun = 35,
+    IndexBackfills = 36,
+    SchemaValidationProgress = 37,
+    ScheduledJobArgs = 38,
+    AuditLogConfig = 39,
     // Keep this number and your user name up to date. The number makes it easy to know
     // what to use next. The username on the same line detects merge conflicts
-    // Next Number - 36 - nipunn
+    // Next Number - 40 - reece
 }
 
 impl From<DefaultTableNumber> for TableNumber {
@@ -305,6 +321,10 @@ impl From<DefaultTableNumber> for &'static dyn ErasedSystemTable {
             DefaultTableNumber::FunctionHandlesTable => &FunctionHandlesTable,
             DefaultTableNumber::CanonicalUrls => &CanonicalUrlsTable,
             DefaultTableNumber::CronNextRun => &CronNextRunTable,
+            DefaultTableNumber::IndexBackfills => &IndexBackfillTable,
+            DefaultTableNumber::SchemaValidationProgress => &SchemaValidationProgressTable,
+            DefaultTableNumber::ScheduledJobArgs => &ScheduledJobArgsTable,
+            DefaultTableNumber::AuditLogConfig => &AuditLogConfigTable,
         }
     }
 }
@@ -318,9 +338,17 @@ pub static DEFAULT_TABLE_NUMBERS: LazyLock<BTreeMap<TableName, TableNumber>> =
                 system_table.table_name().clone(),
                 default_table_number.into(),
             );
-            if let Some((virtual_table_name, ..)) = system_table.virtual_table() {
-                default_table_numbers
-                    .insert(virtual_table_name.clone(), default_table_number.into());
+            if let Some(associated_virtual_table) = system_table.virtual_table() {
+                match associated_virtual_table {
+                    AssociatedVirtualTable::Primary {
+                        virtual_table_name, ..
+                    } => {
+                        default_table_numbers
+                            .insert(virtual_table_name, default_table_number.into());
+                    },
+                    // Secondary system tables don't share table numbers with virtual tables.
+                    AssociatedVirtualTable::Secondary(_) => {},
+                }
             }
         }
         default_table_numbers
@@ -450,14 +478,14 @@ pub async fn initialize_application_system_table<RT: Runtime>(
             .filter(|index| !index.name.is_by_id_or_creation_time())
             .map(|index| {
                 let IndexConfig::Database {
-                    developer_config,
+                    spec,
                     on_disk_state: _,
                 } = &index.config
                 else {
                     // This isn't a strict requirement; it's just not implemented or needed.
                     anyhow::bail!("system tables indexes must be Database");
                 };
-                anyhow::Ok((index.name.clone(), developer_config.fields.clone()))
+                anyhow::Ok((index.name.clone(), spec.fields.clone()))
             })
             .try_collect()?;
 
@@ -532,6 +560,7 @@ pub fn app_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
         &FunctionHandlesTable,
         &CanonicalUrlsTable,
         &LogSinksTable,
+        &AuditLogConfigTable,
         &AwsLambdaVersionsTable,
         &BackendInfoTable,
     ];
@@ -540,12 +569,13 @@ pub fn app_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
     system_tables
 }
 
-/// NOTE: Does not include _schemas because that's not an app system table,
-/// but it is created for each component.
+/// NOTE: Does not include _schemas or _schema_validation_progress because they
+/// are in bootstrapped system tables, but they are created for each component.
 pub fn component_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
     vec![
         &FileStorageTable,
         &ScheduledJobsTable,
+        &ScheduledJobArgsTable,
         &CronJobsTable,
         &CronJobLogsTable,
         &CronNextRunTable,
@@ -576,13 +606,8 @@ pub fn virtual_system_mapping() -> &'static VirtualSystemMapping {
     static MAPPING: LazyLock<VirtualSystemMapping> = LazyLock::new(|| {
         let mut mapping = VirtualSystemMapping::default();
         for table in app_system_tables() {
-            if let Some((virtual_table_name, virtual_indexes, mapper)) = table.virtual_table() {
-                mapping.add_table(
-                    virtual_table_name,
-                    table.table_name(),
-                    virtual_indexes,
-                    mapper,
-                )
+            if let Some(associated_virtual_table) = table.virtual_table() {
+                mapping.add_table(table.table_name().clone(), associated_virtual_table)
             }
         }
         mapping
@@ -620,6 +645,10 @@ pub static FIRST_SEEN_TABLE: LazyLock<BTreeMap<TableName, DatabaseVersion>> = La
         COMPONENT_DEFINITIONS_TABLE.clone() => 100,
         FUNCTION_HANDLES_TABLE.clone() => 102,
         CANONICAL_URLS_TABLE.clone() => 116,
+        INDEX_BACKFILLS_TABLE.clone() => 120,
+        SCHEMA_VALIDATION_PROGRESS_TABLE.clone() => 122,
+        SCHEDULED_JOBS_ARGS_TABLE.clone() => 123,
+        AUDIT_LOG_CONFIG_TABLE.clone() => 124,
     }
 });
 
@@ -645,102 +674,7 @@ pub static FIRST_SEEN_INDEX: LazyLock<BTreeMap<IndexName, DatabaseVersion>> = La
         COMPONENTS_BY_PARENT_INDEX.name() => 100,
         BY_COMPONENT_PATH_INDEX.name() => 102,
         EXPORTS_BY_REQUESTOR.name() => 110,
+        INDEX_BACKFILLS_BY_INDEX_ID.name() => 120,
+        SCHEMA_VALIDATION_PROGRESS_BY_SCHEMA_ID.name() => 122,
     }
 });
-
-#[cfg(test)]
-mod test_default_table_numbers {
-    use std::{
-        collections::BTreeSet,
-        sync::Arc,
-    };
-
-    use common::testing::TestPersistence;
-    use database::{
-        defaults::DEFAULT_BOOTSTRAP_TABLE_NUMBERS,
-        test_helpers::{
-            DbFixtures,
-            DbFixturesArgs,
-        },
-    };
-    use migrations_model::DATABASE_VERSION;
-    use runtime::testing::TestRuntime;
-
-    use crate::{
-        app_system_tables,
-        test_helpers::DbFixturesWithModel,
-        virtual_system_mapping,
-        DEFAULT_TABLE_NUMBERS,
-        FIRST_SEEN_INDEX,
-        FIRST_SEEN_TABLE,
-    };
-
-    #[test]
-    fn test_ensure_consistent() {
-        // Ensure consistent with the bootstrap model defaults
-        for (bootstrap_table_name, bootstrap_table_number) in DEFAULT_BOOTSTRAP_TABLE_NUMBERS.iter()
-        {
-            assert!(
-                DEFAULT_TABLE_NUMBERS.contains_key(bootstrap_table_name),
-                "{bootstrap_table_name} missing from DEFAULT_TABLE_NUMBERS"
-            );
-            assert_eq!(
-                DEFAULT_TABLE_NUMBERS[bootstrap_table_name],
-                *bootstrap_table_number
-            );
-        }
-    }
-
-    #[test]
-    fn test_ensure_defaults() {
-        for table in app_system_tables() {
-            let table_name = table.table_name();
-            assert!(
-                DEFAULT_TABLE_NUMBERS.contains_key(table_name),
-                "{table_name} missing from DEFAULT_TABLE_NUMBERS"
-            );
-        }
-    }
-
-    #[convex_macro::test_runtime]
-    async fn test_initialize_model(rt: TestRuntime) -> anyhow::Result<()> {
-        let args = DbFixturesArgs {
-            tp: Some(Arc::new(TestPersistence::new())),
-            virtual_system_mapping: virtual_system_mapping().clone(),
-            ..Default::default()
-        };
-        // Initialize
-        DbFixtures::new_with_model_and_args(&rt, args.clone()).await?;
-        // Reinitialize (should work a second time - simulating a restart)
-        DbFixtures::new_with_model_and_args(&rt, args).await?;
-        Ok(())
-    }
-
-    #[test]
-    fn test_first_seen() -> anyhow::Result<()> {
-        let tables: BTreeSet<_> = app_system_tables()
-            .into_iter()
-            .map(|table| table.table_name())
-            .collect();
-        let first_seen: BTreeSet<_> = FIRST_SEEN_TABLE.keys().collect();
-        assert_eq!(tables, first_seen);
-        let max_first_seen = *FIRST_SEEN_TABLE.values().max().unwrap();
-        println!("max_first_seen: {}", max_first_seen);
-        assert!(max_first_seen <= DATABASE_VERSION);
-        Ok(())
-    }
-
-    #[test]
-    fn test_first_seen_indexes() -> anyhow::Result<()> {
-        let tables: BTreeSet<_> = app_system_tables()
-            .into_iter()
-            .flat_map(|table| table.indexes())
-            .map(|index| index.name)
-            .collect();
-        let first_seen: BTreeSet<_> = FIRST_SEEN_INDEX.keys().cloned().collect();
-        assert_eq!(tables, first_seen);
-        let max_first_seen = *FIRST_SEEN_INDEX.values().max().unwrap();
-        assert!(max_first_seen <= DATABASE_VERSION);
-        Ok(())
-    }
-}

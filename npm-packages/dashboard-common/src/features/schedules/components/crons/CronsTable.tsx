@@ -1,9 +1,8 @@
 import { jsonToConvex, JSONValue } from "convex/values";
-import Link from "next/link";
 import { useRouter } from "next/router";
 import { useMemo, useState } from "react";
 import { CellProps, useTable } from "react-table";
-import formatDuration from "date-fns/formatDuration";
+import { formatDuration } from "date-fns/formatDuration";
 import { ChevronRightIcon, ExternalLinkIcon } from "@radix-ui/react-icons";
 import {
   CronSchedule,
@@ -21,6 +20,7 @@ import { prettier } from "@common/lib/format";
 import { Tooltip } from "@ui/Tooltip";
 import { useFunctionUrl } from "@common/lib/deploymentApi";
 import { displayName } from "@common/lib/functions/generateFileTree";
+import { Link } from "@ui/Link";
 import { LiveTimestampDistance } from "@common/elements/TimestampDistance";
 import { Button } from "@ui/Button";
 import { DetailPanel } from "@common/elements/DetailPanel";
@@ -82,11 +82,9 @@ function Function({ value }: CellProps<CronDatum, string>) {
   const url = useFunctionUrl(value);
   const name = displayName(value);
   return (
-    <div className="truncate text-content-link hover:underline">
-      <Link href={url} legacyBehavior>
-        {name}
-      </Link>
-    </div>
+    <Link href={url} className="truncate">
+      {name}
+    </Link>
   );
 }
 
@@ -189,13 +187,13 @@ function Args({ value }: CellProps<CronDatum, JSONValue[]>) {
           onClose={() => setShowArgs(false)}
           header="Cron job arguments"
           content={
-            <div className="h-full rounded p-4">
+            <div className="h-full rounded-sm p-4">
               <ReadonlyCode
                 path="scheduling"
                 code={`${prettier(`
                 [${value
                   .map((arg) => stringifyValue(jsonToConvex(arg)))
-                  .join(",")}]`).slice(0, -1)} 
+                  .join(",")}]`).slice(0, -1)}
                 `}
               />
             </div>
@@ -251,17 +249,19 @@ export function CronsTable({ cronJobs }: { cronJobs: CronJobWithRuns[] }) {
   });
 
   return (
-    <Sheet padding={false} className="overflow-x-auto scrollbar">
+    <Sheet padding={false} className="scrollbar overflow-x-auto">
       <div {...getTableProps()} className="mx-4 block min-w-[42rem]">
         <div {...getTableBodyProps()} className="divide-y">
           {rows.map((row) => {
             prepareRow(row);
             return (
+              // eslint-disable-next-line react/jsx-key -- `key` from `row.getRowProps()`
               <div
                 {...row.getRowProps()}
                 className="flex items-stretch justify-start gap-2 py-3 text-xs text-content-primary"
               >
                 {row.cells.map((cell, i) => (
+                  // eslint-disable-next-line react/jsx-key -- `key` from `cell.getCellProps()`
                   <div
                     {...cell.getCellProps()}
                     style={COLUMN_STYLES[i]}

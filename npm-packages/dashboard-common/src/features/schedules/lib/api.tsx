@@ -1,5 +1,5 @@
 import { useContext } from "react";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { useAdminKey, useDeploymentUrl } from "@common/lib/deploymentApi";
 import { useNents } from "@common/lib/useNents";
 import { toast } from "@common/lib/utils";
@@ -34,10 +34,7 @@ export function useCancelAllJobs(): (udfPath?: string) => Promise<void> {
           "error",
           <span>
             There are too many functions being scheduled in this deployment.{" "}
-            <Link
-              href={`${deploymentsURI}/settings/pause-deployment`}
-              className="text-content-link hover:underline"
-            >
+            <Link href={`${deploymentsURI}/settings/pause-deployment`}>
               Pause your deployment
             </Link>{" "}
             to cancel all functions.
@@ -83,6 +80,37 @@ export function useCancelJob(): (
       toast("error", err.message);
     } else {
       toast("success", "Scheduled run canceled.");
+    }
+  };
+}
+
+export function useDeleteScheduledJobsTable(): () => Promise<void> {
+  const deploymentUrl = useDeploymentUrl();
+  const adminKey = useAdminKey();
+  const { selectedNent } = useNents();
+  const { reportHttpError } = useContext(DeploymentInfoContext);
+
+  return async () => {
+    const body = JSON.stringify({
+      componentId: selectedNent?.id ?? undefined,
+    });
+    const res = await fetch(
+      `${deploymentUrl}/api/delete_scheduled_functions_table`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Convex ${adminKey}`,
+          "Content-Type": "application/json",
+        },
+        body,
+      },
+    );
+    if (res.status !== 200) {
+      const err = await res.json();
+      reportHttpError("POST", res.url, err);
+      toast("error", err.message);
+    } else {
+      toast("success", "Scheduled functions table deleted.");
     }
   };
 }

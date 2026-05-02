@@ -213,13 +213,22 @@ impl MetricStore {
         self.add(MetricType::Gauge, metric_name, ts, value)
     }
 
-    fn add(
+    /// Add a sample to a gauge metric, but only update if the new value is
+    /// greater than the existing value in the bucket (tracking maximum).
+    pub fn add_gauge_max(
         &mut self,
-        metric_type: MetricType,
         metric_name: &str,
         ts: SystemTime,
         value: f32,
     ) -> Result<(), UdfMetricsError> {
+        self.add_gauge_with_op(metric_name, ts, value, |existing| existing.max(value))
+    }
+
+    /// Validate timestamp and compute the bucket index.
+    fn validate_and_get_bucket_index(
+        &self,
+        ts: SystemTime,
+    ) -> Result<BucketIndex, UdfMetricsError> {
         let Ok(since_base) = ts.duration_since(self.base_ts) else {
             return Err(UdfMetricsError::SamplePrecedesBaseTimestamp {
                 ts,
@@ -227,16 +236,25 @@ impl MetricStore {
             });
         };
         let bucket_index = (since_base.as_nanos() / self.config.bucket_width.as_nanos()) as u32;
-        if let Some(((max_bucket_index, _), _)) = self.bucket_by_start.get_max() {
-            if bucket_index < *max_bucket_index {
-                return Err(UdfMetricsError::SamplePrecedesCutoff {
-                    ts,
-                    cutoff: self.bucket_start(*max_bucket_index),
-                });
-            }
+        if let Some(((max_bucket_index, _), _)) = self.bucket_by_start.get_max()
+            && bucket_index < *max_bucket_index
+        {
+            return Err(UdfMetricsError::SamplePrecedesCutoff {
+                ts,
+                cutoff: self.bucket_start(*max_bucket_index),
+            });
         }
+        Ok(bucket_index)
+    }
 
-        let metric_key = match self.metrics_by_name.entry(metric_name.to_string()) {
+    /// Get or create a metric key, validating that the metric type matches
+    /// if the metric already exists.
+    fn get_or_create_metric(
+        &mut self,
+        metric_name: &str,
+        metric_type: MetricType,
+    ) -> Result<MetricKey, UdfMetricsError> {
+        match self.metrics_by_name.entry(metric_name.to_string()) {
             hashmap::Entry::Occupied(entry) => {
                 let metric = self
                     .metrics
@@ -248,7 +266,7 @@ impl MetricStore {
                         expected_type: metric.metric_type,
                     });
                 }
-                *entry.get()
+                Ok(*entry.get())
             },
             hashmap::Entry::Vacant(entry) => {
                 let metric = Metric {
@@ -257,9 +275,56 @@ impl MetricStore {
                 };
                 let metric_key = self.metrics.alloc(metric);
                 entry.insert(metric_key);
-                metric_key
+                Ok(metric_key)
+            },
+        }
+    }
+
+    fn add_gauge_with_op(
+        &mut self,
+        metric_name: &str,
+        ts: SystemTime,
+        value: f32,
+        op: impl FnOnce(f32) -> f32,
+    ) -> Result<(), UdfMetricsError> {
+        let bucket_index = self.validate_and_get_bucket_index(ts)?;
+        let metric_key = self.get_or_create_metric(metric_name, MetricType::Gauge)?;
+
+        let inserted = match self.bucket_by_metric.entry((metric_key, bucket_index)) {
+            ordmap::Entry::Occupied(bucket_key) => {
+                let bucket = self
+                    .gauge_buckets
+                    .get_mut(*bucket_key.get())
+                    .context("Invalid bucket key")?;
+                bucket.value = op(bucket.value);
+                false
+            },
+            ordmap::Entry::Vacant(entry) => {
+                let new_bucket = GaugeBucket::new(bucket_index, value);
+                let new_bucket_key = self.gauge_buckets.alloc(new_bucket);
+                entry.insert(new_bucket_key);
+                self.bucket_by_start
+                    .insert((bucket_index, metric_key), new_bucket_key);
+                true
             },
         };
+
+        if inserted {
+            self.prune_buckets()?;
+        }
+
+        Ok(())
+    }
+
+    fn add(
+        &mut self,
+        metric_type: MetricType,
+        metric_name: &str,
+        ts: SystemTime,
+        value: f32,
+    ) -> Result<(), UdfMetricsError> {
+        let bucket_index = self.validate_and_get_bucket_index(ts)?;
+        let metric_key = self.get_or_create_metric(metric_name, metric_type)?;
 
         let inserted = match self.bucket_by_metric.entry((metric_key, bucket_index)) {
             // Try to log into the desired bucket if it exists.
@@ -604,8 +669,8 @@ impl TryFrom<serde_json::Value> for MetricsWindow {
                 parsed.start
             );
         }
-        if parsed.num_buckets == 0 {
-            anyhow::bail!("Invalid query num_buckets: 0");
+        if parsed.num_buckets == 0 || parsed.num_buckets > 10000 {
+            anyhow::bail!("Invalid query num_buckets: {}", parsed.num_buckets);
         }
         Ok(Self {
             start: parsed.start,
@@ -689,7 +754,7 @@ impl MetricsWindow {
         if is_rate {
             let width = self.bucket_width()?.as_secs_f64();
             for (_, value) in &mut result {
-                if let Some(ref mut value) = value {
+                if let Some(value) = value {
                     *value /= width;
                 }
             }
@@ -760,6 +825,10 @@ impl MetricsWindow {
         buckets: Vec<&HistogramBucket>,
         percentiles: &[Percentile],
     ) -> anyhow::Result<BTreeMap<Percentile, Timeseries>> {
+        if percentiles.len() > 5 {
+            anyhow::bail!("Invalid query percentiles: {}", percentiles.len());
+        }
+
         let mut histograms = Vec::with_capacity(self.num_buckets);
         for i in 0..self.num_buckets {
             let bucket_start = self.bucket_start(i)?;
@@ -832,228 +901,3 @@ pub type Timeseries = Vec<(SystemTime, Option<f64>)>;
 
 /// Integer in [0, 100].
 pub type Percentile = usize;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    impl MetricStore {
-        pub fn consistency_check(&self) -> Result<(), anyhow::Error> {
-            // Check that each entry in `metrics` matches its index.
-            for (metric_name, &metric_key) in &self.metrics_by_name {
-                let metric = self
-                    .metrics
-                    .get(metric_key)
-                    .context("metrics_by_name points to invalid metric_key")?;
-                anyhow::ensure!(&metric.name == metric_name);
-            }
-
-            // Check that all bucket keys are covered by both indexes.
-            let mut by_start_keys: Vec<BucketKey> =
-                self.bucket_by_start.values().cloned().collect();
-            by_start_keys.sort();
-            let mut by_metric_keys: Vec<BucketKey> =
-                self.bucket_by_metric.values().cloned().collect();
-            by_metric_keys.sort();
-            anyhow::ensure!(by_start_keys == by_metric_keys);
-            anyhow::ensure!(
-                by_start_keys.len()
-                    == self.counter_buckets.len()
-                        + self.gauge_buckets.len()
-                        + self.histogram_buckets.len()
-            );
-
-            // Check that each index entry matches its bucket.
-            let index_entry_lists = [
-                self.bucket_by_metric
-                    .iter()
-                    .map(|(&(metric_key, bucket_index), &bucket_key)| {
-                        (metric_key, bucket_index, bucket_key)
-                    })
-                    .collect::<Vec<_>>(),
-                self.bucket_by_start
-                    .iter()
-                    .map(|(&(bucket_index, metric_key), &bucket_key)| {
-                        (metric_key, bucket_index, bucket_key)
-                    })
-                    .collect::<Vec<_>>(),
-            ];
-            for index_entries in index_entry_lists {
-                for (metric_key, bucket_index, bucket_key) in index_entries {
-                    let metric = self.metrics.get(metric_key).context("Invalid metric key")?;
-                    match metric.metric_type {
-                        MetricType::Counter => {
-                            let bucket = self
-                                .counter_buckets
-                                .get(bucket_key)
-                                .context("Invalid bucket key")?;
-                            anyhow::ensure!(bucket.index == bucket_index);
-                        },
-                        MetricType::Gauge => {
-                            let bucket = self
-                                .gauge_buckets
-                                .get(bucket_key)
-                                .context("Invalid bucket key")?;
-                            anyhow::ensure!(bucket.index == bucket_index);
-                        },
-                        MetricType::Histogram => {
-                            let bucket = self
-                                .histogram_buckets
-                                .get(bucket_key)
-                                .context("Invalid bucket key")?;
-                            anyhow::ensure!(bucket.index == bucket_index);
-                        },
-                    }
-                }
-            }
-
-            // Check that all buckets are within range.
-            let Some(bucket_index_range) = self.bucket_index_range() else {
-                return Ok(());
-            };
-            for (_, bucket) in self.counter_buckets.iter() {
-                anyhow::ensure!(bucket_index_range.contains(&bucket.index));
-            }
-            for (_, bucket) in self.histogram_buckets.iter() {
-                anyhow::ensure!(bucket_index_range.contains(&bucket.index));
-            }
-
-            // Check that every metric has at least one bucket.
-            for (metric_key, _) in self.metrics.iter() {
-                let mut range = self
-                    .bucket_by_metric
-                    .range((metric_key, 0)..(metric_key + 1, 0));
-                anyhow::ensure!(range.next().is_some());
-            }
-
-            Ok(())
-        }
-    }
-
-    fn new_store(max_buckets: usize) -> MetricStore {
-        let base_ts = SystemTime::UNIX_EPOCH;
-        let config = MetricStoreConfig {
-            bucket_width: Duration::from_secs(60),
-            max_buckets,
-            histogram_min_duration: Duration::from_millis(1),
-            histogram_max_duration: Duration::from_millis(1000 * 60 * 15),
-            histogram_significant_figures: 2,
-        };
-        MetricStore::new(base_ts, config)
-    }
-
-    #[test]
-    fn test_add_and_query_counter() -> anyhow::Result<()> {
-        let mut store = new_store(2);
-
-        let t0 = store.base_ts;
-        let t1 = store.base_ts + Duration::from_secs(60); // next bucket
-
-        store.add_counter("requests", t0, 1.0)?;
-        store.add_counter("requests", t0, 2.0)?; // same bucket, accumulative
-        store.add_counter("requests", t1, 5.0)?; // next bucket
-
-        // Query range covering both buckets
-        let result = store.query_counter("requests", t0..(t0 + Duration::from_secs(1)))?;
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, 3.0);
-
-        let result = store.query_counter("requests", t0..(t1 + Duration::from_secs(120)))?;
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].value, 3.0);
-        assert_eq!(result[1].value, 5.0);
-
-        store.consistency_check()?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_add_and_query_gauge() -> anyhow::Result<()> {
-        let mut store = new_store(2);
-
-        let t0 = store.base_ts;
-        let t1 = store.base_ts + Duration::from_secs(60); // next bucket
-
-        store.add_gauge("requests", t0, 1.0)?;
-        store.add_gauge("requests", t0, 2.0)?; // same bucket, accumulative
-        store.add_gauge("requests", t1, 5.0)?; // next bucket
-
-        let result = store.query_gauge("requests", t0..(t0 + Duration::from_secs(1)))?;
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, 2.0);
-
-        let result = store.query_gauge("requests", t0..(t1 + Duration::from_secs(120)))?;
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].value, 2.0);
-        assert_eq!(result[1].value, 5.0);
-
-        store.consistency_check()?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_add_and_query_histogram() -> anyhow::Result<()> {
-        let mut store = new_store(2);
-
-        let t0 = store.base_ts;
-        let duration_10ms = Duration::from_millis(10);
-        let duration_20ms = Duration::from_millis(20);
-
-        store.add_histogram("latency", t0, duration_10ms)?;
-        store.add_histogram("latency", t0, duration_20ms)?; // same bucket
-
-        let result = store.query_histogram("latency", t0..(t0 + Duration::from_secs(60)))?;
-        assert_eq!(result.len(), 1);
-        let bucket = &result[0];
-        assert_eq!(bucket.index, 0);
-        // Validate histogram counts
-        assert_eq!(bucket.histogram.len(), 2);
-
-        store.consistency_check()?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_metric_type_mismatch() -> anyhow::Result<()> {
-        let mut store = new_store(2);
-        let t0 = store.base_ts;
-
-        store.add_counter("metric_x", t0, 1.0)?;
-        let err = store
-            .add_histogram("metric_x", t0, Duration::from_secs(1))
-            .unwrap_err();
-        assert!(matches!(err, UdfMetricsError::MetricTypeMismatch { .. }));
-
-        store.consistency_check()?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_prune_buckets() -> anyhow::Result<()> {
-        let max_buckets = 2;
-        let mut store = new_store(max_buckets);
-
-        // Fill all of the buckets.
-        for i in 0..=max_buckets {
-            let ts = store.base_ts + Duration::from_secs(i as u64 * 60);
-            store.add_counter("events", ts, 1.0)?;
-        }
-
-        // Now add one more bucket, which should force pruning the oldest one.
-        let ts = store.base_ts + Duration::from_secs((max_buckets + 1) as u64 * 60);
-        store.add_counter("events", ts, 2.0)?;
-
-        // After pruning, we should have exactly max_buckets buckets left.
-        let range = store.bucket_index_range().unwrap();
-        let num_buckets = range.end() - range.start() + 1;
-        assert_eq!(num_buckets as usize, max_buckets);
-
-        store.consistency_check()?;
-
-        Ok(())
-    }
-}

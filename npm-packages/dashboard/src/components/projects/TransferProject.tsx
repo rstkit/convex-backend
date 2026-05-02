@@ -1,17 +1,10 @@
 import { useBBMutation } from "api/api";
-import { useDeployments } from "api/deployments";
 import { useProfile } from "api/profile";
-import { useCurrentProject, useProjects } from "api/projects";
-import {
-  useTeams,
-  useCurrentTeam,
-  useTeamMembers,
-  useTeamEntitlements,
-} from "api/teams";
+import { useCurrentProject } from "api/projects";
+import { useTeams, useCurrentTeam, useTeamMembers } from "api/teams";
 import { Sheet } from "@ui/Sheet";
 import { Combobox } from "@ui/Combobox";
 import { Button } from "@ui/Button";
-import { Callout } from "@ui/Callout";
 import { ConfirmationDialog } from "@ui/ConfirmationDialog";
 import { useRouter } from "next/router";
 import { useState } from "react";
@@ -52,49 +45,25 @@ export function TransferProject() {
     destinationTeamMembers?.find((member) => member.id === me?.id)?.role ===
     "admin";
 
-  const membersNotOnNewTeam = originTeamMembers?.filter(
-    (member) => !destinationTeamMembers?.some((m) => m.id === member.id),
-  );
-
-  const entitlements = useTeamEntitlements(destinationTeamId ?? undefined);
-  const maxProjects = entitlements?.maxProjects ?? 0;
-  const destinationTeamProjects = useProjects(
-    destinationTeamId ?? undefined,
-  )?.filter((p) => !p.isDemo);
-
-  const overProjectLimit =
-    destinationTeamProjects && destinationTeamProjects.length >= maxProjects;
-
-  const { deployments } = useDeployments(project?.id);
-
-  const deploymentsToBeDeleted = deployments?.filter((deployment) =>
-    membersNotOnNewTeam?.some((member) => member.id === deployment.creator),
-  );
-
   const loading = destinationTeamId
-    ? !originTeamMembers ||
-      !destinationTeamMembers ||
-      !entitlements ||
-      !destinationTeamProjects
+    ? !originTeamMembers || !destinationTeamMembers
     : false;
   const canTransfer = isAdminOfOldTeam && isAdminOfNewTeam;
 
   const [showConfirmation, setShowConfirmation] = useState(false);
   const validationError = !destinationTeamId
     ? undefined
-    : overProjectLimit
-      ? `${destinationTeam?.name} has reached it's project limit of ${maxProjects}.`
-      : teams && teams.length === 1
-        ? "You must be a member of another team to transfer a project."
-        : !canTransfer
-          ? `You must be an admin of ${originTeam?.name} and ${destinationTeam?.name} to transfer this project to ${destinationTeam?.name}.`
-          : undefined;
+    : teams && teams.length === 1
+      ? "You must be a member of another team to transfer a project."
+      : !canTransfer
+        ? `You must be an admin of ${originTeam?.name} and ${destinationTeam?.name} to transfer this project to ${destinationTeam?.name}.`
+        : undefined;
   const router = useRouter();
 
   return (
     <Sheet>
       <h3 className="mb-4">Transfer Project</h3>
-      <p className="mb-5  max-w-prose text-sm text-content-primary">
+      <p className="mb-5 max-w-prose text-sm text-content-primary">
         Transfer this project to another team.
       </p>
       {teams && teams.length > 1 && (
@@ -139,7 +108,6 @@ export function TransferProject() {
         disabled={
           loading ||
           !destinationTeamId ||
-          overProjectLimit ||
           !canTransfer ||
           (teams && teams.length === 1)
         }
@@ -166,18 +134,6 @@ export function TransferProject() {
             dialogBody={
               <div className="flex flex-col gap-2">
                 Are you sure you want to transfer this project?
-                {deploymentsToBeDeleted &&
-                  deploymentsToBeDeleted.length > 0 && (
-                    <Callout className="block">
-                      {deploymentsToBeDeleted.length} development deployment
-                      {deploymentsToBeDeleted.length > 1 ? "s" : ""} will be
-                      deleted because their creators are not members of{" "}
-                      <span className="font-semibold">
-                        {destinationTeam.name}
-                      </span>
-                      .
-                    </Callout>
-                  )}
               </div>
             }
             onConfirm={async () => {

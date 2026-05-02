@@ -1,9 +1,14 @@
-use std::time::Instant;
+use std::{
+    future,
+    time::Instant,
+};
 
 use axum::{
     extract::{
+        FromRef,
         FromRequest,
         FromRequestParts,
+        OptionalFromRequest,
         Request,
     },
     http::request::Parts,
@@ -14,10 +19,8 @@ use axum::{
 };
 use bytes::Bytes;
 use errors::ErrorMetadata;
-use fastrace::{
-    future::FutureExt,
-    Span,
-};
+use fastrace::Span;
+use futures::TryFutureExt as _;
 use http::HeaderMap;
 use serde::{
     de::DeserializeOwned,
@@ -85,9 +88,26 @@ where
 
 pub struct Json<T>(pub T);
 
+async fn buffer_body<S: Send + Sync>(req: Request, state: &S) -> anyhow::Result<Bytes> {
+    let span = Span::enter_with_local_parent("buffering_body");
+    let bytes = Bytes::from_request(req, state)
+        .await
+        .map_err(|e| anyhow::anyhow!(ErrorMetadata::bad_request("BadJsonBody", e.body_text())))?;
+    if let Some(duration) = span.elapsed() {
+        span.add_property(|| ("num_bytes", bytes.len().to_string()));
+        span.add_property(|| {
+            (
+                "megabytes_per_sec",
+                format!("{:.3}", bytes.len() as f64 / (duration.as_secs_f64() * 1e6)),
+            )
+        });
+    }
+    Ok(bytes)
+}
+
 /// Fork of axum::Json that uses HttpResponseError instead of JsonRejection to
 /// make sure we get propper logging / error reporting and integrates with our
-/// tracing framework.
+/// tracing framework. Note that we also implement OptionalFromRequest below!
 impl<S, T> FromRequest<S> for Json<T>
 where
     T: DeserializeOwned,
@@ -103,12 +123,7 @@ where
             ));
             return Err(err.into());
         }
-        let bytes = Bytes::from_request(req, state)
-            .in_span(Span::enter_with_local_parent("buffering_body"))
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(ErrorMetadata::bad_request("BadJsonBody", e.body_text()))
-            })?;
+        let bytes = buffer_body(req, state).await?;
 
         let t = {
             let _span = Span::enter_with_local_parent("parse_json");
@@ -120,6 +135,31 @@ where
                 .0
         };
         Ok(Self(t))
+    }
+}
+
+impl<S, T> OptionalFromRequest<S> for Json<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = HttpResponseError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
+        if !json_content_type(req.headers()) {
+            return Ok(None);
+        }
+        let bytes = buffer_body(req, state).await?;
+        let t = {
+            let _span = Span::enter_with_local_parent("parse_json");
+            #[allow(clippy::disallowed_types)]
+            axum::Json::<T>::from_bytes(&bytes)
+                .map_err(|e| {
+                    anyhow::anyhow!(ErrorMetadata::bad_request("BadJsonBody", e.body_text()))
+                })?
+                .0
+        };
+        Ok(Some(Self(t)))
     }
 }
 
@@ -141,7 +181,45 @@ impl<T> IntoResponse for Json<T>
 where
     T: Serialize,
 {
+    #[fastrace::trace]
     fn into_response(self) -> Response {
         axum::Json(self.0).into_response()
+    }
+}
+
+/// Like `axum::extract::State`, but customizable
+pub struct MtState<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for MtState<T>
+where
+    T: FromMtState<S>,
+    S: Send + Sync,
+{
+    type Rejection = HttpResponseError;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        T::from_request_parts(parts, state).map_ok(MtState)
+    }
+}
+
+pub trait FromMtState<Outer>: Sized {
+    fn from_request_parts(
+        parts: &mut Parts,
+        state: &Outer,
+    ) -> impl Future<Output = Result<Self, HttpResponseError>> + Send;
+}
+
+impl<Outer, T: FromRef<Outer>> FromMtState<Outer> for T
+where
+    T: Send + Sync,
+{
+    fn from_request_parts(
+        _parts: &mut Parts,
+        state: &Outer,
+    ) -> impl Future<Output = Result<Self, HttpResponseError>> + Send {
+        future::ready(Ok(T::from_ref(state)))
     }
 }

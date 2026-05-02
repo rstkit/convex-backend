@@ -1,16 +1,21 @@
 use std::{
     collections::HashMap,
+    ffi::c_char,
     marker::PhantomData,
+    mem,
     ops::{
         Deref,
         DerefMut,
     },
+    ptr,
+    str,
     sync::Arc,
 };
 
 use anyhow::{
     anyhow,
     bail,
+    Context as _,
 };
 use async_recursion::async_recursion;
 use common::{
@@ -20,13 +25,21 @@ use common::{
     types::UdfType,
 };
 use deno_core::{
-    v8,
+    v8::{
+        self,
+        callback_scope,
+        scope,
+        tc_scope,
+    },
     ModuleResolutionError,
     ModuleSpecifier,
 };
 use errors::ErrorMetadata;
 use model::modules::{
-    module_versions::FullModuleSource,
+    module_versions::{
+        FullModuleSource,
+        ModuleSource,
+    },
     user_error::{
         ModuleNotFoundError,
         SystemModuleNotFoundError,
@@ -36,7 +49,9 @@ use serde_json::Value as JsonValue;
 use value::heap_size::HeapSize;
 
 use crate::{
+    array_buffer_allocator::ArrayBufferMemoryLimit,
     bundled_js::system_udf_file,
+    context_local_state::GetContextSlot,
     environment::{
         IsolateEnvironment,
         ModuleCodeCacheResult,
@@ -57,6 +72,7 @@ use crate::{
     request_scope::RequestState,
     termination::IsolateHandle,
     IsolateHeapStats,
+    Timeout,
 };
 
 /// V8 will invoke our promise_reject_callback when it determines that a
@@ -138,34 +154,36 @@ impl PendingDynamicImports {
 /// Most functionality for executing JS and manipulating objects executes within
 /// a [`v8::HandleScope`]. The [`ExecutionScope`] wrapper is a convenience
 /// struct that represents executing code within a [`RequestScope`].
-pub struct ExecutionScope<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> {
-    v8_scope: &'a mut v8::HandleScope<'b>,
-    _v8_context: v8::Local<'b, v8::Context>,
+pub struct ExecutionScope<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> {
+    v8_scope: &'a mut v8::PinScope<'s, 'i>,
+    v8_context: v8::Local<'s, v8::Context>,
     _pd: PhantomData<(RT, E)>,
 }
 
-impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> Deref for ExecutionScope<'a, 'b, RT, E> {
-    type Target = v8::HandleScope<'b>;
-
-    fn deref(&self) -> &v8::HandleScope<'b> {
-        self.v8_scope
-    }
-}
-
-impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> DerefMut
-    for ExecutionScope<'a, 'b, RT, E>
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> Deref
+    for ExecutionScope<'a, 's, 'i, RT, E>
 {
-    fn deref_mut(&mut self) -> &mut v8::HandleScope<'b> {
+    type Target = v8::PinScope<'s, 'i>;
+
+    fn deref(&self) -> &v8::PinScope<'s, 'i> {
         self.v8_scope
     }
 }
 
-impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, RT, E> {
-    pub fn new(v8_scope: &'a mut v8::HandleScope<'b>) -> Self {
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> DerefMut
+    for ExecutionScope<'a, 's, 'i, RT, E>
+{
+    fn deref_mut(&mut self) -> &mut v8::PinScope<'s, 'i> {
+        self.v8_scope
+    }
+}
+
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 's, 'i, RT, E> {
+    pub fn new(v8_scope: &'a mut v8::PinScope<'s, 'i>) -> Self {
         let v8_context = v8_scope.get_current_context();
         Self {
             v8_scope,
-            _v8_context: v8_context,
+            v8_context,
             _pd: PhantomData,
         }
     }
@@ -177,17 +195,31 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
     }
 
     pub fn state(&mut self) -> anyhow::Result<&RequestState<RT, E>> {
-        self.v8_scope
-            .get_slot()
+        self.v8_context
+            .get_context_slot(self.v8_scope)
             .ok_or_else(|| anyhow!("ContextState disappeared?"))
     }
 
     // TODO: Delete this method and use with_state_mut everywhere instead in
     // order to make it impossible to hold state across await points.
     pub fn state_mut(&mut self) -> anyhow::Result<&mut RequestState<RT, E>> {
-        self.v8_scope
-            .get_slot_mut()
+        self.v8_context
+            .get_context_slot_mut(self.v8_scope)
             .ok_or_else(|| anyhow!("ContextState disappeared?"))
+    }
+
+    pub fn take_state(&mut self) -> anyhow::Result<RequestState<RT, E>> {
+        self.v8_context
+            .remove_context_slot(self.v8_scope)
+            .ok_or_else(|| anyhow!("ContextState disappeared?"))
+    }
+
+    pub fn return_state(&mut self, state: RequestState<RT, E>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.v8_context.set_context_slot(self.v8_scope, state),
+            "Two ContextStates appeared"
+        );
+        Ok(())
     }
 
     pub fn with_state_mut<T>(
@@ -200,56 +232,64 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
 
     pub fn record_heap_stats(&mut self) -> anyhow::Result<()> {
         let stats = self.get_heap_statistics();
+        let array_buffer_size = self
+            .get_slot::<Arc<ArrayBufferMemoryLimit>>()
+            .context("missing ArrayBufferMemoryLimit?")?
+            .used();
         self.with_state_mut(|state| {
-            let blobs_heap_size = state.blob_parts.heap_size();
             let streams_heap_size = state.streams.heap_size() + state.stream_listeners.heap_size();
             state.environment.record_heap_stats(IsolateHeapStats::new(
                 stats,
-                blobs_heap_size,
                 streams_heap_size,
+                array_buffer_size,
             ));
         })
     }
 
     pub fn module_map(&mut self) -> &ModuleMap {
-        self.v8_scope.get_slot().expect("ModuleMap disappeared?")
+        self.v8_context
+            .get_context_slot(self.v8_scope)
+            .expect("ModuleMap disappeared?")
     }
 
     pub fn module_map_mut(&mut self) -> &mut ModuleMap {
-        self.v8_scope
-            .get_slot_mut()
+        self.v8_context
+            .get_context_slot_mut(self.v8_scope)
             .expect("ModuleMap disappeared?")
     }
 
     #[allow(unused)]
     pub fn pending_unhandled_promise_rejections(&mut self) -> &PendingUnhandledPromiseRejections {
-        self.v8_scope
-            .get_slot_mut()
+        self.v8_context
+            .get_context_slot_mut(self.v8_scope)
             .expect("No PendingUnhandledPromiseRejections found")
     }
 
     pub fn pending_unhandled_promise_rejections_mut(
         &mut self,
     ) -> &mut PendingUnhandledPromiseRejections {
-        self.v8_scope
-            .get_slot_mut()
+        self.v8_context
+            .get_context_slot_mut(self.v8_scope)
             .expect("No PendingUnhandledPromiseRejections found")
     }
 
     pub fn pending_dynamic_imports_mut(&mut self) -> &mut PendingDynamicImports {
-        self.v8_scope
-            .get_slot_mut()
+        self.v8_context
+            .get_context_slot_mut(self.v8_scope)
             .expect("No PendingDynamicImports found")
     }
 
     pub fn with_try_catch<R>(
         &mut self,
-        f: impl FnOnce(&mut v8::HandleScope<'b>) -> R,
+        f: impl FnOnce(&mut v8::PinScope<'s, 'i>) -> R,
     ) -> anyhow::Result<Result<R, JsError>> {
-        let mut tc_scope = v8::TryCatch::new(self.v8_scope);
-        let r = f(&mut tc_scope);
-        if let Some(e) = tc_scope.exception() {
-            drop(tc_scope);
+        let (r, exception);
+        {
+            tc_scope!(let tc_scope, self.v8_scope);
+            r = f(tc_scope);
+            exception = tc_scope.exception();
+        }
+        if let Some(e) = exception {
             return Ok(Err(self.format_traceback(e)?));
         }
         Ok(Ok(r))
@@ -260,9 +300,10 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
         udf_type: UdfType,
         is_dynamic: bool,
         name: &ModuleSpecifier,
+        timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<Result<v8::Local<'a, v8::Module>, JsError>> {
         let timer = metrics::eval_user_module_timer(udf_type, is_dynamic);
-        let module = match self.eval_module(name).await {
+        let module = match self.eval_module(name, timeout).await {
             Ok(id) => id,
             Err(e) => {
                 // TODO: It's a bit awkward that we're calling these "JsError"s, since they
@@ -290,13 +331,14 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
     pub async fn eval_module(
         &mut self,
         name: &ModuleSpecifier,
+        timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<v8::Local<'a, v8::Module>> {
         let _s = static_span!();
 
         // These first two steps of registering and then instantiating the module
         // correspond to `JsRuntime::load_module`. This function is idempotent,
         // so it's safe to rerun.
-        let id = self.register_module(name).await?;
+        let id = self.register_module(name, timeout).await?;
 
         // NB: This part is separate from `self.register_module()` since module
         // registration is recursive, compiling and registering dependencies,
@@ -312,7 +354,11 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
     }
 
     #[async_recursion(?Send)]
-    async fn register_module(&mut self, name: &ModuleSpecifier) -> anyhow::Result<ModuleId> {
+    async fn register_module(
+        &mut self,
+        name: &ModuleSpecifier,
+        timeout: &mut Timeout<RT>,
+    ) -> anyhow::Result<ModuleId> {
         let _s = static_span!();
         {
             let module_map = self.module_map();
@@ -321,8 +367,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
             }
         }
         let (id, import_specifiers) = {
-            let (FullModuleSource { source, source_map }, code_cache) =
-                self.lookup_source(name).await?;
+            let (module_source, code_cache) = self.lookup_source(name, timeout).await?;
 
             // Step 1: Compile the module and discover its imports.
             let timer = metrics::compile_module_timer(matches!(
@@ -331,15 +376,14 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
             ));
 
             // Create a nested scope so that objects can be GC'd
-            let mut scope = v8::HandleScope::new(&mut **self);
-            let mut scope = ExecutionScope::<RT, E>::new(&mut scope);
+            scope!(let scope, &mut **self);
+            let mut scope = ExecutionScope::<RT, E>::new(scope);
 
-            let name_str = v8::String::new(&mut scope, name.as_str())
+            let name_str = v8::String::new(&scope, name.as_str())
                 .ok_or_else(|| anyhow!("Failed to create name string"))?;
-            let source_str = v8::String::new(&mut scope, &source)
-                .ok_or_else(|| anyhow!("Failed to create source string"))?;
+            let source_str = make_source_string(&scope, &module_source.source)?;
 
-            let origin = helpers::module_origin(&mut scope, name_str);
+            let origin = helpers::module_origin(&scope, name_str);
             let (mut v8_source, options) = match &code_cache {
                 ModuleCodeCacheResult::Cached(data) => (
                     v8::script_compiler::Source::new_with_cached_data(
@@ -378,7 +422,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
                 },
                 ModuleCodeCacheResult::Uncached(callback) => {
                     let timer = metrics::create_code_cache_timer();
-                    let module_script = module.get_unbound_module_script(&mut scope);
+                    let module_script = module.get_unbound_module_script(&scope);
                     if let Some(cached_data) = module_script.create_code_cache() {
                         callback(cached_data[..].into());
                         timer.finish();
@@ -391,11 +435,11 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
             let module_requests = module.get_module_requests();
             for i in 0..module_requests.length() {
                 let module_request: v8::Local<v8::ModuleRequest> = module_requests
-                    .get(&mut scope, i)
+                    .get(&scope, i)
                     .ok_or_else(|| anyhow!("Module request {} out of bounds", i))?
                     .try_into()?;
                 let import_specifier =
-                    helpers::to_rust_string(&mut scope, &module_request.get_specifier())?;
+                    helpers::to_rust_string(&scope, &module_request.get_specifier())?;
                 let module_specifier = deno_core::resolve_import(&import_specifier, name.as_str())?;
                 let offset = module_request.get_source_offset();
                 let location = module.source_offset_to_location(offset);
@@ -405,9 +449,9 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
 
             // Step 2: Register the module with the module map.
             let id = {
-                let module_v8 = v8::Global::<v8::Module>::new(&mut scope, module);
+                let module_v8 = v8::Global::<v8::Module>::new(&scope, module);
                 let module_map = scope.module_map_mut();
-                module_map.register(name, module_v8, source_map)
+                module_map.register(name, module_v8, module_source)
             };
             (id, import_specifiers)
         };
@@ -415,10 +459,12 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
         // Step 3: Recursively load the dependencies. Since we've already registered
         // ourselves, this won't create an infinite loop on import cycles.
         for (import_specifier, location) in import_specifiers {
-            self.register_module(&import_specifier).await.map_err(|e| {
-                let Err(e) = self.nicely_show_line_number_on_error(name, location, e);
-                e
-            })?;
+            self.register_module(&import_specifier, timeout)
+                .await
+                .map_err(|e| {
+                    let Err(e) = self.nicely_show_line_number_on_error(name, location, e);
+                    e
+                })?;
         }
 
         Ok(id)
@@ -427,7 +473,8 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
     async fn lookup_source(
         &mut self,
         module_specifier: &ModuleSpecifier,
-    ) -> anyhow::Result<(FullModuleSource, ModuleCodeCacheResult)> {
+        timeout: &mut Timeout<RT>,
+    ) -> anyhow::Result<(Arc<FullModuleSource>, ModuleCodeCacheResult)> {
         let _s = static_span!();
         if module_specifier.scheme() != CONVEX_SCHEME {
             anyhow::bail!(ErrorMetadata::bad_request(
@@ -453,8 +500,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
             anyhow::bail!(ErrorMetadata::bad_request(
                 "CannotBeABase",
                 format!(
-                    "Module URL {} is a cannot-be-a-base URL which is disallowed.",
-                    module_specifier
+                    "Module URL {module_specifier} is a cannot-be-a-base URL which is disallowed."
                 ),
             ));
         }
@@ -470,18 +516,18 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
             let (source, source_map) = system_udf_file(system_path)
                 .ok_or_else(|| SystemModuleNotFoundError::new(system_path))?;
             let result = FullModuleSource {
-                source: source.to_string(),
+                source: source.into(),
                 source_map: source_map.as_ref().map(|s| s.to_string()),
             };
             timer.finish();
             // TODO: should we code-cache system UDFs?
-            return Ok((result, ModuleCodeCacheResult::noop()));
+            return Ok((Arc::new(result), ModuleCodeCacheResult::noop()));
         }
 
         let state = self.state_mut()?;
         let result = state
             .environment
-            .lookup_source(module_path, &mut state.timeout, &mut state.permit)
+            .lookup_source(module_path, timeout)
             .await?
             .ok_or_else(|| ModuleNotFoundError::new(module_path))?;
 
@@ -490,6 +536,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
         Ok(result)
     }
 
+    #[fastrace::trace]
     fn instantiate_and_eval_module(&mut self, id: ModuleId) -> anyhow::Result<()> {
         let _s = static_span!();
         let module = {
@@ -557,24 +604,24 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
         _import_assertions: v8::Local<'c, v8::FixedArray>,
         referrer: v8::Local<'c, v8::Module>,
     ) -> Option<v8::Local<'c, v8::Module>> {
-        let scope = &mut unsafe { v8::CallbackScope::new(context) };
+        callback_scope!(unsafe let scope, context);
         match Self::_module_resolve_callback(scope, referrer, specifier) {
             Ok(m) => Some(m),
             Err(e) => {
-                helpers::throw_type_error(scope, format!("{:?}", e));
+                helpers::throw_type_error(scope, format!("{e:?}"));
                 None
             },
         }
     }
 
     fn _module_resolve_callback<'c>(
-        scope: &mut v8::CallbackScope<'c>,
+        scope: &mut v8::PinScope<'c, '_>,
         referrer: v8::Local<'c, v8::Module>,
         specifier: v8::Local<'c, v8::String>,
     ) -> anyhow::Result<v8::Local<'c, v8::Module>> {
         let mut scope = ExecutionScope::<RT, E>::new(scope);
-        let referrer_global = v8::Global::new(&mut scope, referrer);
-        let specifier_str = helpers::to_rust_string(&mut scope, &specifier)?;
+        let referrer_global = v8::Global::new(&scope, referrer);
+        let specifier_str = helpers::to_rust_string(&scope, &specifier)?;
 
         let module_map = scope.module_map();
         let referrer_name = module_map
@@ -589,7 +636,7 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
             .handle_by_id(id)
             .ok_or_else(|| anyhow!("Couldn't find {specifier_str} in {referrer_name}"))?;
 
-        Ok(v8::Local::new(&mut scope, handle))
+        Ok(v8::Local::new(&scope, handle))
     }
 
     pub fn syscall(
@@ -663,4 +710,41 @@ impl<'a, 'b: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 'b, 
         rv.set(promise.into());
         Ok(())
     }
+}
+
+fn make_source_string<'s>(
+    scope: &v8::PinScope<'s, '_, ()>,
+    module_source: &ModuleSource,
+) -> anyhow::Result<v8::Local<'s, v8::String>> {
+    if module_source.is_ascii() {
+        // Common case: we can use an external string and skip copying the
+        // module to the V8 heap
+        let owned_source: Arc<str> = module_source.source_arc().clone();
+        // SAFETY: we know that `module_source` is ASCII and we have bumped the
+        // refcount, so the string will not be mutated or freed until we call
+        // the destructor
+        let ptr = owned_source.as_ptr();
+        let len = owned_source.len();
+        mem::forget(owned_source);
+        unsafe extern "C" fn destroy(ptr: *mut c_char, len: usize) {
+            unsafe {
+                drop(Arc::from_raw(ptr::from_raw_parts::<str>(
+                    ptr.cast::<u8>().cast_const(),
+                    len,
+                )));
+            }
+        }
+        // N.B.: new_external_onebyte_raw takes a mut pointer but it does not mutate it
+        unsafe {
+            v8::String::new_external_onebyte_raw(
+                scope,
+                ptr.cast::<c_char>().cast_mut(),
+                len,
+                destroy,
+            )
+        }
+    } else {
+        v8::String::new(scope, module_source)
+    }
+    .ok_or_else(|| anyhow!("Failed to create source string"))
 }

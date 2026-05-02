@@ -1,9 +1,12 @@
 pub mod module_loader;
-pub mod permit;
+mod performance;
 mod promise;
 pub mod syscall_error;
 mod version;
 
+use std::ops::Deref;
+
+use anyhow::Context;
 use deno_core::{
     serde_v8,
     v8,
@@ -13,8 +16,10 @@ use errors::{
     ErrorMetadata,
 };
 use serde_json::Value as JsonValue;
+use value::TableName;
 
 pub use self::{
+    performance::PerformanceTimeOrigin,
     promise::{
         resolve_promise,
         resolve_promise_allow_all_errors,
@@ -54,10 +59,10 @@ pub enum Phase {
     Executing,
 }
 
-pub fn json_to_v8<'a>(
-    scope: &mut v8::HandleScope<'a>,
+pub fn json_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     json: JsonValue,
-) -> anyhow::Result<v8::Local<'a, v8::Value>> {
+) -> anyhow::Result<v8::Local<'s, v8::Value>> {
     let value_v8 = serde_v8::to_v8(scope, json)?;
     Ok(value_v8)
 }
@@ -73,4 +78,27 @@ pub fn remove_rejected_before_execution(mut e: anyhow::Error) -> anyhow::Error {
         em.code = ErrorCode::Overloaded;
     }
     e
+}
+
+/// For DB syscalls that take an explicit table name, checks that the
+/// explicit table name that the user used (`requested_table_name`)
+/// matches the name of the ID’s table (`actual_name_name`).
+pub fn check_table_name(
+    requested_table_name: &Option<String>,
+    actual_table_name: &TableName,
+) -> anyhow::Result<()> {
+    if let Some(requested_table_name) = requested_table_name
+        && requested_table_name != actual_table_name.deref()
+    {
+        return Err(ErrorMetadata::bad_request(
+            "InvalidTable",
+            format!(
+                "expected to be an Id<\"{}\">, got Id<\"{}\"> instead.",
+                requested_table_name,
+                actual_table_name.deref()
+            ),
+        ))
+        .context(ArgName("id"));
+    }
+    Ok(())
 }

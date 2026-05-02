@@ -1,23 +1,18 @@
 [package]
 name = "pb_build"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
+
+[package.metadata.cargo-machete]
+ignored = ["tonic_prost_build"]
 
 [lib]
 doctest = false
 
 [dependencies]
-cfg-if = { workspace = true }
 prost = { workspace = true }
-tonic-build = { workspace = true }
-
-[package.metadata.cargo-machete]
-ignored = [
-    # Build dependencies not understood
-    "cfg_if",
-    "tonic_build",
-]
+tonic-prost-build = { workspace = true }
 
 [lints]
 workspace = true

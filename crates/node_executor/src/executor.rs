@@ -20,14 +20,17 @@ use common::{
     execution_context::ExecutionContext,
     knobs::NODE_ANALYZE_MAX_RETRIES,
     log_lines::{
+        run_function_and_collect_log_lines,
         LogLine,
         LogLineStructured,
+        LogLines,
     },
     runtime::Runtime,
     sha256::Sha256Digest,
     types::{
         ActionCallbackToken,
         ConvexOrigin,
+        DeploymentMetadata,
         NodeDependency,
         ObjectKey,
         UdfType,
@@ -38,10 +41,10 @@ use errors::{
     ErrorMetadataAnyhowExt,
 };
 use futures::{
+    FutureExt,
     Stream,
     StreamExt,
 };
-use http::Uri;
 use isolate::{
     deserialize_udf_custom_error,
     deserialize_udf_result,
@@ -88,7 +91,6 @@ use sync_types::{
 };
 use tokio::sync::mpsc;
 use udf::{
-    helpers::serialize_udf_args,
     validation::ValidatedPathAndArgs,
     SyscallStats,
     SyscallTrace,
@@ -127,6 +129,10 @@ pub static EXECUTE_TIMEOUT_RESPONSE_JSON: LazyLock<JsonValue> = LazyLock::new(||
     )
 });
 
+pub const ARGS_TOO_LARGE_RESPONSE_MESSAGE: &str =
+    "Node actions arguments size is too large. The maximum size is 5 MiB. Reduce the size of the \
+     arguments or consider using Convex runtime actions instead, which have a 16 MiB limit. See https://docs.convex.dev/functions/runtimes";
+
 const NODE_ANALYZE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const NODE_ANALYZE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
@@ -152,6 +158,7 @@ pub struct Actions<RT: Runtime> {
     convex_origin: ConvexOrigin,
     user_timeout: Duration,
     runtime: RT,
+    deployment: DeploymentMetadata,
 }
 
 fn construct_js_error(
@@ -203,12 +210,14 @@ impl<RT: Runtime> Actions<RT> {
         convex_origin: ConvexOrigin,
         user_timeout: Duration,
         runtime: RT,
+        deployment: DeploymentMetadata,
     ) -> Self {
         Self {
             executor,
             convex_origin,
             user_timeout,
             runtime,
+            deployment,
         }
     }
 
@@ -238,22 +247,19 @@ impl<RT: Runtime> Actions<RT> {
             // total Node timeout. This allows us to preempt early and give
             // better error message and logs in the common case.
             timeout: self.user_timeout,
+            deployment: self.deployment.clone(),
         };
         let InvokeResponse {
             response,
             aws_request_id,
         } = self.executor.invoke(request, log_line_sender).await?;
-        let execute_result = ExecuteResponse::try_from(response.clone()).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to deserialize execute response: {}. Response: {}",
-                e.to_string(),
-                response
-            )
+        let execute_result = ExecuteResponse::try_from(response.clone()).with_context(|| {
+            format!("Failed to deserialize execute (aws_request_id: {aws_request_id:?}) Response: {response}")
         })?;
 
         tracing::info!(
             "Total:{:?}, executor:{:?}, download:{:?}, import:{:?}, udf:{:?}, \
-             env_invocations:{:?}, memory_allocated_mb:{:?}, aws_request_id:{:?}",
+             env_invocations:{:?}, memory_allocated_mb:{:?}, egress_bytes:{:?}, aws_request_id:{:?}",
             timer.elapsed(),
             execute_result.total_executor_time,
             execute_result.download_time,
@@ -261,6 +267,7 @@ impl<RT: Runtime> Actions<RT> {
             execute_result.udf_time,
             execute_result.num_invocations,
             execute_result.memory_allocated_mb,
+            execute_result.egress_bytes,
             aws_request_id,
         );
         let total_time = timer.finish();
@@ -305,8 +312,8 @@ impl<RT: Runtime> Actions<RT> {
         Ok(NodeActionOutcome {
             result,
             syscall_trace,
-            // This shouldn't ever be None, but we'll use the default 512MB as a fallback.
-            memory_used_in_mb: execute_result.memory_allocated_mb.unwrap_or(512),
+            memory_used_in_mb: execute_result.memory_allocated_mb,
+            egress_bytes: execute_result.egress_bytes,
         })
     }
 
@@ -367,14 +374,23 @@ impl<RT: Runtime> Actions<RT> {
         result
     }
 
-    async fn invoke_analyze(&self, request: AnalyzeRequest) -> anyhow::Result<InvokeResponse> {
+    async fn invoke_analyze(
+        &self,
+        request: AnalyzeRequest,
+    ) -> anyhow::Result<(InvokeResponse, LogLines)> {
         let mut backoff = Backoff::new(NODE_ANALYZE_INITIAL_BACKOFF, NODE_ANALYZE_MAX_BACKOFF);
         let mut retries = 0;
         loop {
-            let (log_line_sender, _log_line_receiver) = mpsc::unbounded_channel();
+            let (log_line_sender, log_line_receiver) = mpsc::unbounded_channel();
             let request = ExecutorRequest::Analyze(request.clone());
-            match self.executor.invoke(request, log_line_sender).await {
-                Ok(response) => return Ok(response),
+            let (response, log_lines) = run_function_and_collect_log_lines(
+                self.executor.invoke(request, log_line_sender).boxed(),
+                log_line_receiver,
+                |_| {},
+            )
+            .await;
+            match response {
+                Ok(response) => return Ok((response, log_lines)),
                 Err(e) => {
                     if retries >= *NODE_ANALYZE_MAX_RETRIES || e.is_deterministic_user_error() {
                         return Err(e);
@@ -396,10 +412,13 @@ impl<RT: Runtime> Actions<RT> {
     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
         let timer = node_executor("analyze");
 
-        let InvokeResponse {
-            response,
-            aws_request_id,
-        } = self.invoke_analyze(request).await?;
+        let (
+            InvokeResponse {
+                response,
+                aws_request_id,
+            },
+            log_lines,
+        ) = self.invoke_analyze(request).await?;
         let response: AnalyzeResponse = serde_json::from_value(response.clone()).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to deserialize analyze response: {}. Response: {}",
@@ -418,7 +437,7 @@ impl<RT: Runtime> Actions<RT> {
             AnalyzeResponse::Success { modules } => modules,
             AnalyzeResponse::Error { message, frames } => {
                 let error = construct_js_error(message, "".to_string(), None, frames, source_maps)?;
-                return Ok(Err(error));
+                return Ok(Err(append_logs_to_error(error, log_lines)));
             },
         };
         let mut result = BTreeMap::new();
@@ -513,7 +532,7 @@ impl<RT: Runtime> Actions<RT> {
                 let function_name: FunctionName = f
                     .name
                     .parse()
-                    .map_err(|e| invalid_function_name_error(&e))?;
+                    .map_err(|e| invalid_function_name_error(&path, &e))?;
                 functions.push(AnalyzedFunction::new(
                     function_name,
                     pos,
@@ -545,6 +564,7 @@ pub enum ExecutorRequest {
         request: ExecuteRequest,
         backend_address: ConvexOrigin,
         timeout: Duration,
+        deployment: DeploymentMetadata,
     },
     Analyze(AnalyzeRequest),
     BuildDeps(BuildDepsRequest),
@@ -559,6 +579,7 @@ impl TryFrom<ExecutorRequest> for JsonValue {
                 request: r,
                 backend_address,
                 timeout,
+                deployment,
             } => {
                 let environment_variables: Vec<JsonValue> = r
                     .environment_variables
@@ -582,7 +603,7 @@ impl TryFrom<ExecutorRequest> for JsonValue {
                         "function": &udf_path.function_name()[..],
                     },
                     // The executor expects the args to be a serialized string.
-                    "args": serialize_udf_args(args)?,
+                    "args": args.get(),
                     "sourcePackage": JsonValue::from(r.source_package),
                     "backendAddress": backend_address,
                     "timeoutSecs": timeout.as_secs_f64(),
@@ -593,6 +614,11 @@ impl TryFrom<ExecutorRequest> for JsonValue {
                     "npmVersion": npm_version.map(|v| v.to_string()),
                     "executionContext": JsonValue::from(r.context),
                     "encodedParentTrace": JsonValue::from(r.encoded_parent_trace),
+                    "deployment": {
+                        "name": deployment.name,
+                        "region": deployment.region,
+                        "class": deployment.class,
+                    },
                 })
             },
             ExecutorRequest::Analyze(r) => {
@@ -617,7 +643,7 @@ impl TryFrom<ExecutorRequest> for JsonValue {
 
                 json!({
                     "type": "build_deps",
-                    "uploadUrl": JsonValue::from(r.upload_url.to_string()),
+                    "uploadUrl": JsonValue::String(r.upload_url),
                     "deps": JsonValue::Array(deps),
                 })
             },
@@ -655,7 +681,7 @@ impl From<SourcePackage> for JsonValue {
 #[derive(Debug, Clone)]
 pub struct Package {
     // Short-lived URI for fetching the source package, if desired.
-    pub uri: Uri,
+    pub uri: String,
 
     // Stable key for caching the package.
     pub key: ObjectKey,
@@ -668,14 +694,13 @@ impl From<Package> for JsonValue {
     fn from(value: Package) -> Self {
         // TODO: this is missing sha256 field
         json!({
-            "uri": value.uri.to_string(),
+            "uri": value.uri,
             "key": String::from(value.key),
             "sha256": base64::encode_urlsafe(&*value.sha256),
         })
     }
 }
 
-#[cfg_attr(any(test, feature = "testing"), derive(Debug))]
 pub struct ExecuteRequest {
     // Note that the lambda executor expects arguments as string, which
     // then directly passes to invokeAction()
@@ -701,7 +726,8 @@ struct ExecuteResponse {
     udf_time: Option<Duration>,
     total_executor_time: Option<Duration>,
     syscall_trace: SyscallTrace,
-    memory_allocated_mb: Option<u64>,
+    memory_allocated_mb: u64,
+    egress_bytes: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -722,6 +748,7 @@ pub struct NodeActionOutcome {
     pub result: Result<ConvexValue, JsError>,
     pub syscall_trace: SyscallTrace,
     pub memory_used_in_mb: u64,
+    pub egress_bytes: u64,
 }
 
 fn duration_from_millis_float(t: f64) -> Duration {
@@ -762,7 +789,8 @@ impl TryFrom<JsonValue> for ExecuteResponse {
                 udf_time_ms: Option<f64>,
                 total_executor_time_ms: Option<f64>,
                 syscall_trace: Option<BTreeMap<String, SyscallStatsJson>>,
-                memory_allocated_mb: Option<u64>,
+                memory_allocated_mb: u64,
+                egress_bytes: u64,
             },
             #[serde(rename_all = "camelCase")]
             Error {
@@ -777,6 +805,7 @@ impl TryFrom<JsonValue> for ExecuteResponse {
                 total_executor_time_ms: Option<f64>,
                 syscall_trace: Option<BTreeMap<String, SyscallStatsJson>>,
                 memory_allocated_mb: Option<u64>,
+                egress_bytes: Option<u64>,
             },
         }
         let resp_json: ExecuteResponseJson = serde_json::from_value(v)?;
@@ -790,6 +819,7 @@ impl TryFrom<JsonValue> for ExecuteResponse {
                 total_executor_time_ms,
                 syscall_trace,
                 memory_allocated_mb,
+                egress_bytes,
             } => ExecuteResponse {
                 result: ExecuteResponseResult::Success { udf_return },
                 num_invocations: Some(num_invocations),
@@ -804,6 +834,7 @@ impl TryFrom<JsonValue> for ExecuteResponse {
                     .collect::<BTreeMap<_, SyscallStats>>()
                     .into(),
                 memory_allocated_mb,
+                egress_bytes,
             },
             ExecuteResponseJson::Error {
                 message,
@@ -817,6 +848,7 @@ impl TryFrom<JsonValue> for ExecuteResponse {
                 total_executor_time_ms,
                 syscall_trace,
                 memory_allocated_mb,
+                egress_bytes,
             } => ExecuteResponse {
                 result: ExecuteResponseResult::Error {
                     message,
@@ -835,7 +867,8 @@ impl TryFrom<JsonValue> for ExecuteResponse {
                     .map(|(k, v)| (k, v.into()))
                     .collect::<BTreeMap<_, SyscallStats>>()
                     .into(),
-                memory_allocated_mb,
+                memory_allocated_mb: memory_allocated_mb.unwrap_or(512),
+                egress_bytes: egress_bytes.unwrap_or(0),
             },
         };
         Ok(result)
@@ -877,7 +910,7 @@ pub struct AnalyzedNodeFunction {
 #[derive(Debug)]
 pub struct BuildDepsRequest {
     pub deps: Vec<NodeDependency>,
-    pub upload_url: Uri,
+    pub upload_url: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -1001,10 +1034,28 @@ pub async fn handle_node_executor_stream(
     }
     anyhow::ensure!(
         result_values.len() <= 1,
-        "Received more than one result from lambda response"
+        "Received more than one result from node executor response"
     );
     let payload = result_values
         .pop()
-        .ok_or_else(|| anyhow::anyhow!("Received no result from lambda response"))?;
+        .ok_or_else(|| anyhow::anyhow!("Received no result from node executor response"))?;
     Ok(Ok(payload))
+}
+
+fn append_logs_to_error(mut error: JsError, log_lines: LogLines) -> JsError {
+    if log_lines.is_empty() {
+        return error;
+    }
+
+    let len = log_lines.len();
+    let logs_text = log_lines
+        .into_iter()
+        // Keep only the last 100 log entries
+        .skip(len.saturating_sub(100))
+        .flat_map(|l| l.to_pretty_strings())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    error.message = format!("{}\n\n{}", error.message, logs_text);
+    error
 }

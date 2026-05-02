@@ -1,34 +1,48 @@
 import { GenericDocument } from "convex/server";
 import { useRouter } from "next/router";
-import { useMemo, useCallback, useRef, useEffect, useState } from "react";
+import {
+  useMemo,
+  useCallback,
+  useRef,
+  useEffect,
+  useState,
+  useContext,
+} from "react";
 import { usePaginatedQuery, PaginationStatus } from "convex/react";
 import udfs from "@common/udfs";
 import { useCounter, useIdle, usePrevious } from "react-use";
-import {
-  isFilterValidationError,
-  FilterValidationError,
-} from "system-udfs/convex/_system/frontend/lib/filters";
+import { isFilterValidationError } from "system-udfs/convex/_system/frontend/lib/filters";
 import { maximumRowsRead } from "system-udfs/convex/_system/paginationLimits";
 import { useNents } from "@common/lib/useNents";
+import { useGlobalLocalStorage } from "@common/lib/useGlobalLocalStorage";
+import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 
-const isGenericDocument = (
-  result: GenericDocument | FilterValidationError,
-): result is GenericDocument => !!result && "_id" in result;
+const DEFAULT_DATA_PAGE_SIZE = 25;
+const dataPageInactivityTimeMinutes = 1;
 
-export const pageSize = 25;
-const dataPageInactivityTime = 10;
+// Declared outside of the hook to be referentially stable without useMemo
+const dataOnError: GenericDocument[] = [];
+
+export function useDataPageSize(componentId: string | null, tableName: string) {
+  const { useCurrentDeployment } = useContext(DeploymentInfoContext);
+  const deployment = useCurrentDeployment();
+  return useGlobalLocalStorage(
+    `dataPageSize/${deployment?.name}/${componentId ? `${componentId}/` : ""}${tableName}`,
+    DEFAULT_DATA_PAGE_SIZE,
+  );
+}
 
 export const useQueryFilteredTable = (tableName: string) => {
   const router = useRouter();
 
   const filters = (router.query.filters as string) || null;
 
-  const isPaused = useIdle(
-    dataPageInactivityTime > 0 ? dataPageInactivityTime * 1000 * 60 : undefined,
-    false,
-  );
+  const isPaused = useIdle(dataPageInactivityTimeMinutes * 1000 * 60, false);
 
   const { selectedNent } = useNents();
+
+  const [pageSize] = useDataPageSize(selectedNent?.id ?? null, tableName);
+
   const { results, loadMore, isLoading, status } = usePaginatedQuery(
     udfs.paginatedTableDocuments.default,
     isPaused
@@ -48,14 +62,12 @@ export const useQueryFilteredTable = (tableName: string) => {
     staleAsOf,
   } = useLastKnownValue(results, status, filters);
 
-  const data = useMemo(
-    () => maybeStaleResults.filter(isGenericDocument),
-    [maybeStaleResults],
-  );
   const errors = useMemo(
     () => results.filter(isFilterValidationError),
     [results],
   );
+  const data =
+    errors.length > 0 ? dataOnError : (maybeStaleResults as GenericDocument[]);
 
   const [
     numRowsReadEstimate,
@@ -67,7 +79,7 @@ export const useQueryFilteredTable = (tableName: string) => {
       loadMore(pageSize);
       incNumRowsReadEstimate(maximumRowsRead);
     }
-  }, [status, loadMore, incNumRowsReadEstimate]);
+  }, [status, loadMore, incNumRowsReadEstimate, pageSize]);
 
   useEffect(() => {
     if (staleAsOf) {
@@ -80,7 +92,9 @@ export const useQueryFilteredTable = (tableName: string) => {
 
   return {
     status:
-      status === "LoadingFirstPage" && everHadResults ? "Loading" : status,
+      status === "LoadingFirstPage" && everHadResults
+        ? ("Loading" as const)
+        : status,
     loadNextPage,
     isLoading,
     staleAsOf,

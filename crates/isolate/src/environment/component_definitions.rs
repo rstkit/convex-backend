@@ -4,6 +4,8 @@ use std::{
         BTreeSet,
     },
     str::FromStr,
+    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -27,6 +29,7 @@ use common::{
         Runtime,
         UnixTimestamp,
     },
+    try_anyhow,
     types::{
         EnvVarName,
         EnvVarValue,
@@ -36,6 +39,7 @@ use deno_core::{
     serde_v8,
     v8::{
         self,
+        scope,
         GetPropertyNamesArgsBuilder,
     },
     ModuleSpecifier,
@@ -43,7 +47,10 @@ use deno_core::{
 use errors::ErrorMetadata;
 use model::{
     config::types::ModuleConfig,
-    modules::module_versions::FullModuleSource,
+    modules::module_versions::{
+        FullModuleSource,
+        ModuleSource,
+    },
 };
 use rand_chacha::ChaCha12Rng;
 use serde_json::Value as JsonValue;
@@ -61,7 +68,6 @@ use super::{
     IsolateEnvironment,
 };
 use crate::{
-    concurrency_limiter::ConcurrencyPermit,
     environment::{
         helpers::syscall_error::{
             syscall_description_for_error,
@@ -167,7 +173,7 @@ impl AppDefinitionEvaluator {
                             &path,
                             &definitions,
                             filename,
-                            source,
+                            Arc::new(source),
                         )
                         .await?;
                     in_progress.remove(&path);
@@ -185,7 +191,7 @@ impl AppDefinitionEvaluator {
         path: &ComponentDefinitionPath,
         evaluated_components: &BTreeMap<ComponentDefinitionPath, ComponentDefinitionMetadata>,
         filename: &str,
-        source: FullModuleSource,
+        source: Arc<FullModuleSource>,
     ) -> anyhow::Result<ComponentDefinitionMetadata> {
         let environment_variables = if path.is_root() {
             let mut env_vars = self.system_env_vars.clone();
@@ -201,88 +207,85 @@ impl AppDefinitionEvaluator {
             environment_variables,
         };
 
-        let (handle, state) = isolate.start_request(client_id.into(), env).await?;
-        let mut handle_scope = isolate.handle_scope();
-        let v8_context = v8::Context::new(&mut handle_scope, v8::ContextOptions::default());
-        let mut context_scope = v8::ContextScope::new(&mut handle_scope, v8_context);
+        let (handle, state, mut timeout) = isolate.start_request(client_id.into(), env).await?;
+        scope!(let handle_scope, isolate.isolate());
+        let v8_context = v8::Context::new(handle_scope, v8::ContextOptions::default());
+        let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
         let mut isolate_context =
-            RequestScope::new(&mut context_scope, handle.clone(), state, false).await?;
+            RequestScope::new(context_scope, handle.clone(), state, false).await?;
         let handle = isolate_context.handle();
 
         let result = {
-            let mut v8_scope = isolate_context.scope();
-            let mut scope = RequestScope::<RT, DefinitionEnvironment>::enter(&mut v8_scope);
+            scope!(let v8_scope, isolate_context.scope());
+            let mut scope = RequestScope::<RT, DefinitionEnvironment>::enter(v8_scope);
             let url = ModuleSpecifier::parse(&format!("{CONVEX_SCHEME}:/{filename}"))?;
-            let module = scope.eval_module(&url).await?;
+            let module = scope.eval_module(&url, &mut timeout).await?;
             let namespace = module
                 .get_module_namespace()
-                .to_object(&mut scope)
+                .to_object(&scope)
                 .context("Module namespace wasn't an object?")?;
-            let default_str = strings::default.create(&mut scope)?;
+            let default_str = strings::default.create(&scope)?;
 
-            if namespace.has(&mut scope, default_str.into()) != Some(true) {
-                anyhow::bail!(ErrorMetadata::bad_request(
-                    "InvalidDefinition",
-                    "Definition file is missing a default export"
-                ));
+            if namespace.has(&scope, default_str.into()) != Some(true) {
+                anyhow::bail!(invalid_export_value(path, "missing default export"));
             }
             let default_export: v8::Local<v8::Object> = namespace
-                .get(&mut scope, default_str.into())
+                .get(&scope, default_str.into())
                 .context("Failed to get default export")?
                 .try_into()
-                .map_err(|_| {
-                    ErrorMetadata::bad_request(
-                        "InvalidDefinition",
-                        "Default export is not an object",
-                    )
-                })?;
+                .map_err(|_| invalid_export_value(path, "the default export is not an object"))?;
 
             let property_names = namespace
-                .get_property_names(&mut scope, GetPropertyNamesArgsBuilder::default().build())
+                .get_property_names(&scope, GetPropertyNamesArgsBuilder::default().build())
                 .context("Failed to get property names")?;
             if property_names.length() != 1 {
-                anyhow::bail!(ErrorMetadata::bad_request(
-                    "InvalidDefinition",
-                    "Definition module has more than one export"
+                anyhow::bail!(invalid_export_value(
+                    path,
+                    "`convex.config.ts` has more than one export"
                 ));
             }
 
-            let export_str = strings::export.create(&mut scope)?;
-            if default_export.has(&mut scope, export_str.into()) != Some(true) {
-                anyhow::bail!(ErrorMetadata::bad_request(
-                    "InvalidDefinition",
-                    "Default export is missing its export function"
+            let export_str = strings::export.create(&scope)?;
+            if default_export.has(&scope, export_str.into()) != Some(true) {
+                anyhow::bail!(invalid_export_value(
+                    path,
+                    "missing `export` property on the default export of `convex.config.ts`"
                 ));
             }
             let export: v8::Local<v8::Function> = default_export
-                .get(&mut scope, export_str.into())
+                .get(&scope, export_str.into())
                 .context("Failed to get export function")?
                 .try_into()
                 .map_err(|_| {
-                    ErrorMetadata::bad_request(
-                        "InvalidDefinition",
-                        "Export function is not a function",
+                    invalid_export_value(
+                        path,
+                        "`app.export` (where `app` is the default export of `convex.config.ts`) \
+                         is not a function",
                     )
                 })?;
 
             let v8_result = export
-                .call(&mut scope, default_export.into(), &[])
+                .call(&scope, default_export.into(), &[])
                 .context("Failed to call export function")?;
 
             // Inject the component definition path into the exported result.
             let result_obj: v8::Local<v8::Object> = v8_result.try_into().map_err(|_| {
-                ErrorMetadata::bad_request("InvalidDefinition", "Export is not an object")
+                invalid_export_value(
+                    path,
+                    "`app.export()` (where `app` is the default export of `convex.config.ts`) \
+                     doesn’t return an object",
+                )
             })?;
-            let key = strings::path.create(&mut scope)?;
+            let key = strings::path.create(&scope)?;
             let path = String::from(path.clone());
             let value =
-                v8::String::new(&mut scope, &path).context("Failed to create string for path")?;
-            anyhow::ensure!(result_obj.set(&mut scope, key.into(), value.into()) == Some(true));
+                v8::String::new(&scope, &path).context("Failed to create string for path")?;
+            anyhow::ensure!(result_obj.set(&scope, key.into(), value.into()) == Some(true));
 
             let metadata: SerializedComponentDefinitionMetadata =
                 serde_v8::from_v8(&mut scope, v8_result).map_err(|e| {
-                    let value = v8::json::stringify(&mut scope, v8_result)
-                        .map(|s| s.to_rust_string_lossy(&mut scope))
+                    let value = v8::json::stringify(&scope, v8_result)
+                        .map(|s| s.to_rust_string_lossy(&scope))
                         .unwrap_or_else(|| "<unknown>".to_string());
                     ErrorMetadata::bad_request(
                         "InvalidDefinition",
@@ -299,6 +302,29 @@ impl AppDefinitionEvaluator {
 
         Ok(result)
     }
+}
+
+fn invalid_export_value(
+    component_path: &ComponentDefinitionPath,
+    msg: &'static str,
+) -> ErrorMetadata {
+    ErrorMetadata::bad_request(
+        "InvalidDefinition",
+        if component_path.is_root() {
+            format!(
+                "The default export of `convex.config.ts` in your app has an invalid value \
+                 ({msg}). Please make sure that you’re exporting the return value of \
+                 `defineApp()` (`import {{ defineApp }} from 'convex/server'`)."
+            )
+        } else {
+            format!(
+                "The default export of `convex.config.ts` in component `{component_path}` has an \
+                 invalid value ({msg}). Please make sure that the component is exporting the \
+                 return value of `defineComponent()` (`import {{ defineComponent }} from \
+                 'convex/server'`).",
+            )
+        },
+    )
 }
 
 pub struct ComponentInitializerEvaluator {
@@ -334,40 +360,40 @@ impl ComponentInitializerEvaluator {
         let filename = COMPONENT_CONFIG_FILE_NAME.to_string();
         let env = DefinitionEnvironment {
             expected_filename: filename.clone(),
-            source: FullModuleSource {
+            source: Arc::new(FullModuleSource {
                 source: self.definition.source,
                 source_map: self.definition.source_map,
-            },
+            }),
             evaluated_definitions: self.evaluated_definitions,
             environment_variables: None,
         };
-        let (handle, state) = isolate.start_request(client_id.into(), env).await?;
-        let mut handle_scope = isolate.handle_scope();
-        let v8_context = v8::Context::new(&mut handle_scope, v8::ContextOptions::default());
-        let mut context_scope = v8::ContextScope::new(&mut handle_scope, v8_context);
+        let (handle, state, mut timeout) = isolate.start_request(client_id.into(), env).await?;
+        scope!(let handle_scope, isolate.isolate());
+        let v8_context = v8::Context::new(handle_scope, v8::ContextOptions::default());
+        let context_scope = &mut v8::ContextScope::new(handle_scope, v8_context);
         let mut isolate_context =
-            RequestScope::new(&mut context_scope, handle.clone(), state, true).await?;
+            RequestScope::new(context_scope, handle.clone(), state, true).await?;
         let handle = isolate_context.handle();
 
         let result = {
-            let mut v8_scope = isolate_context.scope();
-            let mut scope = RequestScope::<RT, DefinitionEnvironment>::enter(&mut v8_scope);
+            scope!(let v8_scope, isolate_context.scope());
+            let mut scope = RequestScope::<RT, DefinitionEnvironment>::enter(v8_scope);
             let url = ModuleSpecifier::parse(&format!("{CONVEX_SCHEME}:/{filename}"))?;
-            let module = scope.eval_module(&url).await?;
+            let module = scope.eval_module(&url, &mut timeout).await?;
             let namespace = module
                 .get_module_namespace()
-                .to_object(&mut scope)
+                .to_object(&scope)
                 .context("Module namespace wasn't an object?")?;
-            let default_str = strings::default.create(&mut scope)?;
+            let default_str = strings::default.create(&scope)?;
 
-            if namespace.has(&mut scope, default_str.into()) != Some(true) {
+            if namespace.has(&scope, default_str.into()) != Some(true) {
                 anyhow::bail!(ErrorMetadata::bad_request(
                     "InvalidDefinition",
                     "Definition file is missing a default export"
                 ));
             }
             let default_export: v8::Local<v8::Object> = namespace
-                .get(&mut scope, default_str.into())
+                .get(&scope, default_str.into())
                 .context("Failed to get default export")?
                 .try_into()
                 .map_err(|_| {
@@ -377,9 +403,9 @@ impl ComponentInitializerEvaluator {
                     )
                 })?;
 
-            let callback_str = strings::_onInitCallbacks.create(&mut scope)?;
+            let callback_str = strings::_onInitCallbacks.create(&scope)?;
             let callbacks: v8::Local<v8::Object> = default_export
-                .get(&mut scope, callback_str.into())
+                .get(&scope, callback_str.into())
                 .context("Failed to get _onInitCallbacks")?
                 .try_into()
                 .map_err(|_| {
@@ -389,10 +415,10 @@ impl ComponentInitializerEvaluator {
                     )
                 })?;
 
-            let name_str = v8::String::new(&mut scope, &String::from(self.name))
+            let name_str = v8::String::new(&scope, &String::from(self.name))
                 .context("Failed to create string for name")?;
             let callback: v8::Local<v8::Function> = callbacks
-                .get(&mut scope, name_str.into())
+                .get(&scope, name_str.into())
                 .context("Failed to get callback")?
                 .try_into()
                 .map_err(|_| {
@@ -411,11 +437,11 @@ impl ComponentInitializerEvaluator {
             }
             let args_obj = ConvexObject::try_from(args_obj)?;
             let args_str = args_obj.json_serialize()?;
-            let args_v8_str = v8::String::new(&mut scope, &args_str)
-                .context("Failed to create string for args")?;
+            let args_v8_str =
+                v8::String::new(&scope, &args_str).context("Failed to create string for args")?;
 
             let v8_result: v8::Local<v8::String> = callback
-                .call(&mut scope, default_export.into(), &[args_v8_str.into()])
+                .call(&scope, default_export.into(), &[args_v8_str.into()])
                 .context("Failed to call callback")?
                 .try_into()
                 .map_err(|_| {
@@ -424,7 +450,7 @@ impl ComponentInitializerEvaluator {
                         "Callback returned non-string value",
                     )
                 })?;
-            let result_str = helpers::to_rust_string(&mut scope, &v8_result)?;
+            let result_str = helpers::to_rust_string(&scope, &v8_result)?;
             let result_json: JsonValue = serde_json::from_str(&result_str)?;
             let result_obj = ConvexObject::try_from(result_json)?;
 
@@ -448,7 +474,7 @@ const APP_CONFIG_FILE_NAME: &str = "convex.config.js";
 
 struct DefinitionEnvironment {
     expected_filename: String,
-    source: FullModuleSource,
+    source: Arc<FullModuleSource>,
 
     evaluated_definitions: BTreeMap<ComponentDefinitionPath, ComponentDefinitionMetadata>,
     /// Environment variables are allowed in app but not in
@@ -486,6 +512,20 @@ impl<RT: Runtime> IsolateEnvironment<RT> for DefinitionEnvironment {
         ))
     }
 
+    fn performance_now(&mut self) -> anyhow::Result<Duration> {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "NoPerformanceDuringDefinitionEvaluation",
+            "The Performance API is not supported when evaluating app definition"
+        ))
+    }
+
+    fn performance_time_origin(&mut self) -> anyhow::Result<UnixTimestamp> {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "NoPerformanceDuringDefinitionEvaluation",
+            "The Performance API is not supported when evaluating app definition"
+        ))
+    }
+
     fn get_environment_variable(
         &mut self,
         name: EnvVarName,
@@ -495,7 +535,7 @@ impl<RT: Runtime> IsolateEnvironment<RT> for DefinitionEnvironment {
             .map(|env_vars| env_vars.get(&name).cloned())
             .context(ErrorMetadata::bad_request(
                 "EnvironmentVariablesUnsupported",
-                "Environment variables are only supported in the app's convex.config.ts.",
+                "Environment variables are only supported in the app's convex.config.ts. Learn more at https://docs.convex.dev/components/authoring#environment-variables",
             ))
     }
 
@@ -510,16 +550,15 @@ impl<RT: Runtime> IsolateEnvironment<RT> for DefinitionEnvironment {
         &mut self,
         path: &str,
         _timeout: &mut Timeout<RT>,
-        _permit: &mut Option<ConcurrencyPermit>,
-    ) -> anyhow::Result<Option<(FullModuleSource, ModuleCodeCacheResult)>> {
+    ) -> anyhow::Result<Option<(Arc<FullModuleSource>, ModuleCodeCacheResult)>> {
         if path == &self.expected_filename {
             return Ok(Some((self.source.clone(), ModuleCodeCacheResult::noop())));
         }
         if let Some(remainder) = path.strip_prefix("_componentDeps/") {
-            let r: anyhow::Result<_> = try {
+            let r: anyhow::Result<_> = try_anyhow!({
                 let def_path_str = String::from_utf8(base64::decode_urlsafe(remainder)?)?;
                 ComponentDefinitionPath::from_str(&def_path_str)?
-            };
+            });
             let def_path =
                 r.map_err(|e| ErrorMetadata::bad_request("InvalidModule", e.to_string()))?;
             let Some(def) = self.evaluated_definitions.get(&def_path) else {
@@ -536,16 +575,19 @@ impl<RT: Runtime> IsolateEnvironment<RT> for DefinitionEnvironment {
             };
 
             let synthetic_module = FullModuleSource {
-                source: format!(
+                source: ModuleSource::new(&format!(
                     "export default {{ export: () => {{ return {} }}, componentDefinitionPath: \
                      \"{}\", defaultName: \"{}\"}}",
                     serde_json::to_string(&serialized_def)?,
                     String::from(def_path.clone()),
                     default_name_string
-                ),
+                )),
                 source_map: None,
             };
-            return Ok(Some((synthetic_module, ModuleCodeCacheResult::noop())));
+            return Ok(Some((
+                Arc::new(synthetic_module),
+                ModuleCodeCacheResult::noop(),
+            )));
         }
         anyhow::bail!(ErrorMetadata::bad_request(
             "NoImportModuleDuringDefinitionEvaluation",

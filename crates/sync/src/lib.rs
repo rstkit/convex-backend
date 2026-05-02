@@ -1,7 +1,7 @@
+#![recursion_limit = "256"]
 #![feature(type_alias_impl_trait)]
-#![feature(let_chains)]
 #![feature(try_blocks)]
-#![feature(btree_extract_if)]
+#![feature(try_blocks_heterogeneous)]
 
 mod metrics;
 mod state;
@@ -11,8 +11,5 @@ pub use worker::{
     SyncWorker,
     SyncWorkerConfig,
 };
-
-#[cfg(test)]
-mod tests;
 
 pub type ServerMessage = sync_types::ServerMessage<common::value::JsonPackedValue>;

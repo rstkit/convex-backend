@@ -1,7 +1,8 @@
-import { Context, logMessage } from "../../../bundler/context.js";
+import { Context } from "../../../bundler/context.js";
+import { logMessage } from "../../../bundler/log.js";
 import { detect } from "detect-port";
 import crypto from "crypto";
-import chalk from "chalk";
+import { chalkStderr } from "chalk";
 
 export async function choosePorts(
   ctx: Context,
@@ -24,7 +25,7 @@ export async function choosePorts(
         return ctx.crash({
           exitCode: 1,
           errorType: "fatal",
-          printedMessage: "Requested port is not available",
+          printedMessage: `Requested port ${requestedPort} is not available`,
         });
       }
       ports.push(port);
@@ -38,25 +39,34 @@ export async function choosePorts(
   return ports;
 }
 
+export async function chooseLocalBackendPorts(
+  ctx: Context,
+  ports?: { cloud?: number | null; site?: number | null },
+): Promise<{ cloudPort: number; sitePort: number }> {
+  const [cloudPort, sitePort] = await choosePorts(ctx, {
+    count: 2,
+    startPort: 3210,
+    requestedPorts: [ports?.cloud ?? null, ports?.site ?? null],
+  });
+  return { cloudPort, sitePort };
+}
+
 export async function isOffline(): Promise<boolean> {
   // TODO(ENG-7080) -- implement this for real
   return false;
 }
 
-export function printLocalDeploymentWelcomeMessage(ctx: Context) {
+export function printLocalDeploymentWelcomeMessage() {
   logMessage(
-    ctx,
-    chalk.cyan("You're trying out the beta local deployment feature!"),
+    chalkStderr.cyan("You're trying out the beta local deployment feature!"),
   );
   logMessage(
-    ctx,
-    chalk.cyan(
+    chalkStderr.cyan(
       "To learn more, read the docs: https://docs.convex.dev/cli/local-deployments",
     ),
   );
   logMessage(
-    ctx,
-    chalk.cyan(
+    chalkStderr.cyan(
       "To opt out at any time, run `npx convex disable-local-deployments`",
     ),
   );

@@ -21,7 +21,6 @@ use crate::{
     },
 };
 
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwsLambdaConfig {
     pub env: BTreeMap<FieldName, String>, // Env to pass to node
@@ -32,9 +31,9 @@ pub struct AwsLambdaConfig {
     pub timeout_sec: i32,
     pub vpc_subnet_ids: Vec<String>,
     pub vpc_security_group_ids: Vec<String>,
+    pub ipv6_enabled: bool,
 }
 
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwsLambdaVersion {
     pub lambda_name: String,
@@ -46,7 +45,6 @@ pub struct AwsLambdaVersion {
 
 /// Stores the configuration information for the Lambda relevant to the type
 /// of Lambda this enum identifies.
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AwsLambdaPackageDesc {
     Static {
@@ -57,7 +55,7 @@ pub enum AwsLambdaPackageDesc {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AwsLambdaType {
     Static,
     Dynamic,
@@ -77,11 +75,10 @@ impl AwsLambdaType {
                 Ok(AwsLambdaPackageDesc::Static { source_package_id })
             },
             Self::Dynamic => {
-                let external_deps_package_id = deployed_code
-                    .map(|source_package| source_package.external_deps_package_id.clone())
-                    .unwrap_or(None);
+                // Dynamic lambdas always download packages at invocation time,
+                // so keep this descriptor constant to avoid unnecessary redeploys.
                 Ok(AwsLambdaPackageDesc::Dynamic {
-                    external_deps_package_id,
+                    external_deps_package_id: None,
                 })
             },
         }
@@ -195,6 +192,7 @@ impl TryFrom<AwsLambdaConfig> for ConvexObject {
             timeout_sec,
             vpc_subnet_ids,
             vpc_security_group_ids,
+            ipv6_enabled,
         }: AwsLambdaConfig,
     ) -> Result<Self, Self::Error> {
         let env: anyhow::Result<BTreeMap<FieldName, ConvexValue>> = env
@@ -217,7 +215,8 @@ impl TryFrom<AwsLambdaConfig> for ConvexObject {
             "diskSizeMb" => (disk_size_mb as i64),
             "timeoutSec" => (timeout_sec as i64),
             "subnetIds" => vpc_subnet_ids,
-            "securityGroupIds" => vpc_security_group_ids
+            "securityGroupIds" => vpc_security_group_ids,
+            "ipv6Enabled" => ipv6_enabled,
         )
     }
 }
@@ -301,6 +300,11 @@ impl TryFrom<ConvexObject> for AwsLambdaConfig {
             None => vec![],
             _ => anyhow::bail!("Invalid 'securityGroupIds' in {object_fields:?}"),
         };
+        let ipv6_enabled = match object_fields.remove("ipv6Enabled") {
+            Some(ConvexValue::Boolean(b)) => b,
+            None => false,
+            r => anyhow::bail!("Invalid 'ipv6Enabled': {r:?}"),
+        };
         Ok(Self {
             env: env?,
             runtime,
@@ -310,6 +314,7 @@ impl TryFrom<ConvexObject> for AwsLambdaConfig {
             timeout_sec,
             vpc_subnet_ids,
             vpc_security_group_ids,
+            ipv6_enabled,
         })
     }
 }
@@ -357,34 +362,5 @@ impl TryFrom<ConvexObject> for AwsLambdaVersion {
             lambda_config,
             package_desc,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use common::testing::assert_roundtrips;
-    use proptest::prelude::*;
-    use value::ConvexObject;
-
-    use super::{
-        AwsLambdaConfig,
-        AwsLambdaVersion,
-    };
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_actions_version_roundtrip(v in any::<AwsLambdaVersion>()) {
-            assert_roundtrips::<AwsLambdaVersion, ConvexObject>(v);
-        }
-
-        #[test]
-        fn test_lambda_config_roundtrip(v in any::<AwsLambdaConfig>()) {
-            assert_roundtrips::<AwsLambdaConfig, ConvexObject>(v);
-        }
     }
 }

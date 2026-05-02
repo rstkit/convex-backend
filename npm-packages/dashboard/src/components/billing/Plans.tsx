@@ -1,37 +1,63 @@
 import { useListPlans } from "api/billing";
-import { Loading } from "@ui/Loading";
-import { OrbSubscriptionResponse, Team } from "generatedApi";
+import {
+  OrbSubscriptionResponse,
+  PlanResponse,
+  TeamResponse,
+} from "generatedApi";
 import { OrbSelfServePlan } from "./planCards/OrbSelfServePlan";
-import { StarterPlan } from "./planCards/StarterPlan";
+import { FreePlan } from "./planCards/FreePlan";
+import { BusinessPlan } from "./planCards/BusinessPlan";
+
+const placeholderPlans: PlanResponse[] = [
+  {
+    id: "placeholder-starter",
+    planType: "CONVEX_STARTER_PLUS",
+    name: "Starter",
+    description: "",
+    status: "active",
+    seatPrice: null,
+  },
+  {
+    id: "placeholder-professional",
+    planType: "CONVEX_PROFESSIONAL",
+    name: "Professional",
+    description: "",
+    status: "active",
+    seatPrice: null,
+  },
+];
 
 export function Plans({
   team,
   hasAdminPermissions,
   subscription,
 }: {
-  team: Team;
+  team: TeamResponse;
   hasAdminPermissions: boolean;
   subscription?: OrbSubscriptionResponse;
 }) {
   const orbPlans = useListPlans(team.id);
+  const isLoading = orbPlans.plans === undefined;
+  const plans = orbPlans.plans ?? placeholderPlans;
 
-  return orbPlans.plans !== undefined ? (
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-      <StarterPlan
+  return (
+    <div className="scrollbar flex gap-3 overflow-x-auto pb-2">
+      <FreePlan
         hasAdminPermissions={hasAdminPermissions}
         subscription={subscription}
         team={team}
+        isLoading={isLoading}
       />
-      {orbPlans.plans.map((plan, idx) => (
+      {plans.map((plan, idx) => (
         <OrbSelfServePlan
           key={idx}
           orbSub={subscription}
           plan={plan}
           team={team}
+          isLoading={isLoading}
         />
       ))}
+      <BusinessPlan subscription={subscription} isLoading={isLoading} />
     </div>
-  ) : (
-    <Loading className="h-48 w-full" fullHeight={false} />
   );
 }

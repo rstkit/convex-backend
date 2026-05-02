@@ -16,7 +16,7 @@ export class Response {
   private _status: number;
   private _statusText: string;
   private _headers: Headers;
-  private _bodyStream: ReadableStream | null;
+  private _bodyStream: ReadableStream | null = null;
   private _bodyUsed = false;
   private _url: string;
   [_contentLength]: number | null;
@@ -53,7 +53,7 @@ export class Response {
     }
     try {
       body = JSON.stringify(data);
-    } catch (e) {
+    } catch {
       throw new TypeError(
         "Failed to execute 'json' on 'Response': The data is not JSON serializable",
       );

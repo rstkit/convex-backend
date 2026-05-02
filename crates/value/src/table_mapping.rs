@@ -13,7 +13,6 @@ use crate::{
     TabletIdAndTableNumber,
 };
 
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 pub enum TableNamespace {
     /// For tables that have a single global namespace, e.g. _tables, _index,
@@ -27,19 +26,6 @@ pub enum TableNamespace {
 }
 
 impl TableNamespace {
-    /// Default namespace for user tables in tests.
-    /// Ideally we should be able to change this to a different namespace
-    /// without any test failures.
-    #[cfg(any(test, feature = "testing"))]
-    pub const fn test_user() -> Self {
-        Self::Global
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    pub const fn test_component() -> Self {
-        Self::ByComponent(DeveloperDocumentId::MIN)
-    }
-
     /// Use this to make it clear that a table pertains to the root component.
     /// It doesn't extend between components like a plain Global.
     /// This is useful for code searching.
@@ -53,20 +39,13 @@ impl TableNamespace {
     pub const fn by_component_TODO() -> Self {
         Self::Global
     }
-
-    /// Namespace that should be passed down, and could be Global, ByComponent,
-    /// or ByComponentDefinition.
-    #[allow(non_snake_case)]
-    pub const fn TODO() -> Self {
-        Self::Global
-    }
 }
 
 // This TableMapping contains the mapping between TableNames and
 // TabletIdAndTableNumber. This only includes active tables and hidden tables
 // (i.e. not deleted tables).
 // Use is_active to determine if a table is active.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableMapping {
     /// Maps from tablet to number and name exist for all tablets.
     tablet_to_table: OrdMap<TabletId, (TableNamespace, TableNumber, TableName)>,
@@ -219,6 +198,15 @@ impl TableMapping {
         self.tablet_to_table
             .get(&id)
             .map(|(namespace, ..)| *namespace)
+            .with_context(|| format!("cannot find table {id:?}"))
+    }
+
+    pub fn get_table_metadata(
+        &self,
+        id: TabletId,
+    ) -> anyhow::Result<&(TableNamespace, TableNumber, TableName)> {
+        self.tablet_to_table
+            .get(&id)
             .with_context(|| format!("cannot find table {id:?}"))
     }
 

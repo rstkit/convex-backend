@@ -2,10 +2,10 @@ syntax = "proto3";
 
 package outcome;
 
-import "google/protobuf/timestamp.proto";
-import "google/protobuf/duration.proto";
 import "common.proto";
 import "convex_query_journal.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 message FunctionOutcome {
   oneof outcome {
@@ -31,6 +31,10 @@ message UdfOutcome {
   SyscallTrace syscall_trace = 8;
 
   optional bool observed_identity = 10;
+  uint64 memory_in_mb = 11;
+  optional google.protobuf.Duration user_execution_time = 12;
+
+  repeated AuditLogLine audit_log_lines = 13;
 }
 
 message ActionOutcome {
@@ -41,8 +45,8 @@ message ActionOutcome {
 
   common.FunctionResult result = 7;
   SyscallTrace syscall_trace = 8;
+  optional google.protobuf.Duration user_execution_time = 10;
 }
-
 
 message HttpActionOutcome {
   google.protobuf.Timestamp unix_timestamp = 1;
@@ -54,6 +58,7 @@ message HttpActionOutcome {
 
   optional string path = 5;
   optional string method = 6;
+  optional google.protobuf.Duration user_execution_time = 7;
 }
 
 message SyscallTrace {
@@ -91,4 +96,9 @@ message LogLine {
     StructuredLogLine line = 2;
     SubFunctionLogLines sub_function = 3;
   }
+}
+
+message AuditLogLine {
+  optional string body_json = 1;
+  reserved 2, 3, 4;
 }

@@ -16,12 +16,16 @@ import { useQuery } from "convex/react";
 import udfs from "@common/udfs";
 import { Doc, Id } from "system-udfs/convex/_generated/dataModel";
 import { formatDistanceStrict } from "date-fns";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { useCurrentTeam, useTeamMembers } from "api/teams";
 import { snapshotImportFormat } from "system-udfs/convex/tableDefs/snapshotImport";
 import { Infer } from "convex/values";
 import { useCancelImport, useConfirmImport } from "hooks/deploymentApi";
-import { Disclosure } from "@headlessui/react";
+import {
+  Disclosure,
+  DisclosureButton,
+  DisclosurePanel,
+} from "@headlessui/react";
 import { useState } from "react";
 import { PuzzlePieceIcon } from "@common/elements/icons";
 
@@ -98,7 +102,7 @@ function ImportStateBody({
         <div>
           {(snapshotImport.checkpoints === null ||
             snapshotImport.checkpoints === undefined) && (
-            <div className="whitespace-pre-wrap font-mono">
+            <div className="font-mono whitespace-pre-wrap">
               {snapshotImport.state.message_to_confirm}
             </div>
           )}
@@ -113,8 +117,8 @@ function ImportStateBody({
         <div>
           <CancelImportButton importId={snapshotImport._id} />
           <div className="flex flex-col">
-            {snapshotImport.state.checkpoint_messages.map((message: string) => (
-              <div className="flex items-center gap-2">
+            {snapshotImport.state.checkpoint_messages.map((message, index) => (
+              <div key={index} className="flex items-center gap-2">
                 <CheckIcon /> {message}
               </div>
             ))}
@@ -144,7 +148,7 @@ function ImportStateBody({
     }
     case "failed":
       return (
-        <div className="flex w-fit items-center gap-1 rounded border p-1 text-sm">
+        <div className="flex w-fit items-center gap-1 rounded-sm border p-1 text-sm">
           <CrossCircledIcon className="min-w-[1rem] text-content-errorSecondary" />
           {snapshotImport.state.error_message}
         </div>
@@ -166,26 +170,26 @@ function ImportStatePill({
     case "uploaded":
     case "waiting_for_confirmation":
       return (
-        <span className="h-fit w-fit rounded bg-blue-100 p-1 text-center text-xs text-blue-900 dark:bg-blue-900 dark:text-blue-100">
+        <span className="h-fit w-fit rounded-sm bg-blue-100 p-1 text-center text-xs text-blue-900 dark:bg-blue-900 dark:text-blue-100">
           pending confirmation
         </span>
       );
     case "in_progress":
       return (
-        <span className="h-fit w-fit rounded bg-blue-100 p-1 text-center text-xs text-blue-900 dark:bg-blue-900 dark:text-blue-100">
+        <span className="h-fit w-fit rounded-sm bg-blue-100 p-1 text-center text-xs text-blue-900 dark:bg-blue-900 dark:text-blue-100">
           in progress
         </span>
       );
 
     case "completed":
       return (
-        <span className="h-fit w-14 rounded bg-background-success p-1 text-center text-xs text-content-success">
+        <span className="h-fit w-14 rounded-sm bg-background-success p-1 text-center text-xs text-content-success">
           success
         </span>
       );
     case "failed":
       return (
-        <span className="h-fit w-14 rounded bg-background-error p-1 text-center text-xs text-content-error">
+        <span className="h-fit w-14 rounded-sm bg-background-error p-1 text-center text-xs text-content-error">
           failure
         </span>
       );
@@ -210,7 +214,7 @@ function snapshotImportFormatToText(
       return "ZIP";
     default: {
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const _: never = format;
+      format satisfies never;
       return "";
     }
   }
@@ -245,31 +249,31 @@ export function ImportSummary({
     >(),
   );
   return (
-    <div>
+    <div className="flex flex-col gap-4">
       {Array.from(checkpointsByComponent.entries()).map(
         ([componentPath, checkpoints]) => (
           <div key={componentPath}>
             {componentPath ? (
-              <div className="flex w-full items-center space-x-1">
-                <PuzzlePieceIcon />
+              <h5 className="mb-1 flex w-full items-center space-x-1">
+                <PuzzlePieceIcon className="text-content-secondary" />
                 <span>{componentPath}</span>
-              </div>
+              </h5>
             ) : null}
-            <table className="mr-auto border-collapse border text-left">
+            <table className="mr-auto border-collapse border text-left text-xs">
               <thead className="border">
                 <tr>
-                  <th className="border px-2 font-semibold">table</th>
-                  <th className="border px-2 font-semibold">create</th>
-                  <th className="border px-2 font-semibold">delete</th>
+                  <th className="border px-2 py-0.5 font-semibold">Table</th>
+                  <th className="border px-2 py-0.5 font-semibold">Created</th>
+                  <th className="border px-2 py-0.5 font-semibold">Deleted</th>
                 </tr>
               </thead>
               <tbody>
                 {checkpoints.map((checkpoint) => (
                   <tr key={checkpoint.display_table_name}>
-                    <td className="border px-2">
+                    <td className="border px-2 py-0.5 font-mono">
                       <span>{checkpoint.display_table_name}</span>
                     </td>
-                    <td className="border px-2">
+                    <td className="border px-2 py-0.5 tabular-nums">
                       {Number(
                         checkpoint.total_num_rows_to_write,
                       ).toLocaleString()}{" "}
@@ -277,7 +281,18 @@ export function ImportSummary({
                         ? `file${Number(checkpoint.total_num_rows_to_write) === 1 ? "" : "s"}`
                         : `document${Number(checkpoint.total_num_rows_to_write) === 1 ? "" : "s"}`}
                     </td>
-                    <td className="border px-2">{`${Number(checkpoint.existing_rows_to_delete).toLocaleString()} of ${Number(checkpoint.existing_rows_in_table).toLocaleString()} ${checkpoint.display_table_name === "_storage" ? "files" : "documents"}`}</td>
+                    <td className="border px-2 py-0.5 tabular-nums">
+                      {Number(
+                        checkpoint.existing_rows_to_delete,
+                      ).toLocaleString()}{" "}
+                      of{" "}
+                      {Number(
+                        checkpoint.existing_rows_in_table,
+                      ).toLocaleString()}{" "}
+                      {checkpoint.display_table_name === "_storage"
+                        ? "files"
+                        : "documents"}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -289,7 +304,7 @@ export function ImportSummary({
   );
 }
 
-function ImportState({
+export function ImportState({
   snapshotImport,
 }: {
   snapshotImport: Doc<"_snapshot_imports"> & { memberName: string };
@@ -322,26 +337,27 @@ function ImportState({
                 prefix="Started "
                 date={new Date(snapshotImport._creationTime)}
               />
-              <Disclosure.Button
-                as={Button}
-                inline
-                variant="neutral"
-                size="xs"
-                tipSide="left"
-                tip="View entry metadata"
-              >
-                {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
-              </Disclosure.Button>
+              <Tooltip side="left" tip="View entry metadata" asChild>
+                <DisclosureButton
+                  as={Button}
+                  inline
+                  variant="neutral"
+                  size="xs"
+                  aria-label={open ? "Hide details" : "Show details"}
+                >
+                  {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
+                </DisclosureButton>
+              </Tooltip>
             </div>
           </div>
-          <Disclosure.Panel>
+          <DisclosurePanel>
             <div className="mt-2 flex flex-col gap-2">
               <ImportStateBody snapshotImport={snapshotImport} />
               <ImportSummary
                 snapshotImportCheckpoints={snapshotImport.checkpoints}
               />
             </div>
-          </Disclosure.Panel>
+          </DisclosurePanel>
         </>
       )}
     </Disclosure>
@@ -379,7 +395,6 @@ export function SnapshotImport() {
               <Link
                 target="_blank"
                 href="https://docs.convex.dev/database/import-export/import"
-                className="text-content-link hover:underline"
               >
                 Learn more
               </Link>

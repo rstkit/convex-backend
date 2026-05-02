@@ -9,22 +9,20 @@ import {
   ReloadIcon,
   StopwatchIcon,
 } from "@radix-ui/react-icons";
-import Link from "next/link";
 import { useRouter } from "next/router";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef } from "react";
 import {
   CronJobLog,
   CronJobWithRuns,
 } from "system-udfs/convex/_system/frontend/common";
-import { FileModal } from "@common/features/schedules/components/crons/FileModal";
 import { CronsTable } from "@common/features/schedules/components/crons/CronsTable";
 import { useCronJobs } from "@common/features/schedules/lib/CronsProvider";
-import { useSourceCode } from "@common/lib/functions/useSourceCode";
 import { Button } from "@ui/Button";
 import { PageContent } from "@common/elements/PageContent";
 import { LoadingTransition } from "@ui/Loading";
 import { Sheet } from "@ui/Sheet";
 import { Tooltip } from "@ui/Tooltip";
+import { Link } from "@ui/Link";
 import { useFunctionUrl } from "@common/lib/deploymentApi";
 import { formatDateTime, msFormat } from "@common/lib/format";
 import { displayName } from "@common/lib/functions/generateFileTree";
@@ -33,13 +31,10 @@ import { entryOutput } from "@common/lib/useLogs";
 import { EmptySection } from "@common/elements/EmptySection";
 
 export function CronJobsContent() {
-  const { loading, cronJobs, cronsModule, cronJobRuns } = useCronJobs();
-  const [showCronsFile, setShowCronsFile] = useState(false);
+  const { loading, cronJobs, cronJobRuns } = useCronJobs();
   const router = useRouter();
   const detailsCron =
     cronJobs && cronJobs.find((c) => c.name === router.query.id);
-
-  const contents = useSourceCode("crons.js");
 
   let content: React.ReactNode;
   if (!cronJobs || cronJobs.length === 0) {
@@ -54,13 +49,6 @@ export function CronJobsContent() {
   } else {
     content = (
       <div className="flex h-full w-full max-w-6xl flex-col gap-2">
-        {showCronsFile && cronsModule && contents && (
-          <FileModal
-            onClose={() => setShowCronsFile(false)}
-            contents={contents}
-            displayName="crons.js"
-          />
-        )}
         <div className="flex justify-between">
           <div className="flex flex-row items-center justify-between">
             <div className="flex flex-col gap-1">
@@ -70,9 +58,6 @@ export function CronJobsContent() {
               </div>
             </div>
           </div>
-          <Button onClick={() => setShowCronsFile(true)} size="sm">
-            Show crons.js
-          </Button>
         </div>
         <CronsTable cronJobs={cronJobs} />
       </div>
@@ -81,9 +66,9 @@ export function CronJobsContent() {
 
   return (
     <PageContent>
-      <LoadingTransition>
-        <div className="h-full w-full max-w-6xl">{!loading && content}</div>
-      </LoadingTransition>
+      <div className="h-full w-full max-w-6xl">
+        <LoadingTransition>{!loading && content}</LoadingTransition>
+      </div>
     </PageContent>
   );
 }
@@ -124,7 +109,7 @@ function Details({
         </div>
       </div>
       <Sheet className="h-full overflow-auto" padding={false}>
-        <h4 className="sticky top-0 mb-4 flex items-center gap-2 whitespace-nowrap border-b bg-background-secondary px-6 py-4">
+        <h4 className="sticky top-0 mb-4 flex items-center gap-2 border-b bg-background-secondary px-6 py-4 whitespace-nowrap">
           <ReloadIcon /> Executions
           <Tooltip
             tip="The logs and results of the last 5 executions of a cron job are available here, as well as any that run while this view is open."
@@ -137,7 +122,7 @@ function Details({
         <ul className="flex w-full flex-col border-b px-6">
           <li
             key="current"
-            className={`w-fit p-2 ${currentlyRunning ? "" : "rounded border border-dashed border-border-selected"}`}
+            className={`w-fit p-2 ${currentlyRunning ? "" : "rounded-sm border border-dashed border-border-selected"}`}
           >
             <TopCronJobLogListItem cronJob={cronJob} />
           </li>
@@ -152,7 +137,7 @@ function Details({
   );
 }
 
-function CronJobLogListItem({ cronJobLog }: { cronJobLog: CronJobLog }) {
+export function CronJobLogListItem({ cronJobLog }: { cronJobLog: CronJobLog }) {
   const url = useFunctionUrl(cronJobLog.udfPath);
   return (
     <div className="flex items-start gap-4 font-mono text-xs">
@@ -161,17 +146,15 @@ function CronJobLogListItem({ cronJobLog }: { cronJobLog: CronJobLog }) {
           <div className="whitespace-nowrap text-content-primary">
             {formatDateTime(new Date(Number(cronJobLog.ts / BigInt(1000000))))}
           </div>
-          <div className="w-14 whitespace-nowrap text-right text-content-secondary">
+          <div className="w-14 text-right whitespace-nowrap text-content-secondary">
             {cronJobLog.status.type !== "canceled" && cronJobLog.executionTime
               ? msFormat(cronJobLog.executionTime * 1000)
               : ""}
           </div>
           <LogStatusLine status={cronJobLog.status} />
-          <div className="truncate text-content-link hover:underline">
-            <Link href={url} legacyBehavior>
-              {displayName(cronJobLog.udfPath)}
-            </Link>
-          </div>
+          <Link href={url} className="truncate">
+            {displayName(cronJobLog.udfPath)}
+          </Link>
         </div>
         {cronJobLog.status.type === "success" ||
         cronJobLog.status.type === "err" ? (
@@ -236,7 +219,7 @@ export function TopCronJobLogListItem({
             {timestamp ?? "unknown"}
           </div>
           <div
-            className={`${textColor} w-14 whitespace-nowrap text-right text-content-secondary`}
+            className={`${textColor} w-14 text-right whitespace-nowrap text-content-secondary`}
           >
             {currentlyRunning ? <span ref={estRuntimeRef}>0ms</span> : ""}
           </div>
@@ -250,11 +233,9 @@ export function TopCronJobLogListItem({
               {currentlyRunning ? "running" : "scheduled"}
             </span>
           </div>
-          <div className="truncate text-content-link hover:underline">
-            <Link href={url} legacyBehavior>
-              {displayName(cronJob.cronSpec.udfPath)}
-            </Link>
-          </div>
+          <Link href={url} className="truncate">
+            {displayName(cronJob.cronSpec.udfPath)}
+          </Link>
         </div>
       </div>
     </div>
@@ -284,7 +265,7 @@ const statusTypes: {
 function LogStatusLine({ status }: { status: CronJobLog["status"] }) {
   const { textColor, Icon } = statusTypes[status.type];
   return (
-    <div className={`flex items-center gap-1 ${textColor} `}>
+    <div className={`flex items-center gap-1 ${textColor}`}>
       <Icon className="h-3.5 w-3.5" />
       <span className={`w-16 ${textColor}`}>
         {status.type === "success" ? (

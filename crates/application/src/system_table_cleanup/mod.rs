@@ -1,19 +1,15 @@
 use std::{
+    collections::BTreeSet,
     sync::Arc,
     time::Duration,
 };
 
 use common::{
-    bootstrap_model::tables::{
-        TableMetadata,
-        TableState,
-        TABLES_TABLE,
-    },
+    backoff::Backoff,
+    bootstrap_model::tables::TableState,
     components::ComponentId,
     document::{
         CreationTime,
-        ParseDocument,
-        ParsedDocument,
         CREATION_TIME_FIELD_PATH,
         ID_FIELD_PATH,
     },
@@ -45,12 +41,12 @@ use common::{
     },
 };
 use database::{
-    query::PaginationOptions,
     BootstrapComponentsModel,
     Database,
     ResolvedQuery,
     SystemMetadataModel,
     TableModel,
+    TablesTable,
 };
 use futures::{
     Future,
@@ -67,10 +63,21 @@ use metrics::{
 };
 use model::{
     exports::ExportsModel,
+    modules::ModuleModel,
     session_requests::SESSION_REQUESTS_TABLE,
+    source_packages::{
+        types::SourcePackageId,
+        SourcePackagesTable,
+    },
+    SystemIndex,
+    SystemTable,
 };
 use rand::Rng;
 use storage::Storage;
+use tokio::sync::mpsc::{
+    self,
+    Receiver,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use value::{
     ConvexValue,
@@ -79,9 +86,13 @@ use value::{
     TabletId,
 };
 
+use crate::system_table_cleanup::metrics::log_tablet_hard_deleted;
+
 mod metrics;
 
-static MAX_ORPHANED_TABLE_NAMESPACE_AGE: Duration = Duration::from_days(2);
+const MAX_ORPHANED_TABLE_NAMESPACE_AGE: Duration = Duration::from_days(2);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 pub struct SystemTableCleanupWorker<RT: Runtime> {
     database: Database<RT>,
@@ -95,10 +106,11 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         runtime: RT,
         database: Database<RT>,
         exports_storage: Arc<dyn Storage>,
+        deleted_tablet_receiver: mpsc::Receiver<TabletId>,
     ) -> impl Future<Output = ()> + Send {
         let mut worker = SystemTableCleanupWorker {
-            database,
-            runtime,
+            database: database.clone(),
+            runtime: runtime.clone(),
             exports_storage,
         };
         async move {
@@ -108,6 +120,10 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
                 );
                 return;
             }
+            let _handle = runtime.clone().spawn(
+                "cleanup_deleted_tablets",
+                Self::cleanup_deleted_tablets(runtime, database, deleted_tablet_receiver),
+            );
             loop {
                 if let Err(e) = worker.run().await {
                     report_error(&mut e.context("SystemTableCleanupWorker died")).await;
@@ -122,6 +138,7 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
             self.runtime.clone(),
             Quota::per_second(*SYSTEM_TABLE_ROWS_PER_SECOND),
         );
+        let mut session_requests_delete_cursor = None;
         loop {
             // Jitter the wait between deletion runs to even out load.
             let delay = SYSTEM_TABLE_CLEANUP_FREQUENCY.mul_f32(self.runtime.rng().random());
@@ -130,6 +147,7 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
             self.cleanup_hidden_tables().await?;
             self.cleanup_orphaned_table_namespaces().await?;
             self.cleanup_expired_exports().await?;
+            self.cleanup_unused_source_packages().await?;
 
             // _session_requests are used to make mutations idempotent.
             // We can delete them after they are old enough that the client that
@@ -140,15 +158,57 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
                 },
                 None => None,
             };
-            self.cleanup_system_table(
-                TableNamespace::Global,
-                &SESSION_REQUESTS_TABLE,
-                session_requests_cutoff
-                    .map_or(CreationTimeInterval::None, CreationTimeInterval::Before),
-                &rate_limiter,
-                *SESSION_CLEANUP_DELETE_CONCURRENCY,
-            )
-            .await?;
+            // Preserve the deletion cursor between runs. This helps skip index tombstones.
+            // Note that we only update the cursor after a successful run.
+            (_, session_requests_delete_cursor) = self
+                .cleanup_system_table(
+                    TableNamespace::Global,
+                    &SESSION_REQUESTS_TABLE,
+                    session_requests_cutoff
+                        .map_or(CreationTimeInterval::None, CreationTimeInterval::Before),
+                    &rate_limiter,
+                    *SESSION_CLEANUP_DELETE_CONCURRENCY,
+                    session_requests_delete_cursor,
+                )
+                .await?;
+        }
+    }
+
+    async fn cleanup_deleted_tablets(
+        rt: RT,
+        database: Database<RT>,
+        mut deleted_tablet_receiver: Receiver<TabletId>,
+    ) {
+        let mut error_backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
+        loop {
+            let r: anyhow::Result<()> = async {
+                while let Some(tablet_id) = deleted_tablet_receiver.recv().await {
+                    let mut tx = database.begin_system().await?;
+                    TableModel::new(&mut tx)
+                        .hard_delete_tablet_document(tablet_id)
+                        .await?;
+                    database
+                        .commit_with_write_source(tx, "cleanup_deleted_tablets")
+                        .await?;
+                    log_tablet_hard_deleted();
+                    error_backoff.reset();
+                }
+                Ok(())
+            }
+            .await;
+            match r {
+                Ok(_) => {
+                    tracing::info!(
+                        "Deleted tablet channel closed, exiting cleanup_deleted_tablets"
+                    );
+                    return;
+                },
+                Err(e) => {
+                    report_error(&mut e.context("cleanup_deleted_tablets failed")).await;
+                    let delay = error_backoff.fail(&mut rt.rng());
+                    rt.wait(delay).await;
+                },
+            }
         }
     }
 
@@ -156,52 +216,30 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         let mut tx = self.database.begin(Identity::system()).await?;
 
         let mut num_deleted = 0;
-        let query = Query::full_table_scan(TABLES_TABLE.clone(), Order::Asc);
-        let mut query_stream = ResolvedQuery::new(&mut tx, TableNamespace::Global, query.clone())?;
-        {
-            while let Some(document) = query_stream.next(&mut tx, None).await? {
-                // Limit rows read and rows deleted to avoid hitting transaction limits size.
-                if query_stream.is_approaching_data_limit() || num_deleted > 1000 {
-                    let cursor = query_stream.cursor();
-                    self.database
-                        .commit_with_write_source(tx, "system_table_cleanup")
-                        .await?;
-                    tracing::info!("Deleted {num_deleted} hidden tables");
-                    num_deleted = 0;
-                    tx = self.database.begin(Identity::system()).await?;
-                    query_stream = ResolvedQuery::new_bounded(
-                        &mut tx,
-                        TableNamespace::Global,
-                        query.clone(),
-                        PaginationOptions::ManualPagination {
-                            start_cursor: cursor,
-                            maximum_rows_read: None,
-                            maximum_bytes_read: None,
-                        },
-                        None,
-                        database::query::TableFilter::IncludePrivateSystemTables,
-                    )?;
-                }
-                let table: ParsedDocument<TableMetadata> = document.parse()?;
-                match table.state {
-                    TableState::Active | TableState::Deleting => {},
-                    TableState::Hidden => {
-                        let now = CreationTime::try_from(*self.database.now_ts_for_reads())?;
-                        let creation_time = table.creation_time();
-                        let age = Duration::from_millis(
-                            (f64::from(now) - f64::from(creation_time)) as u64,
-                        );
-                        // Mark as deleting if hidden for more than twice the max import age.
-                        if age > 2 * (*MAX_IMPORT_AGE) {
-                            let table_id = TabletId(table.id().internal_id());
-                            tracing::info!("Deleting hidden table: {table_id:?}");
-                            TableModel::new(&mut tx)
-                                .delete_hidden_table(table_id)
-                                .await?;
-                            num_deleted += 1;
+        let index = SystemIndex::<TablesTable>::by_creation_time();
+        let mut query = tx.query_system(TableNamespace::Global, &index)?.build();
+        while let Some(table) = query.next().await? {
+            match table.state {
+                TableState::Active | TableState::Deleting => {},
+                TableState::Hidden => {
+                    let now = CreationTime::try_from(*self.database.now_ts_for_reads())?;
+                    let creation_time = table.creation_time();
+                    let age =
+                        Duration::from_millis((f64::from(now) - f64::from(creation_time)) as u64);
+                    // Mark as deleting if hidden for more than twice the max import age.
+                    if age > 2 * (*MAX_IMPORT_AGE) {
+                        let table_id = TabletId(table.id().internal_id());
+                        tracing::info!("Deleting hidden table: {table_id:?}");
+                        TableModel::new(query.tx())
+                            .delete_hidden_table(table_id)
+                            .await?;
+                        num_deleted += 1;
+                        // Limit rows deleted to avoid hitting transaction limits size.
+                        if num_deleted >= 1000 {
+                            break;
                         }
-                    },
-                };
+                    }
+                },
             }
         }
 
@@ -225,7 +263,9 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         let table_mapping = tx.table_mapping().clone();
         let component_paths = BootstrapComponentsModel::new(&mut tx).all_component_paths();
         let mut table_model = TableModel::new(&mut tx);
-        for (namespace, map) in table_mapping.iter_active_namespaces() {
+        const MAX_TABLES_PER_RUN: usize = 1024;
+        let mut deleted_tables = 0;
+        'cleanup: for (namespace, map) in table_mapping.iter_active_namespaces() {
             let component_id = ComponentId::from(*namespace);
             if component_paths.contains_key(&component_id) {
                 continue;
@@ -249,10 +289,24 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
                         "Deleting orphaned table {table_name:?} in non-existent component \
                          {component_id:?}"
                     );
+                    // Bypass schema enforcement to avoid inserting writes to
+                    // _schemas, which can create a corrupt transaction if we
+                    // end up deleting _schemas later.
                     table_model
-                        .delete_active_table(*namespace, table_name.clone())
+                        .delete_table_by_id_bypassing_schema_enforcement(*tablet_id)
                         .await?;
+                    deleted_tables += 1;
                 }
+            }
+
+            if deleted_tables >= MAX_TABLES_PER_RUN {
+                // Don't create an overly large transaction; we'll get
+                // to the remaining tables on the next run.
+                tracing::warn!(
+                    "Hit the limit of {} tables, stopping early",
+                    MAX_TABLES_PER_RUN
+                );
+                break 'cleanup;
             }
         }
         self.database
@@ -268,9 +322,9 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         to_delete: CreationTimeInterval,
         rate_limiter: &RateLimiter<RT>,
         num_deleters: usize,
-    ) -> anyhow::Result<usize> {
+        mut cursor: Option<(CreationTime, ResolvedDocumentId)>,
+    ) -> anyhow::Result<(usize, Option<(CreationTime, ResolvedDocumentId)>)> {
         let _timer = system_table_cleanup_timer();
-        let mut cursor = None;
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let deleter = |chunk: Vec<ResolvedDocumentId>| async {
@@ -307,7 +361,7 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         };
 
         let ((), deleted) = futures::try_join!(reader, deleters)?;
-        Ok(deleted)
+        Ok((deleted, cursor))
     }
 
     async fn cleanup_system_table_read_chunk(
@@ -416,6 +470,46 @@ impl<RT: Runtime> SystemTableCleanupWorker<RT> {
         }
         Ok(())
     }
+
+    async fn cleanup_unused_source_packages(&self) -> anyhow::Result<()> {
+        let mut tx = self.database.begin(Identity::system()).await?;
+        let mut num_deleted = 0;
+        'deletes: for namespace in tx
+            .table_mapping()
+            .namespaces_for_name(SourcePackagesTable::table_name())
+        {
+            let mut source_package_ids: BTreeSet<SourcePackageId> = BTreeSet::new();
+            for module in ModuleModel::new(&mut tx)
+                .get_all_metadata(namespace.into())
+                .await?
+            {
+                source_package_ids.insert(module.source_package_id);
+            }
+            for source_package in tx
+                .query_system(namespace, &SystemIndex::<SourcePackagesTable>::by_id())?
+                .all()
+                .await?
+            {
+                let id = SourcePackageId::from(source_package.id().developer_id);
+                if !source_package_ids.contains(&id) {
+                    SystemMetadataModel::new(&mut tx, namespace)
+                        .delete(source_package.id())
+                        .await?;
+                    num_deleted += 1;
+                    if num_deleted >= 1000 {
+                        break 'deletes;
+                    }
+                }
+            }
+        }
+        if num_deleted > 0 {
+            self.database
+                .commit_with_write_source(tx, "cleanup_unused_source_packages")
+                .await?;
+            tracing::info!("Deleted {num_deleted} unreferenced SourcePackages");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -424,122 +518,4 @@ enum CreationTimeInterval {
     All,
     None,
     Before(CreationTime),
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        num::NonZeroU32,
-        sync::Arc,
-        time::Duration,
-    };
-
-    use common::{
-        document::CreationTime,
-        identity::InertIdentity,
-        runtime::{
-            new_rate_limiter,
-            Runtime,
-        },
-    };
-    use database::test_helpers::DbFixtures;
-    use governor::Quota;
-    use keybroker::Identity;
-    use model::{
-        session_requests::{
-            types::{
-                SessionRequestOutcome,
-                SessionRequestRecord,
-            },
-            SessionRequestModel,
-            SESSION_REQUESTS_TABLE,
-        },
-        test_helpers::DbFixturesWithModel,
-    };
-    use runtime::testing::TestRuntime;
-    use storage::LocalDirStorage;
-    use sync_types::SessionId;
-    use value::{
-        ConvexValue,
-        JsonPackedValue,
-        TableNamespace,
-    };
-
-    use crate::system_table_cleanup::{
-        CreationTimeInterval,
-        SystemTableCleanupWorker,
-    };
-
-    async fn test_system_table_cleanup_helper(
-        rt: TestRuntime,
-        num_deleters: usize,
-    ) -> anyhow::Result<()> {
-        let DbFixtures { db, .. } = DbFixtures::new_with_model(&rt).await?;
-        let exports_storage = Arc::new(LocalDirStorage::new(rt.clone())?);
-        let worker = SystemTableCleanupWorker {
-            database: db.clone(),
-            runtime: rt.clone(),
-            exports_storage: exports_storage.clone(),
-        };
-
-        let mut creation_times = vec![];
-        for _ in 0..10 {
-            let mut tx = db.begin_system().await?;
-            SessionRequestModel::new(&mut tx)
-                .record_session_request(
-                    SessionRequestRecord {
-                        session_id: SessionId::new(rt.new_uuid_v4()),
-                        request_id: 0,
-                        outcome: SessionRequestOutcome::Mutation {
-                            result: JsonPackedValue::pack(ConvexValue::Null),
-                            log_lines: vec![].into(),
-                        },
-                        identity: InertIdentity::System,
-                    },
-                    Identity::system(),
-                )
-                .await?;
-            creation_times.push(*tx.begin_timestamp());
-            db.commit(tx).await?;
-            rt.advance_time(Duration::from_secs(1)).await;
-        }
-
-        let cutoff = CreationTime::try_from(creation_times[4])?;
-        let rate_limiter =
-            new_rate_limiter(rt.clone(), Quota::per_second(NonZeroU32::new(10).unwrap()));
-
-        let deleted = worker
-            .cleanup_system_table(
-                TableNamespace::Global,
-                &SESSION_REQUESTS_TABLE,
-                CreationTimeInterval::Before(cutoff),
-                &rate_limiter,
-                num_deleters,
-            )
-            .await?;
-        assert_eq!(deleted, 3);
-
-        let count = db
-            .begin_system()
-            .await?
-            .count(TableNamespace::Global, &SESSION_REQUESTS_TABLE)
-            .await?;
-        assert_eq!(count, Some(7));
-        Ok(())
-    }
-
-    #[convex_macro::test_runtime]
-    async fn test_system_table_cleanup_1(rt: TestRuntime) -> anyhow::Result<()> {
-        test_system_table_cleanup_helper(rt, 1).await
-    }
-
-    #[convex_macro::test_runtime]
-    async fn test_system_table_cleanup_2(rt: TestRuntime) -> anyhow::Result<()> {
-        test_system_table_cleanup_helper(rt, 2).await
-    }
-
-    #[convex_macro::test_runtime]
-    async fn test_system_table_cleanup_8(rt: TestRuntime) -> anyhow::Result<()> {
-        test_system_table_cleanup_helper(rt, 8).await
-    }
 }

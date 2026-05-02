@@ -1,4 +1,4 @@
-import { Meta, StoryObj } from "@storybook/react";
+import { Meta, StoryObj } from "@storybook/nextjs";
 import { ConvexProvider } from "convex/react";
 import React from "react";
 import udfs from "@common/udfs";
@@ -7,16 +7,19 @@ import { mockConvexReactClient } from "@common/lib/mockConvexReactClient";
 import { Panel, PanelGroup } from "react-resizable-panels";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import { mockDeploymentInfo } from "@common/lib/mockDeploymentInfo";
+import { fn } from "storybook/test";
 
 const mockClient = mockConvexReactClient()
   .registerQueryFake(udfs.listById.default, ({ ids }) => ids.map(() => null))
   .registerQueryFake(udfs.components.list, () => [])
   .registerQueryFake(udfs.getTableMapping.default, () => ({}));
 
-export default {
+const meta = {
   component: EditDocumentPanel,
   args: {
     tableName: "users",
+    onClose: fn(),
+    onSave: fn(),
   },
   render: (args) => (
     <ConvexProvider client={mockClient}>
@@ -28,12 +31,16 @@ export default {
       </DeploymentInfoContext.Provider>
     </ConvexProvider>
   ),
-} as Meta<typeof EditDocumentPanel>;
+  parameters: { a11y: { test: "todo" } },
+} satisfies Meta<typeof EditDocumentPanel>;
 
-export const Adding: StoryObj<typeof EditDocumentPanel> = {
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+export const Adding: Story = {
   args: { defaultDocument: {} },
 };
 
-export const Editing: StoryObj<typeof EditDocumentPanel> = {
+export const Editing: Story = {
   args: { defaultDocument: { abc: 1, def: "ghi" } },
 };

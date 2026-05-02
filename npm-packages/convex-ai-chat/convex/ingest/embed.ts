@@ -1,8 +1,7 @@
 import { v } from "convex/values";
-import { map } from "modern-async";
+import { asyncMap } from "modern-async";
 import OpenAI from "openai";
 import { internal } from "../_generated/api";
-import { Id } from "../_generated/dataModel";
 import {
   internalAction,
   internalMutation,
@@ -27,7 +26,7 @@ export const embedList = internalAction({
   },
   handler: async (ctx, { documentIds }) => {
     const chunks = (
-      await map(documentIds, (documentId) =>
+      await asyncMap(documentIds, (documentId) =>
         ctx.runQuery(internal.ingest.embed.chunksNeedingEmbedding, {
           documentId,
         }),
@@ -35,7 +34,7 @@ export const embedList = internalAction({
     ).flat();
 
     const embeddings = await embedTexts(chunks.map((chunk) => chunk.text));
-    await map(embeddings, async (embedding, i) => {
+    await asyncMap(embeddings, async (embedding, i) => {
       const { _id: chunkId } = chunks[i];
       await ctx.runMutation(internal.ingest.embed.addEmbedding, {
         chunkId,
@@ -45,28 +44,32 @@ export const embedList = internalAction({
   },
 });
 
-export const chunksNeedingEmbedding = internalQuery(
-  async (ctx, { documentId }: { documentId: Id<"documents"> }) => {
+export const chunksNeedingEmbedding = internalQuery({
+  args: {
+    documentId: v.id("documents"),
+  },
+  handler: async (ctx, { documentId }) => {
     const chunks = await ctx.db
       .query("chunks")
       .withIndex("byDocumentId", (q) => q.eq("documentId", documentId))
       .collect();
     return chunks.filter((chunk) => chunk.embeddingId === null);
   },
-);
+});
 
-export const addEmbedding = internalMutation(
-  async (
-    ctx,
-    { chunkId, embedding }: { chunkId: Id<"chunks">; embedding: number[] },
-  ) => {
+export const addEmbedding = internalMutation({
+  args: {
+    chunkId: v.id("chunks"),
+    embedding: v.array(v.number()),
+  },
+  handler: async (ctx, { chunkId, embedding }) => {
     const embeddingId = await ctx.db.insert("embeddings", {
       embedding,
       chunkId,
     });
     await ctx.db.patch(chunkId, { embeddingId });
   },
-);
+});
 
 export async function embedTexts(texts: string[]) {
   if (texts.length === 0) return [];

@@ -1,4 +1,4 @@
-import { Value } from "convex/values";
+import { Value, GenericId } from "convex/values";
 import { GenericDocument } from "convex/server";
 import React, {
   CSSProperties,
@@ -13,7 +13,6 @@ import { Row } from "react-table";
 import classNames from "classnames";
 import { useFirstMountState, usePrevious } from "react-use";
 import { areEqual } from "react-window";
-import { cn } from "@ui/cn";
 import omit from "lodash/omit";
 import { useContextMenuTrigger } from "@common/features/data/lib/useContextMenuTrigger";
 import { Target } from "@common/features/data/components/ContextMenu";
@@ -34,7 +33,7 @@ type DataRowProps = {
     isRowSelected(row: string): boolean;
     isSelectionAllNonExhaustive: boolean;
     resizingColumn: string | undefined;
-    onAuthorizeEdits?(): void;
+    authorizeEdits?(): void;
     patchDocument: ReturnType<typeof usePatchDocumentField>;
     prepareRow: (row: Row) => void;
     rows: Row[];
@@ -58,7 +57,7 @@ function DataRowImpl(props: DataRowProps) {
   const { data, index, style } = props;
 
   const firstRow = data.rows.length ? data.rows[0] : undefined;
-  firstRow && data.prepareRow(firstRow);
+  if (firstRow) data.prepareRow(firstRow);
   const { densityValues } = useTableDensity();
   return index >= data.rows.length ? (
     <div
@@ -67,6 +66,7 @@ function DataRowImpl(props: DataRowProps) {
     >
       {firstRow ? (
         firstRow.cells.map((cell, idx) => (
+          // eslint-disable-next-line react/jsx-key -- `key` from `cell.getCellProps()`
           <div
             {...cell.getCellProps()}
             className={classNames("h-full flex items-center justify-center", {
@@ -89,7 +89,7 @@ function DataRowImpl(props: DataRowProps) {
           </div>
         ))
       ) : (
-        <div className="ml-4 mt-4 h-4 w-full rounded bg-neutral-8/20 dark:bg-neutral-3/20" />
+        <div className="mt-4 ml-4 h-4 w-full rounded-sm bg-neutral-8/20 dark:bg-neutral-3/20" />
       )}
     </div>
   ) : (
@@ -110,7 +110,7 @@ function DataRowLoaded({ index, style, data }: DataRowProps) {
     areEditsAuthorized,
     isRowSelected,
     isSelectionAllNonExhaustive,
-    onAuthorizeEdits,
+    authorizeEdits,
     patchDocument,
     prepareRow,
     rows,
@@ -120,26 +120,31 @@ function DataRowLoaded({ index, style, data }: DataRowProps) {
     onCloseContextMenu,
     canManageTable,
     activeSchema,
-    resizingColumn,
+    resizingColumn: _resizingColumn,
     onEditDocument,
     contextMenuColumn,
     contextMenuRow,
   } = data;
 
-  const row: Row = rows[index];
+  const row: Row<GenericDocument> = rows[index];
   const previousRow = usePrevious(row);
   const previousRows = usePrevious(rows);
 
   const didNumberOfRowsChange = previousRows?.length !== rows.length;
 
-  const { _id } = row.values;
-  const previousRowId = previousRow?.values._id;
+  const _id = row.original._id as GenericId<string>;
+  const previousRowId = previousRow?.original._id as
+    | GenericId<string>
+    | undefined;
 
   const [didJustCreate, setDidJustCreate] = useState(false);
   useEffect(() => {
     // The entire row should be highlighted if the row was recently created and
     // not already rendered.
-    if (!previousRowId && Date.now() - row.values._creationTime < 1000) {
+    if (
+      !previousRowId &&
+      Date.now() - (row.original._creationTime as number) < 1000
+    ) {
       setDidJustCreate(true);
       // To reset the animatation, reset the state after one second.
       setTimeout(() => setDidJustCreate(false), 1000);
@@ -157,15 +162,18 @@ function DataRowLoaded({ index, style, data }: DataRowProps) {
     [onOpenContextMenu, _id],
   );
   useContextMenuTrigger(checkboxRef, contextMenuCallback, onCloseContextMenu);
-  const document = useMemo(() => omit(row.values, "*select"), [row.values]);
+  const document = useMemo(() => omit(row.original, "*select"), [row.original]);
 
   const editDocument = useCallback(() => {
-    canManageTable && onEditDocument(document);
+    if (canManageTable) {
+      onEditDocument(document);
+    }
   }, [canManageTable, onEditDocument, document]);
 
   return (
     <div
       className={classNames(
+        "animate-fadeInFromLoading",
         // Make sure the focus ring is visible on first and last cell
         "focus:ring-none focus:border",
         didJustCreate && "animate-highlight",
@@ -182,13 +190,7 @@ function DataRowLoaded({ index, style, data }: DataRowProps) {
           <div
             {...cell.getCellProps({ style: { width } })}
             key={cell.getCellProps().key}
-            className={cn(
-              columnIndex < row.cells.length - 1
-                ? "border-r transition-colors duration-300"
-                : "transition-colors duration-300",
-              resizingColumn === (cell.column.Header as string) &&
-                "border-r-util-accent",
-            )}
+            className="border-r transition-colors duration-300"
           >
             {columnIndex === 0 ? (
               <TableCheckbox
@@ -219,7 +221,7 @@ function DataRowLoaded({ index, style, data }: DataRowProps) {
                   !mounting && previousRowId !== _id && !didNumberOfRowsChange
                 }
                 areEditsAuthorized={areEditsAuthorized}
-                onAuthorizeEdits={onAuthorizeEdits}
+                authorizeEdits={authorizeEdits}
                 editDocument={editDocument}
                 value={cell.value}
                 column={cell.column}

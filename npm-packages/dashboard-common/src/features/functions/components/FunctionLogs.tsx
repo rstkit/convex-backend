@@ -1,12 +1,12 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { useDebounce, useLocalStorage } from "react-use";
-import { TextInput } from "@ui/TextInput";
 import { LogList } from "@common/features/logs/components/LogList";
 import { LogToolbar } from "@common/features/logs/components/LogToolbar";
+import { SearchLogsInput } from "@common/features/logs/components/SearchLogsInput";
 import { filterLogs } from "@common/features/logs/lib/filterLogs";
 import { displayNameToIdentifier } from "@common/lib/functions/FunctionsProvider";
 import { functionIdentifierValue } from "@common/lib/functions/generateFileTree";
-import { UdfLog, useLogs } from "@common/lib/useLogs";
+import { MAX_LOGS, UdfLog, useLogs } from "@common/lib/useLogs";
 import { ModuleFunction } from "@common/lib/functions/types";
 import { Nent } from "@common/lib/useNents";
 import { Button } from "@ui/Button";
@@ -14,6 +14,7 @@ import { ExternalLinkIcon } from "@radix-ui/react-icons";
 import { useRouter } from "next/router";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import { MultiSelectValue } from "@ui/MultiSelectCombobox";
+import { NoPermissionMessage } from "@common/elements/NoPermissionMessage";
 
 type LogLevel = "success" | "failure" | "DEBUG" | "INFO" | "WARN" | "ERROR";
 
@@ -41,6 +42,7 @@ export function FunctionLogs({
   );
 
   const [logs, setLogs] = useState<UdfLog[]>([]);
+  const [pausedLogs, setPausedLogs] = useState<UdfLog[]>([]);
   const [paused, setPaused] = useState<number>(0);
   const [manuallyPaused, setManuallyPaused] = useState(false);
 
@@ -74,9 +76,28 @@ export function FunctionLogs({
     [innerFilter],
   );
 
+  // Sync innerFilter when filter changes externally (e.g., from side panel)
+  useEffect(() => {
+    if (filter !== undefined && filter !== innerFilter) {
+      setInnerFilter(filter);
+    }
+  }, [filter, innerFilter]);
+
   const onPause = (p: boolean) => {
     const now = new Date().getTime();
     setPaused(p ? now : 0);
+
+    // When unpausing, merge pausedLogs into logs
+    if (!p && pausedLogs.length > 0) {
+      setLogs((prev) => {
+        const combined = [...prev, ...pausedLogs];
+        return combined.slice(
+          Math.max(combined.length - MAX_LOGS, 0),
+          combined.length,
+        );
+      });
+      setPausedLogs([]);
+    }
   };
 
   const logsConnectivityCallbacks = {
@@ -84,88 +105,109 @@ export function FunctionLogs({
     onDisconnected: () => {},
   };
 
-  const receiveLogs = (entries: UdfLog[]) => {
-    setLogs((prev) => {
-      const newLogs = filterLogs(
-        {
-          logTypes: DEFAULT_LOG_LEVELS,
-          functions: [functionId],
-          selectedFunctions: [functionId],
-          selectedNents: selectedNent ? [selectedNent.path] : "all",
-          filter: "",
-        },
-        entries,
+  const receiveLogs = (entries: UdfLog[], isPaused: boolean) => {
+    const newLogs = filterLogs(
+      {
+        logTypes: DEFAULT_LOG_LEVELS,
+        functions: [functionId],
+        selectedFunctions: [functionId],
+        selectedNents: selectedNent ? [selectedNent.path] : "all",
+        filter: "",
+      },
+      entries,
+    );
+    if (!newLogs || newLogs.length === 0) {
+      return;
+    }
+
+    if (isPaused) {
+      // When paused, store new logs separately
+      setPausedLogs((prev) => [...prev, ...newLogs]);
+    } else {
+      setLogs((prev) =>
+        [...prev, ...newLogs].slice(
+          Math.max(prev.length + newLogs.length - MAX_LOGS, 0),
+          prev.length + newLogs.length,
+        ),
       );
-      if (!newLogs) {
-        return prev;
-      }
-      return [...prev, ...newLogs].slice(
-        Math.max(prev.length + entries.length - 10000, 0),
-        prev.length + entries.length,
-      );
-    });
+    }
   };
 
-  useLogs(logsConnectivityCallbacks, receiveLogs, paused > 0 || manuallyPaused);
+  useLogs(
+    logsConnectivityCallbacks,
+    (entries) => receiveLogs(entries, paused > 0 || manuallyPaused),
+    false, // Never skip the stream, always stay connected
+  );
 
   const router = useRouter();
-  const { deploymentsURI } = useContext(DeploymentInfoContext);
+  const { deploymentsURI, useIsOperationAllowed } = useContext(
+    DeploymentInfoContext,
+  );
+  const canViewLogs = useIsOperationAllowed("ViewLogs");
+
+  if (!canViewLogs) {
+    return (
+      <NoPermissionMessage message="You do not have permission to view logs in this deployment." />
+    );
+  }
 
   return (
-    <div className="flex h-full w-full min-w-[48rem] grow flex-col gap-2">
-      <LogToolbar
-        functions={[functionId]}
-        selectedFunctions={[functionId]}
-        setSelectedFunctions={(_functions) => {}}
-        selectedLevels={selectedLevels}
-        setSelectedLevels={setSelectedLevels}
-        selectedNents={selectedNent ? [selectedNent.path] : "all"}
-        setSelectedNents={() => {}}
-        hideFunctionFilter
-        firstItem={
-          <div className="flex grow gap-2">
-            <Button
-              variant="neutral"
-              size="sm"
-              icon={<ExternalLinkIcon />}
-              href={`${deploymentsURI}/logs${router.query.component ? `?component=${router.query.component}` : ""}`}
-            >
-              View all Logs
-            </Button>
-            <TextInput
-              id="Search logs"
-              placeholder="Filter logs..."
-              value={innerFilter}
-              onChange={(e) => setInnerFilter(e.target.value)}
-              type="search"
-            />
-          </div>
-        }
-      />
-      <LogList
-        nents={selectedNent ? [selectedNent] : []}
-        logs={logs}
-        filteredLogs={filterLogs(
-          {
-            logTypes: selectedLevels,
-            functions: [functionId],
-            selectedFunctions: [functionId],
-            selectedNents: selectedNent ? [selectedNent.path] : "all",
-            filter: filter ?? "",
-          },
-          logs,
-        )}
-        deploymentAuditLogs={[]}
-        filter={filter ?? ""}
-        clearedLogs={[]}
-        setClearedLogs={() => {}}
-        paused={paused > 0 || manuallyPaused}
-        setPaused={onPause}
-        setManuallyPaused={(p) => {
-          onPause(p);
-          setManuallyPaused(p);
-        }}
-      />
+    <div className="flex h-full w-full max-w-full min-w-0 grow flex-col gap-2 overflow-hidden">
+      <div className="flex min-w-0 shrink-0">
+        <LogToolbar
+          functions={[functionId]}
+          selectedFunctions={[functionId]}
+          setSelectedFunctions={(_functions) => {}}
+          selectedLevels={selectedLevels}
+          setSelectedLevels={setSelectedLevels}
+          selectedNents={selectedNent ? [selectedNent.path] : "all"}
+          setSelectedNents={() => {}}
+          hideFunctionFilter
+          firstItem={
+            <div className="flex min-w-0 grow gap-2">
+              <Button
+                variant="neutral"
+                size="sm"
+                icon={<ExternalLinkIcon />}
+                href={`${deploymentsURI}/logs${router.query.component ? `?component=${router.query.component}` : ""}`}
+              >
+                View all Logs
+              </Button>
+              <SearchLogsInput
+                value={innerFilter}
+                onChange={(e) => setFilter(e.target.value)}
+                logs={logs}
+              />
+            </div>
+          }
+        />
+      </div>
+      <div className="flex min-h-0 min-w-0 grow">
+        <LogList
+          logs={logs}
+          pausedLogs={pausedLogs}
+          filteredLogs={filterLogs(
+            {
+              logTypes: selectedLevels,
+              functions: [functionId],
+              selectedFunctions: [functionId],
+              selectedNents: selectedNent ? [selectedNent.path] : "all",
+              filter: filter ?? "",
+            },
+            logs,
+          )}
+          deploymentAuditLogs={[]}
+          setFilter={setFilter}
+          clearedLogs={[]}
+          setClearedLogs={() => {}}
+          paused={paused > 0 || manuallyPaused}
+          setPaused={onPause}
+          setManuallyPaused={(p) => {
+            onPause(p);
+            setManuallyPaused(p);
+          }}
+        />
+      </div>
     </div>
   );
 }

@@ -2,6 +2,7 @@ use std::cmp;
 
 use async_trait::async_trait;
 use common::{
+    knobs::DEFAULT_QUERY_PREFETCH,
     query::CursorPosition,
     runtime::Runtime,
     types::{
@@ -11,11 +12,10 @@ use common::{
 };
 
 use super::{
-    DeveloperIndexRangeResponse,
+    IndexRangeResponse,
     QueryNode,
     QueryStream,
     QueryStreamNext,
-    DEFAULT_QUERY_PREFETCH,
 };
 use crate::Transaction;
 
@@ -59,7 +59,7 @@ impl QueryStream for Limit {
             return Ok(QueryStreamNext::Ready(None));
         }
         let inner_hint = cmp::min(
-            prefetch_hint.unwrap_or(DEFAULT_QUERY_PREFETCH),
+            prefetch_hint.unwrap_or(*DEFAULT_QUERY_PREFETCH),
             self.limit - self.rows_emitted,
         );
         let result = self.inner.next(tx, Some(inner_hint)).await?;
@@ -69,7 +69,7 @@ impl QueryStream for Limit {
         Ok(result)
     }
 
-    fn feed(&mut self, index_range_response: DeveloperIndexRangeResponse) -> anyhow::Result<()> {
+    fn feed(&mut self, index_range_response: IndexRangeResponse) -> anyhow::Result<()> {
         self.inner.feed(index_range_response)
     }
 

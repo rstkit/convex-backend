@@ -1,12 +1,8 @@
 import chokidar from "chokidar";
 import path from "path";
 import { Observations, RecordingFs, WatchEvent } from "../../bundler/fs.js";
-import {
-  BigBrainAuth,
-  Context,
-  ErrorType,
-  logFailure,
-} from "../../bundler/context.js";
+import { BigBrainAuth, Context, ErrorType } from "../../bundler/context.js";
+import { logFailure } from "../../bundler/log.js";
 import * as Sentry from "@sentry/node";
 import { Ora } from "ora";
 
@@ -95,7 +91,9 @@ export class Crash extends Error {
 
   constructor(errorType?: ErrorType, err?: any) {
     super(err?.message);
-    this.errorType = errorType;
+    if (errorType) {
+      this.errorType = errorType;
+    }
   }
 }
 
@@ -106,12 +104,18 @@ export class WatchContext implements Context {
   > = {};
   fs: RecordingFs;
   deprecationMessagePrinted: boolean;
+  isFirstPush: boolean;
   spinner: Ora | undefined;
   private _bigBrainAuth: BigBrainAuth | null;
 
-  constructor(traceEvents: boolean, bigBrainAuth: BigBrainAuth | null) {
+  constructor(
+    traceEvents: boolean,
+    bigBrainAuth: BigBrainAuth | null,
+    isFirstPush: boolean,
+  ) {
     this.fs = new RecordingFs(traceEvents);
     this.deprecationMessagePrinted = false;
+    this.isFirstPush = isFirstPush;
     this._bigBrainAuth = bigBrainAuth;
   }
 
@@ -125,7 +129,7 @@ export class WatchContext implements Context {
       Sentry.captureException(args.errForSentry);
     }
     if (args.printedMessage !== null) {
-      logFailure(this, args.printedMessage);
+      logFailure(args.printedMessage);
     }
     for (const fn of Object.values(this._cleanupFns)) {
       await fn(args.exitCode, args.errForSentry);

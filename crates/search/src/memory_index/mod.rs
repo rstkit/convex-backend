@@ -261,13 +261,13 @@ impl MemoryTextIndex {
                     .collect::<BTreeSet<_>>();
                 for term in term_set {
                     let mut inserted = false;
-                    if let Some(term_id) = self.term_table.get(term) {
-                        if let Some(count) = stats.term_freq_diffs.get_mut(&term_id) {
-                            *count = count.checked_sub(1).ok_or_else(|| {
-                                anyhow::anyhow!("Underflow on term frequency diff")
-                            })?;
-                            inserted = true;
-                        }
+                    if let Some(term_id) = self.term_table.get(term)
+                        && let Some(count) = stats.term_freq_diffs.get_mut(&term_id)
+                    {
+                        *count = count
+                            .checked_sub(1)
+                            .ok_or_else(|| anyhow::anyhow!("Underflow on term frequency diff"))?;
+                        inserted = true;
                     }
                     if !inserted {
                         let term_id = self.term_table.incref(term);
@@ -295,13 +295,13 @@ impl MemoryTextIndex {
                     .collect::<BTreeSet<_>>();
                 for term in term_set {
                     let mut inserted = false;
-                    if let Some(term_id) = self.term_table.get(term) {
-                        if let Some(count) = stats.term_freq_diffs.get_mut(&term_id) {
-                            *count = count.checked_add(1).ok_or_else(|| {
-                                anyhow::anyhow!("Overflow on term frequency diff")
-                            })?;
-                            inserted = true;
-                        }
+                    if let Some(term_id) = self.term_table.get(term)
+                        && let Some(count) = stats.term_freq_diffs.get_mut(&term_id)
+                    {
+                        *count = count
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("Overflow on term frequency diff"))?;
+                        inserted = true;
                     }
                     if !inserted {
                         let term_id = self.term_table.incref(term);
@@ -341,13 +341,13 @@ impl MemoryTextIndex {
         // NB: It's friendlier to `OrdMap` to do a readonly check for existence before
         // removing, since removing nonexistent IDs still has to do an
         // `Arc::make_mut` for the root, which then has to do a clone.
-        if self.documents.contains_key(&id) {
-            if let Some(prev_document) = self.documents.remove(&id) {
-                for (term_id, term_freq) in prev_document.term_list.iter_term_freqs() {
-                    self.term_table.decref(term_id, term_freq);
-                }
-                self.documents_terms_size -= prev_document.term_list.heap_allocations();
+        if self.documents.contains_key(&id)
+            && let Some(prev_document) = self.documents.remove(&id)
+        {
+            for (term_id, term_freq) in prev_document.term_list.iter_term_freqs() {
+                self.term_table.decref(term_id, term_freq);
             }
+            self.documents_terms_size -= prev_document.term_list.heap_allocations();
         }
 
         if let Some((terms, creation_time)) = new_value {
@@ -632,7 +632,7 @@ impl MemoryTextIndex {
         let mut intersection_term_ids = BTreeSet::new();
         let mut union_id_boosts = BTreeMap::new();
 
-        for CompiledFilterCondition::Must(ref filter_term) in &query.filter_conditions {
+        for CompiledFilterCondition::Must(filter_term) in &query.filter_conditions {
             let Some(term_id) = self.term_table.get(filter_term) else {
                 // If a filter condition's term is entirely missing, no documents match the
                 // query.
@@ -950,74 +950,5 @@ impl PreparedMemoryPostingListQuery {
         self.union_terms
             .iter_ones()
             .map(move |idx| self.sorted_terms[idx])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use common::{
-        document::CreationTime,
-        types::Timestamp,
-    };
-    use tantivy::{
-        schema::Field,
-        Term,
-    };
-    use value::InternalId;
-
-    use super::MemoryTextIndex;
-    use crate::{
-        memory_index::WriteTimestamp,
-        DocumentTerm,
-        FieldPosition,
-    };
-
-    #[test]
-    fn test_truncation() -> anyhow::Result<()> {
-        let ts0 = Timestamp::MIN;
-        let mut index = MemoryTextIndex::new(WriteTimestamp::Committed(ts0));
-
-        // Insert 1 document at t=1
-        let ts1 = ts0.succ()?;
-        let field = Field::from_field_id(0);
-        let term = Term::from_field_text(field, "value");
-        index.update(
-            InternalId::MIN,
-            WriteTimestamp::Committed(ts1),
-            None,
-            Some((
-                vec![DocumentTerm::Search {
-                    term: term.clone(),
-                    pos: FieldPosition::default(),
-                }],
-                CreationTime::ONE,
-            )),
-        )?;
-
-        // At t=1 we can see the document and have a size.
-        let query_terms = vec![term];
-        assert_eq!(
-            index
-                .bm25_statistics_diff(ts0, &query_terms)?
-                .num_documents_diff,
-            1
-        );
-        assert!(index.size() > 0);
-
-        // Truncate the index at t=2.
-        let ts2 = ts1.succ()?;
-        index.truncate(ts2)?;
-
-        // We can no longer query before t=2.
-        assert!(index
-            .bm25_statistics_diff(ts0, &query_terms)
-            .unwrap_err()
-            .to_string()
-            .contains("Timestamps are out of order"));
-
-        // The index now has size 0.
-        assert_eq!(index.size(), 0);
-
-        Ok(())
     }
 }

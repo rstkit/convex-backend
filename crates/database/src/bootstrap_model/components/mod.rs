@@ -2,7 +2,10 @@ pub mod definition;
 
 use std::{
     collections::BTreeMap,
-    sync::LazyLock,
+    sync::{
+        Arc,
+        LazyLock,
+    },
 };
 
 use anyhow::Context;
@@ -29,10 +32,6 @@ use common::{
         ParseDocument,
         ParsedDocument,
     },
-    query::{
-        Order,
-        Query,
-    },
     runtime::Runtime,
 };
 use errors::ErrorMetadata;
@@ -52,7 +51,7 @@ use crate::{
         SystemIndex,
         SystemTable,
     },
-    ResolvedQuery,
+    ComponentDefinitionsTable,
     Transaction,
     COMPONENT_DEFINITIONS_TABLE,
 };
@@ -131,17 +130,14 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
     #[fastrace::trace]
     pub async fn load_all_components(
         &mut self,
-    ) -> anyhow::Result<Vec<ParsedDocument<ComponentMetadata>>> {
-        let mut query = ResolvedQuery::new(
-            self.tx,
-            TableNamespace::Global,
-            Query::full_table_scan(COMPONENTS_TABLE.clone(), Order::Asc),
-        )?;
-        let mut components = Vec::new();
-        while let Some(doc) = query.next(self.tx, None).await? {
-            components.push(doc.parse()?);
-        }
-        Ok(components)
+    ) -> anyhow::Result<Vec<Arc<ParsedDocument<ComponentMetadata>>>> {
+        self.tx
+            .query_system(
+                TableNamespace::Global,
+                &SystemIndex::<ComponentsTable>::by_creation_time(),
+            )?
+            .all()
+            .await
     }
 
     pub fn resolve_component_id(
@@ -234,7 +230,7 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
                 } else {
                     anyhow::bail!(ErrorMetadata::bad_request(
                         "InvalidReference",
-                        format!("Component {:?} not found", id),
+                        format!("Component {id:?} not found"),
                     ))
                 }
             },
@@ -274,7 +270,7 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
     pub async fn load_definition(
         &mut self,
         id: ComponentDefinitionId,
-    ) -> anyhow::Result<Option<ParsedDocument<ComponentDefinitionMetadata>>> {
+    ) -> anyhow::Result<Option<Arc<ParsedDocument<ComponentDefinitionMetadata>>>> {
         let internal_id = match id {
             ComponentDefinitionId::Root => match self.root_component()? {
                 Some(root_component) => root_component.definition_id,
@@ -282,14 +278,16 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
             },
             ComponentDefinitionId::Child(id) => id,
         };
-        let component_definition_doc_id = self.resolve_component_definition_id(internal_id)?;
-        let Some(doc) = self.tx.get(component_definition_doc_id).await? else {
+        let Some(mut doc) = self
+            .tx
+            .get_system::<ComponentDefinitionsTable>(TableNamespace::Global, internal_id)
+            .await?
+        else {
             return Ok(None);
         };
-        let mut doc: ParsedDocument<ComponentDefinitionMetadata> = doc.parse()?;
         if !doc.exports.is_empty() {
             metrics::log_nonempty_component_exports();
-            doc.exports = BTreeMap::new();
+            Arc::make_mut(&mut doc).exports = BTreeMap::new();
         }
         Ok(Some(doc))
     }
@@ -299,7 +297,7 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
         id: ComponentDefinitionId,
     ) -> anyhow::Result<ComponentDefinitionMetadata> {
         match self.load_definition(id).await? {
-            Some(doc) => Ok(doc.into_value()),
+            Some(doc) => Ok(Arc::unwrap_or_clone(doc).into_value()),
             None => {
                 if id.is_root() {
                     // The root component's metadata document may be missing if the app hasn't been
@@ -310,11 +308,12 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
                         child_components: Vec::new(),
                         exports: BTreeMap::new(),
                         http_mounts: BTreeMap::new(),
+                        http_prefix: None,
                     })
                 } else {
                     anyhow::bail!(ErrorMetadata::bad_request(
                         "InvalidReference",
-                        format!("Component definition {:?} not found", id),
+                        format!("Component definition {id:?} not found"),
                     ))
                 }
             },
@@ -325,19 +324,21 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
     pub async fn load_all_definitions(
         &mut self,
     ) -> anyhow::Result<
-        BTreeMap<ComponentDefinitionPath, ParsedDocument<ComponentDefinitionMetadata>>,
+        BTreeMap<ComponentDefinitionPath, Arc<ParsedDocument<ComponentDefinitionMetadata>>>,
     > {
-        let mut query = ResolvedQuery::new(
-            self.tx,
-            TableNamespace::Global,
-            Query::full_table_scan(COMPONENT_DEFINITIONS_TABLE.clone(), Order::Asc),
-        )?;
         let mut definitions = BTreeMap::new();
-        while let Some(doc) = query.next(self.tx, None).await? {
-            let mut definition: ParsedDocument<ComponentDefinitionMetadata> = doc.parse()?;
+        for mut definition in self
+            .tx
+            .query_system(
+                TableNamespace::Global,
+                &SystemIndex::<ComponentDefinitionsTable>::by_creation_time(),
+            )?
+            .all()
+            .await?
+        {
             if !definition.exports.is_empty() {
                 metrics::log_nonempty_component_exports();
-                definition.exports = BTreeMap::new();
+                Arc::make_mut(&mut definition).exports = BTreeMap::new();
             }
             anyhow::ensure!(definitions
                 .insert(definition.path.clone(), definition)
@@ -372,116 +373,5 @@ impl<'a, RT: Runtime> BootstrapComponentsModel<'a, RT> {
             component,
             module_path: path.udf_path.module().clone(),
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use common::{
-        bootstrap_model::components::{
-            definition::{
-                ComponentDefinitionMetadata,
-                ComponentDefinitionType,
-                ComponentInstantiation,
-            },
-            ComponentMetadata,
-            ComponentState,
-            ComponentType,
-        },
-        components::{
-            ComponentDefinitionPath,
-            ComponentId,
-            ComponentPath,
-        },
-    };
-    use keybroker::Identity;
-    use runtime::testing::TestRuntime;
-
-    use super::definition::COMPONENT_DEFINITIONS_TABLE;
-    use crate::{
-        bootstrap_model::components::{
-            BootstrapComponentsModel,
-            COMPONENTS_TABLE,
-        },
-        test_helpers::new_test_database,
-        SystemMetadataModel,
-    };
-
-    #[convex_macro::test_runtime]
-    async fn test_component_path(rt: TestRuntime) -> anyhow::Result<()> {
-        let db = new_test_database(rt.clone()).await;
-        let mut tx = db.begin(Identity::system()).await?;
-        let child_definition_path: ComponentDefinitionPath = "../app/child".parse().unwrap();
-        let child_definition_id = SystemMetadataModel::new_global(&mut tx)
-            .insert(
-                &COMPONENT_DEFINITIONS_TABLE,
-                ComponentDefinitionMetadata {
-                    path: child_definition_path.clone(),
-                    definition_type: ComponentDefinitionType::ChildComponent {
-                        name: "child".parse().unwrap(),
-                        args: BTreeMap::new(),
-                    },
-                    child_components: Vec::new(),
-                    http_mounts: BTreeMap::new(),
-                    exports: BTreeMap::new(),
-                }
-                .try_into()?,
-            )
-            .await?;
-        let root_definition_id = SystemMetadataModel::new_global(&mut tx)
-            .insert(
-                &COMPONENT_DEFINITIONS_TABLE,
-                ComponentDefinitionMetadata {
-                    path: "".parse().unwrap(),
-                    definition_type: ComponentDefinitionType::App,
-                    child_components: vec![ComponentInstantiation {
-                        name: "child_subcomponent".parse().unwrap(),
-                        path: child_definition_path,
-                        args: Some(BTreeMap::new()),
-                    }],
-                    http_mounts: BTreeMap::new(),
-                    exports: BTreeMap::new(),
-                }
-                .try_into()?,
-            )
-            .await?;
-        let root_id = SystemMetadataModel::new_global(&mut tx)
-            .insert(
-                &COMPONENTS_TABLE,
-                ComponentMetadata {
-                    definition_id: root_definition_id.into(),
-                    component_type: ComponentType::App,
-                    state: ComponentState::Active,
-                }
-                .try_into()?,
-            )
-            .await?;
-        let child_id = SystemMetadataModel::new_global(&mut tx)
-            .insert(
-                &COMPONENTS_TABLE,
-                ComponentMetadata {
-                    definition_id: child_definition_id.into(),
-                    component_type: ComponentType::ChildComponent {
-                        parent: root_id.into(),
-                        name: "subcomponent_child".parse()?,
-                        args: Default::default(),
-                    },
-                    state: ComponentState::Active,
-                }
-                .try_into()?,
-            )
-            .await?;
-        let resolved_path = BootstrapComponentsModel::new(&mut tx)
-            .resolve_path(&ComponentPath::from(vec!["subcomponent_child".parse()?]))?;
-        assert_eq!(resolved_path.unwrap().id(), child_id);
-        let path = BootstrapComponentsModel::new(&mut tx)
-            .must_component_path(ComponentId::Child(child_id.into()))?;
-        assert_eq!(
-            path,
-            ComponentPath::from(vec!["subcomponent_child".parse()?]),
-        );
-        Ok(())
     }
 }

@@ -1,0 +1,1168 @@
+use std::collections::BTreeMap;
+
+use anyhow::Context;
+use application::{
+    log_streaming::LogSinkWithId,
+    Application,
+};
+use axum::{
+    extract::FromRef,
+    response::IntoResponse,
+};
+use common::{
+    http::{
+        extract::{
+            Json,
+            MtState,
+            Path,
+        },
+        HttpResponseError,
+    },
+    knobs::AXIOM_MAX_ATTRIBUTES,
+    log_streaming::LogEventFormatVersion,
+};
+use errors::ErrorMetadata;
+use http::StatusCode;
+use model::log_sinks::types::{
+    axiom::{
+        AxiomAttribute,
+        AxiomConfig,
+        VALID_AXIOM_INGEST_URLS,
+    },
+    datadog::{
+        DatadogConfig,
+        DatadogSiteLocation,
+    },
+    posthog_error_tracking::PostHogErrorTrackingConfig,
+    posthog_logs::PostHogLogsConfig,
+    sentry::{
+        ExceptionFormatVersion,
+        SentryConfig,
+    },
+    webhook::{
+        generate_webhook_hmac_secret,
+        WebhookConfig,
+        WebhookFormat,
+    },
+    SinkConfig,
+    SinkType,
+};
+use runtime::prod::ProdRuntime;
+use sentry::types::Dsn;
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use utoipa::ToSchema;
+use utoipa_axum::router::OpenApiRouter;
+use value::FieldName;
+
+use crate::{
+    authentication::ExtractIdentity,
+    LocalAppState,
+};
+
+/// Status of a log stream
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
+pub enum LogStreamStatus {
+    Pending,
+    Restarting,
+    #[serde(rename_all = "camelCase")]
+    Failed {
+        reason: String,
+    },
+    Active,
+    #[serde(rename = "deleting")]
+    Tombstoned,
+}
+
+impl From<model::log_sinks::types::SerializedSinkState> for LogStreamStatus {
+    fn from(value: model::log_sinks::types::SerializedSinkState) -> Self {
+        use model::log_sinks::types::SerializedSinkState;
+        match value {
+            SerializedSinkState::Pending => LogStreamStatus::Pending,
+            SerializedSinkState::Restarting => LogStreamStatus::Restarting,
+            SerializedSinkState::Failed { reason } => LogStreamStatus::Failed { reason },
+            SerializedSinkState::Active => LogStreamStatus::Active,
+            SerializedSinkState::Tombstoned => LogStreamStatus::Tombstoned,
+        }
+    }
+}
+
+fn validate_axiom_ingest_url(ingest_url: Option<&String>) -> anyhow::Result<()> {
+    if let Some(url) = ingest_url
+        && !VALID_AXIOM_INGEST_URLS.contains(&url.as_str())
+    {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "InvalidAxiomIngestUrl",
+            format!(
+                "Invalid Axiom ingest URL: {url}. Must be one of: {}",
+                VALID_AXIOM_INGEST_URLS.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+enum LogStreamType {
+    Datadog,
+    Webhook,
+    Axiom,
+    Sentry,
+    PostHogLogs,
+    PostHogErrorTracking,
+}
+
+impl From<LogStreamType> for SinkType {
+    fn from(log_stream_type: LogStreamType) -> Self {
+        match log_stream_type {
+            LogStreamType::Datadog => SinkType::Datadog,
+            LogStreamType::Webhook => SinkType::Webhook,
+            LogStreamType::Axiom => SinkType::Axiom,
+            LogStreamType::Sentry => SinkType::Sentry,
+            LogStreamType::PostHogLogs => SinkType::PostHogLogs,
+            LogStreamType::PostHogErrorTracking => SinkType::PostHogErrorTracking,
+        }
+    }
+}
+
+/// Delete log stream
+///
+/// Delete the deployment's log stream with the given id.
+#[utoipa::path(
+    post,
+    path = "/delete_log_stream/{id}",
+    tag = "Log Streams",
+    responses((status = 200)),
+    params(
+        ("id" = String, Path, description = "id of the log stream to delete"),
+    ),
+    security(
+        ("Deploy Key" = []),
+        ("OAuth Team Token" = []),
+        ("Team Token" = []),
+        ("OAuth Project Token" = []),
+    ),
+)]
+pub async fn delete_log_stream(
+    MtState(st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    identity.require_operation(keybroker::DeploymentOp::WriteIntegrations)?;
+    st.application
+        .ensure_log_streaming_allowed(identity)
+        .await?;
+
+    st.application.remove_log_sink_by_id(id).await?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDatadogLogStreamArgs {
+    /// Location of your Datadog deployment.
+    site_location: DatadogSiteLocation,
+    /// Datadog API key for authentication.
+    dd_api_key: String,
+    /// Optional comma-separated list of tags. These are sent to Datadog in each
+    /// log event via the `ddtags` field.
+    dd_tags: Vec<String>,
+    /// Service name used as a special tag in Datadog.
+    service: Option<String>,
+}
+
+impl TryFrom<CreateDatadogLogStreamArgs> for DatadogConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(value: CreateDatadogLogStreamArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            site_location: value.site_location,
+            dd_api_key: value.dd_api_key.into(),
+            dd_tags: value.dd_tags,
+            version: LogEventFormatVersion::V2,
+            service: value.service,
+        })
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWebhookLogStreamArgs {
+    /// URL to send logs to.
+    url: String,
+    /// Format for the webhook payload. JSONL sends one object per line of
+    /// request, JSON sends one array per request.
+    format: WebhookFormat,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAxiomLogStreamArgs {
+    /// Axiom API key for authentication.
+    api_key: String,
+    /// Name of the dataset in Axiom. This is where the logs will be sent.
+    dataset_name: String,
+    /// Optional list of attributes. These are extra fields and values sent to
+    /// Axiom in each log event.
+    attributes: Vec<AxiomAttribute>,
+    /// Optional ingest endpoint for Axiom
+    ingest_url: Option<String>,
+}
+
+impl TryFrom<CreateAxiomLogStreamArgs> for AxiomConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(value: CreateAxiomLogStreamArgs) -> Result<Self, Self::Error> {
+        validate_axiom_ingest_url(value.ingest_url.as_ref())?;
+
+        Ok(Self {
+            api_key: value.api_key.into(),
+            dataset_name: value.dataset_name,
+            attributes: value.attributes,
+            version: LogEventFormatVersion::V2,
+            ingest_url: value.ingest_url,
+        })
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSentryLogStreamArgs {
+    /// Sentry Data Source Name (DSN) to route exceptions to.
+    dsn: String,
+    /// Tags to add to all events routed to Sentry.
+    #[schema(value_type = Option<BTreeMap<String, String>>)]
+    tags: Option<BTreeMap<FieldName, String>>,
+}
+
+impl TryFrom<CreateSentryLogStreamArgs> for SentryConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(value: CreateSentryLogStreamArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
+            dsn: value
+                .dsn
+                .parse::<Dsn>()
+                .context(ErrorMetadata::bad_request(
+                    "InvalidSentryDsn",
+                    "The Sentry DSN passed was invalid",
+                ))?
+                .into(),
+            tags: value.tags,
+            version: ExceptionFormatVersion::V2,
+        })
+    }
+}
+
+fn validate_posthog_host(host: Option<&String>) -> anyhow::Result<()> {
+    if let Some(url) = host {
+        url.parse::<reqwest::Url>().map_err(|_| {
+            anyhow::anyhow!(ErrorMetadata::bad_request(
+                "InvalidPostHogHost",
+                format!("Invalid PostHog host URL: {url}"),
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePostHogLogsLogStreamArgs {
+    /// PostHog project token.
+    api_key: String,
+    /// PostHog host URL. Defaults to https://us.i.posthog.com.
+    host: Option<String>,
+    /// OTLP service.name attribute. Defaults to the deployment name.
+    service_name: Option<String>,
+}
+
+impl TryFrom<CreatePostHogLogsLogStreamArgs> for PostHogLogsConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(value: CreatePostHogLogsLogStreamArgs) -> Result<Self, Self::Error> {
+        validate_posthog_host(value.host.as_ref())?;
+        Ok(Self {
+            api_key: value.api_key.into(),
+            host: value.host,
+            service_name: value.service_name,
+        })
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePostHogErrorTrackingLogStreamArgs {
+    /// PostHog project token.
+    api_key: String,
+    /// PostHog host URL. Defaults to https://us.i.posthog.com.
+    host: Option<String>,
+}
+
+impl TryFrom<CreatePostHogErrorTrackingLogStreamArgs> for PostHogErrorTrackingConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(value: CreatePostHogErrorTrackingLogStreamArgs) -> Result<Self, Self::Error> {
+        validate_posthog_host(value.host.as_ref())?;
+        Ok(Self {
+            api_key: value.api_key.into(),
+            host: value.host,
+        })
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", tag = "logStreamType")]
+pub enum CreateLogStreamArgs {
+    #[schema(title = "Datadog")]
+    Datadog(CreateDatadogLogStreamArgs),
+    #[schema(title = "Webhook")]
+    Webhook(CreateWebhookLogStreamArgs),
+    #[schema(title = "Axiom")]
+    Axiom(CreateAxiomLogStreamArgs),
+    #[schema(title = "Sentry")]
+    Sentry(CreateSentryLogStreamArgs),
+    #[schema(title = "PostHogLogs")]
+    PostHogLogs(CreatePostHogLogsLogStreamArgs),
+    #[schema(title = "PostHogErrorTracking")]
+    PostHogErrorTracking(CreatePostHogErrorTrackingLogStreamArgs),
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWebhookLogStreamResponse {
+    id: String,
+    /// Use this secret to verify webhook signatures.
+    hmac_secret: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase", tag = "logStreamType")]
+pub enum CreateLogStreamResponse {
+    #[schema(title = "Webhook")]
+    Webhook(CreateWebhookLogStreamResponse),
+    #[schema(title = "Datadog")]
+    Datadog { id: String },
+    #[schema(title = "Axiom")]
+    Axiom { id: String },
+    #[schema(title = "Sentry")]
+    Sentry { id: String },
+    #[schema(title = "PostHogLogs")]
+    PostHogLogs { id: String },
+    #[schema(title = "PostHogErrorTracking")]
+    PostHogErrorTracking { id: String },
+}
+
+async fn ensure_log_sink_does_not_exist(
+    application: &Application<ProdRuntime>,
+    sink_type: &SinkType,
+) -> Result<(), HttpResponseError> {
+    if application.get_log_sink(sink_type).await?.is_some() {
+        return Err(anyhow::anyhow!(ErrorMetadata::conflict(
+            "LogStreamAlreadyExists",
+            format!("{sink_type:?} log stream already exists for this deployment",)
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Create log stream
+///
+/// Create a new log stream for the deployment. Errors if a log stream of the
+/// given type already exists.
+#[utoipa::path(
+    post,
+    path = "/create_log_stream",
+    tag = "Log Streams",
+    responses((status = 200, body = CreateLogStreamResponse)),
+    security(
+        ("Deploy Key" = []),
+        ("OAuth Team Token" = []),
+        ("Team Token" = []),
+        ("OAuth Project Token" = []),
+    ),
+)]
+pub async fn create_log_stream(
+    MtState(st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+    Json(args): Json<CreateLogStreamArgs>,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    identity.require_operation(keybroker::DeploymentOp::WriteIntegrations)?;
+    st.application
+        .ensure_log_streaming_allowed(identity)
+        .await?;
+
+    match args {
+        CreateLogStreamArgs::Datadog(datadog_sink_post_args) => {
+            ensure_log_sink_does_not_exist(&st.application, &SinkType::Datadog).await?;
+
+            let config: DatadogConfig = datadog_sink_post_args.try_into()?;
+            let id = st
+                .application
+                .add_log_sink(SinkConfig::Datadog(config))
+                .await?;
+            Ok(Json(CreateLogStreamResponse::Datadog {
+                id: id.to_string(),
+            }))
+        },
+        CreateLogStreamArgs::Webhook(webhook_sink_post_args) => {
+            ensure_log_sink_does_not_exist(&st.application, &SinkType::Webhook).await?;
+
+            let hmac_secret = generate_webhook_hmac_secret(st.application.runtime());
+
+            let url = webhook_sink_post_args.url.parse().map_err(|_| {
+                anyhow::anyhow!(ErrorMetadata::bad_request(
+                    "InvalidWebhookUrl",
+                    "The URL passed was invalid"
+                ))
+            })?;
+
+            let config = WebhookConfig {
+                url,
+                format: webhook_sink_post_args.format,
+                hmac_secret: hmac_secret.clone(),
+            };
+            let id = st
+                .application
+                .add_log_sink(SinkConfig::Webhook(config))
+                .await?;
+
+            Ok(Json(CreateLogStreamResponse::Webhook(
+                CreateWebhookLogStreamResponse {
+                    hmac_secret,
+                    id: id.to_string(),
+                },
+            )))
+        },
+        CreateLogStreamArgs::Axiom(axiom_sink_post_args) => {
+            ensure_log_sink_does_not_exist(&st.application, &SinkType::Axiom).await?;
+
+            if axiom_sink_post_args.attributes.len() > *AXIOM_MAX_ATTRIBUTES {
+                return Err(anyhow::anyhow!(
+                    "Exceeded max number of Axiom attributes. Contact support@convex.dev to \
+                     request a limit increase."
+                )
+                .into());
+            }
+
+            let config: AxiomConfig = axiom_sink_post_args.try_into()?;
+            let id = st
+                .application
+                .add_log_sink(SinkConfig::Axiom(config))
+                .await?;
+
+            Ok(Json(CreateLogStreamResponse::Axiom { id: id.to_string() }))
+        },
+        CreateLogStreamArgs::Sentry(sentry_config_args) => {
+            ensure_log_sink_does_not_exist(&st.application, &SinkType::Sentry).await?;
+
+            let config = sentry_config_args.try_into()?;
+            let id = st
+                .application
+                .add_log_sink(SinkConfig::Sentry(config))
+                .await?;
+            Ok(Json(CreateLogStreamResponse::Sentry { id: id.to_string() }))
+        },
+        CreateLogStreamArgs::PostHogLogs(args) => {
+            ensure_log_sink_does_not_exist(&st.application, &SinkType::PostHogLogs).await?;
+
+            let config: PostHogLogsConfig = args.try_into()?;
+            let id = st
+                .application
+                .add_log_sink(SinkConfig::PostHogLogs(config))
+                .await?;
+            Ok(Json(CreateLogStreamResponse::PostHogLogs {
+                id: id.to_string(),
+            }))
+        },
+        CreateLogStreamArgs::PostHogErrorTracking(args) => {
+            ensure_log_sink_does_not_exist(&st.application, &SinkType::PostHogErrorTracking)
+                .await?;
+
+            let config: PostHogErrorTrackingConfig = args.try_into()?;
+            let id = st
+                .application
+                .add_log_sink(SinkConfig::PostHogErrorTracking(config))
+                .await?;
+            Ok(Json(CreateLogStreamResponse::PostHogErrorTracking {
+                id: id.to_string(),
+            }))
+        },
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", tag = "logStreamType")]
+pub enum RotateLogStreamSecretArgs {
+    Webhook,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase", tag = "logStreamType")]
+pub enum RotateLogStreamSecretResponse {
+    #[serde(rename_all = "camelCase")]
+    #[schema(title = "Webhook")]
+    Webhook { hmac_secret: String },
+}
+
+/// Rotate webhook log stream secret
+///
+/// Rotate the secret for the webhook log stream.
+#[utoipa::path(
+    post,
+    path = "/rotate_webhook_secret/{id}",
+    tag = "Log Streams",
+    responses((status = 200, body = RotateLogStreamSecretResponse)),
+    params(
+        ("id" = String, Path, description = "id of the webhook log stream for which to rotate the secret"),
+    ),
+    security(
+        ("Deploy Key" = []),
+        ("OAuth Team Token" = []),
+        ("Team Token" = []),
+        ("OAuth Project Token" = []),
+    ),
+)]
+pub async fn rotate_webhook_secret(
+    MtState(st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    identity.require_operation(keybroker::DeploymentOp::WriteIntegrations)?;
+    st.application
+        .ensure_log_streaming_allowed(identity)
+        .await?;
+
+    let Some(LogSinkWithId {
+        config: sink_config,
+        ..
+    }) = st.application.get_log_sink_by_id(&id).await?
+    else {
+        return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+            "LogStreamDoesntExist",
+            "No log stream with the given id exists for this deployment",
+        ))
+        .into());
+    };
+
+    match sink_config {
+        SinkConfig::Webhook(existing_webhook_sink) => {
+            let hmac_secret = generate_webhook_hmac_secret(st.application.runtime());
+
+            let config = WebhookConfig {
+                url: existing_webhook_sink.url,
+                format: existing_webhook_sink.format,
+                hmac_secret: hmac_secret.clone(),
+            };
+            st.application
+                .patch_log_sink_config(&id, SinkConfig::Webhook(config))
+                .await?;
+
+            Ok(Json(RotateLogStreamSecretResponse::Webhook { hmac_secret }))
+        },
+        _ => Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+            "NoSecretToRotate",
+            "This log stream does not have a secret to rotate."
+        ))
+        .into()),
+    }
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", tag = "logStreamType")]
+enum LogStreamConfig {
+    #[schema(title = "Datadog")]
+    Datadog(DatadogLogStreamConfig),
+    #[schema(title = "Webhook")]
+    Webhook(WebhookLogStreamConfig),
+    #[schema(title = "Axiom")]
+    Axiom(AxiomLogStreamConfig),
+    #[schema(title = "Sentry")]
+    Sentry(SentryLogStreamConfig),
+    #[schema(title = "PostHogLogs")]
+    PostHogLogs(PostHogLogsLogStreamConfig),
+    #[schema(title = "PostHogErrorTracking")]
+    PostHogErrorTracking(PostHogErrorTrackingLogStreamConfig),
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(title = "DatadogConfig")]
+pub struct DatadogLogStreamConfig {
+    pub id: String,
+    /// Status of the log stream
+    pub status: LogStreamStatus,
+    /// Location of your Datadog deployment.
+    pub site_location: DatadogSiteLocation,
+    /// Optional comma-separated list of tags. These are sent to Datadog in each
+    /// log event via the `ddtags` field.
+    pub dd_tags: Vec<String>,
+    /// Service name used as a special tag in Datadog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(title = "WebhookConfig")]
+pub struct WebhookLogStreamConfig {
+    pub id: String,
+    /// Status of the log stream
+    pub status: LogStreamStatus,
+    /// URL to send logs to.
+    pub url: String,
+    /// Format for the webhook payload. JSONL sends one object per line of
+    /// request, JSON sends one array per request.
+    pub format: WebhookFormat,
+    /// Use this secret to verify webhook signatures.
+    pub hmac_secret: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(title = "AxiomConfig")]
+pub struct AxiomLogStreamConfig {
+    pub id: String,
+    /// Status of the log stream
+    pub status: LogStreamStatus,
+    /// Name of the dataset in Axiom. This is where the logs will be sent.
+    pub dataset_name: String,
+    /// Optional list of attributes. These are extra fields and values sent to
+    /// Axiom in each log event.
+    pub attributes: Vec<AxiomAttribute>,
+    /// Optional ingest endpoint for Axiom
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest_url: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(title = "SentryConfig")]
+pub struct SentryLogStreamConfig {
+    pub id: String,
+    /// Status of the log stream
+    pub status: LogStreamStatus,
+    /// Tags to add to all events routed to Sentry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(title = "PostHogLogsConfig")]
+pub struct PostHogLogsLogStreamConfig {
+    pub id: String,
+    /// Status of the log stream
+    pub status: LogStreamStatus,
+    /// PostHog host URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// OTLP service.name attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+#[schema(title = "PostHogErrorTrackingConfig")]
+pub struct PostHogErrorTrackingLogStreamConfig {
+    pub id: String,
+    /// Status of the log stream
+    pub status: LogStreamStatus,
+    /// PostHog host URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+fn log_sink_to_log_stream_config(sink: LogSinkWithId) -> Option<LogStreamConfig> {
+    let status: LogStreamStatus =
+        Into::<model::log_sinks::types::SerializedSinkState>::into(sink.status).into();
+    match sink.config {
+        SinkConfig::Datadog(config) => Some(LogStreamConfig::Datadog(DatadogLogStreamConfig {
+            id: sink.id.to_string(),
+            status,
+            site_location: config.site_location,
+            dd_tags: config.dd_tags,
+            service: config.service,
+        })),
+        SinkConfig::Webhook(config) => Some(LogStreamConfig::Webhook(WebhookLogStreamConfig {
+            id: sink.id.to_string(),
+            status,
+            url: config.url.to_string(),
+            format: config.format,
+            hmac_secret: config.hmac_secret,
+        })),
+        SinkConfig::Axiom(config) => Some(LogStreamConfig::Axiom(AxiomLogStreamConfig {
+            id: sink.id.to_string(),
+            status,
+            dataset_name: config.dataset_name,
+            attributes: config.attributes,
+            ingest_url: config.ingest_url,
+        })),
+        SinkConfig::Sentry(config) => Some(LogStreamConfig::Sentry(SentryLogStreamConfig {
+            id: sink.id.to_string(),
+            status,
+            tags: config
+                .tags
+                .map(|tags| tags.into_iter().map(|(k, v)| (k.into(), v)).collect()),
+        })),
+        SinkConfig::PostHogLogs(config) => {
+            Some(LogStreamConfig::PostHogLogs(PostHogLogsLogStreamConfig {
+                id: sink.id.to_string(),
+                status,
+                host: config.host,
+                service_name: config.service_name,
+            }))
+        },
+        SinkConfig::PostHogErrorTracking(config) => Some(LogStreamConfig::PostHogErrorTracking(
+            PostHogErrorTrackingLogStreamConfig {
+                id: sink.id.to_string(),
+                status,
+                host: config.host,
+            },
+        )),
+        _ => None,
+    }
+}
+
+/// List log streams
+///
+/// List configs for all existing log streams in a deployment.
+#[utoipa::path(
+    get,
+    path = "/list_log_streams",
+    tag = "Log Streams",
+    responses((status = 200, body = Vec<LogStreamConfig>)),
+    security(
+        ("Deploy Key" = []),
+        ("OAuth Team Token" = []),
+        ("Team Token" = []),
+        ("OAuth Project Token" = []),
+    ),
+)]
+pub async fn list_log_streams(
+    MtState(st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    identity.require_operation(keybroker::DeploymentOp::ViewIntegrations)?;
+
+    Ok(Json(
+        st.application
+            .list_log_sinks()
+            .await?
+            .into_iter()
+            .filter_map(log_sink_to_log_stream_config)
+            .collect::<Vec<LogStreamConfig>>(),
+    ))
+}
+
+/// Get log stream
+///
+/// Get the config for a specific log stream by id.
+#[utoipa::path(
+    get,
+    path = "/get_log_stream/{id}",
+    tag = "Log Streams",
+    responses((status = 200, body = LogStreamConfig)),
+    params(
+        ("id" = String, Path, description = "id of the log stream to retrieve"),
+    ),
+    security(
+        ("Deploy Key" = []),
+        ("OAuth Team Token" = []),
+        ("Team Token" = []),
+        ("OAuth Project Token" = []),
+    ),
+)]
+pub async fn get_log_stream(
+    MtState(st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    identity.require_operation(keybroker::DeploymentOp::ViewIntegrations)?;
+
+    let Some(log_sink_with_id) = st.application.get_log_sink_by_id(&id).await? else {
+        return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+            "LogStreamDoesntExist",
+            "No log stream with the given id exists for this deployment",
+        ))
+        .into());
+    };
+
+    let config = log_sink_to_log_stream_config(log_sink_with_id).ok_or_else(|| {
+        anyhow::anyhow!(ErrorMetadata::bad_request(
+            "UnsupportedLogStreamType",
+            "This log stream type is not supported",
+        ))
+    })?;
+
+    Ok(Json(config))
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDatadogSinkArgs {
+    /// Location of your Datadog deployment.
+    #[serde(default)]
+    site_location: Option<DatadogSiteLocation>,
+    /// Datadog API key for authentication.
+    #[serde(default)]
+    dd_api_key: Option<String>,
+    /// Optional comma-separated list of tags. These are sent to Datadog in each
+    /// log event via the `ddtags` field.
+    #[serde(default)]
+    dd_tags: Option<Vec<String>>,
+    /// Service name used as a special tag in Datadog.
+    #[serde(default, with = "::serde_with::rust::double_option")]
+    service: Option<Option<String>>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWebhookSinkArgs {
+    /// URL to send logs to.
+    #[serde(default)]
+    url: Option<String>,
+    /// Format for the webhook payload. JSONL sends one object per line of
+    /// request, JSON sends one array per request.
+    #[serde(default)]
+    format: Option<WebhookFormat>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAxiomSinkArgs {
+    /// Axiom API key for authentication.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Name of the dataset in Axiom. This is where the logs will be sent.
+    #[serde(default)]
+    dataset_name: Option<String>,
+    /// Optional list of attributes. These are extra fields and values sent to
+    /// Axiom in each log event.
+    #[serde(default)]
+    attributes: Option<Vec<AxiomAttribute>>,
+    /// Optional ingest endpoint for Axiom
+    #[serde(default, with = "::serde_with::rust::double_option")]
+    ingest_url: Option<Option<String>>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSentrySinkArgs {
+    /// Sentry Data Source Name (DSN) to route exceptions to.
+    #[serde(default)]
+    dsn: Option<String>,
+    /// Tags to add to all events routed to Sentry.
+    #[serde(default, with = "::serde_with::rust::double_option")]
+    #[schema(value_type = Option<Option<BTreeMap<String, String>>>)]
+    tags: Option<Option<BTreeMap<FieldName, String>>>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePostHogLogsSinkArgs {
+    /// PostHog project token.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// PostHog host URL.
+    #[serde(default, with = "::serde_with::rust::double_option")]
+    host: Option<Option<String>>,
+    /// OTLP service.name attribute.
+    #[serde(default, with = "::serde_with::rust::double_option")]
+    service_name: Option<Option<String>>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePostHogErrorTrackingSinkArgs {
+    /// PostHog project token.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// PostHog host URL.
+    #[serde(default, with = "::serde_with::rust::double_option")]
+    host: Option<Option<String>>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", tag = "logStreamType")]
+pub enum UpdateLogStreamArgs {
+    #[schema(title = "Datadog")]
+    Datadog(UpdateDatadogSinkArgs),
+    #[schema(title = "Webhook")]
+    Webhook(UpdateWebhookSinkArgs),
+    #[schema(title = "Axiom")]
+    Axiom(UpdateAxiomSinkArgs),
+    #[schema(title = "Sentry")]
+    Sentry(UpdateSentrySinkArgs),
+    #[schema(title = "PostHogLogs")]
+    PostHogLogs(UpdatePostHogLogsSinkArgs),
+    #[schema(title = "PostHogErrorTracking")]
+    PostHogErrorTracking(UpdatePostHogErrorTrackingSinkArgs),
+}
+
+/// Update log stream
+///
+/// Update an existing log stream for the deployment. Omit a field to keep the
+/// existing value, and use `null` to unset a field.
+#[utoipa::path(
+    post,
+    path = "/update_log_stream/{id}",
+    tag = "Log Streams",
+    responses((status = 200)),
+    params(
+        ("id" = String, Path, description = "id of the log stream to update"),
+    ),
+    security(
+        ("Deploy Key" = []),
+        ("OAuth Team Token" = []),
+        ("Team Token" = []),
+        ("OAuth Project Token" = []),
+    ),
+)]
+pub async fn update_log_stream(
+    MtState(st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+    Path(id): Path<String>,
+    Json(args): Json<UpdateLogStreamArgs>,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    identity.require_operation(keybroker::DeploymentOp::WriteIntegrations)?;
+    st.application
+        .ensure_log_streaming_allowed(identity)
+        .await?;
+
+    let Some(LogSinkWithId {
+        config: sink_config,
+        ..
+    }) = st.application.get_log_sink_by_id(&id).await?
+    else {
+        return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+            "LogStreamDoesntExist",
+            "No log stream with the given id exists for this deployment",
+        ))
+        .into());
+    };
+
+    match sink_config {
+        SinkConfig::Datadog(existing_config) => {
+            let UpdateLogStreamArgs::Datadog(update_args) = args else {
+                return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                    "LogStreamTypeMismatch",
+                    "Cannot update a Datadog log stream with arguments for a different log stream \
+                     type",
+                ))
+                .into());
+            };
+
+            let config = DatadogConfig {
+                site_location: update_args
+                    .site_location
+                    .unwrap_or(existing_config.site_location),
+                dd_api_key: update_args
+                    .dd_api_key
+                    .map(|k| k.into())
+                    .unwrap_or(existing_config.dd_api_key),
+                dd_tags: update_args.dd_tags.unwrap_or(existing_config.dd_tags),
+                version: existing_config.version,
+                service: update_args.service.unwrap_or(existing_config.service),
+            };
+
+            st.application
+                .patch_log_sink_config(&id, SinkConfig::Datadog(config))
+                .await?;
+        },
+        SinkConfig::Webhook(existing_config) => {
+            let UpdateLogStreamArgs::Webhook(update_args) = args else {
+                return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                    "LogStreamTypeMismatch",
+                    "Cannot update a Webhook log stream with arguments for a different log stream \
+                     type",
+                ))
+                .into());
+            };
+
+            let url = if let Some(url_str) = update_args.url {
+                url_str.parse().map_err(|_| {
+                    anyhow::anyhow!(ErrorMetadata::bad_request(
+                        "InvalidWebhookUrl",
+                        "The URL passed was invalid"
+                    ))
+                })?
+            } else {
+                existing_config.url
+            };
+
+            let config = WebhookConfig {
+                url,
+                format: update_args.format.unwrap_or(existing_config.format),
+                hmac_secret: existing_config.hmac_secret,
+            };
+
+            st.application
+                .patch_log_sink_config(&id, SinkConfig::Webhook(config))
+                .await?;
+        },
+        SinkConfig::Axiom(existing_config) => {
+            let UpdateLogStreamArgs::Axiom(update_args) = args else {
+                return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                    "LogStreamTypeMismatch",
+                    "Cannot update an Axiom log stream with arguments for a different log stream \
+                     type",
+                ))
+                .into());
+            };
+
+            let attributes = update_args.attributes.unwrap_or(existing_config.attributes);
+            if attributes.len() > *AXIOM_MAX_ATTRIBUTES {
+                return Err(anyhow::anyhow!(
+                    "Exceeded max number of Axiom attributes. Contact support@convex.dev to \
+                     request a limit increase."
+                )
+                .into());
+            }
+
+            let ingest_url = update_args.ingest_url.unwrap_or(existing_config.ingest_url);
+            if ingest_url.is_some() {
+                validate_axiom_ingest_url(ingest_url.as_ref())?
+            }
+
+            let config = AxiomConfig {
+                api_key: update_args
+                    .api_key
+                    .map(|k| k.into())
+                    .unwrap_or(existing_config.api_key),
+                dataset_name: update_args
+                    .dataset_name
+                    .unwrap_or(existing_config.dataset_name),
+                attributes,
+                version: existing_config.version,
+                ingest_url,
+            };
+
+            st.application
+                .patch_log_sink_config(&id, SinkConfig::Axiom(config))
+                .await?;
+        },
+        SinkConfig::Sentry(existing_config) => {
+            let UpdateLogStreamArgs::Sentry(update_args) = args else {
+                return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                    "LogStreamTypeMismatch",
+                    "Cannot update a Sentry log stream with arguments for a different log stream \
+                     type",
+                ))
+                .into());
+            };
+
+            let dsn = if let Some(dsn_str) = update_args.dsn {
+                dsn_str
+                    .parse::<Dsn>()
+                    .context(ErrorMetadata::bad_request(
+                        "InvalidSentryDsn",
+                        "The Sentry DSN passed was invalid",
+                    ))?
+                    .into()
+            } else {
+                existing_config.dsn
+            };
+
+            let config = SentryConfig {
+                dsn,
+                tags: update_args.tags.unwrap_or(existing_config.tags),
+                version: existing_config.version,
+            };
+
+            st.application
+                .patch_log_sink_config(&id, SinkConfig::Sentry(config))
+                .await?;
+        },
+        SinkConfig::PostHogLogs(existing_config) => {
+            let UpdateLogStreamArgs::PostHogLogs(update_args) = args else {
+                return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                    "LogStreamTypeMismatch",
+                    "Cannot update a PostHog Logs log stream with arguments for a different log \
+                     stream type",
+                ))
+                .into());
+            };
+
+            let host = update_args.host.unwrap_or(existing_config.host);
+            if host.is_some() {
+                validate_posthog_host(host.as_ref())?;
+            }
+
+            let config = PostHogLogsConfig {
+                api_key: update_args
+                    .api_key
+                    .map(|k| k.into())
+                    .unwrap_or(existing_config.api_key),
+                host,
+                service_name: update_args
+                    .service_name
+                    .unwrap_or(existing_config.service_name),
+            };
+
+            st.application
+                .patch_log_sink_config(&id, SinkConfig::PostHogLogs(config))
+                .await?;
+        },
+        SinkConfig::PostHogErrorTracking(existing_config) => {
+            let UpdateLogStreamArgs::PostHogErrorTracking(update_args) = args else {
+                return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                    "LogStreamTypeMismatch",
+                    "Cannot update a PostHog Error Tracking log stream with arguments for a \
+                     different log stream type",
+                ))
+                .into());
+            };
+
+            let host = update_args.host.unwrap_or(existing_config.host);
+            if host.is_some() {
+                validate_posthog_host(host.as_ref())?;
+            }
+
+            let config = PostHogErrorTrackingConfig {
+                api_key: update_args
+                    .api_key
+                    .map(|k| k.into())
+                    .unwrap_or(existing_config.api_key),
+                host,
+            };
+
+            st.application
+                .patch_log_sink_config(&id, SinkConfig::PostHogErrorTracking(config))
+                .await?;
+        },
+        _ => {
+            return Err(anyhow::anyhow!(ErrorMetadata::bad_request(
+                "UnsupportedLogStreamType",
+                "This log stream type does not support updates",
+            ))
+            .into())
+        },
+    }
+
+    // Reset the log sink status to Pending so that it retries verification
+    st.application.reset_log_sink_to_pending(&id).await?;
+
+    Ok(StatusCode::OK)
+}
+
+pub fn platform_router<S>() -> OpenApiRouter<S>
+where
+    LocalAppState: FromRef<S>,
+    S: Clone + Send + Sync + 'static,
+{
+    OpenApiRouter::new()
+        .routes(utoipa_axum::routes!(list_log_streams))
+        .routes(utoipa_axum::routes!(get_log_stream))
+        .routes(utoipa_axum::routes!(delete_log_stream))
+        .routes(utoipa_axum::routes!(create_log_stream))
+        .routes(utoipa_axum::routes!(update_log_stream))
+        .routes(utoipa_axum::routes!(rotate_webhook_secret))
+}

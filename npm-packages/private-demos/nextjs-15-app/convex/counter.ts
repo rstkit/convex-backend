@@ -1,9 +1,14 @@
+import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
 
-export const get = query(
-  async ({ db }, { counterName }: { counterName: string }) => {
+export const get = query({
+  args: {
+    counterName: v.string(),
+  },
+  handler: async ({ db }, { counterName }) => {
     const counterDoc = await db
       .query("counter_table")
+      // eslint-disable-next-line @convex-dev/no-filter-in-query -- demo uses `.filter()` for simplicity
       .filter((q) => q.eq(q.field("name"), counterName))
       .first();
     console.log(`Read counter ${counterName}:`, counterDoc);
@@ -12,12 +17,16 @@ export const get = query(
     }
     return counterDoc.counter;
   },
-);
+});
 
-export const increment = mutation(
-  async ({ db }, { counterName }: { counterName: string }) => {
+export const increment = mutation({
+  args: {
+    counterName: v.string(),
+  },
+  handler: async ({ db }, { counterName }) => {
     const counterDoc = await db
       .query("counter_table")
+      // eslint-disable-next-line @convex-dev/no-filter-in-query -- demo uses `.filter()` for simplicity
       .filter((q) => q.eq(q.field("name"), counterName))
       .first();
     const incrementBy = 1;
@@ -36,4 +45,4 @@ export const increment = mutation(
       );
     }
   },
-);
+});

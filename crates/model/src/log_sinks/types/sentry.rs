@@ -13,19 +13,11 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use utoipa::ToSchema;
 use value::FieldName;
 
-#[cfg(any(test, feature = "testing"))]
-pub const TEST_DSN: &str =
-    "https://ef1d32d342354c87869ab2db8b490b2c@o1192621.ingest.sentry.io/6333191";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct SentryConfig {
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(value = "(TEST_DSN.parse::<Dsn>().unwrap()).into()")
-    )]
     pub dsn: PII<Dsn>,
     pub tags: Option<BTreeMap<FieldName, String>>,
     pub version: ExceptionFormatVersion,
@@ -55,14 +47,18 @@ impl TryFrom<SerializedSentryConfig> for SentryConfig {
     type Error = anyhow::Error;
 
     fn try_from(value: SerializedSentryConfig) -> Result<Self, Self::Error> {
+        let version = match value.version {
+            Some(v) => ExceptionFormatVersion::from_str(&v)?,
+            // Treat missing version as V1
+            None => ExceptionFormatVersion::V1,
+        };
+        if version == ExceptionFormatVersion::V1 {
+            tracing::info!("Instance is on exception format version 1 (sentry)")
+        }
         Ok(Self {
             dsn: value.dsn.parse::<Dsn>()?.into(),
             tags: value.tags,
-            version: match value.version {
-                Some(v) => ExceptionFormatVersion::from_str(&v)?,
-                // Treat missing version as V1
-                None => ExceptionFormatVersion::V1,
-            },
+            version,
         })
     }
 }
@@ -73,8 +69,7 @@ impl fmt::Display for SentryConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum ExceptionFormatVersion {
     V1,
     V2,
@@ -98,12 +93,5 @@ impl Display for ExceptionFormatVersion {
             Self::V1 => write!(f, "1"),
             Self::V2 => write!(f, "2"),
         }
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Default for ExceptionFormatVersion {
-    fn default() -> Self {
-        Self::V2
     }
 }

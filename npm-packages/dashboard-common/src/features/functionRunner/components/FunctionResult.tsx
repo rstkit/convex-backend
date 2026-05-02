@@ -2,13 +2,13 @@ import { LockOpen2Icon, PlayIcon } from "@radix-ui/react-icons";
 import classNames from "classnames";
 import type { FunctionResult as FunctionResultType } from "convex/browser";
 import { useContext, useEffect, useState } from "react";
-import { useSessionStorage } from "react-use";
 import { Value } from "convex/values";
 import { Button } from "@ui/Button";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import { toast } from "@common/lib/utils";
 import { RequestFilter } from "@common/lib/appMetrics";
 import { ComponentId } from "@common/lib/useNents";
+import { Visibility } from "system-udfs/convex/_system/frontend/common";
 import { Result } from "@common/features/functionRunner/components/Result";
 import {
   useRunHistory,
@@ -16,19 +16,25 @@ import {
   useImpersonatedUser,
   useIsImpersonating,
 } from "@common/features/functionRunner/components/RunHistory";
+import { useEditsAuthorization } from "@common/features/data/lib/useEditsAuthorization";
 
 // This is a hook because we want to return composable components that can be arranged
 // vertically or horizontally.
 export function useFunctionResult({
   udfType,
+  visibility,
+  isInComponent,
   onSubmit,
   disabled,
   functionIdentifier,
   componentId,
   args,
   runHistoryItem,
+  onCopiedQueryResult,
 }: {
   udfType?: "Mutation" | "Action" | "Query" | "HttpAction";
+  visibility?: Visibility | null;
+  isInComponent?: boolean;
   onSubmit(): {
     requestFilter: RequestFilter | null;
     runFunctionPromise: Promise<FunctionResultType> | null;
@@ -38,6 +44,7 @@ export function useFunctionResult({
   componentId: ComponentId;
   args: Record<string, Value>;
   runHistoryItem?: RunHistoryItem;
+  onCopiedQueryResult?: () => void;
 }) {
   const { appendRunHistory } = useRunHistory(
     functionIdentifier || "",
@@ -81,7 +88,9 @@ export function useFunctionResult({
       setStartCursor(0);
       if (runHistoryItem.type === "arguments") {
         setIsImpersonating(!!runHistoryItem.user);
-        runHistoryItem.user && setImpersonatedUser(runHistoryItem.user);
+        if (runHistoryItem.user) {
+          setImpersonatedUser(runHistoryItem.user);
+        }
       }
     }
   }, [runHistoryItem, setImpersonatedUser, setIsImpersonating]);
@@ -89,23 +98,49 @@ export function useFunctionResult({
   const {
     useCurrentDeployment,
     useHasProjectAdminPermissions,
+    useIsOperationAllowed,
     useLogDeploymentEvent,
   } = useContext(DeploymentInfoContext);
 
   const deployment = useCurrentDeployment();
-  const isProd = deployment?.deploymentType === "prod";
-  const [prodEditsEnabled, setProdEditsEnabled] = useSessionStorage(
-    "prodEditsEnabled",
-    false,
-  );
+  const dtype = deployment?.deploymentType;
+  const isProd = dtype === "prod";
+
+  const { areEditsAuthorized, authorizeEdits } = useEditsAuthorization();
   const log = useLogDeploymentEvent();
   const hasAdminPermissions = useHasProjectAdminPermissions(
     deployment?.projectId,
   );
+  const canRunInternalQueries = useIsOperationAllowed("RunInternalQueries");
+  const canRunInternalMutations = useIsOperationAllowed("RunInternalMutations");
+  const canRunInternalActions = useIsOperationAllowed("RunInternalActions");
+  const canViewData = useIsOperationAllowed("ViewData");
+  const canWriteData = useIsOperationAllowed("WriteData");
+
+  const isInternal = visibility?.kind === "internal";
+
+  const canRunOp = (() => {
+    if (isInternal) {
+      // Internal functions require explicit RunInternal* permissions
+      return udfType === "Query"
+        ? canRunInternalQueries
+        : udfType === "Mutation"
+          ? canRunInternalMutations
+          : canRunInternalActions;
+    }
+    if (isInComponent) {
+      // Public functions in a component require ViewData (queries) or WriteData (mutations/actions)
+      return udfType === "Query" ? canViewData : canWriteData;
+    }
+    // Public functions at the top level are always allowed
+    return true;
+  })();
+
   const canRunFunction =
-    udfType === "Query" ||
-    deployment?.deploymentType !== "prod" ||
-    hasAdminPermissions;
+    (udfType === "Query" ||
+      deployment?.deploymentType !== "prod" ||
+      hasAdminPermissions) &&
+    canRunOp;
 
   if (isInvalidUdfType) {
     return { button: null, result: null };
@@ -163,37 +198,37 @@ export function useFunctionResult({
           tip={
             disabled
               ? "Fix the errors above to continue."
-              : isProd && !prodEditsEnabled
-                ? `You are about to run a ${udfType.toLowerCase()} in Production. Unlock Production to continue.`
-                : !canRunFunction
-                  ? "You do not have permission to run this function in production."
+              : !canRunFunction
+                ? "You do not have permission to run this function in this deployment."
+                : !areEditsAuthorized
+                  ? // TODO(ENG-10340) Edit this message to use the deployment ref
+                    `You are about to run a ${udfType.toLowerCase()} in a ${`${dtype ?? ""} deployment`.trim()}. Unlock edits to continue.`
                   : undefined
           }
           size="sm"
           className="w-full max-w-[48rem] items-center justify-center"
-          disabled={
-            disabled || (isProd && !prodEditsEnabled) || !canRunFunction
-          }
+          disabled={disabled || !areEditsAuthorized || !canRunFunction}
           loading={isInFlight}
           onClick={runFunction}
           icon={<PlayIcon />}
         >
           Run {udfType.toLowerCase()}
         </Button>
-        {canRunFunction && isProd && !prodEditsEnabled && (
+        {canRunFunction && !areEditsAuthorized && (
+          // TODO(ENG-10340) Include the deployment ref in the tooltip
           <Button
-            tip="Enables changes to Production for the remainder of this dashboard session"
+            tip="Enables changes to this deployment for the remainder of this dashboard session"
             size="sm"
             onClick={() => {
-              setProdEditsEnabled(true);
+              authorizeEdits?.();
               toast(
                 "success",
-                "Production edits enabled for the remainder of this dashboard session",
+                "Edits enabled for the remainder of this dashboard session",
               );
             }}
             icon={<LockOpen2Icon />}
           >
-            Unlock Production
+            Unlock Edits
           </Button>
         )}
       </div>
@@ -205,6 +240,7 @@ export function useFunctionResult({
         lastRequestTiming={lastRequestTiming}
         requestFilter={requestFilter}
         startCursor={startCursor}
+        onCopiedQueryResult={onCopiedQueryResult}
       />
     ),
     runFunction,

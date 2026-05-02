@@ -1,8 +1,8 @@
-import type { Meta, StoryObj } from "@storybook/react";
+import type { Meta, StoryObj } from "@storybook/nextjs";
 
 import { UsageBanner } from "./UsageBanner";
 
-const meta: Meta<typeof UsageBanner> = {
+const meta = {
   component: UsageBanner,
   args: {
     team: {
@@ -15,10 +15,10 @@ const meta: Meta<typeof UsageBanner> = {
       referredBy: null,
     },
   },
-};
+} satisfies Meta<typeof UsageBanner>;
 
 export default meta;
-type Story = StoryObj<typeof UsageBanner>;
+type Story = StoryObj<typeof meta>;
 
 export const Approaching: Story = {
   args: {

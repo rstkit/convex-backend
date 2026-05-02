@@ -3,7 +3,6 @@
 // https://github.com/denoland/deno/blob/main/LICENSE.md
 
 import { throwNotImplementedMethodError } from "./helpers";
-import { performOp } from "./syscall";
 import { ReadableStream } from "./06_streams";
 
 async function* toIterator(
@@ -22,34 +21,28 @@ async function* toIterator(
   }
 }
 
-// TODO(presley): To have proper streaming, BlobReference should be able to
-// reference resources in rust and fetch them via ops. For now, just wrap Uint8Array.
 class BlobReference {
-  private _id: string;
-  private _size: number;
+  #data: ArrayBuffer;
 
-  constructor(id: string, size: number) {
-    this._id = id;
-    this._size = size;
+  constructor(data: ArrayBuffer) {
+    this.#data = data;
   }
 
   static fromUint8Array(data: Uint8Array) {
-    const id = performOp("blob/createPart", data);
-    return new BlobReference(id, data.byteLength);
+    // Copy the data to freeze it, in case `data` gets mutated later
+    return new BlobReference(data.slice().buffer);
   }
 
   slice(start: number, end: number): BlobReference {
-    const size = end - start;
-    const id = performOp("blob/slicePart", this._id, start, size);
-    return new BlobReference(id, size);
+    return new BlobReference(this.#data.slice(start, end));
   }
 
   arrayBuffer(): ArrayBuffer {
-    return performOp("blob/readPart", this._id);
+    return this.#data.slice();
   }
 
   get size() {
-    return this._size;
+    return this.#data.byteLength;
   }
 }
 
@@ -72,7 +65,6 @@ class BlobStreamReference {
     const sliced = new ReadableStream({
       type: "bytes",
       async pull(controller) {
-        // eslint-disable-next-line no-constant-condition
         while (true) {
           const { value, done } = await reader.read();
           if (done || bytesRead >= end) return controller.close();
@@ -105,7 +97,6 @@ function iteratorToReadableStream(
   return new ReadableStream({
     type: "bytes",
     async pull(controller) {
-      // eslint-disable-next-line no-constant-condition
       while (true) {
         const { value, done } = await iterator.next();
         if (done) return controller.close();
@@ -119,22 +110,31 @@ function iteratorToReadableStream(
 
 const NORMALIZE_PATTERN = new RegExp(/^[\x20-\x7E]*$/);
 
-export function isSupportedBlobPart(part): boolean {
+export function isSupportedBlobPart(part: unknown): part is BlobPart {
   if (part === undefined || part === null) {
     return false;
   }
-  return (
+  if (
     typeof part === "string" ||
     part instanceof ArrayBuffer ||
-    part instanceof Blob ||
-    ((part.buffer instanceof ArrayBuffer ||
-      part.buffer instanceof SharedArrayBuffer) &&
-      typeof part.byteLength === "number" &&
-      typeof part.byteOffset === "number")
+    part instanceof Blob
+  ) {
+    return true;
+  }
+  const view = part as {
+    buffer?: unknown;
+    byteLength?: unknown;
+    byteOffset?: unknown;
+  };
+  return (
+    (view.buffer instanceof ArrayBuffer ||
+      view.buffer instanceof SharedArrayBuffer) &&
+    typeof view.byteLength === "number" &&
+    typeof view.byteOffset === "number"
   );
 }
 
-type BlobPart = string | BufferSource | Blob;
+type BlobPart = string | ArrayBufferView | ArrayBuffer | Blob;
 
 export class Blob {
   private _parts: (BlobReference | BlobStreamReference | Blob)[];
@@ -236,7 +236,6 @@ export class Blob {
     const bytes = new Uint8Array(this._size);
     const partIterator = toIterator(this._parts);
     let offset = 0;
-    // eslint-disable-next-line no-constant-condition
     while (true) {
       const { value, done } = await partIterator.next();
       if (done) break;
@@ -311,13 +310,6 @@ export class Blob {
       normalizedType = str;
     }
     return normalizedType.toLowerCase();
-  }
-
-  static fromIdPart(id: string, size: number): Blob {
-    const blob = new Blob();
-    blob._parts = [new BlobReference(id, size)];
-    blob._size = size;
-    return blob;
   }
 
   static fromStream(

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ValidatorJSON, Value } from "convex/values";
 import isPlainObject from "lodash/isPlainObject";
 import omitBy from "lodash/omitBy";
-import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/patchDocumentsFields";
+import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/lib/values";
 import { ObjectEditor } from "@common/elements/ObjectEditor/ObjectEditor";
 import { Button } from "@ui/Button";
 
@@ -126,11 +126,11 @@ export function JavascriptDocumentsForm({
           mode={mode}
         />
       </div>
-      <div className="flex max-h-40 w-full grow  bg-background-secondary px-4 py-2 sm:px-6">
+      <div className="flex max-h-40 w-full grow bg-background-secondary px-4 py-2 sm:px-6">
         <div className="float-right flex w-full grow items-center justify-end gap-4 whitespace-pre-line">
           {validationMessage && (
             <p
-              className="mt-1 max-h-full overflow-y-auto break-words text-xs text-content-errorSecondary scrollbar"
+              className="mt-1 scrollbar max-h-full overflow-y-auto text-xs break-words text-content-errorSecondary"
               role="alert"
             >
               {validationMessage}

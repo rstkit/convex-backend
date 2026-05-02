@@ -15,32 +15,33 @@ use application::{
     },
     valid_identifier::ValidIdentifier,
 };
-use axum::{
-    debug_handler,
-    extract::State,
-    response::IntoResponse,
-};
+use axum::response::IntoResponse;
 use common::{
     self,
     components::ComponentPath,
     http::{
-        extract::Json,
+        extract::{
+            Json,
+            MtState,
+        },
         HttpResponseError,
     },
     schemas::json::DatabaseSchemaJson,
 };
-use convex_fivetran_destination::api_types::{
+use errors::ErrorMetadata;
+use fivetran_destination::api_types::{
     BatchWriteRow,
     CreateTableArgs,
     DeleteType,
     TruncateTableArgs,
 };
-use errors::ErrorMetadata;
 use http::StatusCode;
+use model::snapshot_imports::types::ImportRequestor;
 use serde::{
     Deserialize,
     Serialize,
 };
+use usage_tracking::FunctionUsageTracker;
 use value::{
     identifier::IDENTIFIER_REQUIREMENTS,
     TableName,
@@ -48,10 +49,6 @@ use value::{
 };
 
 use crate::{
-    admin::{
-        must_be_admin,
-        must_be_admin_with_write_access,
-    },
     authentication::ExtractIdentity,
     LocalAppState,
 };
@@ -63,13 +60,15 @@ pub struct AirbyteImportArgs {
     messages: Vec<AirbyteRecordMessage>,
 }
 
-#[debug_handler]
 pub async fn import_airbyte_records(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(AirbyteImportArgs { tables, messages }): Json<AirbyteImportArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
+
+    let usage = FunctionUsageTracker::new();
+
     let records = messages
         .into_iter()
         .map(|msg| msg.try_into())
@@ -78,33 +77,41 @@ pub async fn import_airbyte_records(
         .into_iter()
         .map(|(k, v)| Ok((k.parse::<ValidIdentifier<TableName>>()?.0, v.try_into()?)))
         .collect::<anyhow::Result<_>>()?;
+
     st.application
-        .import_airbyte_records(&identity, records, tables)
+        .import_airbyte_records(&identity, records, tables, usage.clone())
         .await?;
+
+    // Not tracking streaming_import
+    drop(usage);
+
     Ok(StatusCode::OK)
 }
 
-#[debug_handler]
 pub async fn apply_fivetran_operations(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(rows): Json<Vec<BatchWriteRow>>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
+
+    let usage = FunctionUsageTracker::new();
 
     st.application
-        .apply_fivetran_operations(&identity, rows)
+        .apply_fivetran_operations(&identity, rows, usage.clone())
         .await?;
+
+    // Not tracking streaming_import
+    drop(usage);
 
     Ok(StatusCode::OK)
 }
 
-#[debug_handler]
 pub async fn get_schema(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
     let schema = st
         .application
         .get_schema(TableNamespace::root_component(), &identity)
@@ -115,13 +122,12 @@ pub async fn get_schema(
     }))
 }
 
-#[debug_handler]
 pub async fn fivetran_create_table(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(CreateTableArgs { table_definition }): Json<CreateTableArgs>,
 ) -> Result<StatusCode, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
     let table_definition = table_definition.try_into()?;
     st.application
         .fivetran_create_table(&identity, table_definition)
@@ -136,13 +142,15 @@ pub struct ClearTableArgs {
     table_names: Vec<String>,
 }
 
-#[debug_handler]
 pub async fn clear_tables(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(ClearTableArgs { table_names }): Json<ClearTableArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
+
+    let usage = FunctionUsageTracker::new();
+
     let table_names = table_names
         .into_iter()
         .map(|t| {
@@ -152,7 +160,20 @@ pub async fn clear_tables(
             ))
         })
         .collect::<anyhow::Result<_>>()?;
-    st.application.clear_tables(&identity, table_names).await?;
+
+    let _num_deleted = st
+        .application
+        .clear_tables(
+            &identity,
+            table_names,
+            ImportRequestor::StreamingImport,
+            usage.clone(),
+        )
+        .await?;
+
+    // Not tracking streaming_import
+    drop(usage);
+
     Ok(StatusCode::OK)
 }
 
@@ -169,9 +190,8 @@ pub async fn clear_tables(
 /// In any case, we use the index that the user created on `fivetran.synced`
 /// (and `fivetran.deleted` when using soft deletes) to efficiently find the
 /// rows to delete.
-#[debug_handler]
 pub async fn fivetran_truncate_table(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(TruncateTableArgs {
         table_name,
@@ -179,21 +199,41 @@ pub async fn fivetran_truncate_table(
         delete_type,
     }): Json<TruncateTableArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
+
+    let usage = FunctionUsageTracker::new();
 
     let table_name = table_name.parse::<ValidIdentifier<TableName>>()?;
 
     // Full table hard deletes can be done through the optimized implementation
     if delete_before.is_none() && delete_type == DeleteType::HardDelete {
         st.application
-            .clear_tables(&identity, vec![(ComponentPath::root(), table_name.0)])
+            .clear_tables(
+                &identity,
+                vec![(ComponentPath::root(), table_name.0)],
+                ImportRequestor::StreamingImport,
+                usage.clone(),
+            )
             .await?;
+
+        // Not tracking streaming_import
+        drop(usage);
+
         return Ok(StatusCode::OK);
     }
 
     st.application
-        .fivetran_truncate(&identity, table_name.0, delete_before, delete_type)
+        .fivetran_truncate(
+            &identity,
+            table_name.0,
+            delete_before,
+            delete_type,
+            usage.clone(),
+        )
         .await?;
+
+    // Not tracking streaming_import
+    drop(usage);
 
     Ok(StatusCode::OK)
 }
@@ -204,9 +244,8 @@ pub struct ReplaceTableArgs {
     _table_names: BTreeMap<String, String>,
 }
 
-#[debug_handler]
 pub async fn replace_tables(
-    State(_st): State<LocalAppState>,
+    MtState(_st): MtState<LocalAppState>,
     ExtractIdentity(_identity): ExtractIdentity,
     Json(ReplaceTableArgs { _table_names: _ }): Json<ReplaceTableArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
@@ -227,13 +266,12 @@ pub struct AddIndexesArgs {
     indexes: BTreeMap<String, Vec<Vec<String>>>,
 }
 
-#[debug_handler]
 pub async fn add_primary_key_indexes(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(AddIndexesArgs { indexes }): Json<AddIndexesArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin_with_write_access(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
     let indexes: BTreeMap<TableName, PrimaryKey> = indexes
         .into_iter()
         .map(|(stream, primary_key)| {
@@ -265,13 +303,12 @@ pub struct IndexesReadyResponse {
     indexes_ready: bool,
 }
 
-#[debug_handler]
 pub async fn primary_key_indexes_ready(
-    State(st): State<LocalAppState>,
+    MtState(st): MtState<LocalAppState>,
     ExtractIdentity(identity): ExtractIdentity,
     Json(IndexesReadyArgs { tables }): Json<IndexesReadyArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    must_be_admin(&identity)?;
+    identity.require_operation(keybroker::DeploymentOp::ImportBackups)?;
     let table_names = tables
         .into_iter()
         .map(|t| Ok(t.parse::<ValidIdentifier<TableName>>()?.0))

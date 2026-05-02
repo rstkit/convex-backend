@@ -1,12 +1,7 @@
-use std::{
-    fmt::{
-        Display,
-        Formatter,
-    },
-    str::FromStr,
-};
+use std::str::FromStr;
 
 use anyhow::Context;
+use derive_more::Display;
 use rand::Rng;
 use serde::{
     Deserialize,
@@ -29,8 +24,124 @@ use crate::{
     types::FunctionCaller,
 };
 
+/// A client IP address extracted from HTTP headers, with max length
+/// enforcement.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ClientIp(String);
+
+impl ClientIp {
+    pub const MAX_LENGTH: usize = 256;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for ClientIp {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        anyhow::ensure!(
+            value.len() <= Self::MAX_LENGTH,
+            "Client IP exceeds max length of {} bytes",
+            Self::MAX_LENGTH
+        );
+        Ok(Self(value))
+    }
+}
+
+/// A client user-agent string extracted from HTTP headers, with max length
+/// enforcement.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ClientUserAgent(String);
+
+impl ClientUserAgent {
+    pub const MAX_LENGTH: usize = 1024;
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for ClientUserAgent {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        anyhow::ensure!(
+            value.len() <= Self::MAX_LENGTH,
+            "Client user-agent exceeds max length of {} bytes",
+            Self::MAX_LENGTH
+        );
+        Ok(Self(value))
+    }
+}
+
+/// Metadata about the HTTP request that triggered this function execution.
+/// Fields are `None` for system-originated calls (scheduled jobs, cron jobs,
+/// internal RPCs, etc.).
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
+pub struct RequestMetadata {
+    pub ip: Option<ClientIp>,
+    pub user_agent: Option<ClientUserAgent>,
+}
+
+impl RequestMetadata {
+    /// Create metadata for system-originated requests where there is no
+    /// originating HTTP request (e.g. scheduled jobs, cron jobs, internal
+    /// RPCs). Analogous to `Identity::system()`.
+    pub fn system() -> Self {
+        Self {
+            ip: None,
+            user_agent: None,
+        }
+    }
+
+}
+
+impl HeapSize for RequestMetadata {
+    fn heap_size(&self) -> usize {
+        self.ip.as_ref().map_or(0, |ip| ip.as_str().len())
+            + self.user_agent.as_ref().map_or(0, |ua| ua.as_str().len())
+    }
+}
+
+/// Context about the originating request, bundling the request ID with
+/// metadata from the HTTP layer (IP, user agent). Threaded from the API
+/// boundary down to where `ExecutionContext` is constructed.
+#[derive(Clone, Debug)]
+pub struct RequestContext {
+    pub request_id: RequestId,
+    pub request_metadata: RequestMetadata,
+}
+
+impl RequestContext {
+    pub fn new(request_id: RequestId, request_metadata: RequestMetadata) -> Self {
+        Self {
+            request_id,
+            request_metadata,
+        }
+    }
+
+    /// Create a request context for system-originated calls that have a
+    /// request ID but no HTTP metadata (e.g. cached queries, internal RPCs).
+    pub fn new_for_system_request(request_id: RequestId) -> Self {
+        Self {
+            request_id,
+            request_metadata: RequestMetadata::system(),
+        }
+    }
+
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionContext {
     pub request_id: RequestId,
     // A unique ID per entry in the function logs.
@@ -44,15 +155,18 @@ pub struct ExecutionContext {
     /// version of this would be something like parent_execution_id:
     /// Option<ExecutionId>
     is_root: bool,
+    /// Metadata about the originating HTTP request (IP, user agent).
+    pub request_metadata: RequestMetadata,
 }
 
 impl ExecutionContext {
-    pub fn new(request_id: RequestId, caller: &FunctionCaller) -> Self {
+    pub fn new(request_context: RequestContext, caller: &FunctionCaller) -> Self {
         Self {
-            request_id,
+            request_id: request_context.request_id,
             execution_id: ExecutionId::new(),
             parent_scheduled_job: caller.parent_scheduled_job(),
             is_root: caller.is_root(),
+            request_metadata: request_context.request_metadata,
         }
     }
 
@@ -61,12 +175,14 @@ impl ExecutionContext {
         execution_id: ExecutionId,
         parent_scheduled_job: Option<(ComponentId, DeveloperDocumentId)>,
         is_root: bool,
+        request_metadata: RequestMetadata,
     ) -> Self {
         Self {
             request_id,
             execution_id,
             parent_scheduled_job,
             is_root,
+            request_metadata,
         }
     }
 
@@ -74,19 +190,9 @@ impl ExecutionContext {
         self.is_root
     }
 
-    #[cfg(any(test, feature = "testing"))]
-    pub fn new_for_test() -> Self {
-        Self {
-            request_id: RequestId::new(),
-            execution_id: ExecutionId::new(),
-            parent_scheduled_job: None,
-            is_root: true,
-        }
-    }
-
     pub fn add_sentry_tags(&self, scope: &mut sentry::Scope) {
         scope.set_tag("request_id", &self.request_id);
-        scope.set_tag("execution_id", &self.execution_id);
+        scope.set_tag("execution_id", self.execution_id);
     }
 }
 
@@ -98,11 +204,13 @@ impl HeapSize for ExecutionContext {
                 .parent_scheduled_job
                 .map_or(0, |(_, document_id)| document_id.heap_size())
             + self.is_root.heap_size()
+            + self.request_metadata.heap_size()
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
+#[derive(Clone, Debug, PartialEq, Eq, Display, Serialize, Deserialize)]
+#[display("{_0}")]
+#[serde(transparent)]
 pub struct RequestId(String);
 
 impl RequestId {
@@ -148,33 +256,9 @@ impl TryFrom<String> for RequestId {
     }
 }
 
-impl Display for RequestId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 impl HeapSize for RequestId {
     fn heap_size(&self) -> usize {
         self.0.heap_size()
-    }
-}
-
-impl Serialize for RequestId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.as_str().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for RequestId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer).map(RequestId)
     }
 }
 
@@ -186,22 +270,10 @@ impl<'de> Deserialize<'de> for RequestId {
 ///
 /// Execution ids are not meant to be human readable, but they must be globally
 /// unique.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Display, Serialize, Deserialize)]
+#[display("{_0}")]
+#[serde(transparent)]
 pub struct ExecutionId(Uuid);
-
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for ExecutionId {
-    type Parameters = ();
-
-    type Strategy = impl proptest::strategy::Strategy<Value = Self>;
-
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        "[a-f0-9]{32}"
-            .prop_filter_map("Invalid Uuid", |s| s.parse().ok().map(Self))
-            .boxed()
-    }
-}
 
 impl Default for ExecutionId {
     fn default() -> Self {
@@ -214,30 +286,6 @@ impl FromStr for ExecutionId {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(ExecutionId(value.parse()?))
-    }
-}
-
-impl Display for ExecutionId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Serialize for ExecutionId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.to_string().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for ExecutionId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer).and_then(|s| s.parse().map_err(serde::de::Error::custom))
     }
 }
 
@@ -263,6 +311,8 @@ impl From<ExecutionContext> for pb::common::ExecutionContext {
                 .and_then(|id| id.serialize_to_string()),
             parent_scheduled_job: parent_document_id.map(Into::into),
             is_root: Some(value.is_root),
+            client_ip: value.request_metadata.ip.map(|ip| ip.into_string()),
+            client_user_agent: value.request_metadata.user_agent.map(|ua| ua.into_string()),
         }
     }
 }
@@ -283,6 +333,13 @@ impl TryFrom<pb::common::ExecutionContext> for ExecutionContext {
             },
             parent_scheduled_job: parent_document_id.map(|id| (parent_component_id, id)),
             is_root: value.is_root.unwrap_or_default(),
+            request_metadata: RequestMetadata {
+                ip: value.client_ip.map(ClientIp::try_from).transpose()?,
+                user_agent: value
+                    .client_user_agent
+                    .map(ClientUserAgent::try_from)
+                    .transpose()?,
+            },
         })
     }
 }
@@ -296,6 +353,8 @@ impl From<ExecutionContext> for JsonValue {
             "isRoot": value.is_root,
             "parentScheduledJob": parent_document_id.map(|id| id.to_string()),
             "parentScheduledJobComponentId": parent_component_id.unwrap_or(ComponentId::Root).serialize_to_string(),
+            "ip": value.request_metadata.ip.map(|ip| ip.into_string()),
+            "userAgent": value.request_metadata.user_agent.map(|ua| ua.into_string()),
         })
     }
 }

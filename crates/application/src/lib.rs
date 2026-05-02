@@ -1,10 +1,10 @@
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
+#![feature(stmt_expr_attributes)]
 #![feature(iterator_try_collect)]
-#![feature(let_chains)]
 #![feature(coroutines)]
-#![feature(round_char_boundary)]
 #![feature(duration_constructors)]
-#![feature(assert_matches)]
+#![feature(never_type)]
 
 use std::{
     collections::{
@@ -21,16 +21,22 @@ use std::{
     },
 };
 
+use ::exports::interface::ExportProvider;
+use ::log_streaming::{
+    LogManager,
+    LogManagerClient,
+};
 use airbyte_import::{
     AirbyteRecord,
     PrimaryKey,
     ValidatedAirbyteStream,
 };
 use anyhow::Context;
+use audit_logging::AuditLogClient;
 use authentication::{
     application_auth::ApplicationAuth,
     validate_id_token,
-    Auth0IdToken,
+    AuthIdToken,
 };
 use aws_s3::storage::S3Storage;
 use bytes::Bytes;
@@ -68,46 +74,61 @@ use common::{
     },
     document::{
         DocumentUpdate,
+        PackedDocument,
+        ParsedDocument,
         CREATION_TIME_FIELD_PATH,
     },
     errors::{
         report_error,
         JsError,
     },
-    http::RequestDestination,
+    http::{
+        fetch::FetchClient,
+        RequestDestination,
+    },
+    index::IndexKeyBytes,
+    interval::Interval,
     knobs::{
         APPLICATION_MAX_CONCURRENT_UPLOADS,
+        ENABLE_INDEX_BACKFILL,
+        ENV_VAR_LIMIT,
         MAX_JOBS_CANCEL_BATCH,
         MAX_USER_MODULES,
-        SNAPSHOT_LIST_LIMIT,
     },
     log_lines::LogLines,
-    log_streaming::LogSender,
+    log_streaming::{
+        LogEvent,
+        LogSender,
+        StructuredLogEvent,
+    },
     paths::FieldPath,
     persistence::Persistence,
     query::{
+        CursorPosition,
         IndexRange,
         IndexRangeExpression,
         Order,
     },
     query_journal::QueryJournal,
     runtime::{
-        shutdown_and_join,
         JoinSet,
         Runtime,
-        SpawnHandle,
         UnixTimestamp,
     },
     schemas::{
         DatabaseSchema,
         TableDefinition,
     },
+    shutdown::ShutdownSignal,
+    try_anyhow,
     types::{
         env_var_limit_met,
         env_var_name_not_unique,
+        AllowedVisibility,
         ConvexOrigin,
         ConvexSite,
-        CursorMs,
+        DeploymentMetadata,
+        DeploymentType,
         EnvVarName,
         EnvVarValue,
         FullyQualifiedObjectKey,
@@ -120,25 +141,15 @@ use common::{
         RepeatableTimestamp,
         TableName,
         Timestamp,
-        UdfIdentifier,
         UdfType,
-        ENV_VAR_LIMIT,
     },
+    RequestContext,
     RequestId,
-};
-use convex_fivetran_destination::{
-    api_types::{
-        BatchWriteRow,
-        DeleteType,
-    },
-    constants::FIVETRAN_PRIMARY_KEY_INDEX_DESCRIPTOR,
 };
 use cron_jobs::CronJobExecutor;
 use database::{
-    unauthorized_error,
     BootstrapComponentsModel,
     Database,
-    DocumentDeltas,
     FastForwardIndexWorker,
     IndexModel,
     IndexWorker,
@@ -147,9 +158,6 @@ use database::{
     SchemaModel,
     SearchIndexWorkers,
     Snapshot,
-    SnapshotPage,
-    StreamingExportTableFilter,
-    Subscription,
     TableModel,
     Token,
     Transaction,
@@ -161,6 +169,7 @@ use errors::{
     ErrorMetadata,
     ErrorMetadataAnyhowExt,
 };
+use events::usage::UsageEventLogger;
 use fastrace::{
     collector::SpanContext,
     func_path,
@@ -168,13 +177,15 @@ use fastrace::{
     Span,
 };
 use file_storage::{
-    FileRangeStream,
     FileStorage,
     FileStream,
 };
-use function_log::{
-    FunctionExecution,
-    FunctionExecutionPart,
+use fivetran_destination::{
+    api_types::{
+        BatchWriteRow,
+        DeleteType,
+    },
+    constants::FIVETRAN_PRIMARY_KEY_INDEX_DESCRIPTOR,
 };
 use function_runner::FunctionRunner;
 use futures::stream::BoxStream;
@@ -183,14 +194,15 @@ use headers::{
     ContentType,
 };
 use http_client::{
-    cached_http_client_for,
+    CachedHttpClient,
     ClientPurpose,
 };
-use isolate::helpers::source_map_from_slice;
 use keybroker::{
+    DeploymentOp,
     Identity,
     KeyBroker,
 };
+use log_streaming::add_local_log_sink_on_startup;
 use maplit::{
     btreemap,
     btreeset,
@@ -200,7 +212,9 @@ use model::{
         AirbyteImportModel,
         AIRBYTE_PRIMARY_KEY_INDEX_DESCRIPTOR,
     },
+    audit_log_config::AuditLogConfigModel,
     auth::AuthInfoModel,
+    backend_info::BackendInfoModel,
     backend_state::BackendStateModel,
     canonical_urls::{
         types::CanonicalUrl,
@@ -213,7 +227,6 @@ use model::{
         ComponentsModel,
     },
     config::{
-        module_loader::ModuleLoader,
         types::{
             ConfigFile,
             ConfigMetadata,
@@ -252,6 +265,7 @@ use model::{
     file_storage::{
         types::FileStorageEntry,
         FileStorageId,
+        FileStorageModel,
     },
     fivetran_import::FivetranImportModel,
     migrations::MigrationWorker,
@@ -260,9 +274,14 @@ use model::{
             AnalyzedModule,
             Visibility,
         },
+        types::ModuleMetadata,
         ModuleModel,
     },
-    scheduled_jobs::SchedulerModel,
+    scheduled_jobs::{
+        args::ScheduledJobArgsTable,
+        ScheduledJobsTable,
+        SchedulerModel,
+    },
     session_requests::types::SessionRequestIdentifier,
     snapshot_imports::types::{
         ImportFormat,
@@ -271,10 +290,14 @@ use model::{
     },
     source_packages::{
         types::{
+            NodeVersion,
             PackageSize,
             SourcePackage,
         },
-        upload_download::upload_package,
+        upload_download::{
+            download_package,
+            upload_package,
+        },
         SourcePackageModel,
     },
     udf_config::{
@@ -295,12 +318,8 @@ use search::{
     },
 };
 use semver::Version;
-use serde_json::Value as JsonValue;
 use short_future::ShortBoxFuture;
-use snapshot_import::{
-    clear_tables,
-    start_stored_import,
-};
+use snapshot_import::start_stored_import;
 use storage::{
     BufferedUpload,
     ClientDrivenUploadPartToken,
@@ -313,18 +332,15 @@ use storage::{
     Upload,
 };
 use sync_types::{
+    types::SerializedArgs,
     AuthenticationToken,
     CanonicalizedModulePath,
     CanonicalizedUdfPath,
     FunctionName,
-    ModulePath,
     SerializedQueryJournal,
 };
 use system_table_cleanup::SystemTableCleanupWorker;
-use table_summary_worker::{
-    TableSummaryClient,
-    TableSummaryWorker,
-};
+use table_summary_worker::TableSummaryWorker;
 use tokio::sync::{
     oneshot,
     Semaphore,
@@ -335,16 +351,11 @@ use udf::{
         CONVEX_ORIGIN,
         CONVEX_SITE,
     },
-    helpers::parse_udf_args,
     HttpActionRequest,
     HttpActionResponseStreamer,
     HttpActionResult,
 };
-use udf_metrics::{
-    MetricsWindow,
-    Percentile,
-    Timeseries,
-};
+use usage_gauges_tracking_worker::UsageGaugesTrackingWorker;
 use usage_tracking::{
     FunctionUsageStats,
     FunctionUsageTracker,
@@ -357,6 +368,7 @@ use value::{
     Namespace,
     ResolvedDocumentId,
     TableNamespace,
+    TabletId,
 };
 use vector::{
     PublicVectorSearchQueryResult,
@@ -367,10 +379,9 @@ use crate::{
     application_function_runner::ApplicationFunctionRunner,
     exports::worker::ExportWorker,
     function_log::{
+        FunctionEntriesLog,
         FunctionExecutionLog,
-        TableRate,
-        UdfMetricSummary,
-        UdfRate,
+        FunctionMetricsLog,
     },
     log_visibility::LogVisibility,
     module_cache::ModuleCache,
@@ -378,17 +389,24 @@ use crate::{
         RedactedJsError,
         RedactedLogLines,
     },
-    snapshot_import::SnapshotImportWorker,
+    snapshot_import::{
+        clear_tables,
+        SnapshotImportWorker,
+    },
 };
 
 pub mod airbyte_import;
 pub mod api;
 pub mod application_function_runner;
+pub mod audit_logging;
 mod cache;
 pub mod cron_jobs;
 pub mod deploy_config;
+pub mod deployment_state;
+mod execute_query_timestamp;
 mod exports;
 pub mod function_log;
+pub mod log_streaming;
 pub mod log_visibility;
 mod metrics;
 mod module_cache;
@@ -396,19 +414,19 @@ pub mod redaction;
 pub mod scheduled_jobs;
 mod schema_worker;
 pub mod snapshot_import;
+mod streaming_export;
 mod system_table_cleanup;
 mod table_summary_worker;
 pub mod valid_identifier;
-
-#[cfg(any(test, feature = "testing"))]
-pub mod test_helpers;
-#[cfg(test)]
-mod tests;
+mod worker_handles;
 
 pub use crate::cache::QueryCache;
-use crate::metrics::{
-    log_external_deps_package,
-    log_source_package_size_bytes_total,
+use crate::{
+    metrics::{
+        log_external_deps_package,
+        log_source_package_size_bytes_total,
+    },
+    worker_handles::WorkerHandles,
 };
 
 pub struct ConfigMetadataAndSchema {
@@ -526,6 +544,7 @@ pub struct ApplicationStorage {
     snapshot_imports_storage: Arc<dyn Storage>,
 }
 
+#[derive(Clone)]
 pub struct Application<RT: Runtime> {
     runtime: RT,
     database: Database<RT>,
@@ -533,59 +552,18 @@ pub struct Application<RT: Runtime> {
     function_log: FunctionExecutionLog<RT>,
     file_storage: FileStorage<RT>,
     application_storage: ApplicationStorage,
-    usage_tracking: UsageCounter,
+    usage_counter: UsageCounter,
+    usage_event_logger: Arc<dyn UsageEventLogger>,
     key_broker: KeyBroker,
-    instance_name: String,
-    scheduled_job_runner: ScheduledJobRunner,
-    cron_job_executor: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    index_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    fast_forward_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    search_worker: Arc<Mutex<SearchIndexWorkers>>,
-    search_and_vector_bootstrap_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    table_summary_worker: TableSummaryClient,
-    schema_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    snapshot_import_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    export_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    system_table_cleanup_worker: Arc<Mutex<Box<dyn SpawnHandle>>>,
-    migration_worker: Arc<Mutex<Option<Box<dyn SpawnHandle>>>>,
-    log_sender: Arc<dyn LogSender>,
+    deployment: DeploymentMetadata,
+    workers: WorkerHandles,
     log_visibility: Arc<dyn LogVisibility<RT>>,
     module_cache: ModuleCache<RT>,
     system_env_var_names: HashSet<EnvVarName>,
     app_auth: Arc<ApplicationAuth>,
-}
-
-impl<RT: Runtime> Clone for Application<RT> {
-    fn clone(&self) -> Self {
-        Self {
-            runtime: self.runtime.clone(),
-            database: self.database.clone(),
-            runner: self.runner.clone(),
-            function_log: self.function_log.clone(),
-            file_storage: self.file_storage.clone(),
-            application_storage: self.application_storage.clone(),
-            usage_tracking: self.usage_tracking.clone(),
-            key_broker: self.key_broker.clone(),
-            instance_name: self.instance_name.clone(),
-            scheduled_job_runner: self.scheduled_job_runner.clone(),
-            cron_job_executor: self.cron_job_executor.clone(),
-            index_worker: self.index_worker.clone(),
-            fast_forward_worker: self.fast_forward_worker.clone(),
-            search_worker: self.search_worker.clone(),
-            search_and_vector_bootstrap_worker: self.search_and_vector_bootstrap_worker.clone(),
-            table_summary_worker: self.table_summary_worker.clone(),
-            schema_worker: self.schema_worker.clone(),
-            snapshot_import_worker: self.snapshot_import_worker.clone(),
-            export_worker: self.export_worker.clone(),
-            system_table_cleanup_worker: self.system_table_cleanup_worker.clone(),
-            migration_worker: self.migration_worker.clone(),
-            log_sender: self.log_sender.clone(),
-            log_visibility: self.log_visibility.clone(),
-            module_cache: self.module_cache.clone(),
-            system_env_var_names: self.system_env_var_names.clone(),
-            app_auth: self.app_auth.clone(),
-        }
-    }
+    log_manager_client: LogManagerClient,
+    audit_log_client: AuditLogClient,
+    oidc_http_client: CachedHttpClient,
 }
 
 /// Create storage based on the storage type configuration
@@ -594,7 +572,7 @@ pub async fn create_storage<RT: Runtime>(
     storage_type: &model::database_globals::types::StorageType,
     use_case: StorageUseCase,
 ) -> anyhow::Result<Arc<dyn Storage>> {
-    Ok(match storage_type {
+    let storage: Arc<dyn Storage> = match storage_type {
         model::database_globals::types::StorageType::S3 { s3_prefix } => {
             Arc::new(S3Storage::for_use_case(use_case, s3_prefix.clone(), runtime).await?)
         },
@@ -603,7 +581,8 @@ pub async fn create_storage<RT: Runtime>(
             tracing::info!("{use_case} storage path: {:?}", storage.path());
             Arc::new(storage)
         },
-    })
+    };
+    Ok(storage)
 }
 
 impl<RT: Runtime> Application<RT> {
@@ -661,9 +640,9 @@ impl<RT: Runtime> Application<RT> {
         database: Database<RT>,
         file_storage: FileStorage<RT>,
         application_storage: ApplicationStorage,
-        usage_tracking: UsageCounter,
+        usage_event_logger: Arc<dyn UsageEventLogger>,
         key_broker: KeyBroker,
-        instance_name: String,
+        deployment: DeploymentMetadata,
         function_runner: Arc<dyn FunctionRunner<RT>>,
         convex_origin: ConvexOrigin,
         convex_site: ConvexSite,
@@ -671,11 +650,18 @@ impl<RT: Runtime> Application<RT> {
         segment_term_metadata_fetcher: Arc<dyn SegmentTermMetadataFetcher>,
         persistence: Arc<dyn Persistence>,
         node_actions: Actions<RT>,
-        log_sender: Arc<dyn LogSender>,
         log_visibility: Arc<dyn LogVisibility<RT>>,
         app_auth: Arc<ApplicationAuth>,
         cache: QueryCache,
+        fetch_client: Arc<dyn FetchClient>,
+        local_log_sink: Option<String>,
+        lease_lost_shutdown: ShutdownSignal,
+        export_provider: Arc<dyn ExportProvider<RT>>,
+        deleted_tablet_receiver: tokio::sync::mpsc::Receiver<TabletId>,
+        oidc_http_client: CachedHttpClient,
     ) -> anyhow::Result<Self> {
+        let instance_name = deployment.name.clone();
+        let deployment_region = deployment.region.clone();
         let module_cache =
             ModuleCache::new(runtime.clone(), application_storage.modules_storage.clone()).await;
         let module_loader = Arc::new(module_cache.clone());
@@ -685,13 +671,20 @@ impl<RT: Runtime> Application<RT> {
             CONVEX_SITE.clone() => convex_site.parse()?
         };
 
-        let index_worker = IndexWorker::new(
-            runtime.clone(),
-            persistence.clone(),
-            database.retention_validator(),
-            database.clone(),
-        );
-        let index_worker = Arc::new(Mutex::new(runtime.spawn("index_worker", index_worker)));
+        let mut index_worker = Arc::new(Mutex::new(None));
+        if *ENABLE_INDEX_BACKFILL {
+            let index_worker_fut = IndexWorker::new(
+                runtime.clone(),
+                persistence.clone(),
+                database.retention_validator(),
+                database.clone(),
+                instance_name.clone(),
+                UsageCounter::new(usage_event_logger.clone()),
+            );
+            index_worker = Arc::new(Mutex::new(Some(
+                runtime.spawn("index_worker", index_worker_fut),
+            )));
+        };
         let fast_forward_worker =
             FastForwardIndexWorker::create_and_start(runtime.clone(), database.clone());
         let fast_forward_worker = Arc::new(Mutex::new(
@@ -708,8 +701,12 @@ impl<RT: Runtime> Application<RT> {
         let search_worker = Arc::new(Mutex::new(search_worker));
         let search_and_vector_bootstrap_worker =
             Arc::new(Mutex::new(database.start_search_and_vector_bootstrap()));
-        let table_summary_worker =
-            TableSummaryWorker::start(runtime.clone(), database.clone(), persistence.clone());
+        let table_summary_worker = TableSummaryWorker::start(
+            runtime.clone(),
+            database.clone(),
+            persistence.clone(),
+            lease_lost_shutdown,
+        );
         let schema_worker = Arc::new(Mutex::new(runtime.spawn(
             "schema_worker",
             SchemaWorker::start(runtime.clone(), database.clone()),
@@ -719,16 +716,67 @@ impl<RT: Runtime> Application<RT> {
             runtime.clone(),
             database.clone(),
             application_storage.exports_storage.clone(),
+            deleted_tablet_receiver,
         );
         let system_table_cleanup_worker = Arc::new(Mutex::new(
             runtime.spawn("system_table_cleanup_worker", system_table_cleanup_worker),
         ));
 
+        // If local_log_sink is passed in, this is a local instance, so we enable log
+        // streaming by default. Otherwise, it's hard to grant the
+        // entitlement in testing and in load generator. If not local, we
+        // read the entitlement from the database.
+        let mut tx = database.begin(Identity::system()).await?;
+        let mut bi = BackendInfoModel::new(&mut tx);
+        let log_streaming_allowed = if let Some(path) = local_log_sink {
+            add_local_log_sink_on_startup(database.clone(), path).await?;
+            true
+        } else {
+            bi.is_log_streaming_allowed().await?
+        };
+
+        let usage_counter = UsageCounter::new(usage_event_logger.clone());
+        let log_manager_client = LogManager::start(
+            runtime.clone(),
+            database.clone(),
+            fetch_client.clone(),
+            instance_name.clone(),
+            deployment_region.as_ref().map(|r| r.to_string()),
+            log_streaming_allowed,
+            usage_counter.clone(),
+        )
+        .await;
+
+        let is_dev_deployment = if let Some(doc) = bi.get().await? {
+            doc.deployment_type == DeploymentType::Dev
+        } else {
+            false
+        };
+        let firehose_stream_name = AuditLogConfigModel::new(&mut tx)
+            .get()
+            .await?
+            .and_then(|c| c.firehose_stream_name.clone());
+        let audit_log_client = AuditLogClient::new(
+            log_manager_client.clone(),
+            is_dev_deployment,
+            firehose_stream_name,
+            &deployment.name,
+        )
+        .await?;
+
         let function_log = FunctionExecutionLog::new(
             runtime.clone(),
-            database.usage_counter(),
-            log_sender.clone(),
+            usage_counter.clone(),
+            Arc::new(log_manager_client.clone()),
         );
+
+        {
+            let function_log = function_log.clone();
+            database.set_invalidation_callback(Arc::new(move |events| {
+                function_log.record_subscription_invalidations(events);
+            }))?;
+        }
+
         let runner = Arc::new(ApplicationFunctionRunner::new(
             runtime.clone(),
             database.clone(),
@@ -739,6 +787,7 @@ impl<RT: Runtime> Application<RT> {
             application_storage.modules_storage.clone(),
             module_loader,
             function_log.clone(),
+            audit_log_client.clone(),
             default_system_env_vars.clone(),
             cache,
         ));
@@ -768,21 +817,24 @@ impl<RT: Runtime> Application<RT> {
             database.clone(),
             application_storage.exports_storage.clone(),
             application_storage.files_storage.clone(),
-            database.usage_counter().clone(),
+            export_provider,
+            usage_counter.clone(),
             instance_name.clone(),
         );
-        let export_worker = Arc::new(Mutex::new(runtime.spawn("export_worker", export_worker)));
+        let export_worker = Arc::new(Mutex::new(Some(
+            runtime.spawn("export_worker", export_worker),
+        )));
 
         let snapshot_import_worker = SnapshotImportWorker::start(
             runtime.clone(),
             database.clone(),
             application_storage.snapshot_imports_storage.clone(),
             file_storage.clone(),
-            database.usage_counter().clone(),
+            usage_counter.clone(),
         );
-        let snapshot_import_worker = Arc::new(Mutex::new(
+        let snapshot_import_worker = Arc::new(Mutex::new(Some(
             runtime.spawn("snapshot_import_worker", snapshot_import_worker),
-        ));
+        )));
 
         let migration_worker = MigrationWorker::new(
             runtime.clone(),
@@ -794,6 +846,30 @@ impl<RT: Runtime> Application<RT> {
             runtime.spawn("migration_worker", migration_worker.go()),
         )));
 
+        let usage_gauges_tracking_worker = UsageGaugesTrackingWorker::start(
+            runtime.clone(),
+            database.clone(),
+            usage_event_logger.clone(),
+            Arc::new(log_manager_client.clone()),
+            instance_name.clone(),
+        );
+
+        let workers = WorkerHandles {
+            usage_gauges_tracking_worker,
+            scheduled_job_runner,
+            cron_job_executor,
+            index_worker,
+            fast_forward_worker,
+            search_worker,
+            search_and_vector_bootstrap_worker,
+            table_summary_worker,
+            schema_worker,
+            snapshot_import_worker,
+            export_worker,
+            system_table_cleanup_worker,
+            migration_worker,
+        };
+
         Ok(Self {
             runtime,
             database,
@@ -801,26 +877,18 @@ impl<RT: Runtime> Application<RT> {
             function_log,
             file_storage,
             application_storage,
-            usage_tracking,
+            usage_event_logger,
+            usage_counter,
             key_broker,
-            scheduled_job_runner,
-            cron_job_executor,
-            instance_name,
-            index_worker,
-            fast_forward_worker,
-            search_worker,
-            search_and_vector_bootstrap_worker,
-            table_summary_worker,
-            schema_worker,
-            export_worker,
-            snapshot_import_worker,
-            system_table_cleanup_worker,
-            migration_worker,
-            log_sender,
+            deployment,
+            workers,
             log_visibility,
             module_cache,
             system_env_var_names: default_system_env_vars.into_keys().collect(),
             app_auth,
+            log_manager_client,
+            audit_log_client,
+            oidc_http_client,
         })
     }
 
@@ -844,8 +912,22 @@ impl<RT: Runtime> Application<RT> {
         self.runner.clone()
     }
 
-    pub fn function_log(&self) -> FunctionExecutionLog<RT> {
-        self.function_log.clone()
+    pub fn metrics_log(&self, identity: &Identity) -> anyhow::Result<FunctionMetricsLog<'_, RT>> {
+        identity.require_operation(DeploymentOp::ViewMetrics)?;
+        Ok(FunctionMetricsLog::new(&self.function_log))
+    }
+
+    pub fn function_log(&self, identity: &Identity) -> anyhow::Result<FunctionEntriesLog<'_, RT>> {
+        identity.require_operation(DeploymentOp::ViewLogs)?;
+        Ok(FunctionEntriesLog::new(&self.function_log))
+    }
+
+    pub fn log_manager_client(&self) -> &LogManagerClient {
+        &self.log_manager_client
+    }
+
+    pub fn audit_log_client(&self) -> &AuditLogClient {
+        &self.audit_log_client
     }
 
     pub fn now_ts_for_reads(&self) -> RepeatableTimestamp {
@@ -853,17 +935,16 @@ impl<RT: Runtime> Application<RT> {
     }
 
     pub fn instance_name(&self) -> String {
-        self.instance_name.clone()
+        self.deployment.name.clone()
+    }
+
+    pub fn deployment(&self) -> &DeploymentMetadata {
+        &self.deployment
     }
 
     #[fastrace::trace]
     pub async fn begin(&self, identity: Identity) -> anyhow::Result<Transaction<RT>> {
         self.database.begin(identity).await
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    pub async fn commit_test(&self, transaction: Transaction<RT>) -> anyhow::Result<Timestamp> {
-        self.commit(transaction, "test").await
     }
 
     #[fastrace::trace]
@@ -878,74 +959,38 @@ impl<RT: Runtime> Application<RT> {
     }
 
     #[fastrace::trace]
-    pub async fn subscribe(&self, token: Token) -> anyhow::Result<Subscription> {
-        self.database.subscribe(token).await
+    pub async fn subscribe_and_wait_for_invalidation(
+        &self,
+        token: Token,
+    ) -> anyhow::Result<Option<Timestamp>> {
+        self.database
+            .subscribe_and_wait_for_invalidation(token)
+            .await
     }
 
     pub fn usage_counter(&self) -> UsageCounter {
-        self.database.usage_counter().clone()
-    }
-
-    #[fastrace::trace]
-    pub async fn document_deltas(
-        &self,
-        identity: Identity,
-        cursor: Timestamp,
-        table_filter: Option<TableName>,
-        component_filter: Option<ComponentPath>,
-        rows_read_limit: usize,
-        rows_returned_limit: usize,
-    ) -> anyhow::Result<DocumentDeltas> {
-        if let Some(ref component_filter) = component_filter {
-            if !component_filter.is_root() {
-                anyhow::bail!(
-                    "Components are currently unsupported in streaming export: {}",
-                    String::from(component_filter.clone())
-                );
-            }
-        }
-        self.database
-            .document_deltas(
-                identity,
-                Some(cursor),
-                StreamingExportTableFilter {
-                    table_name: table_filter,
-                    component_path: component_filter,
-                    ..Default::default()
-                },
-                rows_read_limit,
-                rows_returned_limit,
-            )
-            .await
-    }
-
-    #[fastrace::trace]
-    pub async fn list_snapshot(
-        &self,
-        identity: Identity,
-        snapshot: Option<Timestamp>,
-        cursor: Option<ResolvedDocumentId>,
-        table_filter: Option<TableName>,
-        component_filter: Option<ComponentPath>,
-    ) -> anyhow::Result<SnapshotPage> {
-        self.database
-            .list_snapshot(
-                identity,
-                snapshot,
-                cursor,
-                StreamingExportTableFilter {
-                    table_name: table_filter,
-                    component_path: component_filter,
-                    ..Default::default()
-                },
-                *SNAPSHOT_LIST_LIMIT,
-                *SNAPSHOT_LIST_LIMIT,
-            )
-            .await
+        self.usage_counter.clone()
     }
 
     pub fn snapshot(&self, ts: RepeatableTimestamp) -> anyhow::Result<Snapshot> {
         self.database.snapshot(ts)
+    }
+
+    pub async fn index_page(
+        &self,
+        ts: RepeatableTimestamp,
+        index_id: IndexId,
+        tablet_id: TabletId,
+        interval: &Interval,
+        order: Order,
+        max_size: usize,
+    ) -> anyhow::Result<(
+        Vec<(IndexKeyBytes, Timestamp, PackedDocument)>,
+        CursorPosition,
+    )> {
+        self.database
+            .index_page(ts, index_id, tablet_id, interval, order, max_size)
+            .await
     }
 
     pub fn latest_snapshot(&self) -> anyhow::Result<Snapshot> {
@@ -956,7 +1001,7 @@ impl<RT: Runtime> Application<RT> {
         &self.app_auth
     }
 
-    pub async fn search_with_compiled_query(
+    pub async fn text_search_at_ts(
         &self,
         index_id: IndexId,
         printable_index_name: IndexName,
@@ -965,7 +1010,7 @@ impl<RT: Runtime> Application<RT> {
         ts: RepeatableTimestamp,
     ) -> anyhow::Result<RevisionWithKeys> {
         self.database
-            .search_with_compiled_query(index_id, printable_index_name, query, pending_updates, ts)
+            .text_search_at_ts(index_id, printable_index_name, query, pending_updates, ts)
             .await
     }
 
@@ -975,41 +1020,6 @@ impl<RT: Runtime> Application<RT> {
         query: VectorSearch,
     ) -> anyhow::Result<(Vec<PublicVectorSearchQueryResult>, FunctionUsageStats)> {
         self.database.vector_search(identity, query).await
-    }
-
-    pub async fn get_source_code(
-        &self,
-        identity: Identity,
-        path: ModulePath,
-        component: ComponentId,
-    ) -> anyhow::Result<Option<String>> {
-        let mut tx = self.begin(identity).await?;
-        let path = CanonicalizedComponentModulePath {
-            component,
-            module_path: path.canonicalize(),
-        };
-        let Some(metadata) = ModuleModel::new(&mut tx).get_metadata(path.clone()).await? else {
-            return Ok(None);
-        };
-        let Some(analyze_result) = &metadata.analyze_result else {
-            return Ok(None);
-        };
-        let Some(source_index) = analyze_result.source_index else {
-            return Ok(None);
-        };
-        let Some(full_source) = self.module_cache.get_module(&mut tx, path).await? else {
-            return Ok(None);
-        };
-        let Some(source_map_str) = &full_source.source_map else {
-            return Ok(None);
-        };
-        let Some(source_map) = source_map_from_slice(source_map_str.as_bytes()) else {
-            return Ok(None);
-        };
-        let Some(source_map_content) = source_map.get_source_contents(source_index) else {
-            return Ok(None);
-        };
-        Ok(Some(source_map_content.to_owned()))
     }
 
     pub async fn storage_generate_upload_url(
@@ -1022,7 +1032,12 @@ impl<RT: Runtime> Application<RT> {
         let url = self
             .file_storage
             .transactional_file_storage
-            .generate_upload_url(&mut tx, self.key_broker(), issued_ts, component)
+            .generate_upload_url(
+                &mut tx,
+                &self.key_broker().function_runner_keybroker(),
+                issued_ts,
+                component,
+            )
             .await?;
 
         Ok(url)
@@ -1030,28 +1045,29 @@ impl<RT: Runtime> Application<RT> {
 
     pub async fn read_only_udf(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         path: PublicFunctionPath,
-        args: Vec<JsonValue>,
+        args: SerializedArgs,
         identity: Identity,
         caller: FunctionCaller,
     ) -> anyhow::Result<RedactedQueryReturn> {
         let ts = *self.now_ts_for_reads();
-        self.read_only_udf_at_ts(request_id, path, args, identity, ts, None, caller)
+        self.read_only_udf_at_ts(request_context, path, args, identity, ts, None, caller)
             .await
     }
 
     #[fastrace::trace]
     pub async fn read_only_udf_at_ts(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         path: PublicFunctionPath,
-        args: Vec<JsonValue>,
+        args: SerializedArgs,
         identity: Identity,
         ts: Timestamp,
         journal: Option<Option<String>>,
         caller: FunctionCaller,
     ) -> anyhow::Result<RedactedQueryReturn> {
+        let request_id = request_context.request_id.clone();
         let persistence_version = self.database.persistence_version();
         let block_logging = self
             .log_visibility
@@ -1062,7 +1078,7 @@ impl<RT: Runtime> Application<RT> {
             )
             .await?;
 
-        let query_return: anyhow::Result<_> = try {
+        let query_return: anyhow::Result<_> = try_anyhow!({
             let journal = journal
                 .map(|serialized_journal| {
                     self.key_broker
@@ -1071,7 +1087,7 @@ impl<RT: Runtime> Application<RT> {
                 .transpose()?;
             self.runner
                 .run_query_at_ts(
-                    request_id.clone(),
+                    request_context.clone(),
                     path,
                     args,
                     identity,
@@ -1080,7 +1096,7 @@ impl<RT: Runtime> Application<RT> {
                     caller,
                 )
                 .await?
-        };
+        });
 
         let redacted_query_return = match query_return {
             Ok(query_return) => RedactedQueryReturn {
@@ -1116,16 +1132,15 @@ impl<RT: Runtime> Application<RT> {
     #[fastrace::trace]
     pub async fn mutation_udf(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         path: PublicFunctionPath,
-        args: Vec<JsonValue>,
+        args: SerializedArgs,
         identity: Identity,
         // Identifier used to make this mutation idempotent.
         mutation_identifier: Option<SessionRequestIdentifier>,
         caller: FunctionCaller,
         mutation_queue_length: Option<usize>,
     ) -> anyhow::Result<Result<RedactedMutationReturn, RedactedMutationError>> {
-        identity.ensure_can_run_function(UdfType::Mutation)?;
         let block_logging = self
             .log_visibility
             .should_redact_logs_and_error(
@@ -1134,10 +1149,11 @@ impl<RT: Runtime> Application<RT> {
                 caller.allowed_visibility(),
             )
             .await?;
+        let request_id = request_context.request_id.clone();
         let result = match self
             .runner
             .retry_mutation(
-                request_id.clone(),
+                request_context,
                 path,
                 args,
                 identity,
@@ -1182,14 +1198,12 @@ impl<RT: Runtime> Application<RT> {
     #[fastrace::trace]
     pub async fn action_udf(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         name: PublicFunctionPath,
-        args: Vec<JsonValue>,
+        args: SerializedArgs,
         identity: Identity,
         caller: FunctionCaller,
     ) -> anyhow::Result<Result<RedactedActionReturn, RedactedActionError>> {
-        identity.ensure_can_run_function(UdfType::Action)?;
-
         let block_logging = self
             .log_visibility
             .should_redact_logs_and_error(
@@ -1201,13 +1215,13 @@ impl<RT: Runtime> Application<RT> {
 
         let should_spawn = caller.run_until_completion_if_cancelled();
         let runner: Arc<ApplicationFunctionRunner<RT>> = self.runner.clone();
-        let request_id_ = request_id.clone();
+        let request_id = request_context.request_id.clone();
         let span = SpanContext::current_local_parent()
             .map(|ctx| Span::root(format!("{}::actions_future", func_path!()), ctx))
             .unwrap_or(Span::noop());
         let run_action = async move {
             runner
-                .run_action(request_id_, name, args, identity, caller)
+                .run_action(request_context, name, args, identity, caller)
                 .in_span(span)
                 .await
         };
@@ -1249,13 +1263,12 @@ impl<RT: Runtime> Application<RT> {
     #[fastrace::trace]
     pub async fn http_action_udf(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         http_request: HttpActionRequest,
         identity: Identity,
         caller: FunctionCaller,
         mut response_streamer: HttpActionResponseStreamer,
     ) -> anyhow::Result<()> {
-        identity.ensure_can_run_function(UdfType::HttpAction)?;
         let block_logging = self
             .log_visibility
             .should_redact_logs_and_error(
@@ -1279,7 +1292,7 @@ impl<RT: Runtime> Application<RT> {
             .spawn_background("run_http_action", async move {
                 let result = runner
                     .run_http_action(
-                        request_id,
+                        request_context,
                         http_request,
                         response_streamer_,
                         identity,
@@ -1315,12 +1328,13 @@ impl<RT: Runtime> Application<RT> {
     /// Run a function of an arbitrary type from its name
     pub async fn any_udf(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         path: CanonicalizedComponentFunctionPath,
-        args: Vec<JsonValue>,
+        args: SerializedArgs,
         identity: Identity,
         caller: FunctionCaller,
     ) -> anyhow::Result<Result<FunctionReturn, FunctionError>> {
+        let request_id = request_context.request_id.clone();
         let block_logging = self
             .log_visibility
             .should_redact_logs_and_error(
@@ -1348,8 +1362,7 @@ impl<RT: Runtime> Application<RT> {
             })
         else {
             let missing_or_internal = format!(
-                "Could not find function for '{}'{}. Did you forget to run `npx convex dev` or \
-                 `npx convex deploy`?",
+                "Could not find function for '{}'{}. Did you forget to run `npx convex dev`?",
                 String::from(canonicalized_path.udf_path.strip()),
                 canonicalized_path.component.in_component_str(),
             );
@@ -1363,12 +1376,10 @@ impl<RT: Runtime> Application<RT> {
             }));
         };
 
-        identity.ensure_can_run_function(analyzed_function.udf_type)?;
-
         match analyzed_function.udf_type {
             UdfType::Query => self
                 .read_only_udf(
-                    request_id,
+                    request_context,
                     PublicFunctionPath::Component(path),
                     args,
                     identity,
@@ -1387,7 +1398,7 @@ impl<RT: Runtime> Application<RT> {
                 ),
             UdfType::Mutation => self
                 .mutation_udf(
-                    request_id,
+                    request_context,
                     PublicFunctionPath::Component(path),
                     args,
                     identity,
@@ -1410,7 +1421,7 @@ impl<RT: Runtime> Application<RT> {
                 }),
             UdfType::Action => self
                 .action_udf(
-                    request_id,
+                    request_context,
                     PublicFunctionPath::Component(path),
                     args,
                     identity,
@@ -1446,10 +1457,7 @@ impl<RT: Runtime> Application<RT> {
         requestor: ExportRequestor,
         expiration_ts_ns: Option<u64>,
     ) -> anyhow::Result<DeveloperDocumentId> {
-        anyhow::ensure!(
-            identity.is_admin() || identity.is_system(),
-            unauthorized_error("request_export")
-        );
+        identity.require_operation(DeploymentOp::CreateBackups)?;
         if let Some(expiration_ts_ns) = expiration_ts_ns {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1493,7 +1501,26 @@ impl<RT: Runtime> Application<RT> {
                     )),
             ),
         }?;
-        self.commit(tx, "request_export").await?;
+        let component_id = component.serialize_to_string();
+        let component_path = tx.must_component_path(component)?;
+        let format_str = match &format {
+            ExportFormat::Zip { include_storage } if *include_storage => {
+                "zip_with_storage".to_string()
+            },
+            ExportFormat::Zip { .. } => "zip".to_string(),
+        };
+        self.commit_with_audit_log_events(
+            tx,
+            vec![DeploymentAuditLogEvent::RequestExport {
+                id: DeveloperDocumentId::from(snapshot_id).encode(),
+                component_id,
+                component: component_path,
+                format: format_str,
+                requestor: requestor.usage_tag().to_string(),
+            }],
+            "request_export",
+        )
+        .await?;
         Ok(snapshot_id.into())
     }
 
@@ -1546,7 +1573,7 @@ impl<RT: Runtime> Application<RT> {
         let filename = format!(
             // This should match the format in SnapshotExport.tsx.
             "snapshot_{}_{snapshot_ts}.zip",
-            self.instance_name
+            self.deployment.name
         );
         Ok((storage_get_stream, filename))
     }
@@ -1592,10 +1619,7 @@ impl<RT: Runtime> Application<RT> {
 
         let all_env_vars = model.get_all().await?;
 
-        anyhow::ensure!(
-            all_env_vars.len() as u64 <= (ENV_VAR_LIMIT as u64),
-            env_var_limit_met(),
-        );
+        anyhow::ensure!(all_env_vars.len() <= *ENV_VAR_LIMIT, env_var_limit_met(),);
 
         Self::reevaluate_existing_auth_config(self.runner().clone(), tx).await?;
 
@@ -1609,8 +1633,7 @@ impl<RT: Runtime> Application<RT> {
     ) -> anyhow::Result<Vec<DeploymentAuditLogEvent>> {
         let all_env_vars = EnvironmentVariablesModel::new(tx).get_all().await?;
         anyhow::ensure!(
-            environment_variables.len() as u64 + all_env_vars.len() as u64
-                <= (ENV_VAR_LIMIT as u64),
+            environment_variables.len() + all_env_vars.len() <= *ENV_VAR_LIMIT,
             env_var_limit_met(),
         );
         for environment_variable in environment_variables.clone() {
@@ -1728,6 +1751,7 @@ impl<RT: Runtime> Application<RT> {
         Self::reevaluate_existing_auth_config(self.runner().clone(), tx).await
     }
 
+    #[fastrace::trace]
     pub async fn analyze(
         &self,
         udf_config: UdfConfig,
@@ -1774,12 +1798,14 @@ impl<RT: Runtime> Application<RT> {
         fields.try_into()
     }
 
+    #[fastrace::trace]
     pub async fn evaluate_schema(&self, schema: ModuleConfig) -> anyhow::Result<DatabaseSchema> {
         self._evaluate_schema(schema).await.map_err(|e| {
             e.wrap_error_message(|msg| format!("Hit an error while evaluating your schema:\n{msg}"))
         })
     }
 
+    #[fastrace::trace]
     async fn _evaluate_schema(&self, schema: ModuleConfig) -> anyhow::Result<DatabaseSchema> {
         let rng_seed = self.runtime().rng().random();
         let unix_timestamp = self.runtime().unix_timestamp();
@@ -1789,7 +1815,11 @@ impl<RT: Runtime> Application<RT> {
             .await?;
 
         for table_schema in schema.tables.values_mut() {
-            for index_schema in table_schema.indexes.values_mut() {
+            for index_schema in table_schema
+                .indexes
+                .values_mut()
+                .chain(table_schema.staged_db_indexes.values_mut())
+            {
                 index_schema.fields =
                     self._validate_user_defined_index_fields(index_schema.fields.clone())?;
             }
@@ -2018,9 +2048,12 @@ impl<RT: Runtime> Application<RT> {
     ) -> anyhow::Result<(
         Option<ExternalDepsPackageId>,
         BTreeMap<ComponentDefinitionPath, SourcePackage>,
+        Vec<ModuleConfig>,
     )> {
         let upload_limit = Arc::new(Semaphore::new(*APPLICATION_MAX_CONCURRENT_UPLOADS));
 
+        let mut app_functions: Vec<ModuleConfig> =
+            config.app_definition.changed_runtime_modules.clone();
         let root_future = async {
             let permit = upload_limit.acquire().await?;
             let external_deps_id_and_pkg = if !config.node_dependencies.is_empty() {
@@ -2031,9 +2064,90 @@ impl<RT: Runtime> Application<RT> {
             } else {
                 None
             };
-            let app_modules = config.app_definition.modules().cloned().collect();
+            if !config
+                .app_definition
+                .unchanged_runtime_module_hashes
+                .is_empty()
+            {
+                // Query existing packages from the database
+                let mut tx = self.begin(Identity::system()).await?;
+
+                // Get existing package for root component
+                let existing_root_package =
+                    SourcePackageModel::new(&mut tx, TableNamespace::Global)
+                        .get_latest()
+                        .await?;
+
+                let module_metadata: BTreeMap<
+                    CanonicalizedModulePath,
+                    ParsedDocument<ModuleMetadata>,
+                > = ModuleModel::new(&mut tx)
+                    .get_all_metadata(ComponentId::Root)
+                    .await?
+                    .into_iter()
+                    .map(|module| (module.path.clone(), module))
+                    .collect();
+
+                tx.into_token()?;
+
+                // Download root package
+                let existing_app_modules: BTreeMap<CanonicalizedModulePath, ModuleConfig> =
+                    if let Some(root_pkg) = existing_root_package {
+                        download_package(
+                            self.modules_storage().clone(),
+                            root_pkg.storage_key.clone(),
+                            root_pkg.sha256.clone(),
+                        )
+                        .await?
+                        .into_values()
+                        .map(|v| (v.path.clone().canonicalize(), v))
+                        .collect()
+                    } else {
+                        anyhow::bail!("Failed to download source package for root component.");
+                    };
+
+                // Add unchanged modules to app_functions
+                for unchanged_module in config.app_definition.unchanged_runtime_module_hashes.iter()
+                {
+                    let canonicalized_module_path = unchanged_module.path.clone().canonicalize();
+                    let Some(module) = existing_app_modules.get(&canonicalized_module_path) else {
+                        anyhow::bail!(ErrorMetadata::conflict(
+                            "MissingExistingModule",
+                            "Could not find existing unchanged module."
+                        ));
+                    };
+                    let Some(metadata) = module_metadata.get(&canonicalized_module_path) else {
+                        anyhow::bail!(ErrorMetadata::conflict(
+                            "MissingExistingModuleMetadata",
+                            "Missing metadata for existing module."
+                        ));
+                    };
+                    if metadata.sha256 != unchanged_module.sha256 {
+                        anyhow::bail!(ErrorMetadata::conflict(
+                            "ExistingModuleHashConflict",
+                            "Existing module hash does not match."
+                        ));
+                    }
+                    if metadata.environment != unchanged_module.environment {
+                        anyhow::bail!(ErrorMetadata::conflict(
+                            "ExistingModuleEnvConflict",
+                            "Existing module environment does not match."
+                        ));
+                    }
+                    app_functions.push(module.clone());
+                }
+            }
+            let app_modules: Vec<ModuleConfig> = config
+                .app_definition
+                .all_modules(&app_functions)
+                .cloned()
+                .collect();
             let app_pkg = self
-                .upload_package(&app_modules, external_deps_id_and_pkg.clone())
+                .upload_package(
+                    &app_modules,
+                    external_deps_id_and_pkg.clone(),
+                    config.node_version,
+                )
                 .await?;
             drop(permit);
             Ok((external_deps_id_and_pkg, app_pkg))
@@ -2047,7 +2161,7 @@ impl<RT: Runtime> Application<RT> {
             let upload_limit = upload_limit.clone();
             let component_pkg_future = async move {
                 let permit = upload_limit.acquire().await?;
-                let component_pkg = app.upload_package(&component_modules, None).await?;
+                let component_pkg = app.upload_package(&component_modules, None, None).await?;
                 drop(permit);
                 anyhow::Ok((definition_path, component_pkg))
             };
@@ -2084,10 +2198,15 @@ impl<RT: Runtime> Application<RT> {
         }
 
         let external_deps_id = external_deps.map(|(id, _)| id);
-        Ok((external_deps_id, component_definition_packages))
+        Ok((
+            external_deps_id,
+            component_definition_packages,
+            app_functions,
+        ))
     }
 
     // Helper method to call analyze and throw appropriate HttpError.
+    #[fastrace::trace]
     pub async fn analyze_modules(
         &self,
         udf_config: UdfConfig,
@@ -2148,12 +2267,7 @@ impl<RT: Runtime> Application<RT> {
         &self,
         identity: Identity,
     ) -> anyhow::Result<ClientDrivenUploadToken> {
-        if !identity.is_admin() {
-            anyhow::bail!(ErrorMetadata::forbidden(
-                "InvalidImport",
-                "Only an admin of the deployment can import"
-            ));
-        }
+        identity.require_operation(DeploymentOp::ImportBackups)?;
         let upload = self
             .application_storage
             .snapshot_imports_storage
@@ -2169,12 +2283,7 @@ impl<RT: Runtime> Application<RT> {
         part_number: u16,
         part: Bytes,
     ) -> anyhow::Result<ClientDrivenUploadPartToken> {
-        if !identity.is_admin() {
-            anyhow::bail!(ErrorMetadata::forbidden(
-                "InvalidImport",
-                "Only an admin of the deployment can import"
-            ));
-        }
+        identity.require_operation(DeploymentOp::ImportBackups)?;
         let part_token = self
             .application_storage
             .snapshot_imports_storage
@@ -2192,12 +2301,7 @@ impl<RT: Runtime> Application<RT> {
         upload_token: ClientDrivenUploadToken,
         part_tokens: Vec<ClientDrivenUploadPartToken>,
     ) -> anyhow::Result<DeveloperDocumentId> {
-        if !identity.is_admin() {
-            anyhow::bail!(ErrorMetadata::forbidden(
-                "InvalidImport",
-                "Only an admin of the deployment can import"
-            ));
-        }
+        identity.require_operation(DeploymentOp::ImportBackups)?;
         let object_key = self
             .application_storage
             .snapshot_imports_storage
@@ -2244,6 +2348,7 @@ impl<RT: Runtime> Application<RT> {
         &self,
         modules: &Vec<ModuleConfig>,
         external_deps_id_and_pkg: Option<(ExternalDepsPackageId, ExternalDepsPackage)>,
+        node_version: Option<NodeVersion>,
     ) -> anyhow::Result<SourcePackage> {
         // If there are any node actions, turn on the lambdas.
         if modules
@@ -2291,29 +2396,32 @@ impl<RT: Runtime> Application<RT> {
             sha256,
             external_deps_package_id,
             package_size,
+            node_version,
         })
     }
 
     // Clear all records for specified tables concurrently, potentially taking
-    // multiple transactions for each. Returns the total number of documents
-    // deleted.
+    // multiple transactions for each.
     pub async fn clear_tables(
         &self,
         identity: &Identity,
         table_names: Vec<(ComponentPath, TableName)>,
+        requestor: ImportRequestor,
+        usage: FunctionUsageTracker,
     ) -> anyhow::Result<u64> {
-        clear_tables(self, identity, table_names).await
+        clear_tables(self, identity, table_names, requestor, usage).await
     }
 
     pub async fn execute_standalone_module(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         module: ModuleConfig,
-        args: Vec<JsonValue>,
+        args: SerializedArgs,
         identity: Identity,
         caller: FunctionCaller,
         component: ComponentId,
     ) -> anyhow::Result<Result<FunctionReturn, FunctionError>> {
+        let request_id = request_context.request_id.clone();
         let block_logging = self
             .log_visibility
             .should_redact_logs_and_error(
@@ -2326,7 +2434,9 @@ impl<RT: Runtime> Application<RT> {
         // Write (and commit) the module source to S3.
         // This will become a dangling reference since the _modules entry won't
         // be committed to the database, but we have to deal with those anyway.
-        let source_package = self.upload_package(&vec![module.clone()], None).await?;
+        let source_package = self
+            .upload_package(&vec![module.clone()], None, None)
+            .await?;
 
         let mut tx = self.begin(identity.clone()).await?;
         let (user_environment_variables, system_env_var_overrides) = if component.is_root() {
@@ -2342,7 +2452,7 @@ impl<RT: Runtime> Application<RT> {
 
         let mut udf_config_model = UdfConfigModel::new(&mut tx, component.into());
         let udf_config = match udf_config_model.get().await? {
-            Some(udf_config) => udf_config.into_value(),
+            Some(udf_config) => (**udf_config).clone(),
             None => {
                 // If there hasn't been a push
                 // yet, act like the most recent version.
@@ -2434,11 +2544,10 @@ impl<RT: Runtime> Application<RT> {
             component: component_path,
             udf_path: CanonicalizedUdfPath::new(module_path, function_name),
         };
-        let arguments = parse_udf_args(&path.udf_path, args)?;
         let (result, log_lines) = match analyzed_function.udf_type {
             UdfType::Query => {
                 self.runner
-                    .run_query_without_caching(request_id.clone(), tx, path, arguments, caller)
+                    .run_query_without_caching(request_context, tx, path, args, caller)
                     .await
             },
             UdfType::Mutation => {
@@ -2525,22 +2634,33 @@ impl<RT: Runtime> Application<RT> {
         &self,
         identity: &Identity,
         table_names: Vec<TableName>,
-        table_namespace: TableNamespace,
+        component_id: ComponentId,
     ) -> anyhow::Result<u64> {
+        let table_namespace = TableNamespace::from(component_id);
         let mut tx = self.begin(identity.clone()).await?;
         let mut count = 0;
-        for table_name in table_names {
+        for table_name in &table_names {
             anyhow::ensure!(
                 !table_name.is_system(),
                 "cannot delete system table {table_name}"
             );
             let mut table_model = TableModel::new(&mut tx);
-            count += table_model.must_count(table_namespace, &table_name).await?;
+            count += table_model.must_count(table_namespace, table_name).await?;
             table_model
-                .delete_active_table(table_namespace, table_name)
+                .delete_active_table(table_namespace, table_name.clone())
                 .await?;
         }
-        self.commit(tx, "delete_tables").await?;
+        let component = tx.must_component_path(component_id)?;
+        self.commit_with_audit_log_events(
+            tx,
+            vec![DeploymentAuditLogEvent::DeleteTables {
+                component_id: component_id.serialize_to_string(),
+                component,
+                table_names,
+            }],
+            "delete_tables",
+        )
+        .await?;
         Ok(count)
     }
 
@@ -2550,10 +2670,20 @@ impl<RT: Runtime> Application<RT> {
         component_id: ComponentId,
     ) -> anyhow::Result<()> {
         let mut tx = self.begin(identity.clone()).await?;
+        let cid = component_id.serialize_to_string();
+        let component = tx.must_component_path(component_id)?;
         ComponentConfigModel::new(&mut tx)
             .delete_component(component_id)
             .await?;
-        self.commit(tx, "delete_component").await?;
+        self.commit_with_audit_log_events(
+            tx,
+            vec![DeploymentAuditLogEvent::DeleteComponent {
+                component_id: cid,
+                component,
+            }],
+            "delete_component",
+        )
+        .await?;
         Ok(())
     }
 
@@ -2577,7 +2707,7 @@ impl<RT: Runtime> Application<RT> {
             {
                 if !index_metadata
                     .config
-                    .same_config(&existing_index_metadata.config)
+                    .same_spec(&existing_index_metadata.config)
                 {
                     IndexModel::new(&mut tx)
                         .drop_index(existing_index_metadata.id())
@@ -2626,7 +2756,7 @@ impl<RT: Runtime> Application<RT> {
                 content_type,
                 body,
                 expected_sha256,
-                &self.usage_tracking,
+                &self.usage_counter,
             )
             .await?;
         Ok(storage_id)
@@ -2639,7 +2769,7 @@ impl<RT: Runtime> Application<RT> {
     ) -> anyhow::Result<DeveloperDocumentId> {
         let storage_id = self
             .file_storage
-            .store_entry(component.into(), entry, &self.usage_tracking)
+            .store_entry(component.into(), entry, &self.usage_counter)
             .await?;
         Ok(storage_id)
     }
@@ -2674,11 +2804,8 @@ impl<RT: Runtime> Application<RT> {
     ) -> anyhow::Result<FileStream> {
         self.bail_if_not_running().await?;
         let mut file_storage_tx = self.begin(Identity::system()).await?;
-        let Some(file_entry) = self
-            .file_storage
-            .transactional_file_storage
-            // The transaction is not part of UDF so use the global usage counters.
-            .get_file_entry(&mut file_storage_tx, component.into(), storage_id.clone())
+        let Some(parsed_doc) = FileStorageModel::new(&mut file_storage_tx, component.into())
+            .get_file(storage_id.clone())
             .await?
         else {
             return Err(ErrorMetadata::not_found(
@@ -2694,12 +2821,28 @@ impl<RT: Runtime> Application<RT> {
             )
             .into());
         };
-        self
+        let doc_id = parsed_doc.developer_id().to_string();
+        let file_entry = parsed_doc.into_value();
+        let mut file_stream = self
             .file_storage
             .transactional_file_storage
             // The transaction is not part of UDF so use the global usage counters.
-            .get_file_stream(component_path, file_entry, self.usage_tracking.clone())
-            .await
+            .get_file_stream(component_path, file_entry, self.usage_counter.clone())
+            .await?;
+        let log_manager_client = self.log_manager_client.clone();
+        file_stream.add_on_complete(Box::new(move |egress_bytes| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before epoch");
+            log_manager_client.send_logs(vec![LogEvent {
+                timestamp: UnixTimestamp::from_millis(now.as_millis() as u64),
+                event: StructuredLogEvent::StorageApiBandwidth {
+                    storage_id: doc_id,
+                    egress_bytes,
+                },
+            }]);
+        }));
+        Ok(file_stream)
     }
 
     pub async fn get_file_range(
@@ -2707,15 +2850,12 @@ impl<RT: Runtime> Application<RT> {
         component: ComponentId,
         storage_id: FileStorageId,
         bytes_range: (Bound<u64>, Bound<u64>),
-    ) -> anyhow::Result<FileRangeStream> {
+    ) -> anyhow::Result<FileStream> {
         self.bail_if_not_running().await?;
         let mut file_storage_tx = self.begin(Identity::system()).await?;
 
-        let Some(file_entry) = self
-            .file_storage
-            .transactional_file_storage
-            // The transaction is not part of UDF so use the global usage counters.
-            .get_file_entry(&mut file_storage_tx, component.into(), storage_id.clone())
+        let Some(parsed_doc) = FileStorageModel::new(&mut file_storage_tx, component.into())
+            .get_file(storage_id.clone())
             .await?
         else {
             return Err(ErrorMetadata::not_found(
@@ -2731,8 +2871,9 @@ impl<RT: Runtime> Application<RT> {
             )
             .into());
         };
-
-        self
+        let doc_id = parsed_doc.developer_id().to_string();
+        let file_entry = parsed_doc.into_value();
+        let mut file_stream = self
             .file_storage
             .transactional_file_storage
             // The transaction is not part of UDF so use the global usage counters.
@@ -2740,9 +2881,23 @@ impl<RT: Runtime> Application<RT> {
                 component_path,
                 file_entry,
                 bytes_range,
-                self.usage_tracking.clone(),
+                self.usage_counter.clone(),
             )
-            .await
+            .await?;
+        let log_manager_client = self.log_manager_client.clone();
+        file_stream.add_on_complete(Box::new(move |egress_bytes| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before epoch");
+            log_manager_client.send_logs(vec![LogEvent {
+                timestamp: UnixTimestamp::from_millis(now.as_millis() as u64),
+                event: StructuredLogEvent::StorageApiBandwidth {
+                    storage_id: doc_id,
+                    egress_bytes,
+                },
+            }]);
+        }));
+        Ok(file_stream)
     }
 
     pub async fn authenticate(
@@ -2752,10 +2907,7 @@ impl<RT: Runtime> Application<RT> {
     ) -> anyhow::Result<Identity> {
         let identity = match token {
             AuthenticationToken::Admin(token, acting_as) => {
-                let admin_identity = self
-                    .app_auth()
-                    .check_key(token.to_string(), self.instance_name())
-                    .await?;
+                let admin_identity = self.app_auth().check_key(token.to_string()).await?;
 
                 match acting_as {
                     Some(acting_user) => {
@@ -2774,17 +2926,33 @@ impl<RT: Runtime> Application<RT> {
                 let mut tx = self.begin(Identity::system()).await?;
                 let auth_infos = AuthInfoModel::new(&mut tx).get().await?;
 
-                let identity = validate_id_token(
-                    Auth0IdToken(id_token),
-                    cached_http_client_for(ClientPurpose::ProviderMetadata),
-                    auth_infos
-                        .into_iter()
-                        .map(|auth_info| auth_info.into_value())
-                        .collect(),
+                let auth_info_values: Vec<_> = auth_infos
+                    .into_iter()
+                    .map(|auth_info| auth_info.into_value())
+                    .collect();
+
+                let should_redact_errors = self
+                    .log_visibility
+                    .should_redact_logs_and_error(
+                        &mut tx,
+                        Identity::Unknown(None),
+                        AllowedVisibility::PublicOnly,
+                    )
+                    .await?;
+
+                let identity_result = validate_id_token(
+                    // This is any JWT.
+                    AuthIdToken(id_token),
+                    self.oidc_http_client
+                        .clone()
+                        .for_purpose(ClientPurpose::ProviderMetadata),
+                    auth_info_values,
                     system_time,
+                    should_redact_errors,
                 )
-                .await?;
-                Identity::user(identity)
+                .await;
+
+                Identity::user(identity_result?)
             },
             AuthenticationToken::None => Identity::Unknown(None),
         };
@@ -2804,124 +2972,31 @@ impl<RT: Runtime> Application<RT> {
         Ok(())
     }
 
-    pub async fn udf_rate(
+    pub async fn delete_scheduled_jobs_table(
         &self,
         identity: Identity,
-        identifier: UdfIdentifier,
-        metric: UdfRate,
-        window: MetricsWindow,
-    ) -> anyhow::Result<Timeseries> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("udf_rate"));
-        }
-        self.function_log.udf_rate(identifier, metric, window)
-    }
-
-    pub async fn failure_percentage_top_k(
-        &self,
-        identity: Identity,
-        window: MetricsWindow,
-        k: usize,
-    ) -> anyhow::Result<Vec<(String, Timeseries)>> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("failure_percentage_top_k"));
-        }
-        self.function_log.failure_percentage_top_k(window, k)
-    }
-
-    pub async fn cache_hit_percentage_top_k(
-        &self,
-        identity: Identity,
-        window: MetricsWindow,
-        k: usize,
-    ) -> anyhow::Result<Vec<(String, Timeseries)>> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("failure_percentage_top_k"));
-        }
-        self.function_log.cache_hit_percentage_top_k(window, k)
-    }
-
-    pub async fn cache_hit_percentage(
-        &self,
-        identity: Identity,
-        identifier: UdfIdentifier,
-        window: MetricsWindow,
-    ) -> anyhow::Result<Timeseries> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("cache_hit_percentage"));
-        }
-        self.function_log.cache_hit_percentage(identifier, window)
-    }
-
-    pub async fn latency_percentiles(
-        &self,
-        identity: Identity,
-        identifier: UdfIdentifier,
-        percentiles: Vec<Percentile>,
-        window: MetricsWindow,
-    ) -> anyhow::Result<BTreeMap<Percentile, Timeseries>> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("latency_percentiles_ms"));
-        }
-        self.function_log
-            .latency_percentiles(identifier, percentiles, window)
-    }
-
-    pub async fn udf_summary(
-        &self,
-        identity: Identity,
-        cursor: Option<CursorMs>,
-    ) -> anyhow::Result<(Option<UdfMetricSummary>, Option<CursorMs>)> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("latency_percentiles_ms"));
-        }
-        Ok(self.function_log.udf_summary(cursor))
-    }
-
-    pub async fn table_rate(
-        &self,
-        identity: Identity,
-        name: TableName,
-        metric: TableRate,
-        window: MetricsWindow,
-    ) -> anyhow::Result<Timeseries> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("table_rate"));
-        }
-        self.function_log.table_rate(name, metric, window)
-    }
-
-    pub async fn stream_udf_execution(
-        &self,
-        identity: Identity,
-        cursor: CursorMs,
-    ) -> anyhow::Result<(Vec<FunctionExecution>, CursorMs)> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("stream_udf_execution"));
-        }
-        Ok(self.function_log.stream(cursor).await)
-    }
-
-    pub async fn stream_function_logs(
-        &self,
-        identity: Identity,
-        cursor: CursorMs,
-    ) -> anyhow::Result<(Vec<FunctionExecutionPart>, CursorMs)> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("stream_function_logs"));
-        }
-        Ok(self.function_log.stream_parts(cursor).await)
-    }
-
-    pub async fn scheduled_job_lag(
-        &self,
-        identity: Identity,
-        window: MetricsWindow,
-    ) -> anyhow::Result<Timeseries> {
-        if !(identity.is_admin() || identity.is_system()) {
-            anyhow::bail!(unauthorized_error("scheduled_job_lag"));
-        }
-        self.function_log.scheduled_job_lag(window)
+        component_id: ComponentId,
+    ) -> anyhow::Result<()> {
+        identity.require_operation(DeploymentOp::WriteData)?;
+        let mut tx = self.begin(identity).await?;
+        let mut model = TableModel::new(&mut tx);
+        model
+            .replace_with_empty_table(ScheduledJobsTable, component_id.into())
+            .await?;
+        model
+            .replace_with_empty_table(ScheduledJobArgsTable, component_id.into())
+            .await?;
+        let component = tx.must_component_path(component_id)?;
+        self.commit_with_audit_log_events(
+            tx,
+            vec![DeploymentAuditLogEvent::DeleteScheduledJobsTable {
+                component_id: component_id.serialize_to_string(),
+                component,
+            }],
+            "delete_scheduled_jobs_table",
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn cancel_all_jobs(
@@ -2968,7 +3043,16 @@ impl<RT: Runtime> Application<RT> {
         let count = SchedulerModel::new(tx, component_id.into())
             .cancel_all(path, max_jobs, start_next_ts, end_next_ts)
             .await?;
-        Ok((count, vec![]))
+        let component = tx.must_component_path(component_id)?;
+        let events = if count > 0 {
+            vec![DeploymentAuditLogEvent::CancelAllScheduledFunctions {
+                component_id: component_id.serialize_to_string(),
+                component,
+            }]
+        } else {
+            vec![]
+        };
+        Ok((count, events))
     }
 
     /// Commit a transaction and send audit log events to the log manager if the
@@ -2990,7 +3074,7 @@ impl<RT: Runtime> Application<RT> {
             })
             .try_collect()?;
 
-        self.log_sender.send_logs(logs);
+        self.log_manager_client.send_logs(logs);
         Ok(ts)
     }
 
@@ -3059,6 +3143,38 @@ impl<RT: Runtime> Application<RT> {
         .await
     }
 
+    pub async fn execute_with_audit_log_events_and_occ_retries_with_timestamp<'a, F, T>(
+        &self,
+        identity: Identity,
+        write_source: impl Into<WriteSource>,
+        f: F,
+    ) -> anyhow::Result<(T, Timestamp)>
+    where
+        F: Send + Sync,
+        T: Send + 'static,
+        F: for<'b> Fn(
+            &'b mut Transaction<RT>,
+        )
+            -> ShortBoxFuture<'b, 'a, anyhow::Result<(T, Vec<DeploymentAuditLogEvent>)>>,
+    {
+        let db = self.database.clone();
+        let (ts, (t, events), _stats) = db
+            .execute_with_occ_retries(identity, FunctionUsageTracker::new(), write_source, |tx| {
+                Self::insert_deployment_audit_log_events(tx, &f).into()
+            })
+            .await?;
+        // Send deployment audit logs
+        let logs = events
+            .into_iter()
+            .map(|event| {
+                DeploymentAuditLogEvent::to_log_event(event, UnixTimestamp::from_nanos(ts.into()))
+            })
+            .try_collect()?;
+
+        self.log_manager_client.send_logs(logs);
+        Ok((t, ts))
+    }
+
     pub async fn execute_with_audit_log_events_and_occ_retries_with_pause_client<'a, F, T>(
         &self,
         identity: Identity,
@@ -3088,7 +3204,7 @@ impl<RT: Runtime> Application<RT> {
             })
             .try_collect()?;
 
-        self.log_sender.send_logs(logs);
+        self.log_manager_client.send_logs(logs);
         Ok((t, stats))
     }
 
@@ -3199,8 +3315,9 @@ impl<RT: Runtime> Application<RT> {
                 return Ok(());
             }
             let token = tx.into_token()?;
-            let subscription = self.database.subscribe(token).await?;
-            subscription.wait_for_invalidation().await;
+            self.database
+                .subscribe_and_wait_for_invalidation(token)
+                .await?;
         }
     }
 
@@ -3281,16 +3398,20 @@ impl<RT: Runtime> Application<RT> {
         }
     }
 
-    /// Insert airbyte record messages into the table for the stream. Returns
-    /// the number of documents inserted.
+    /// Insert airbyte record messages into the table for the stream.
     pub async fn import_airbyte_records(
         &self,
         identity: &Identity,
         records: Vec<AirbyteRecord>,
         tables: BTreeMap<TableName, ValidatedAirbyteStream>,
+        usage: FunctionUsageTracker,
     ) -> anyhow::Result<u64> {
-        let mut count = 0;
-        let mut tx = self.begin(identity.clone()).await?;
+        let usage = usage.without_v1_database_ingress();
+        let mut tx = self
+            .database
+            .begin_with_usage(identity.clone(), usage.clone())
+            .await?;
+        let mut num_records_written = 0u64;
         for record in records {
             let table_name = record.table_name();
             let stream = tables.get(table_name).context(ErrorMetadata::bad_request(
@@ -3299,26 +3420,36 @@ impl<RT: Runtime> Application<RT> {
             ))?;
             let insert_fut = self.process_record(&mut tx, record.clone(), stream);
             match insert_fut.await {
-                Ok(()) => {},
+                Ok(()) => {
+                    num_records_written += 1;
+                },
                 Err(e) if e.is_pagination_limit() => {
                     self.commit(tx, "airbyte_write_page").await?;
-                    tx = self.begin(identity.clone()).await?;
+                    tx = self
+                        .database
+                        .begin_with_usage(identity.clone(), usage.clone())
+                        .await?;
                     self.process_record(&mut tx, record, stream).await?;
+                    num_records_written += 1;
                 },
                 Err(e) => anyhow::bail!(e),
             }
-            count += 1;
         }
         self.commit(tx, "app_private_import_airbyte").await?;
-        Ok(count)
+        Ok(num_records_written)
     }
 
     pub async fn apply_fivetran_operations(
         &self,
         identity: &Identity,
         rows: Vec<BatchWriteRow>,
+        usage: FunctionUsageTracker,
     ) -> anyhow::Result<()> {
-        let mut tx = self.begin(identity.clone()).await?;
+        let usage = usage.without_v1_database_ingress();
+        let mut tx = self
+            .database
+            .begin_with_usage(identity.clone(), usage.clone())
+            .await?;
         let mut model = FivetranImportModel::new(&mut tx);
 
         for row in rows {
@@ -3327,7 +3458,10 @@ impl<RT: Runtime> Application<RT> {
                 Err(e) if e.is_pagination_limit() => {
                     self.commit(tx, "fivetran_write_page").await?;
 
-                    tx = self.begin(identity.clone()).await?;
+                    tx = self
+                        .database
+                        .begin_with_usage(identity.clone(), usage.clone())
+                        .await?;
                     model = FivetranImportModel::new(&mut tx);
 
                     model.apply_operation(row).await?;
@@ -3346,12 +3480,17 @@ impl<RT: Runtime> Application<RT> {
         table_name: TableName,
         delete_before: Option<DateTime<Utc>>,
         delete_type: DeleteType,
+        usage: FunctionUsageTracker,
     ) -> anyhow::Result<()> {
+        let usage = usage.without_v1_database_ingress();
         let mut done = false;
         while !done {
-            let mut tx = self.begin(identity.clone()).await?;
+            let mut tx = self
+                .database
+                .begin_with_usage(identity.clone(), usage.clone())
+                .await?;
             if !TableModel::new(&mut tx).table_exists(TableNamespace::Global, &table_name) {
-                // Simply accept the truncate if the table exists
+                // Simply accept the truncate if the table doesn't exist
                 return Ok(());
             }
             let mut query: ResolvedQuery<_> = FivetranImportModel::new(&mut tx)
@@ -3359,7 +3498,7 @@ impl<RT: Runtime> Application<RT> {
                 .await?;
 
             loop {
-                let res: anyhow::Result<()> = try {
+                let res: anyhow::Result<()> = try_anyhow!({
                     match query.next(&mut tx, None).await? {
                         Some(doc) => {
                             FivetranImportModel::new(&mut tx)
@@ -3371,7 +3510,7 @@ impl<RT: Runtime> Application<RT> {
                             break;
                         },
                     }
-                };
+                });
                 if let Err(e) = res {
                     if e.is_pagination_limit() {
                         // Need a new transaction: commit what we already have and continue
@@ -3413,7 +3552,7 @@ impl<RT: Runtime> Application<RT> {
             .indexes
             .into_iter()
             .map(|(descriptor, fields)| {
-                let index_name = IndexName::new_reserved(table_name.clone(), descriptor.clone())?;
+                let index_name = IndexName::new_reserved(table_name.clone(), descriptor)?;
                 let index_fields = fields.fields;
                 Ok((index_name, index_fields))
             })
@@ -3433,30 +3572,19 @@ impl<RT: Runtime> Application<RT> {
                 return Ok(());
             }
             let token = tx.into_token()?;
-            let subscription = self.database.subscribe(token).await?;
-            subscription.wait_for_invalidation().await;
+            self.database
+                .subscribe_and_wait_for_invalidation(token)
+                .await?;
         }
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.log_sender.shutdown()?;
-        self.table_summary_worker.shutdown().await?;
-        self.system_table_cleanup_worker.lock().shutdown();
-        self.schema_worker.lock().shutdown();
-        self.index_worker.lock().shutdown();
-        self.search_worker.lock().shutdown();
-        self.search_and_vector_bootstrap_worker.lock().shutdown();
-        self.fast_forward_worker.lock().shutdown();
-        self.export_worker.lock().shutdown();
-        self.snapshot_import_worker.lock().shutdown();
+        self.workers.shutdown().await?;
+        self.log_manager_client.shutdown().await?;
         self.runner.shutdown().await?;
-        self.scheduled_job_runner.shutdown();
-        self.cron_job_executor.lock().shutdown();
         self.database.shutdown().await?;
-        let migration_worker = self.migration_worker.lock().take();
-        if let Some(migration_worker) = migration_worker {
-            shutdown_and_join(migration_worker).await?;
-        }
+        self.function_log.shutdown();
+        self.usage_event_logger.shutdown().await?;
         tracing::info!("Application shut down");
         Ok(())
     }

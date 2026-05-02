@@ -15,12 +15,13 @@ export function AskAI() {
         data-project-color="#3F5295"
         data-project-logo="https://img.stackshare.io/service/41143/default_f1d33b63d360437ba28c8ac981dd68d7d2478b22.png"
         data-user-analytics-fingerprint-enabled="true"
+        data-user-analytics-cookie-enabled="true"
         data-search-mode-enabled="true"
         // Additional styles are applied to this modal in globals.css
       />
       <Button
         inline
-        className="js-launch-kapa-ai flex items-center gap-1 px-2.5 text-sm text-content-primary"
+        className="js-launch-kapa-ai flex items-center gap-1 rounded-full px-2.5 text-sm text-content-primary"
       >
         <SparklesIcon className="size-4" />
         <span className="hidden md:block">Ask AI</span>

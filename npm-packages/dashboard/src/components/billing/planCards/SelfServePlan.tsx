@@ -6,27 +6,34 @@ export function SelfServePlan({
   percentOff,
   plan,
   action,
+  isLoading = false,
 }: {
   currentPlan?: string;
   plan: PlanResponse;
   percentOff?: number;
   action?: React.ReactNode;
+  isLoading?: boolean;
 }) {
   return (
     <PlanCard
       selected={currentPlan === plan.id}
       plan={plan}
       saleHeader={
-        percentOff ? (
-          <>
-            <span className="mr-1 line-through">${plan.seatPrice}</span>$
-            {Number((plan.seatPrice * (1 - percentOff / 100)).toFixed(2))}
-          </>
+        isLoading ? (
+          ""
+        ) : plan.seatPrice ? (
+          percentOff ? (
+            <>
+              <span className="mr-1 line-through">${plan.seatPrice}</span>$
+              {Number((plan.seatPrice * (1 - percentOff / 100)).toFixed(2))}
+            </>
+          ) : (
+            `$${plan.seatPrice} per member, per month + usage`
+          )
         ) : (
-          `$${plan.seatPrice}`
+          "Usage-based pricing"
         )
       }
-      saleSubheader="per member, per month"
       action={action}
     />
   );

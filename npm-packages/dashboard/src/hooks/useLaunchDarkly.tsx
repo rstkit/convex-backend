@@ -1,41 +1,58 @@
 import { useFlags } from "launchdarkly-react-client-sdk";
 import kebabCase from "lodash/kebabCase";
 
-const flagDefaults: {
-  oauthProviderConfiguration: Record<
-    string,
-    {
-      allowedRedirects: string[];
-      name: string;
-      allowImplicitFlow?: boolean;
-    }
-  >;
-  spendingLimits: boolean;
-  enableIndexFilters: boolean;
-  referralsPage: boolean;
+export const flagDefaults: {
   commandPalette: boolean;
   commandPaletteDeleteProjects: boolean;
-  multipleUserIdentities: boolean;
+  singleSignOn: boolean;
+  workOsEnvironmentProvisioningDashboardUi: boolean;
+  enableNewDashboardVersionNotification: boolean;
+  enableStatuspageWidget: boolean;
+  connectionStateCheckIntervalMs: number;
+  postHogIntegrations: boolean;
+  usageDashboardV2: boolean;
+  personalAccessTokens: boolean;
+  showScheduledJobArgsInComponents: boolean;
+  subscriptionInvalidationsChart: boolean;
+  transferDeployment: boolean;
+  scopedDeployKeys: boolean;
+  healthHeatmaps: boolean;
+  allowTokenExpiry: boolean;
 } = {
-  oauthProviderConfiguration: {},
-  spendingLimits: false,
-  enableIndexFilters: false,
-  referralsPage: false,
   commandPalette: false,
   commandPaletteDeleteProjects: false,
-  multipleUserIdentities: false,
+  singleSignOn: false,
+  workOsEnvironmentProvisioningDashboardUi: false,
+  enableNewDashboardVersionNotification: false,
+  enableStatuspageWidget: true,
+  connectionStateCheckIntervalMs: 2500,
+  postHogIntegrations: false,
+  personalAccessTokens: false,
+  usageDashboardV2: false,
+  showScheduledJobArgsInComponents: false,
+  subscriptionInvalidationsChart: false,
+  transferDeployment: false,
+  scopedDeployKeys: false,
+  healthHeatmaps: false,
+  allowTokenExpiry: false,
 };
-
-function kebabCaseKeys(object: typeof flagDefaults) {
-  return Object.entries(object).reduce(
-    (carry, [key, value]) => ({ ...carry, [kebabCase(key)]: value }),
-    {} as { [key: string]: any },
-  );
-}
 
 // Flag defaults need to be in the default kebab-case format:
 // https://docs.launchdarkly.com/sdk/client-side/react/react-web#configuring-the-react-sdk
-export const flagDefaultsKebabCase = kebabCaseKeys(flagDefaults);
+// Note: kebabCaseKeys uses lodash kebabCase which splits "V2" into "v-2".
+// We fix keys where this produces incorrect results.
+const KEBAB_CASE_OVERRIDES: Record<string, string> = {
+  usageDashboardV2: "usage-dashboard-v2",
+};
+
+function kebabCaseKey(key: string): string {
+  return KEBAB_CASE_OVERRIDES[key] ?? kebabCase(key);
+}
+
+export const flagDefaultsKebabCase = Object.entries(flagDefaults).reduce(
+  (carry, [key, value]) => ({ ...carry, [kebabCaseKey(key)]: value }),
+  {} as { [key: string]: any },
+);
 
 // useLaunchDarkly is a thin wrapper on LaunchDarkly's react sdk which adds manual to flag keys.
 // At some point, we can generate this file.

@@ -1,15 +1,19 @@
 import { Command, Option } from "@commander-js/extra-typings";
-import { logVerbose, oneoffContext } from "../bundler/context.js";
+import { chalkStderr } from "chalk";
+import { installSigintHandler, oneoffContext } from "../bundler/context.js";
 import { deploymentCredentialsOrConfigure } from "./configure.js";
 import { usageStateWarning } from "./lib/usage.js";
 import { normalizeDevOptions } from "./lib/command.js";
 import { devAgainstDeployment } from "./lib/dev.js";
-import { deploymentSelectionWithinProjectFromOptions } from "./lib/api.js";
 import {
   CONVEX_DEPLOYMENT_ENV_VAR_NAME,
   CONVEX_SELF_HOSTED_URL_VAR_NAME,
 } from "./lib/utils/utils.js";
-import { getDeploymentSelection } from "./lib/deploymentSelection.js";
+import {
+  getDeploymentSelection,
+  type DeploymentSelection,
+} from "./lib/deploymentSelection.js";
+import { checkVersionAndAiFilesStaleness } from "./lib/updates.js";
 
 export const dev = new Command("dev")
   .summary("Develop against a dev deployment, watching for changes")
@@ -17,7 +21,7 @@ export const dev = new Command("dev")
     "Develop against a dev deployment, watching for changes\n\n" +
       "  1. Configures a new or existing project (if needed)\n" +
       "  2. Updates generated types and pushes code to the configured dev deployment\n" +
-      "  3. Runs the provided command (if `--run` or `--run-sh` is used)\n" +
+      "  3. Runs the provided command (if `--start` or `--run` is used)\n" +
       "  4. Watches for file changes, and repeats step 2\n",
   )
   .allowExcessArguments(false)
@@ -40,6 +44,14 @@ export const dev = new Command("dev")
       .choices(["enable", "disable"] as const)
       .default("enable" as const),
   )
+  .addOption(
+    new Option(
+      "--push-all-modules",
+      "Push all modules without checking for unchanged module hashes from the server",
+    )
+      .default(false)
+      .hideHelp(),
+  )
   .option(
     "--once",
     "Execute only the first 3 steps, stop on any failure",
@@ -52,22 +64,28 @@ export const dev = new Command("dev")
   )
   .addOption(
     new Option(
+      "--start <command>",
+      "Start a long-running command alongside `convex dev`, like a frontend " +
+        "dev server. The command inherits stdin/stdout so you can interact " +
+        "with it directly. Example: npx convex dev --start 'vite --open'",
+    ).conflicts(["--run", "--run-sh"]),
+  )
+  .addOption(
+    new Option("--run-sh <command>", "Deprecated: use --start instead.")
+      .conflicts(["--start", "--run"])
+      .hideHelp(),
+  )
+  .addOption(
+    new Option(
       "--run <functionName>",
       "The identifier of the function to run in step 3, " +
         "like `api.init.createData` or `myDir/myFile:myFunction`",
-    ).conflicts(["--run-sh"]),
+    ).conflicts(["--start"]),
   )
   .option(
     "--run-component <functionName>",
     "If --run is used and the function is in a component, the path the component tree defined in convex.config.ts. " +
       "Components are a beta feature. This flag is unstable and may change in subsequent releases.",
-  )
-  .addOption(
-    new Option(
-      "--run-sh <command>",
-      "A shell command to run in step 3, like `node myScript.js`. " +
-        "If you just want to run a Convex function, use `--run` instead.",
-    ).conflicts(["--run"]),
   )
   .addOption(
     new Option(
@@ -79,6 +97,7 @@ export const dev = new Command("dev")
   )
   .addOption(new Option("--trace-events").default(false).hideHelp())
   .addOption(new Option("--debug-bundle-path <path>").hideHelp())
+  .addOption(new Option("--debug-node-apis").hideHelp())
   .addOption(new Option("--live-component-sources").hideHelp())
   .addOption(
     new Option(
@@ -86,7 +105,7 @@ export const dev = new Command("dev")
       "Ignore existing configuration and configure new or existing project, interactively or set by --team <team_slug>, --project <project_slug>, and --dev-deployment local|cloud",
     )
       .choices(["new", "existing"] as const)
-      .conflicts(["--local", "--cloud"]),
+      .conflicts(["--local", "--cloud", "--url", "--admin-key", "--env-file"]),
   )
   .addOption(
     new Option(
@@ -137,7 +156,7 @@ Same format as .env.local or .env files, and overrides them.`,
   .addOption(new Option("--local-site-port <port>").hideHelp())
   .addOption(new Option("--local-backend-version <version>").hideHelp())
   .addOption(new Option("--local-force-upgrade").default(false).hideHelp())
-  .addOption(new Option("--partition-id <id>").hideHelp())
+  .addOption(new Option("--deployment <deployment>").hideHelp())
   .addOption(
     new Option(
       "--local",
@@ -159,15 +178,23 @@ Same format as .env.local or .env files, and overrides them.`,
   .showHelpAfterError()
   .action(async (cmdOptions) => {
     const ctx = await oneoffContext(cmdOptions);
-    process.on("SIGINT", async () => {
-      logVerbose(ctx, "Received SIGINT, cleaning up...");
-      await ctx.flushAndExit(-2);
-    });
+    installSigintHandler(ctx);
+
+    if (cmdOptions.deployment !== undefined) {
+      return await ctx.crash({
+        exitCode: 1,
+        errorType: "fatal",
+        printedMessage:
+          "`--deployment` can’t be used with `npx convex dev`. \n\n" +
+          "  To select this deployment for development, run: \n" +
+          chalkStderr.bold(
+            `      npx convex deployment select ${cmdOptions.deployment}\n`,
+          ) +
+          "  Then, run `npx convex dev` again.",
+      });
+    }
 
     const devOptions = await normalizeDevOptions(ctx, cmdOptions);
-
-    const selectionWithinProject =
-      await deploymentSelectionWithinProjectFromOptions(ctx, cmdOptions);
 
     if (cmdOptions.configure === undefined) {
       if (cmdOptions.team || cmdOptions.project || cmdOptions.devDeployment)
@@ -217,12 +244,19 @@ Same format as .env.local or .env files, and overrides them.`,
       localOptions["forceUpgrade"] = cmdOptions.localForceUpgrade;
     }
 
-    const partitionId = cmdOptions.partitionId
-      ? parseInt(cmdOptions.partitionId)
-      : undefined;
     const configure =
       cmdOptions.configure === true ? "ask" : (cmdOptions.configure ?? null);
-    const deploymentSelection = await getDeploymentSelection(ctx, cmdOptions);
+    // --configure means "pick a project" — skip deployment selection entirely
+    const deploymentSelection =
+      configure !== null
+        ? ({
+            kind: "chooseProject",
+            selectionWithinProject: {
+              // For backwards compatibility, allow `--configure --prod`
+              kind: cmdOptions.prod ? "prod" : "unspecified",
+            },
+          } satisfies DeploymentSelection)
+        : await getDeploymentSelection(ctx, cmdOptions);
     const credentials = await deploymentCredentialsOrConfigure(
       ctx,
       deploymentSelection,
@@ -230,26 +264,35 @@ Same format as .env.local or .env files, and overrides them.`,
       {
         ...cmdOptions,
         localOptions,
-        selectionWithinProject,
       },
-      partitionId,
     );
 
-    if (credentials.deploymentFields !== null) {
-      await usageStateWarning(ctx, credentials.deploymentFields.deploymentName);
-    }
-
-    if (cmdOptions.skipPush) {
-      return;
-    }
-
-    await devAgainstDeployment(
-      ctx,
-      {
-        url: credentials.url,
-        adminKey: credentials.adminKey,
-        deploymentName: credentials.deploymentFields?.deploymentName ?? null,
-      },
-      devOptions,
-    );
+    await Promise.all([
+      ...(!cmdOptions.skipPush
+        ? [
+            devAgainstDeployment(
+              ctx,
+              {
+                url: credentials.url,
+                adminKey: credentials.adminKey,
+                deploymentName:
+                  credentials.deploymentFields?.deploymentName ?? null,
+                ...(credentials.deploymentFields?.deploymentType !== undefined
+                  ? {
+                      deploymentType:
+                        credentials.deploymentFields.deploymentType,
+                    }
+                  : {}),
+              },
+              devOptions,
+            ),
+          ]
+        : []),
+      ...(credentials.deploymentFields !== null
+        ? [
+            usageStateWarning(ctx, credentials.deploymentFields.deploymentName),
+            checkVersionAndAiFilesStaleness(ctx),
+          ]
+        : []),
+    ]);
   });

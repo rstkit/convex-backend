@@ -3,7 +3,7 @@
 // https://github.com/denoland/deno/blob/main/LICENSE.md
 
 import { performOp } from "udf-syscall-ffi";
-import { copyBuffer } from "./crypto/helpers.js";
+import { copyBuffer } from "./helpers.js";
 import inspect from "object-inspect";
 
 class TextEncoder {
@@ -99,6 +99,7 @@ class TextDecoder {
     } finally {
       if (!stream && this.#rid !== null) {
         performOp("textEncoder/cleanup", this.#rid);
+        this.#rid = null;
       }
     }
   }
@@ -168,6 +169,7 @@ class TextDecoderStream {
           return Promise.reject(err);
         }
       },
+      // @ts-expect-error FIXME
       cancel: (_reason) => {
         try {
           const _ = this.#decoder.decode();

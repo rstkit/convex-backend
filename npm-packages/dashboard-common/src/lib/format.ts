@@ -10,6 +10,9 @@ type TableDefinition = {
   indexes: Index[];
   searchIndexes: SearchIndex[];
   vectorIndexes?: VectorIndex[];
+  stagedDbIndexes?: Index[];
+  stagedSearchIndexes?: SearchIndex[];
+  stagedVectorIndexes?: VectorIndex[];
   documentType: ValidatorJSON | null;
 };
 
@@ -88,12 +91,6 @@ export function displaySchemaFromShape({
       return `v.id("${variant.tableName}")`;
     case "Int64":
       return `v.int64()`;
-    case "Map":
-      return `v.map(${displaySchemaFromShape({
-        shape: variant.keyShape,
-      })}, ${displaySchemaFromShape({
-        shape: variant.valueShape,
-      })})`;
     case "Never":
       // If the developer saves an empty map, set, or array the shape of the values
       // is Never (we don't know it!). Convert to `v.any()` so the schema is at least functional.
@@ -121,10 +118,6 @@ export function displaySchemaFromShape({
       const values = objectFieldToSchema(variant.valueShape);
       return `v.record(${keys}, ${values})`;
     }
-    case "Set":
-      return `v.set(${displaySchemaFromShape({
-        shape: variant.shape,
-      })})`;
     case "String":
       return `v.string()`;
     case "Union":
@@ -142,7 +135,7 @@ export function displaySchemaFromShape({
       return `v.any()`;
     default: {
       // Enforce that the switch-case is exhaustive.
-      const _: never = variant;
+      variant satisfies never;
       throw new Error(`Unrecognized variant ${shape.type} in ${shape}`);
     }
   }
@@ -221,12 +214,8 @@ function displayValidator(validator: ValidatorJSON): string {
       )}, ${displayObjectFieldSchema(validator.values)})`;
     // Deprecated, but could be shown in History tab
     case "set" as any:
-      return `v.set(${displayValidator((validator as any).value)})`;
-    // Deprecated, but could be shown in History tab
     case "map" as any:
-      return `v.map(${displayValidator(
-        (validator as any).keys,
-      )}, ${displayValidator((validator as any).values)})`;
+      return `v.any()`;
     case "object":
       return `v.object(${displayObjectSchema(validator.value)})`;
     case "union":
@@ -235,33 +224,39 @@ function displayValidator(validator: ValidatorJSON): string {
         .join(",\n")})`;
     default: {
       // Enforce that the switch-case is exhaustive.
-      const _: never = validator;
+      validator satisfies never;
       throw new Error(`Unrecognized validator variant: ${validator}`);
     }
   }
 }
 
-function displayIndexes(indexes: Index[]): string {
+function displayIndexes(indexes: Index[], type: "staged" | "active"): string {
   return indexes
-    .map(
-      (index) =>
-        `.index("${index.indexDescriptor}", [${index.fields
-          // Filter out system fields that start with underscore. Ideally these are filtered out in backend (CX-3805), but for now we do it here.
-          .filter((field) => (field.length > 0 ? field[0] !== "_" : true))
-          .map((field) => `"${field}"`)
-          .join(",")}])`,
-    )
+    .map((index) => {
+      const fields = `[${index.fields
+        // Filter out system fields that start with underscore. Ideally these are filtered out in backend (CX-3805), but for now we do it here.
+        .filter((field) => (field.length > 0 ? field[0] !== "_" : true))
+        .map((field) => `"${field}"`)
+        .join(",")}]`;
+      return type === "staged"
+        ? `.index("${index.indexDescriptor}", { fields: ${fields}, staged: true })`
+        : `.index("${index.indexDescriptor}", ${fields})`;
+    })
     .join("");
 }
 
-function displaySearchIndexes(searchIndexes: SearchIndex[]): string {
+function displaySearchIndexes(
+  searchIndexes: SearchIndex[],
+  type: "staged" | "active",
+): string {
   return searchIndexes
     .map(
       (searchIndex) =>
         `.searchIndex("${searchIndex.indexDescriptor}", {searchField: "${
           searchIndex.searchField
         }"
-        ${appendFilterFieldsOrEmpty(searchIndex)}})`,
+        ${appendFilterFieldsOrEmpty(searchIndex)}
+        ${appendStagedOrEmpty(type)}})`,
     )
     .join("");
 }
@@ -274,13 +269,21 @@ function appendFilterFieldsOrEmpty(index: SearchIndex | VectorIndex): string {
     : "";
 }
 
-function displayVectorIndexes(vectorIndexes: VectorIndex[]): string {
+function appendStagedOrEmpty(type: "staged" | "active"): string {
+  return type === "staged" ? ", staged: true" : "";
+}
+
+function displayVectorIndexes(
+  vectorIndexes: VectorIndex[],
+  type: "staged" | "active",
+): string {
   return vectorIndexes
     .map(
       (vectorIndex) => `.vectorIndex("${vectorIndex.indexDescriptor}"
         , {vectorField: "${vectorIndex.vectorField}"
         , dimensions: ${vectorIndex.dimensions}
         ${appendFilterFieldsOrEmpty(vectorIndex)}
+        ${appendStagedOrEmpty(type)}
       })`,
     )
     .join("");
@@ -291,9 +294,14 @@ function displayTableDefinition(tableDefinition: TableDefinition): string {
     tableDefinition.documentType ?? { type: "any" },
   );
   return `${tableDefinition.tableName}: defineTable(${documentType}
-  )${displayIndexes(tableDefinition.indexes)}${displaySearchIndexes(
-    tableDefinition.searchIndexes,
-  )}${displayVectorIndexes(tableDefinition.vectorIndexes ?? [])}`;
+  )${
+    displayIndexes(tableDefinition.indexes, "active") +
+    displayIndexes(tableDefinition.stagedDbIndexes ?? [], "staged") +
+    displaySearchIndexes(tableDefinition.searchIndexes, "active") +
+    displaySearchIndexes(tableDefinition.stagedSearchIndexes ?? [], "staged") +
+    displayVectorIndexes(tableDefinition.vectorIndexes ?? [], "active") +
+    displayVectorIndexes(tableDefinition.stagedVectorIndexes ?? [], "staged")
+  }`;
 }
 
 export function displaySchema(schema: SchemaJson, relativePath = "") {
@@ -422,3 +430,76 @@ export function toNumericUTC(dateString: string) {
   const [year, month, day] = dateString.split("-");
   return Date.UTC(Number(year), Number(month) - 1, Number(day));
 }
+
+export const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+
+export function toDateTimeLocalValue(
+  d: Date,
+  options?: { includeSeconds?: boolean },
+): string {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const hours = String(d.getHours()).padStart(2, "0");
+  const minutes = String(d.getMinutes()).padStart(2, "0");
+  const base = `${year}-${month}-${day}T${hours}:${minutes}`;
+  if (!options?.includeSeconds) return base;
+  const seconds = String(d.getSeconds()).padStart(2, "0");
+  return `${base}:${seconds}`;
+}
+
+export function toDateInputValue(d: Date): string {
+  return toDateTimeLocalValue(d).slice(0, 10);
+}
+
+export function parseDateInputValue(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  const [, year, month, day] = match;
+  return new Date(Number(year), Number(month) - 1, Number(day));
+}
+
+export const timeLabelForMinute = (value: string | number | undefined) => {
+  // Handle undefined, null, or empty values
+  if (value === undefined || value === null || value === "") {
+    return "";
+  }
+
+  // Convert number to string
+  const stringValue = typeof value === "number" ? String(value) : value;
+
+  // TODO(ari): Consolidate all the time rendering logic - this is a hack
+  // for now
+  if (stringValue.includes("-") || !stringValue.includes(":")) {
+    return stringValue;
+  }
+  const [time, modifier] = stringValue.split(" ");
+  const [hours, minutes] = time.split(":");
+  const date = new Date();
+  const hourValue = parseInt(hours);
+
+  // Handle 12-hour to 24-hour conversion
+  let hour24 = hourValue;
+  if (modifier === "PM" && hourValue !== 12) {
+    hour24 = hourValue + 12;
+  } else if (modifier === "AM" && hourValue === 12) {
+    hour24 = 0;
+  }
+
+  date.setHours(hour24);
+  date.setMinutes(parseInt(minutes));
+  const oneMinuteLater = new Date(date);
+  oneMinuteLater.setMinutes(date.getMinutes() + 1);
+
+  return `${formatTime(date)} – ${formatTime(oneMinuteLater)}`;
+};
+
+const formatTime = (date: Date) => {
+  let hours = date.getHours();
+  const minutes = date.getMinutes();
+  const ampm = hours >= 12 ? "PM" : "AM";
+  hours %= 12;
+  hours = hours || 12; // the hour '0' should be '12'
+  const strMinutes = minutes < 10 ? `0${minutes}` : minutes;
+  return `${hours}:${strMinutes} ${ampm}`;
+};

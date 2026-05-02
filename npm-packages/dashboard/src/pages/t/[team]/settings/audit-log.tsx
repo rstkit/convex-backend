@@ -8,16 +8,18 @@ import { useRouter } from "next/router";
 
 export { getServerSideProps } from "lib/ssr";
 
-function AuditLogPage() {
+export function AuditLogPage() {
   const team = useCurrentTeam();
-  const auditLogsEnabled = useTeamEntitlements(team?.id)?.auditLogsEnabled;
+  const auditLogRetentionDays = useTeamEntitlements(
+    team?.id,
+  )?.auditLogRetentionDays;
   const router = useRouter();
 
-  if (auditLogsEnabled === undefined) {
+  if (auditLogRetentionDays === undefined) {
     return <Loading />;
   }
-  if (!auditLogsEnabled) {
-    toast("info", "The audit log is only available on paid plans.", "upsell");
+  if (auditLogRetentionDays === 0) {
+    toast("info", "The audit log is only available on the Pro plan.", "upsell");
     void router.push(`/t/${router.query.team}/settings/billing`);
     return null;
   }

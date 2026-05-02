@@ -44,13 +44,19 @@ table's schema. Every vector index has a unique name and a definition with:
 
 1. `vectorField` string
    - The name of the field indexed for vector search.
-1. `dimensions` number
+2. `dimensions` number
    - The fixed size of the vectors index. If you're using embeddings, this
      dimension should match the size of your embeddings (e.g. `1536` for
      OpenAI).
-1. [Optional] `filterFields` array
+3. [Optional] `filterFields` array
    - The names of additional fields that are indexed for fast filtering within
      your vector index.
+4. [Optional] `staged` boolean
+   - If set to `true`, the index will be backfilled asynchronously from the
+     deploy similar to
+     [staged database indexes](/database/reading-data/indexes#staged-indexes).
+     This is useful for large tables where the index backfill time is
+     significant. Defaults to `false`.
 
 For example, if you want an index that can search for similar foods within a
 given cuisine, your table definition could look like:
@@ -81,9 +87,8 @@ They generally involve three steps:
 Here's an example of the first two steps for searching for similar French foods
 based on a description:
 
-<TSAndJSSnippet
-  sourceTS={VectorSearchSnippets}
-  sourceJS={VectorSearchSnippets}
+<Snippet
+  source={VectorSearchSnippets}
   title="convex/foods.ts"
   snippet="vectorSearchQuery"
   highlightPatterns={["vectorSearch"]}
@@ -131,16 +136,10 @@ For now, let's load the documents and return them from the action. To do so,
 we'll pass the list of results to a Convex query and run it inside of our
 action, returning the result:
 
-<TSAndJSSnippet
-  sourceTS={Foods}
-  sourceJS={Foods}
-  title="convex/foods.ts"
-  snippet="fetchResults"
-/>
+<Snippet source={Foods} title="convex/foods.ts" snippet="fetchResults" />
 
-<TSAndJSSnippet
-  sourceTS={VectorSearchSnippets2}
-  sourceJS={VectorSearchSnippets2}
+<Snippet
+  source={VectorSearchSnippets2}
   title="convex/foods.ts"
   snippet="fetchResults"
 />
@@ -230,9 +229,8 @@ different since we have an ID for `movieEmbeddings` but want to load a `movies`
 document. We can do this using the `by_embedding` database index on the `movies`
 table:
 
-<TSAndJSSnippet
-  sourceTS={VectorSearchSnippets}
-  sourceJS={VectorSearchSnippets}
+<Snippet
+  source={VectorSearchSnippets}
   title="convex/movies.ts"
   snippet="fetchMovies"
   highlightPatterns={["withIndex"]}

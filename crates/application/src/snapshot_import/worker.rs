@@ -9,7 +9,10 @@ use common::{
     errors::report_error,
     runtime::Runtime,
 };
-use database::Database;
+use database::{
+    Database,
+    Token,
+};
 use file_storage::FileStorage;
 use keybroker::Identity;
 use model::snapshot_imports::{
@@ -22,13 +25,16 @@ use usage_tracking::UsageCounter;
 use crate::{
     metrics::log_worker_starting,
     snapshot_import::{
-        metrics::snapshot_import_timer,
+        metrics::{
+            log_snapshot_import_failed,
+            snapshot_import_timer,
+        },
         SnapshotImportExecutor,
     },
 };
 
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 pub struct SnapshotImportWorker;
 
@@ -50,7 +56,17 @@ impl SnapshotImportWorker {
         };
         async move {
             loop {
-                if let Err(e) = Self::run_once(&mut worker).await {
+                let result: anyhow::Result<()> = async {
+                    let token = Box::pin(Self::run_once(&mut worker)).await?;
+                    worker
+                        .database
+                        .subscribe_and_wait_for_invalidation(token)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(e) = result {
+                    log_snapshot_import_failed(&e);
                     report_error(&mut e.context("SnapshotImportWorker died")).await;
                     let delay = worker.backoff.fail(&mut worker.runtime.rng());
                     worker.runtime.wait(delay).await;
@@ -66,8 +82,8 @@ impl SnapshotImportWorker {
     /// If an import is InProgress, execute it.
     async fn run_once<RT: Runtime>(
         executor: &mut SnapshotImportExecutor<RT>,
-    ) -> anyhow::Result<()> {
-        let status = log_worker_starting("SnapshotImport");
+    ) -> anyhow::Result<Token> {
+        let _status = log_worker_starting("SnapshotImport");
         let mut tx = executor.database.begin(Identity::system()).await?;
         let mut import_model = SnapshotImportModel::new(&mut tx);
         let import_uploaded = import_model.import_in_state(ImportState::Uploaded).await?;
@@ -89,9 +105,6 @@ impl SnapshotImportWorker {
                 .await?;
             timer.finish();
         }
-        drop(status);
-        let subscription = executor.database.subscribe(token).await?;
-        subscription.wait_for_invalidation().await;
-        Ok(())
+        Ok(token)
     }
 }

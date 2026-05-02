@@ -1,7 +1,9 @@
+// eslint-disable-next-line no-restricted-imports -- chalk used for formatting stdout via logOutput()
 import chalk from "chalk";
-import { logOutput } from "../../bundler/context.js";
+import { logOutput } from "../../bundler/log.js";
 import { runSystemQuery } from "./run.js";
 import { Context } from "../../bundler/context.js";
+import { convexToJson } from "../../values/value.js";
 
 export async function functionSpecForDeployment(
   ctx: Context,
@@ -26,13 +28,17 @@ export async function functionSpecForDeployment(
     args: {},
   })) as string;
 
-  const output = JSON.stringify({ url, functions }, null, 2);
+  const output = JSON.stringify(
+    { url, functions: convexToJson(functions) },
+    null,
+    2,
+  );
 
   if (options.file) {
     const fileName = `function_spec_${Date.now().valueOf()}.json`;
     ctx.fs.writeUtf8File(fileName, output);
-    logOutput(ctx, chalk.green(`Wrote function spec to ${fileName}`));
+    logOutput(chalk.green(`Wrote function spec to ${fileName}`));
   } else {
-    logOutput(ctx, output);
+    logOutput(output);
   }
 }

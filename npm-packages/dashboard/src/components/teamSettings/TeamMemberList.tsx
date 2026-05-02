@@ -1,10 +1,9 @@
-import { Team, InvitationResponse, TeamMemberResponse } from "generatedApi";
+import { TeamResponse, InvitationResponse, TeamMember } from "generatedApi";
 
 import { Sheet } from "@ui/Sheet";
 import { LoadingTransition } from "@ui/Loading";
 import { TextInput } from "@ui/TextInput";
 import { useState } from "react";
-import { useProjects } from "api/projects";
 import {
   useUpdateTeamMemberRole,
   useIsCurrentMemberTeamAdmin,
@@ -20,8 +19,8 @@ import { TeamMemberListItem } from "./TeamMemberListItem";
 import { TeamMemberListSkeleton } from "./TeamMemberListSkeleton";
 
 type TeamMemberListProps = {
-  team: Team;
-  members?: TeamMemberResponse[];
+  team: TeamResponse;
+  members?: TeamMember[];
   invites?: InvitationResponse[];
 };
 
@@ -55,7 +54,6 @@ export function TeamMemberList({
   const hasAdminPermissions = useIsCurrentMemberTeamAdmin();
 
   const { projectRoles } = useProjectRoles();
-  const projects = useProjects(team.id);
 
   const updateProjectRoles = useUpdateProjectRoles(team.id);
 
@@ -75,13 +73,12 @@ export function TeamMemberList({
           </div>
         </div>
         <LoadingTransition>
-          {profile && members && projectRoles && projects && (
+          {profile && members && projectRoles && (
             <div className="flex w-full flex-col">
               {/* Always show self at the top */}
               {me && (
                 <TeamMemberListItem
                   team={team}
-                  projects={projects}
                   member={me}
                   members={members}
                   canChangeRole={false}
@@ -108,7 +105,6 @@ export function TeamMemberList({
                   <TeamMemberListItem
                     key={`member${member.id}`}
                     team={team}
-                    projects={projects}
                     member={member}
                     members={members}
                     canChangeRole

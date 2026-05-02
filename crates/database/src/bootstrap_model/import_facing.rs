@@ -9,14 +9,13 @@ use common::{
     runtime::Runtime,
 };
 use errors::ErrorMetadata;
+use keybroker::DeploymentOp;
 use value::{
-    check_user_size,
     ConvexObject,
     ConvexValue,
     DeveloperDocumentId,
     FieldName,
     ResolvedDocumentId,
-    Size,
     TableMapping,
     TableName,
     TabletIdAndTableNumber,
@@ -69,17 +68,10 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
                 .all(|t| t.table_name() != table_name),
             "Cannot import into bootstrap system table {table_name}"
         );
-        if !(self.tx.identity.is_admin() || self.tx.identity.is_system()) {
-            anyhow::bail!(ErrorMetadata::bad_request(
-                "UnauthorizedImport",
-                "Import requires admin auth"
-            ));
-        }
+        self.tx
+            .identity
+            .require_operation(DeploymentOp::ImportBackups)?;
 
-        if !table_name.is_system() {
-            check_user_size(value.size())?;
-        }
-        self.tx.retention_validator.fail_if_falling_behind()?;
         let id_field = FieldName::from(ID_FIELD.clone());
         let internal_id = if let Some(ConvexValue::String(s)) = value.get(&id_field) {
             let id_v6 = DeveloperDocumentId::decode(s).context(ErrorMetadata::bad_request(
@@ -119,6 +111,9 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         };
 
         let document = ResolvedDocument::new(id, creation_time, value)?;
+        if !table_name.is_system() {
+            document.check_user_size()?;
+        }
         SchemaModel::new(self.tx, namespace)
             .enforce_with_table_mapping(&document, &table_mapping_for_schema.namespace(namespace))
             .await?;
@@ -151,16 +146,10 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
                 .all(|t| t.table_name() != table_name),
             "Cannot import into bootstrap system table {table_name}"
         );
-        if !(self.tx.identity.is_admin() || self.tx.identity.is_system()) {
-            anyhow::bail!(ErrorMetadata::bad_request(
-                "UnauthorizedImport",
-                "Import requires admin auth"
-            ));
-        }
+        self.tx
+            .identity
+            .require_operation(DeploymentOp::ImportBackups)?;
 
-        if !table_name.is_system() {
-            check_user_size(value.size())?;
-        }
         let id_field = FieldName::from(ID_FIELD.clone());
         let developer_id = if let Some(ConvexValue::String(s)) = value.get(&id_field) {
             let id_v6 = DeveloperDocumentId::decode(s).context(ErrorMetadata::bad_request(
@@ -197,6 +186,9 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
         };
 
         let document = ResolvedDocument::new(id, creation_time, value)?;
+        if !table_name.is_system() {
+            document.check_user_size()?;
+        }
         SchemaModel::new(self.tx, namespace)
             .enforce_with_table_mapping(&document, &table_mapping_for_schema.namespace(namespace))
             .await?;
@@ -228,12 +220,9 @@ impl<'a, RT: Runtime> ImportFacingModel<'a, RT> {
                 .all(|t| t.table_name() != table_name),
             "Cannot import into bootstrap system table {table_name}"
         );
-        if !(self.tx.identity.is_admin() || self.tx.identity.is_system()) {
-            anyhow::bail!(ErrorMetadata::bad_request(
-                "UnauthorizedImport",
-                "Import requires admin auth"
-            ));
-        }
+        self.tx
+            .identity
+            .require_operation(DeploymentOp::ImportBackups)?;
 
         let id = ResolvedDocumentId::new(table_id.tablet_id, developer_id);
         let existing_doc = self.tx.get_with_ts(id).await?;

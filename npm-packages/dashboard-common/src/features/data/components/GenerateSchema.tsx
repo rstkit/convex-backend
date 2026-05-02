@@ -1,7 +1,6 @@
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import React, { useMemo } from "react";
 import { Shape } from "shapes";
-import { ExternalLinkIcon } from "@radix-ui/react-icons";
 import { ConvexSchemaFilePath } from "@common/features/data/components/ConvexSchemaFilePath";
 import { HighlightLines, ReadonlyCode } from "@common/elements/ReadonlyCode";
 import { displaySchemaFromShapes } from "@common/lib/format";
@@ -40,12 +39,11 @@ export function GenerateSchema({
   const widthString = displayedSchema ? "max-w-full" : "w-[32rem]";
   const learnMoreLink = (
     <Link
-      className="inline-flex items-center text-content-link"
       href="https://docs.convex.dev/database/schemas"
       target="_blank"
+      externalIcon
     >
       Schema docs
-      <ExternalLinkIcon className="ml-2" />
     </Link>
   );
   return (
@@ -86,7 +84,7 @@ export function GenerateSchema({
       </div>
       {displayedSchema && (
         <div
-          className="relative block whitespace-pre-wrap break-words rounded border p-4 text-sm"
+          className="relative block rounded-sm border p-4 text-sm break-words whitespace-pre-wrap"
           aria-hidden="true"
         >
           <ReadonlyCode
@@ -99,7 +97,7 @@ export function GenerateSchema({
             disableLineNumbers
             height={{ type: "content", maxHeightRem: 52 }}
           />
-          <div className="absolute right-0 top-0 h-10">
+          <div className="absolute top-0 right-0 h-10">
             <CopyButton text={displayedSchema} />
           </div>
         </div>

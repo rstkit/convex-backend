@@ -12,7 +12,7 @@ import { defaultValueForValidator } from "@common/lib/defaultValueForValidator";
 
 export const useDefaultDocument = (tableName: string): GenericDocument => {
   const { tables } = useTableShapes();
-  const shape = tables?.get(tableName)!;
+  const shape = tables?.get(tableName);
   validateDocumentShape(shape);
 
   const schemas = useQuery(udfs.getSchemas.default, {
@@ -66,16 +66,14 @@ const validateDocumentShape = (shape: Shape | undefined) => {
     case "Float64":
     case "Int64":
     case "Id":
-    case "Map":
     case "Null":
-    case "Set":
     case "String":
     case "Union":
       // Note that Union is not a valid top level shape since our algorithm
       // merges all objects into one, or uses a supertype like Record or Unknown
       throw new Error(`Table has invalid top level shape: ${shape.type}`);
     default: {
-      const _typeCheck: never = shape;
+      shape satisfies never;
       throw new Error(`Table with unexpected type: ${(shape as any).type}`);
     }
   }

@@ -14,8 +14,17 @@ import { useRouter } from "next/router";
 import { cn } from "@ui/cn";
 import { LoadingLogo } from "@ui/Loading";
 import { ProjectEnvVarConfig } from "@common/features/settings/lib/types";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
 
 export const PROVISION_PROD_PAGE_NAME = "production";
+export const PROVISION_DEV_PAGE_NAME = "development";
+
+type FallbackRender = (errorData: {
+  error: Error;
+  componentStack: string;
+  eventId: string;
+  resetError(): void;
+}) => React.ReactElement;
 
 export type DeploymentInfo = (
   | {
@@ -31,7 +40,10 @@ export type DeploymentInfo = (
       [key: string]: any;
     };
   }) => void;
-  captureMessage: (msg: string) => void;
+  captureMessage: (
+    msg: string,
+    severity: "fatal" | "error" | "warning" | "log" | "debug" | "info",
+  ) => void;
   captureException: (e: any) => void;
   reportHttpError: (
     method: string,
@@ -50,7 +62,7 @@ export type DeploymentInfo = (
   ): { id: number; name?: string | null; email?: string }[] | undefined;
   useTeamEntitlements(teamId?: number):
     | {
-        auditLogsEnabled?: boolean;
+        auditLogRetentionDays?: number;
         logStreamingEnabled?: boolean;
         streamingExportEnabled?: boolean;
       }
@@ -64,41 +76,242 @@ export type DeploymentInfo = (
         slug: string;
       }
     | undefined;
-  useCurrentDeployment():
-    | {
-        id: number;
-        name: string;
-        projectId: number;
-        deploymentType: "prod" | "dev" | "preview";
-        kind: "local" | "cloud";
-        previewIdentifier?: string | null;
-      }
-    | undefined;
+  useCurrentDeployment(): PlatformDeploymentResponse | undefined;
+  /**
+   * Whether the current deployment should be treated as a "protected deployment"
+   * in the dashboard UI.
+   *
+   * A protected deployment enables safeguards against accidental edits (for
+   * example: extra confirmation dialogs, "unlock" flows before running mutations,
+   * and other protections for destructive actions).
+   *
+   * In the Convex Cloud dashboard this is currently true for production
+   * deployments. In the self-hosted dashboard this always returns false.
+   */
+  useIsProtectedDeployment(): boolean;
   useProjectEnvironmentVariables(
     projectId?: number,
     refreshInterval?: number,
   ): { configs: ProjectEnvVarConfig[] } | undefined;
   useHasProjectAdminPermissions(projectId: number | undefined): boolean;
+  /**
+   * Check whether the current admin key is allowed to perform a specific
+   * deployment operation (e.g. "ViewData", "WriteData").
+   *
+   * Returns `true` when all operations are allowed (full admin key) or when
+   * the operation is in the key's allowed list.
+   */
+  useIsOperationAllowed(operation: string): boolean;
   useIsDeploymentPaused(): boolean | undefined;
   useLogDeploymentEvent(): (msg: string, props?: object | null) => void;
+  workOSOperations: {
+    useDeploymentWorkOSEnvironment(deploymentName?: string):
+      | {
+          teamId: number;
+          environment?:
+            | {
+                deploymentName: string;
+                workosEnvironmentId: string;
+                workosEnvironmentName: string;
+                workosClientId: string;
+                workosTeamId: string;
+                isProduction: boolean;
+              }
+            | undefined
+            | null;
+          workosTeam?:
+            | {
+                convexTeamId: number;
+                workosTeamId: string;
+                workosTeamName: string;
+                workosAdminEmail: string;
+                creatorMemberId: number;
+              }
+            | undefined
+            | null;
+        }
+      | undefined;
+    useTeamWorkOSIntegration(teamId?: string):
+      | {
+          teamAssociation?:
+            | {
+                workosTeamId: string;
+                workosTeamName: string;
+                adminEmail: string;
+                creatorName?: string | null;
+                creatorEmail: string;
+              }
+            | undefined
+            | null;
+          environments: Array<{
+            deploymentName: string;
+            workosEnvironmentId: string;
+            workosEnvironmentName: string;
+            workosClientId: string;
+          }>;
+        }
+      | undefined;
+    useWorkOSTeamHealth(teamId?: string):
+      | {
+          data?:
+            | {
+                teamProvisioned: boolean;
+                teamInfo?:
+                  | {
+                      id: string;
+                      name: string;
+                      productionState:
+                        | "active"
+                        | "inactive"
+                        | "suspended"
+                        | "deleting";
+                    }
+                  | null
+                  | undefined;
+              }
+            | undefined;
+          error?: any;
+        }
+      | undefined;
+    useWorkOSEnvironmentHealth(deploymentName?: string): {
+      data?:
+        | {
+            id: string;
+            name: string;
+            clientId: string;
+          }
+        | undefined;
+      error?: any;
+    };
+    useDisconnectWorkOSTeam(teamId?: string): (body: {
+      teamId: number;
+    }) => Promise<
+      | {
+          workosTeamId: string;
+          workosTeamName: string;
+        }
+      | undefined
+    >;
+    useInviteWorkOSTeamMember(): (body: {
+      teamId: number;
+      email: string;
+    }) => Promise<
+      | {
+          email: string;
+          roleSlug: string;
+        }
+      | undefined
+    >;
+    useWorkOSInvitationEligibleEmails(teamId?: string):
+      | {
+          eligibleEmails: string[];
+          adminEmail?: string | null;
+        }
+      | undefined;
+    useAvailableWorkOSTeamEmails():
+      | {
+          availableEmails: string[];
+          usedEmails: string[];
+        }
+      | undefined;
+    useProvisionWorkOSTeam(teamId?: string): (body: {
+      teamId: number;
+      email: string;
+    }) => Promise<
+      | {
+          workosTeamId: string;
+          workosTeamName: string;
+          adminEmail: string;
+        }
+      | undefined
+    >;
+    useProvisionWorkOSEnvironment(
+      deploymentName?: string,
+    ): (body: {
+      deploymentName: string;
+      isProduction: boolean;
+    }) => Promise<any>;
+    useDeleteWorkOSEnvironment(
+      deploymentName?: string,
+    ): (body: { deploymentName: string }) => Promise<any>;
+    useProjectWorkOSEnvironments(projectId?: number):
+      | Array<{
+          workosEnvironmentId: string;
+          workosEnvironmentName: string;
+          workosClientId: string;
+          userEnvironmentName: string;
+          isProduction: boolean;
+        }>
+      | undefined;
+    useGetProjectWorkOSEnvironment(
+      projectId?: number,
+      clientId?: string,
+    ):
+      | {
+          workosEnvironmentId: string;
+          workosEnvironmentName: string;
+          workosClientId: string;
+          workosApiKey: string;
+          userEnvironmentName: string;
+          isProduction: boolean;
+        }
+      | undefined;
+    useCheckProjectEnvironmentHealth(
+      projectId?: number,
+      clientId?: string,
+    ): () => Promise<{ id: string; name: string; clientId: string } | null>;
+    useProvisionProjectWorkOSEnvironment(projectId?: number): (body: {
+      environmentName: string;
+    }) => Promise<{
+      workosEnvironmentId: string;
+      workosEnvironmentName: string;
+      workosClientId: string;
+      workosApiKey: string;
+      newlyProvisioned: boolean;
+      userEnvironmentName: string;
+    }>;
+    useDeleteProjectWorkOSEnvironment(projectId?: number): (
+      clientId: string,
+    ) => Promise<{
+      workosEnvironmentId: string;
+      workosEnvironmentName: string;
+      workosTeamId: string;
+    }>;
+  };
   CloudImport(props: { sourceCloudBackupId: number }): JSX.Element;
   TeamMemberLink(props: {
     memberId?: number | null;
     name: string;
   }): JSX.Element;
-  ErrorBoundary(props: { children: ReactNode }): JSX.Element;
+  Link(props: {
+    href: string;
+    className?: string;
+    target?: string;
+    rel?: string;
+    children?: ReactNode;
+  }): ReactNode;
+  ErrorBoundary(props: {
+    children: ReactNode;
+    fallback?: FallbackRender;
+  }): JSX.Element;
+  DisconnectOverlay(props: {
+    deployment: ConnectedDeployment;
+    deploymentName: string;
+  }): JSX.Element;
   teamsURI: string;
   projectsURI: string;
   deploymentsURI: string;
   isSelfHosted: boolean;
-  enableIndexFilters: boolean;
+  workosIntegrationEnabled: boolean;
+  connectionStateCheckIntervalMs: number;
+  showScheduledJobArgsInComponents: boolean;
 };
 
 export const DeploymentInfoContext = createContext<DeploymentInfo>(
   undefined as unknown as DeploymentInfo,
 );
 
-type ConnectedDeployment = {
+export type ConnectedDeployment = {
   client: ConvexReactClient;
   httpClient: ConvexHttpClient;
   deploymentUrl: string;
@@ -169,9 +382,12 @@ const useConnectedDeployment = (
     if (
       deploymentName === undefined ||
       // TODO(ari): Refactor out of dashboard-common. This is only used in the cloud dashboard.
-      deploymentName === PROVISION_PROD_PAGE_NAME
+      deploymentName === PROVISION_PROD_PAGE_NAME ||
+      deploymentName === PROVISION_DEV_PAGE_NAME
     )
       return;
+
+    setState(undefined);
 
     let canceled = false;
     let client: ConvexReactClient;
@@ -292,6 +508,7 @@ export function DeploymentApiProvider({
   } else if (connected && !connected?.ok) {
     deploymentInfoContext?.captureMessage(
       `Can't connect to deployment ${connected?.errorCode} ${connected?.errorMessage}`,
+      "warning",
     );
   }
 
@@ -346,8 +563,6 @@ export function WaitForDeploymentApi({
   );
 }
 
-const CONNECTION_STATE_CHECK_INTERVAL_MS = 2500;
-
 function DeploymentWithConnectionState({
   deployment,
   children,
@@ -355,9 +570,12 @@ function DeploymentWithConnectionState({
   deployment: ConnectedDeployment;
   children: ReactNode;
 }) {
-  const { isSelfHosted, captureMessage, addBreadcrumb } = useContext(
-    DeploymentInfoContext,
-  );
+  const {
+    captureMessage,
+    addBreadcrumb,
+    DisconnectOverlay,
+    connectionStateCheckIntervalMs,
+  } = useContext(DeploymentInfoContext);
   const { client, deploymentUrl, deploymentName } = deployment;
   const [lastObservedConnectionState, setLastObservedConnectionState] =
     useState<
@@ -385,7 +603,7 @@ function DeploymentWithConnectionState({
       }
       if (
         previousState.time.getTime() <
-        Date.now() - CONNECTION_STATE_CHECK_INTERVAL_MS * 2
+        Date.now() - connectionStateCheckIntervalMs * 2
       ) {
         // If the previous state was observed a while ago, consider it stale (maybe the tab
         // got backgrounded).
@@ -408,7 +626,7 @@ function DeploymentWithConnectionState({
             instanceNameResp = await fetch(
               new URL("/instance_name", deploymentUrl),
             );
-          } catch (e) {
+          } catch {
             // do nothing, we'll check the WS connection status below
           }
           if (instanceNameResp !== null && instanceNameResp.ok) {
@@ -422,11 +640,11 @@ function DeploymentWithConnectionState({
       }
       return "Unknown";
     },
-    [deploymentName, deploymentUrl],
+    [deploymentName, deploymentUrl, connectionStateCheckIntervalMs],
   );
 
   useEffect(() => {
-    // Poll `.connectionState()` every 5 seconds. If we're disconnected twice in a row,
+    // Poll `.connectionState()`. If we're disconnected twice in a row,
     // consider the deployment to be disconnected.
     const checkConnection = setInterval(async () => {
       if (lastObservedConnectionState === "LocalDeploymentMismatch") {
@@ -459,7 +677,7 @@ function DeploymentWithConnectionState({
                 },
               });
               // Log to sentry including the instance name when we seem to be unable to connect to a cloud deployment
-              captureMessage(`Cloud deployment is disconnected`);
+              captureMessage(`Cloud deployment is disconnected`, "warning");
             }
           }
           setIsDisconnected(true);
@@ -478,17 +696,17 @@ function DeploymentWithConnectionState({
                 message: `Cloud deployment reconnected: ${deploymentName}`,
               });
               // Log to sentry including the instance name when we seem to be unable to connect to a cloud deployment
-              captureMessage(`Cloud deployment has reconnected`);
+              captureMessage(`Cloud deployment has reconnected`, "warning");
             }
           }
           setIsDisconnected(false);
           break;
         default: {
-          const _exhaustiveCheck: never = result;
+          result satisfies never;
           throw new Error(`Unknown connection state: ${result}`);
         }
       }
-    }, CONNECTION_STATE_CHECK_INTERVAL_MS);
+    }, connectionStateCheckIntervalMs);
     return () => clearInterval(checkConnection);
   }, [
     lastObservedConnectionState,
@@ -499,6 +717,7 @@ function DeploymentWithConnectionState({
     captureMessage,
     handleConnectionStateChange,
     isDisconnected,
+    connectionStateCheckIntervalMs,
   ]);
   const value = useMemo(
     () => ({
@@ -509,65 +728,15 @@ function DeploymentWithConnectionState({
   );
   return (
     <>
-      {isDisconnected &&
-        (deploymentName.startsWith("local-") ? (
-          <LocalDeploymentDisconnectOverlay />
-        ) : isSelfHosted ? (
-          <SelfHostedDisconnectOverlay deploymentUrl={deploymentUrl} />
-        ) : null)}
+      {isDisconnected && (
+        <DisconnectOverlay
+          deployment={deployment}
+          deploymentName={deploymentName}
+        />
+      )}
       <ConnectedDeploymentContext.Provider value={value}>
         {children}
       </ConnectedDeploymentContext.Provider>
     </>
-  );
-}
-
-function LocalDeploymentDisconnectOverlay() {
-  return (
-    <div
-      className="absolute z-50 mt-[3.5rem] flex h-[calc(100vh-3.5rem)] w-full items-center justify-center"
-      style={{
-        backdropFilter: "blur(0.5rem)",
-      }}
-    >
-      <div className="max-w-prose">
-        <h3 className="mb-4">This local deployment is not online.</h3>
-        <p className="mb-2">
-          Check that <code className="text-sm">npx convex dev</code> is running
-          successfully.
-        </p>
-        <p>
-          If you have multiple devices you use with this Convex project, the
-          local deployment may be running on a different device, and can only be
-          accessed on that machine.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-function SelfHostedDisconnectOverlay({
-  deploymentUrl,
-}: {
-  deploymentUrl: string;
-}) {
-  return (
-    <div
-      className="absolute z-50  mt-[3.5rem] flex h-[calc(100vh-3.5rem)] w-full items-center justify-center"
-      style={{
-        backdropFilter: "blur(0.5rem)",
-      }}
-    >
-      <div className="max-w-prose">
-        <h3 className="mb-4">This deployment is not online.</h3>
-        <p className="mb-2">
-          Check that your Convex server is running and accessible at{" "}
-          <code className="text-sm">{deploymentUrl}</code>.
-        </p>
-        <p>
-          If you continue to have issues, try restarting your Convex server.
-        </p>
-      </div>
-    </div>
   );
 }

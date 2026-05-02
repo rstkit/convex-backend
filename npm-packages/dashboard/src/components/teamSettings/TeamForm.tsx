@@ -4,13 +4,19 @@ import { Tooltip } from "@ui/Tooltip";
 import { Sheet } from "@ui/Sheet";
 import { TextInput } from "@ui/TextInput";
 import { useFormik } from "formik";
-import { Team } from "generatedApi";
+import { RegionName, TeamResponse } from "generatedApi";
 import * as Yup from "yup";
 import { useCopy } from "@common/lib/useCopy";
+import { useDeploymentRegions } from "api/deployments";
+import { DefaultRegionSelector } from "./DefaultRegionSelector";
 
 export type TeamFormProps = {
-  team: Team;
-  onUpdateTeam: (body: { name: string; slug: string }) => void;
+  team: TeamResponse;
+  onUpdateTeam: (body: {
+    name: string;
+    slug: string;
+    defaultRegion: RegionName | null;
+  }) => Promise<void>;
   hasAdminPermissions: boolean;
 };
 
@@ -27,16 +33,19 @@ const TeamSchema = Yup.object().shape({
       "Team slug may contain numbers, letters, underscores, and '-'.",
     )
     .required(),
+  defaultRegion: Yup.string().nullable(),
 });
 export function TeamForm({
   team,
   onUpdateTeam,
   hasAdminPermissions,
 }: TeamFormProps) {
+  const { regions } = useDeploymentRegions(team.id);
   const formState = useFormik({
     initialValues: {
       name: team.name,
       slug: team.slug,
+      defaultRegion: team.defaultRegion ?? null,
     },
     enableReinitialize: true,
     validationSchema: TeamSchema,
@@ -54,7 +63,7 @@ export function TeamForm({
     <Sheet className="text-sm">
       <h3 className="mb-4">Edit Team</h3>
       <form onSubmit={formState.handleSubmit} aria-label="Edit team settings">
-        <div className="mb-6 flex max-w-xs flex-col gap-4">
+        <div className="mb-6 flex flex-col gap-4">
           <Tooltip
             tip={
               !hasAdminPermissions
@@ -70,7 +79,7 @@ export function TeamForm({
               value={formState.values.name}
               id="name"
               error={formState.errors.name}
-              disabled={!hasAdminPermissions}
+              disabled={!hasAdminPermissions || team.managedBy === "vercel"}
             />
           </Tooltip>
           <Tooltip
@@ -86,13 +95,24 @@ export function TeamForm({
               placeholder="Enter a slug for your team"
               onChange={formState.handleChange}
               value={formState.values.slug}
-              Icon={CopyIcon}
+              // We hide the button when the tooltip is visible to avoid nesting buttons
+              Icon={hasAdminPermissions ? CopyIcon : undefined}
               action={() => copyToClipboard(formState.values.slug)}
               id="slug"
               error={formState.errors.slug}
               disabled={!hasAdminPermissions}
             />
           </Tooltip>
+
+          <DefaultRegionSelector
+            value={formState.values.defaultRegion}
+            onChange={(region) =>
+              formState.setFieldValue("defaultRegion", region)
+            }
+            regions={regions}
+            teamSlug={team.slug}
+            disabledDueToPermissions={!hasAdminPermissions}
+          />
         </div>
 
         <Button

@@ -5,18 +5,23 @@ use std::{
 };
 
 use common::types::{
+    DeploymentClass,
     DeploymentId,
     DeploymentType,
     ProjectId,
     TeamId,
 };
-use keybroker::AdminIdentityPrincipal;
+use keybroker::{
+    AdminIdentityPrincipal,
+    DeploymentOp,
+};
 use serde::{
     Deserialize,
     Serialize,
 };
 use utoipa::ToSchema;
 
+use crate::types::AccessToken;
 pub use crate::types::{
     CloudBackupId,
     PartitionId,
@@ -70,7 +75,7 @@ impl DeploymentAuthArgs {
 #[serde(deny_unknown_fields)]
 pub struct DeploymentAuthProdArgs {
     pub deployment_name: String,
-    pub partition_id: Option<PartitionId>,
+    pub deployment_class: Option<DeploymentClass>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -86,7 +91,7 @@ pub struct DeploymentAuthArgsSimple {
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentAuthResponse {
     pub deployment_name: String,
-    pub admin_key: String,
+    pub admin_key: AccessToken,
     pub url: String,
     pub deployment_type: DeploymentType,
 }
@@ -101,12 +106,14 @@ pub struct AccessTokenDeploymentAuthArgs {
     pub action: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AccessTokenDeploymentAuthResponse {
     pub is_authorized: bool,
     pub authorized_entity: Option<AdminIdentityPrincipal>,
     pub is_read_only: Option<bool>,
+    #[serde(default)]
+    pub allowed_ops: Option<Vec<DeploymentOp>>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]

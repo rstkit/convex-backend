@@ -11,6 +11,7 @@ use errors::{
     ErrorMetadataAnyhowExt,
 };
 use itertools::Itertools;
+use json_trait::JsonForm;
 use serde::{
     Deserialize,
     Serialize,
@@ -45,11 +46,10 @@ use crate::{
         },
         vector_index::VectorDimensions,
     },
-    json::JsonSerializable,
     schemas::{
         invalid_top_level_type_in_schema,
-        SearchIndexSchema,
         TableDefinition,
+        TextIndexSchema,
         MAX_INDEXES_PER_TABLE,
     },
     types::{
@@ -65,7 +65,7 @@ pub struct DatabaseSchemaJson {
     schema_validation: Option<bool>,
 }
 
-impl JsonSerializable for DatabaseSchema {
+impl JsonForm for DatabaseSchema {
     type Json = DatabaseSchemaJson;
 }
 
@@ -116,12 +116,15 @@ impl TryFrom<DatabaseSchema> for DatabaseSchemaJson {
 pub struct TableDefinitionJson {
     table_name: String,
     indexes: Vec<IndexSchemaJson>,
-    search_indexes: Option<Vec<SearchIndexSchemaJson>>,
+    staged_db_indexes: Option<Vec<IndexSchemaJson>>,
+    search_indexes: Option<Vec<TextIndexSchemaJson>>,
+    staged_search_indexes: Option<Vec<TextIndexSchemaJson>>,
     vector_indexes: Option<Vec<VectorIndexSchemaJson>>,
+    staged_vector_indexes: Option<Vec<VectorIndexSchemaJson>>,
     document_type: Option<ValidatorJson>,
 }
 
-impl JsonSerializable for TableDefinition {
+impl JsonForm for TableDefinition {
     type Json = TableDefinitionJson;
 }
 
@@ -142,13 +145,12 @@ fn parse_names_and_indexes<T: TryFrom<U, Error = anyhow::Error>, U>(
     .map_err(|e: anyhow::Error| e.wrap_error_message(|s| format!("In table \"{table_name}\": {s}")))
 }
 
-fn validate_unique_index_fields<T, Y: Clone + Eq + std::hash::Hash>(
-    indexes: &BTreeMap<IndexDescriptor, T>,
+fn validate_unique_index_fields<'a, T: 'a, Y: Clone + Eq + std::hash::Hash>(
+    indexes: impl Iterator<Item = (&'a IndexDescriptor, &'a T)>,
     unique_index_field: impl Fn(&T) -> Y,
     non_unique_error: impl Fn(&IndexDescriptor, &IndexDescriptor) -> ErrorMetadata,
 ) -> anyhow::Result<()> {
     let index_fields: BTreeMap<_, _> = indexes
-        .iter()
         .map(|(name, fields)| (name, unique_index_field(fields)))
         .collect();
 
@@ -165,8 +167,11 @@ impl TryFrom<TableDefinitionJson> for TableDefinition {
     type Error = anyhow::Error;
 
     fn try_from(j: TableDefinitionJson) -> Result<Self, Self::Error> {
-        let search_indexes = j.search_indexes.unwrap_or_default();
+        let staged_db_indexes = j.staged_db_indexes.unwrap_or_default();
+        let text_indexes = j.search_indexes.unwrap_or_default();
+        let staged_text_indexes = j.staged_search_indexes.unwrap_or_default();
         let vector_indexes = j.vector_indexes.unwrap_or_default();
+        let staged_vector_indexes = j.staged_vector_indexes.unwrap_or_default();
 
         let document_type = j.document_type.map(|t| t.try_into()).transpose()?;
 
@@ -179,7 +184,14 @@ impl TryFrom<TableDefinitionJson> for TableDefinition {
             index_validation_error::table_name_reserved(&table_name)
         );
 
-        if j.indexes.len() + vector_indexes.len() + search_indexes.len() > MAX_INDEXES_PER_TABLE {
+        if j.indexes.len()
+            + vector_indexes.len()
+            + text_indexes.len()
+            + staged_db_indexes.len()
+            + staged_text_indexes.len()
+            + staged_vector_indexes.len()
+            > MAX_INDEXES_PER_TABLE
+        {
             anyhow::bail!(index_validation_error::too_many_indexes(
                 &table_name,
                 MAX_INDEXES_PER_TABLE
@@ -192,22 +204,43 @@ impl TryFrom<TableDefinitionJson> for TableDefinition {
             })?;
         for schema in indexes.values() {
             if schema.fields.is_empty() {
-                anyhow::bail!(index_validation_error::empty_index(&table_name, schema));
+                anyhow::bail!(index_validation_error::empty_index(
+                    &table_name,
+                    schema,
+                    false
+                ));
+            }
+        }
+        let (staged_db_index_names, staged_db_indexes) =
+            parse_names_and_indexes(&table_name, staged_db_indexes, |idx: &IndexSchema| {
+                &idx.index_descriptor
+            })?;
+        for schema in staged_db_indexes.values() {
+            if schema.fields.is_empty() {
+                anyhow::bail!(index_validation_error::empty_index(
+                    &table_name,
+                    schema,
+                    true
+                ));
             }
         }
         validate_unique_index_fields(
-            &indexes,
-            |idx| Vec::<FieldPath>::from(idx.fields.clone()),
+            indexes.iter().chain(staged_db_indexes.iter()),
+            |idx: &IndexSchema| Vec::<FieldPath>::from(idx.fields.clone()),
             |index1, index2| index_not_unique(&table_name, index1, index2),
         )?;
 
-        let (search_index_names, search_indexes) =
-            parse_names_and_indexes(&table_name, search_indexes, |idx: &SearchIndexSchema| {
+        let (text_index_names, text_indexes) =
+            parse_names_and_indexes(&table_name, text_indexes, |idx: &TextIndexSchema| {
+                &idx.index_descriptor
+            })?;
+        let (staged_text_index_names, staged_text_indexes) =
+            parse_names_and_indexes(&table_name, staged_text_indexes, |idx: &TextIndexSchema| {
                 &idx.index_descriptor
             })?;
         validate_unique_index_fields(
-            &search_indexes,
-            |idx| idx.search_field.clone(),
+            text_indexes.iter().chain(staged_text_indexes.iter()),
+            |idx: &TextIndexSchema| (idx.search_field.clone(), idx.filter_fields.clone()),
             |index1, index2| search_field_not_unique(&table_name, index1, index2),
         )?;
 
@@ -215,15 +248,24 @@ impl TryFrom<TableDefinitionJson> for TableDefinition {
             parse_names_and_indexes(&table_name, vector_indexes, |idx: &VectorIndexSchema| {
                 &idx.index_descriptor
             })?;
+        let (staged_vector_index_names, staged_vector_indexes): (Vec<_>, BTreeMap<_, _>) =
+            parse_names_and_indexes(
+                &table_name,
+                staged_vector_indexes,
+                |idx: &VectorIndexSchema| &idx.index_descriptor,
+            )?;
         validate_unique_index_fields(
-            &vector_indexes,
-            |idx| (idx.vector_field.clone(), idx.dimension),
+            vector_indexes.iter().chain(staged_vector_indexes.iter()),
+            |idx: &VectorIndexSchema| (idx.vector_field.clone(), idx.dimension),
             |index1, index2| vector_field_not_unique(&table_name, index1, index2),
         )?;
 
         let all_index_names: Vec<_> = index_names
             .into_iter()
-            .chain(search_index_names)
+            .chain(staged_db_index_names)
+            .chain(text_index_names)
+            .chain(staged_text_index_names)
+            .chain(staged_vector_index_names)
             .chain(vector_index_names)
             .collect();
 
@@ -248,8 +290,11 @@ impl TryFrom<TableDefinitionJson> for TableDefinition {
         Ok(Self {
             table_name,
             indexes,
-            search_indexes,
+            staged_db_indexes,
+            text_indexes,
+            staged_text_indexes,
             vector_indexes,
+            staged_vector_indexes,
             document_type,
         })
     }
@@ -262,8 +307,11 @@ impl TryFrom<TableDefinition> for TableDefinitionJson {
         TableDefinition {
             table_name,
             indexes,
-            search_indexes,
+            staged_db_indexes,
+            text_indexes: search_indexes,
+            staged_text_indexes: staged_search_indexes,
             vector_indexes,
+            staged_vector_indexes,
             document_type,
         }: TableDefinition,
     ) -> anyhow::Result<Self> {
@@ -272,10 +320,22 @@ impl TryFrom<TableDefinition> for TableDefinitionJson {
             .into_values()
             .map(IndexSchemaJson::try_from)
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let staged_db_indexes = Some(
+            staged_db_indexes
+                .into_values()
+                .map(IndexSchemaJson::try_from)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        );
         let search_indexes = Some(
             search_indexes
                 .into_values()
-                .map(SearchIndexSchemaJson::try_from)
+                .map(TextIndexSchemaJson::try_from)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        );
+        let staged_search_indexes = Some(
+            staged_search_indexes
+                .into_values()
+                .map(TextIndexSchemaJson::try_from)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         );
         let document_type = document_type.map(ValidatorJson::try_from).transpose()?;
@@ -285,11 +345,20 @@ impl TryFrom<TableDefinition> for TableDefinitionJson {
                 .map(VectorIndexSchemaJson::try_from)
                 .collect::<anyhow::Result<Vec<_>>>()?,
         );
+        let staged_vector_indexes = Some(
+            staged_vector_indexes
+                .into_values()
+                .map(VectorIndexSchemaJson::try_from)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        );
         Ok(TableDefinitionJson {
             table_name,
             indexes,
+            staged_db_indexes,
             search_indexes,
+            staged_search_indexes,
             vector_indexes,
+            staged_vector_indexes,
             document_type,
         })
     }
@@ -302,7 +371,7 @@ pub struct IndexSchemaJson {
     fields: Vec<String>,
 }
 
-impl JsonSerializable for IndexSchema {
+impl JsonForm for IndexSchema {
     type Json = IndexSchemaJson;
 }
 
@@ -360,7 +429,7 @@ pub struct VectorIndexSchemaJson {
     filter_fields: Vec<String>,
 }
 
-impl JsonSerializable for VectorIndexSchema {
+impl JsonForm for VectorIndexSchema {
     type Json = VectorIndexSchemaJson;
 }
 
@@ -420,20 +489,20 @@ impl TryFrom<VectorIndexSchema> for VectorIndexSchemaJson {
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchIndexSchemaJson {
+pub struct TextIndexSchemaJson {
     index_descriptor: String,
     search_field: String,
     filter_fields: BTreeSet<String>,
 }
 
-impl JsonSerializable for SearchIndexSchema {
-    type Json = SearchIndexSchemaJson;
+impl JsonForm for TextIndexSchema {
+    type Json = TextIndexSchemaJson;
 }
 
-impl TryFrom<SearchIndexSchemaJson> for SearchIndexSchema {
+impl TryFrom<TextIndexSchemaJson> for TextIndexSchema {
     type Error = anyhow::Error;
 
-    fn try_from(j: SearchIndexSchemaJson) -> Result<Self, Self::Error> {
+    fn try_from(j: TextIndexSchemaJson) -> Result<Self, Self::Error> {
         let index_descriptor = IndexDescriptor::new(j.index_descriptor)?;
         let search_field = j.search_field.parse().with_context(|| {
             index_validation_error::invalid_index_field(&index_descriptor, &j.search_field)
@@ -452,18 +521,18 @@ impl TryFrom<SearchIndexSchemaJson> for SearchIndexSchema {
     }
 }
 
-impl TryFrom<SearchIndexSchema> for SearchIndexSchemaJson {
+impl TryFrom<TextIndexSchema> for TextIndexSchemaJson {
     type Error = anyhow::Error;
 
     fn try_from(
-        SearchIndexSchema {
+        TextIndexSchema {
             index_descriptor,
             search_field,
             filter_fields,
             ..
-        }: SearchIndexSchema,
+        }: TextIndexSchema,
     ) -> anyhow::Result<Self> {
-        Ok(SearchIndexSchemaJson {
+        Ok(TextIndexSchemaJson {
             index_descriptor: index_descriptor.to_string(),
             search_field: String::from(search_field),
             filter_fields: filter_fields
@@ -536,7 +605,7 @@ pub struct FieldTypeJson {
     optional: bool,
 }
 
-impl JsonSerializable for FieldValidator {
+impl JsonForm for FieldValidator {
     type Json = FieldTypeJson;
 }
 
@@ -572,6 +641,8 @@ pub enum ValidatorJson {
     Boolean,
     String,
     Bytes,
+    #[serde(alias = "map")]
+    #[serde(alias = "set")]
     Any,
     Literal {
         value: JsonValue,
@@ -582,13 +653,6 @@ pub enum ValidatorJson {
     },
     Array {
         value: Box<ValidatorJson>,
-    },
-    Set {
-        value: Box<ValidatorJson>,
-    },
-    Map {
-        keys: Box<ValidatorJson>,
-        values: Box<ValidatorJson>,
     },
     Record {
         keys: Box<ValidatorJson>,
@@ -602,7 +666,7 @@ pub enum ValidatorJson {
     },
 }
 
-impl JsonSerializable for Validator {
+impl JsonForm for Validator {
     type Json = ValidatorJson;
 }
 
@@ -621,11 +685,6 @@ impl TryFrom<ValidatorJson> for Validator {
             ValidatorJson::Literal { value } => Ok(Validator::Literal(value.try_into()?)),
             ValidatorJson::Id { table_name } => Ok(Validator::Id(table_name.parse()?)),
             ValidatorJson::Array { value } => Ok(Validator::Array(Box::new((*value).try_into()?))),
-            ValidatorJson::Set { value } => Ok(Validator::Set(Box::new((*value).try_into()?))),
-            ValidatorJson::Map { keys, values } => Ok(Validator::Map(
-                Box::new((*keys).try_into()?),
-                Box::new((*values).try_into()?),
-            )),
             ValidatorJson::Record { keys, values } => {
                 let error_short_code = "InvalidRecordType";
                 let keys_validator = Validator::try_from(*keys)?;
@@ -689,13 +748,6 @@ impl TryFrom<Validator> for ValidatorJson {
             Validator::Array(t) => ValidatorJson::Array {
                 value: Box::new(ValidatorJson::try_from(*t)?),
             },
-            Validator::Set(t) => ValidatorJson::Set {
-                value: Box::new(ValidatorJson::try_from(*t)?),
-            },
-            Validator::Map(k, v) => ValidatorJson::Map {
-                keys: Box::new(ValidatorJson::try_from(*k)?),
-                values: Box::new(ValidatorJson::try_from(*v)?),
-            },
             Validator::Record(k, v) => ValidatorJson::Record {
                 keys: Box::new(ValidatorJson::try_from(*k)?),
                 values: Box::new(FieldTypeJson::try_from(FieldValidator {
@@ -733,8 +785,10 @@ impl TryFrom<LiteralValidator> for JsonValue {
         let v = match s {
             LiteralValidator::Float64(f) => {
                 let f: f64 = f.into();
-                let n = serde_json::Number::from_f64(f)
-                    .ok_or_else(|| anyhow::anyhow!("Number failed to serialize from f64: {f}"))?;
+                let n = serde_json::Number::from_f64(f).context(ErrorMetadata::bad_request(
+                    "UnsupportedFloatLiteral",
+                    "Infinite or NaN values are not supported in literal validators.",
+                ))?;
                 JsonValue::Number(n)
             },
             LiteralValidator::Int64(i) => JsonValue::from(ConvexValue::Int64(i)),

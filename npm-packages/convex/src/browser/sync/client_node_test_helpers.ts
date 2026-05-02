@@ -1,5 +1,5 @@
 import { Base64 } from "../../values/index.js";
-import { Long } from "../long.js";
+import { Long } from "../../vendor/long.js";
 
 // --experimental-vm-modules which we use for jest doesn't support named exports
 import WebSocket, { WebSocketServer } from "ws";
@@ -7,13 +7,20 @@ import WebSocket, { WebSocketServer } from "ws";
 // Let's pretend this ws WebSocket is a browser WebSocket (it's very close)
 export const nodeWebSocket = WebSocket as unknown as typeof window.WebSocket;
 
-import { ClientMessage, ServerMessage } from "./protocol.js";
+import { ClientMessage, WireServerMessage } from "./protocol.js";
+import {
+  PaginatedQueryToken,
+  QueryToken,
+  serializedQueryTokenIsPaginated,
+} from "./udf_path_utils.js";
+import { BaseConvexClient } from "./client.js";
+import { PaginatedQueryClient } from "./paginated_query_client.js";
 
 export type InMemoryWebSocketTest = (args: {
   address: string;
   socket: () => WebSocket;
   receive: () => Promise<ClientMessage>;
-  send: (message: ServerMessage) => void;
+  send: (message: WireServerMessage) => void;
   close: () => void;
 }) => Promise<void>;
 
@@ -60,9 +67,11 @@ export async function withInMemoryWebSocket(
     if (!msgP) {
       throw new Error("Receive() called twice? No message promise found.");
     }
-    return JSON.parse(await msgP);
+    const text = await msgP;
+    const structured = JSON.parse(text);
+    return structured;
   }
-  function send(message: ServerMessage) {
+  function send(message: WireServerMessage) {
     // eslint-disable-next-line no-console
     if (debug) console.debug(`      <--${message.type}-- server`);
     socket!.send(encodeServerMessage(message));
@@ -79,18 +88,21 @@ export async function withInMemoryWebSocket(
       send,
       close: () => {
         // eslint-disable-next-line no-console
-        if (debug) console.debug(`           -->8-CLOSE- server`);
+        if (debug) console.debug(`           --CLOSE-->8-- server`);
         socket!.close();
         setUpSocket();
       },
     });
   } finally {
-    socket!.close();
+    const s = socket!;
+    if (s!) {
+      socket!.close();
+    }
     wss.close();
   }
 }
 
-export function encodeServerMessage(message: ServerMessage): string {
+export function encodeServerMessage(message: WireServerMessage): string {
   function replacer(_key: string, value: any) {
     if (Long.isLong(value)) {
       return encodeLong(value);
@@ -103,4 +115,86 @@ export function encodeServerMessage(message: ServerMessage): string {
 function encodeLong(n: Long) {
   const integerBytes = Uint8Array.from(n.toBytesLE());
   return Base64.fromByteArray(integerBytes);
+}
+
+/**
+ * const q = new UpdateQueue();
+ * const client = new BaseConvexClient(address, queryTokens => { q.onTransition(client)(queryTokens) });
+ *
+ * await q.updatePromises[3];
+ *
+ */
+export class UpdateQueue {
+  updateResolves: ((v: Record<QueryToken, any>) => void)[];
+  updatePromises: Promise<Record<QueryToken, any>>[];
+  updates: Record<QueryToken, any>[];
+  allResults: Record<QueryToken, any>;
+  nextIndex: number;
+
+  constructor(maxLength = 10) {
+    this.updateResolves = [];
+    this.updatePromises = [];
+    this.allResults = {};
+    this.updates = [];
+    this.nextIndex = 0;
+
+    let nextResolve: (v: Record<QueryToken, any>) => void;
+    let nextPromise: Promise<Record<QueryToken, any>>;
+
+    for (let i = 0; i < maxLength; i++) {
+      nextPromise = new Promise((r) => {
+        nextResolve = r;
+      });
+      this.updateResolves.push(nextResolve!);
+      this.updatePromises.push(nextPromise);
+    }
+  }
+
+  /**
+   * Useful to use instead of directly awaiting so that the timeout has a line number
+   * unlike the default Vite test timeout.
+   */
+  async awaitPromiseAtIndexWithTimeout(
+    i: number,
+  ): Promise<Record<QueryToken | PaginatedQueryToken, any>> {
+    if (!this.updatePromises[i]) {
+      throw new Error("That promise doesn't exist yet");
+    }
+    const inBandSignal = "UpdateQueue await timed out";
+    const result = await Promise.race([
+      new Promise((r) => setTimeout(() => r(inBandSignal), 1000)),
+      this.updatePromises[i],
+    ]);
+    if (result === inBandSignal) {
+      throw new Error("Awaiting promise in UpdateQueue");
+    }
+    // cast from the updatePromises where this was any, but know it's unknown
+    return result as any;
+  }
+
+  onTransition =
+    (client: BaseConvexClient, paginatedClient?: PaginatedQueryClient) =>
+    (updatedQueryTokens: (QueryToken | PaginatedQueryToken)[]) => {
+      const update: Record<QueryToken, any> = {};
+      for (const queryToken of updatedQueryTokens) {
+        if (serializedQueryTokenIsPaginated(queryToken)) {
+          if (!paginatedClient) {
+            throw new Error(
+              "No PaginatedQueryClient provided to look up value for token " +
+                queryToken,
+            );
+          }
+          const value = paginatedClient?.localQueryResultByToken(queryToken);
+          update[queryToken] = value;
+          this.allResults[queryToken] = value;
+        } else {
+          const value = client.localQueryResultByToken(queryToken);
+          update[queryToken] = value;
+          this.allResults[queryToken] = value;
+        }
+      }
+      this.updateResolves[this.nextIndex](update);
+      this.updates.push(update);
+      this.nextIndex++;
+    };
 }

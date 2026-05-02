@@ -7,14 +7,14 @@ import {
   qualifiedDefinitionPath,
   toComponentDefinitionPath,
 } from "./directoryStructure.js";
+import { Context } from "../../../../bundler/context.js";
 import {
-  Context,
   logMessage,
   logWarning,
   showSpinner,
-} from "../../../../bundler/context.js";
+} from "../../../../bundler/log.js";
 import esbuild, { BuildOptions, Metafile, OutputFile, Plugin } from "esbuild";
-import chalk from "chalk";
+import { chalkStderr } from "chalk";
 import {
   AppDefinitionSpecWithoutImpls,
   ComponentDefinitionSpecWithoutImpls,
@@ -27,6 +27,77 @@ import {
   entryPointsByEnvironment,
 } from "../../../../bundler/index.js";
 import { NodeDependency } from "../../deployApi/modules.js";
+
+const VIRTUAL_CONFIG_NAMESPACE = "convex-virtual-config";
+const VIRTUAL_CONFIG_CONTENTS = `import { defineApp } from "convex/server";\nconst app = defineApp();\nexport default app;`;
+
+/**
+ * An esbuild plugin to insert a virtual `convex.config.js` file into the bundle
+ * when Convex project doesn't have one explicitly defined.
+ *
+ * This allows us to use the components push path even when the Convex project doesn't
+ * have a config file defined.
+ *
+ * When importComponentPath is provided, the virtual config will import and use the
+ * component found at that path.
+ */
+function virtualConfig({
+  rootComponentDirectory,
+  importComponentPath,
+}: {
+  rootComponentDirectory: ComponentDirectory;
+  importComponentPath?: string;
+}): Plugin {
+  // Empty config with no components
+  let contents = VIRTUAL_CONFIG_CONTENTS;
+
+  if (importComponentPath) {
+    // Generate config that imports the specified component
+    const relativeImport = path.relative(
+      rootComponentDirectory.path,
+      importComponentPath,
+    );
+    let normalizedImport = relativeImport
+      .replace(/\\/g, "/")
+      .replace(/\.ts$/, ".js");
+
+    // We don't generate code for this synthetic root component so the name we
+    // use for the component doesn't matter.
+    contents = `import { defineApp } from "convex/server";
+import component from "${normalizedImport}";
+
+const app = defineApp();
+app.use(component, { name: "exampleComponentInstance" });
+export default app;`;
+  }
+
+  return {
+    name: `convex-virtual-config`,
+    async setup(build) {
+      const filter = pathToRegexFilter(rootComponentDirectory);
+      build.onResolve({ filter }, async (args) => {
+        return { path: args.path, namespace: VIRTUAL_CONFIG_NAMESPACE };
+      });
+      build.onLoad(
+        { filter, namespace: VIRTUAL_CONFIG_NAMESPACE },
+        async (_args) => {
+          return {
+            contents,
+            resolveDir: rootComponentDirectory.path,
+          };
+        },
+      );
+    },
+  };
+}
+
+function pathToRegexFilter(root: ComponentDirectory) {
+  let path = qualifiedDefinitionPath(root);
+  const escaped = path
+    .replace(/\\/g, "/")
+    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped}$`);
+}
 
 /**
  * An esbuild plugin to mark component definitions external or return a list of
@@ -55,13 +126,16 @@ function componentPlugin({
       // This regex can't be really precise since developers could import
       // "convex.config", "convex.config.js", "convex.config.ts", etc.
       build.onResolve({ filter: /.*convex.config.*/ }, async (args) => {
-        verbose && logMessage(ctx, "esbuild resolving import:", args);
-        if (args.namespace !== "file") {
-          verbose && logMessage(ctx, "  Not a file.");
+        verbose && logMessage("esbuild resolving import:", args);
+        if (
+          args.namespace !== "file" &&
+          args.namespace !== VIRTUAL_CONFIG_NAMESPACE
+        ) {
+          verbose && logMessage("  Not a file or virtual config.");
           return;
         }
         if (args.kind === "entry-point") {
-          verbose && logMessage(ctx, "  -> Top-level entry-point.");
+          verbose && logMessage("  -> Top-level entry-point.");
           const componentDirectory = await buildComponentDirectory(
             ctx,
             path.resolve(args.path),
@@ -104,7 +178,7 @@ function componentPlugin({
           }
         }
         if (resolvedPath === undefined) {
-          verbose && logMessage(ctx, `  -> ${args.path} not found.`);
+          verbose && logMessage(`  -> ${args.path} not found.`);
           return;
         }
 
@@ -113,7 +187,7 @@ function componentPlugin({
         if (!imported) {
           const isComponent = isComponentDirectory(ctx, parentDir, false);
           if (isComponent.kind !== "ok") {
-            verbose && logMessage(ctx, "  -> Not a component:", isComponent);
+            verbose && logMessage("  -> Not a component:", isComponent);
             return;
           }
           imported = isComponent.component;
@@ -122,7 +196,6 @@ function componentPlugin({
 
         verbose &&
           logMessage(
-            ctx,
             "  -> Component import! Recording it.",
             args.path,
             resolvedPath,
@@ -183,7 +256,7 @@ function sharedEsbuildOptions({
     outdir: path.parse(process.cwd()).root,
     outbase: path.parse(process.cwd()).root,
 
-    minify: true,
+    minify: true, // Note that this implies NODE_ENV="production".
     keepNames: true,
 
     metafile: true,
@@ -210,6 +283,17 @@ export async function componentGraph(
   components: Map<string, ComponentDirectory>;
   dependencyGraph: [ComponentDirectory, ComponentDirectory][];
 }> {
+  if (
+    rootComponentDirectory.isRootWithoutConfig &&
+    !rootComponentDirectory.syntheticComponentImport
+  ) {
+    return {
+      components: new Map([
+        [rootComponentDirectory.path, rootComponentDirectory],
+      ]),
+      dependencyGraph: [],
+    };
+  }
   let result;
   try {
     result = await esbuild.build({
@@ -222,6 +306,15 @@ export async function componentGraph(
           verbose,
           rootComponentDirectory,
         }),
+        ...(rootComponentDirectory.syntheticComponentImport
+          ? [
+              virtualConfig({
+                rootComponentDirectory,
+                importComponentPath:
+                  rootComponentDirectory.syntheticComponentImport,
+              }),
+            ]
+          : []),
       ],
       sourcemap: "external",
       sourcesContent: false,
@@ -246,9 +339,19 @@ export async function componentGraph(
     });
   }
   for (const warning of result.warnings) {
-    // eslint-disable-next-line no-console
-    console.log(chalk.yellow(`esbuild warning: ${warning.text}`));
+    logWarning(chalkStderr.yellow(`esbuild warning: ${warning.text}`));
   }
+
+  if (rootComponentDirectory.syntheticComponentImport) {
+    // Virtual configs appear in the metafile with a namespace prefix
+    // and can't have ComponentDirectory objects built by reading the filesystem
+    // so swap in this rootComponentDirectory.
+    return await findComponentDependencies(ctx, result.metafile, {
+      [`${VIRTUAL_CONFIG_NAMESPACE}:${qualifiedDefinitionPath(rootComponentDirectory)}`]:
+        rootComponentDirectory,
+    });
+  }
+
   return await findComponentDependencies(ctx, result.metafile);
 }
 
@@ -277,53 +380,82 @@ export function getDeps(
  * This doesn't work on just any esbuild metafile because it assumes input
  * imports have not been transformed. We run it on the metafile produced by
  * the esbuild invocation that uses the component plugin in "discover" mode.
+ *
+ * @param inputOverrides - ComponentDirectory objects to be used for metafile.inputs
+ * keys, in case they don't exist (namely virtual configs via esbuild plugin namespaces).
  */
 async function findComponentDependencies(
   ctx: Context,
   metafile: Metafile,
+  inputOverrides: Record<string, ComponentDirectory> = {},
 ): Promise<{
   components: Map<string, ComponentDirectory>;
   dependencyGraph: [ComponentDirectory, ComponentDirectory][];
 }> {
   const { inputs } = metafile;
-  // This filter means we only supports *direct imports* of component definitions
-  // from other component definitions.
-  const componentInputs = Object.keys(inputs).filter((path) =>
-    path.includes(".config."),
-  );
 
-  // Absolute path doesn't appear to be necessary here since only inputs marked
-  // external get transformed to an absolute path but it's not clear what's an
-  // esbuild implementation detail in the metafile or which settings change this.
-  const componentsByAbsPath = new Map<string, ComponentDirectory>();
-  for (const inputPath of componentInputs) {
-    const importer = await buildComponentDirectory(ctx, inputPath);
-    componentsByAbsPath.set(path.resolve(inputPath), importer);
+  const componentsByKey = new Map<string, ComponentDirectory>();
+  for (const inputPath of Object.keys(inputs)) {
+    if (!inputPath.includes(".config.")) continue;
+
+    const override: ComponentDirectory | undefined = inputOverrides[inputPath];
+    if (override) {
+      componentsByKey.set(inputPath, override);
+    } else {
+      // Normal component - build from filesystem
+      const component = await buildComponentDirectory(ctx, inputPath);
+      componentsByKey.set(path.resolve(inputPath), component);
+    }
   }
+
   const dependencyGraph: [ComponentDirectory, ComponentDirectory][] = [];
-  for (const inputPath of componentInputs) {
-    const importer = componentsByAbsPath.get(path.resolve(inputPath))!;
+
+  for (const inputPath of Object.keys(inputs)) {
+    if (!inputPath.includes(".config.")) continue;
+
+    // For overridden inputs, use the original key; for normal components, use resolved path
+    const importerKey =
+      inputPath in inputOverrides ? inputPath : path.resolve(inputPath);
+
+    const importer = componentsByKey.get(importerKey);
+    if (!importer) continue;
+
     const { imports } = inputs[inputPath];
     const componentImports = imports.filter((imp) =>
       imp.path.includes(".config."),
     );
-    for (const importPath of componentImports.map((dep) => dep.path)) {
-      const imported = componentsByAbsPath.get(path.resolve(importPath));
+
+    for (const imp of componentImports) {
+      const imported = componentsByKey.get(path.resolve(imp.path));
       if (!imported) {
         return await ctx.crash({
           exitCode: 1,
           errorType: "invalid filesystem data",
-          printedMessage: `Didn't find ${path.resolve(importPath)} in ${[...componentsByAbsPath.keys()].toString()}`,
+          printedMessage: `Didn't find ${path.resolve(imp.path)} in ${[...componentsByKey.keys()].toString()}`,
         });
       }
+
+      // Grab the import specifier from the metafile (e.g. `@convex-dev/workpool/convex.config`) so
+      // we can use it to import component APIs
+      if (imp.original) {
+        const importSpecifier = imp.original;
+        const relativeSpecifier = importSpecifier.replace(
+          /\/convex\.config.*$/,
+          "",
+        );
+
+        imported.importSpecifier = relativeSpecifier;
+      }
+
       dependencyGraph.push([importer, imported]);
     }
   }
 
   const components = new Map<string, ComponentDirectory>();
-  for (const directory of componentsByAbsPath.values()) {
+  for (const directory of componentsByKey.values()) {
     components.set(directory.path, directory);
   }
+
   return { components, dependencyGraph };
 }
 
@@ -347,19 +479,37 @@ export async function bundleDefinitions(
 }> {
   let result;
   try {
+    let plugins = [
+      componentPlugin({
+        ctx,
+        mode: "bundle",
+        verbose,
+        rootComponentDirectory,
+      }),
+    ];
+    if (
+      rootComponentDirectory.syntheticComponentImport ||
+      rootComponentDirectory.isRootWithoutConfig
+    ) {
+      // Use virtual config (either with a component import or empty)
+      plugins.push(
+        virtualConfig(
+          rootComponentDirectory.syntheticComponentImport
+            ? {
+                rootComponentDirectory,
+                importComponentPath:
+                  rootComponentDirectory.syntheticComponentImport,
+              }
+            : { rootComponentDirectory },
+        ),
+      );
+    }
     result = await esbuild.build({
       absWorkingDir,
       entryPoints: componentDirectories.map((dir) =>
         qualifiedDefinitionPath(dir),
       ),
-      plugins: [
-        componentPlugin({
-          ctx,
-          mode: "bundle",
-          verbose,
-          rootComponentDirectory,
-        }),
-      ],
+      plugins,
       sourcemap: true,
       ...sharedEsbuildOptions({ liveComponentSources }),
     });
@@ -381,8 +531,7 @@ export async function bundleDefinitions(
     });
   }
   for (const warning of result.warnings) {
-    // eslint-disable-next-line no-console
-    console.log(chalk.yellow(`esbuild warning: ${warning.text}`));
+    logWarning(chalkStderr.yellow(`esbuild warning: ${warning.text}`));
   }
 
   const outputs: {
@@ -469,14 +618,23 @@ export async function bundleDefinitions(
   };
 }
 
-export async function bundleImplementations(
-  ctx: Context,
-  rootComponentDirectory: ComponentDirectory,
-  componentDirectories: ComponentDirectory[],
-  nodeExternalPackages: string[],
-  extraConditions: string[],
-  verbose: boolean = false,
-): Promise<{
+export async function bundleImplementations({
+  ctx,
+  rootComponentDirectory,
+  componentDirectories,
+  nodeExternalPackages,
+  extraConditions,
+  verbose = false,
+  includeSourcesContent = false,
+}: {
+  ctx: Context;
+  rootComponentDirectory: ComponentDirectory;
+  componentDirectories: ComponentDirectory[];
+  nodeExternalPackages: string[];
+  extraConditions: string[];
+  verbose: boolean;
+  includeSourcesContent?: boolean;
+}): Promise<{
   appImplementation: {
     schema: Bundle | null;
     functions: Bundle[];
@@ -491,8 +649,13 @@ export async function bundleImplementations(
   let appImplementation;
   const componentImplementations = [];
 
-  let isRoot = true;
-  for (const directory of [rootComponentDirectory, ...componentDirectories]) {
+  // For --component-dir flag, skip bundling root implementations (no real code to bundle)
+  const directoriesToBundle = rootComponentDirectory.syntheticComponentImport
+    ? componentDirectories
+    : [rootComponentDirectory, ...componentDirectories];
+
+  for (const directory of directoriesToBundle) {
+    const isRoot = directory.path === rootComponentDirectory.path;
     const resolvedPath = path.resolve(
       rootComponentDirectory.path,
       directory.path,
@@ -513,16 +676,15 @@ export async function bundleImplementations(
       modules: Bundle[];
       externalDependencies: Map<string, string>;
       bundledModuleNames: Set<string>;
-    } = await bundle(
+    } = await bundle({
       ctx,
-      resolvedPath,
-      entryPoints.isolate,
-      true,
-      "browser",
-      undefined,
-      undefined,
+      dir: resolvedPath,
+      entryPoints: entryPoints.isolate,
+      generateSourceMaps: true,
+      platform: "browser",
       extraConditions,
-    );
+      includeSourcesContent,
+    });
 
     if (convexResult.externalDependencies.size !== 0) {
       return await ctx.crash({
@@ -534,22 +696,23 @@ export async function bundleImplementations(
     const functions = convexResult.modules;
     if (isRoot) {
       if (verbose) {
-        showSpinner(ctx, "Bundling modules for Node.js runtime...");
+        showSpinner("Bundling modules for Node.js runtime...");
       }
       const nodeResult: {
         modules: Bundle[];
         externalDependencies: Map<string, string>;
         bundledModuleNames: Set<string>;
-      } = await bundle(
+      } = await bundle({
         ctx,
-        resolvedPath,
-        entryPoints.node,
-        true,
-        "node",
-        path.join("_deps", "node"),
-        nodeExternalPackages,
+        dir: resolvedPath,
+        entryPoints: entryPoints.node,
+        generateSourceMaps: true,
+        platform: "node",
+        chunksFolder: path.join("_deps", "node"),
+        externalPackagesAllowList: nodeExternalPackages,
         extraConditions,
-      );
+        includeSourcesContent,
+      });
 
       const externalNodeDependencies: NodeDependency[] = [];
       for (const [
@@ -574,16 +737,17 @@ export async function bundleImplementations(
           modules: Bundle[];
           externalDependencies: Map<string, string>;
           bundledModuleNames: Set<string>;
-        } = await bundle(
+        } = await bundle({
           ctx,
-          resolvedPath,
-          entryPoints.node,
-          true,
-          "node",
-          path.join("_deps", "node"),
-          nodeExternalPackages,
+          dir: resolvedPath,
+          entryPoints: entryPoints.node,
+          generateSourceMaps: true,
+          platform: "node",
+          chunksFolder: path.join("_deps", "node"),
+          externalPackagesAllowList: nodeExternalPackages,
           extraConditions,
-        );
+          includeSourcesContent,
+        });
         if (nodeResult.modules.length > 0) {
           // TODO(ENG-7116) Remove error and bundle the component node actions when we are ready to support them.
           await ctx.crash({
@@ -600,15 +764,23 @@ export async function bundleImplementations(
       );
       componentImplementations.push({ definitionPath, schema, functions });
     }
-    isRoot = false;
   }
 
   if (!appImplementation) {
-    return await ctx.crash({
-      exitCode: 1,
-      errorType: "fatal",
-      printedMessage: "No app implementation found",
-    });
+    // For --component-dir flag, we don't bundle root implementations so provide an empty one
+    if (rootComponentDirectory.syntheticComponentImport) {
+      appImplementation = {
+        schema: null,
+        functions: [],
+        externalNodeDependencies: [],
+      };
+    } else {
+      return await ctx.crash({
+        exitCode: 1,
+        errorType: "fatal",
+        printedMessage: "No app implementation found",
+      });
+    }
   }
 
   return { appImplementation, componentImplementations };
@@ -637,7 +809,6 @@ async function registerEsbuildReads(
       // Consider this a transient error so we'll try again and hopefully
       // no files change right after esbuild next time.
       logWarning(
-        ctx,
         `Bundled file ${absPath} changed right after esbuild invocation`,
       );
       return await ctx.crash({

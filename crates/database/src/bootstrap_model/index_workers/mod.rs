@@ -1,8 +1,10 @@
 use std::{
     cmp::max,
-    collections::BTreeMap,
     str::FromStr,
-    sync::LazyLock,
+    sync::{
+        Arc,
+        LazyLock,
+    },
 };
 
 use common::{
@@ -10,20 +12,16 @@ use common::{
         ParseDocument,
         ParsedDocument,
     },
-    query::{
-        IndexRange,
-        IndexRangeExpression,
-        Order,
-        Query,
-    },
     runtime::Runtime,
     types::IndexId,
 };
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use sync_types::Timestamp;
 use value::{
-    obj,
-    ConvexObject,
-    ConvexValue,
+    codegen_convex_serialization,
     FieldPath,
     InternalId,
     TableName,
@@ -35,7 +33,6 @@ use crate::{
         SystemIndex,
         SystemTable,
     },
-    ResolvedQuery,
     SystemMetadataModel,
     Transaction,
 };
@@ -57,7 +54,7 @@ impl<'a, RT: Runtime> IndexWorkerMetadataModel<'a, RT> {
         let metadata = self.get_metadata(index_id).await?;
 
         let fast_forward_ts = metadata
-            .map(|meta| *meta.into_value().index_metadata.mut_fast_forward_ts())
+            .map(|meta| meta.index_metadata.fast_forward_ts())
             .unwrap_or_default();
         Ok(max(snapshot_ts, fast_forward_ts))
     }
@@ -91,21 +88,12 @@ impl<'a, RT: Runtime> IndexWorkerMetadataModel<'a, RT> {
     pub async fn get_metadata(
         &mut self,
         id: IndexId,
-    ) -> anyhow::Result<Option<ParsedDocument<IndexWorkerMetadataRecord>>> {
-        let range = vec![IndexRangeExpression::Eq(
-            INDEX_DOC_ID_FIELD.clone(),
-            ConvexValue::String(id.to_string().try_into()?).into(),
-        )];
-        let query = Query::index_range(IndexRange {
-            index_name: INDEX_DOC_ID_INDEX.name(),
-            range,
-            order: Order::Asc,
-        });
-        let mut query_stream = ResolvedQuery::new(self.tx, TableNamespace::Global, query)?;
-        let result = query_stream.next(self.tx, None).await?;
-        result
-            .map(ParseDocument::<IndexWorkerMetadataRecord>::parse)
-            .transpose()
+    ) -> anyhow::Result<Option<Arc<ParsedDocument<IndexWorkerMetadataRecord>>>> {
+        self.tx
+            .query_system(TableNamespace::Global, &INDEX_DOC_ID_INDEX)?
+            .eq(&[String::from(id).as_str()])?
+            .unique()
+            .await
     }
 
     async fn get_or_create_metadata(
@@ -115,7 +103,7 @@ impl<'a, RT: Runtime> IndexWorkerMetadataModel<'a, RT> {
     ) -> anyhow::Result<ParsedDocument<IndexWorkerMetadataRecord>> {
         let existing_doc = self.get_metadata(id).await?;
         if let Some(doc) = existing_doc {
-            return Ok(doc);
+            return Ok(Arc::unwrap_or_clone(doc));
         }
         self.create_metadata(IndexWorkerMetadataRecord {
             index_id: id,
@@ -166,48 +154,38 @@ impl SystemTable for IndexWorkerMetadataTable {
 /// Metadata that impacts how the index is queried belongs in the actual index
 /// metadata. This must be used only within the index worker as an
 /// implementation detail of how the index is built.
-#[derive(Debug)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(proptest_derive::Arbitrary, Clone, PartialEq)
-)]
+#[derive(Debug, Clone)]
 pub struct IndexWorkerMetadataRecord {
     index_id: InternalId,
     pub index_metadata: IndexWorkerMetadata,
 }
 
-impl TryFrom<IndexWorkerMetadataRecord> for ConvexObject {
-    type Error = anyhow::Error;
+#[derive(Serialize, Deserialize)]
+pub struct SerializedIndexWorkerMetadataRecord {
+    pub index_id: String,
+    pub index_metadata: SerializedIndexWorkerMetadata,
+}
 
-    fn try_from(value: IndexWorkerMetadataRecord) -> Result<Self, Self::Error> {
-        obj!(
-            "index_id" => ConvexValue::String(value.index_id.to_string().try_into()?),
-            "index_metadata"=> ConvexValue::Object(value.index_metadata.try_into()?),
-        )
+codegen_convex_serialization!(
+    IndexWorkerMetadataRecord,
+    SerializedIndexWorkerMetadataRecord
+);
+
+impl From<IndexWorkerMetadataRecord> for SerializedIndexWorkerMetadataRecord {
+    fn from(value: IndexWorkerMetadataRecord) -> Self {
+        SerializedIndexWorkerMetadataRecord {
+            index_id: value.index_id.to_string(),
+            index_metadata: value.index_metadata.into(),
+        }
     }
 }
 
-impl TryFrom<ConvexObject> for IndexWorkerMetadataRecord {
+impl TryFrom<SerializedIndexWorkerMetadataRecord> for IndexWorkerMetadataRecord {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
-        let mut fields: BTreeMap<_, _> = value.into();
-
-        let index_id = match fields.remove("index_id") {
-            Some(ConvexValue::String(index_id)) => {
-                InternalId::from_str(index_id.to_string().as_str())?
-            },
-            _ => anyhow::bail!("Missing or invalid `index_id` field for IndexWorkerMetadataRecord"),
-        };
-
-        let index_metadata = match fields.remove("index_metadata") {
-            Some(ConvexValue::Object(index_metadata)) => {
-                IndexWorkerMetadata::try_from(index_metadata)?
-            },
-            _ => anyhow::bail!(
-                "Missing or invalid `index_metadata` field for IndexWorkerMetadataRecord"
-            ),
-        };
+    fn try_from(value: SerializedIndexWorkerMetadataRecord) -> Result<Self, Self::Error> {
+        let index_id = InternalId::from_str(&value.index_id)?;
+        let index_metadata = IndexWorkerMetadata::try_from(value.index_metadata)?;
         Ok(IndexWorkerMetadataRecord {
             index_id,
             index_metadata,
@@ -215,11 +193,7 @@ impl TryFrom<ConvexObject> for IndexWorkerMetadataRecord {
     }
 }
 
-#[derive(Debug)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(proptest_derive::Arbitrary, Clone, PartialEq)
-)]
+#[derive(Debug, Clone)]
 pub enum IndexWorkerMetadata {
     TextSearch(IndexWorkerBatchMetadata),
     VectorSearch(IndexWorkerBatchMetadata),
@@ -228,48 +202,49 @@ pub enum IndexWorkerMetadata {
 impl IndexWorkerMetadata {
     pub fn mut_fast_forward_ts(&mut self) -> &mut Timestamp {
         &mut match self {
-            IndexWorkerMetadata::TextSearch(ref mut meta) => meta,
-            IndexWorkerMetadata::VectorSearch(ref mut meta) => meta,
+            IndexWorkerMetadata::TextSearch(meta) => meta,
+            IndexWorkerMetadata::VectorSearch(meta) => meta,
+        }
+        .fast_forward_ts
+    }
+
+    pub fn fast_forward_ts(&self) -> Timestamp {
+        match self {
+            IndexWorkerMetadata::TextSearch(meta) => meta,
+            IndexWorkerMetadata::VectorSearch(meta) => meta,
         }
         .fast_forward_ts
     }
 }
 
-impl TryFrom<IndexWorkerMetadata> for ConvexObject {
-    type Error = anyhow::Error;
+#[derive(Serialize, Deserialize)]
+pub struct SerializedIndexWorkerMetadata {
+    pub metadata_type: String,
+    pub metadata: SerializedIndexWorkerBatchMetadata,
+}
 
-    fn try_from(value: IndexWorkerMetadata) -> Result<Self, Self::Error> {
+impl From<IndexWorkerMetadata> for SerializedIndexWorkerMetadata {
+    fn from(value: IndexWorkerMetadata) -> Self {
         let (metadata_type, metadata) = match value {
             IndexWorkerMetadata::TextSearch(metadata) => ("text_search", metadata),
             IndexWorkerMetadata::VectorSearch(metadata) => ("vector_search", metadata),
         };
-        obj!(
-            "metadata_type" => ConvexValue::String(metadata_type.to_string().try_into()?),
-            "metadata" => ConvexValue::Object(metadata.try_into()?),
-        )
+        SerializedIndexWorkerMetadata {
+            metadata_type: metadata_type.to_string(),
+            metadata: metadata.into(),
+        }
     }
 }
 
-impl TryFrom<ConvexObject> for IndexWorkerMetadata {
+impl TryFrom<SerializedIndexWorkerMetadata> for IndexWorkerMetadata {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
-        let mut fields: BTreeMap<_, _> = value.into();
-
-        let metadata = match fields.remove("metadata") {
-            Some(ConvexValue::Object(metadata)) => IndexWorkerBatchMetadata::try_from(metadata)?,
-            _ => anyhow::bail!("Missing or invalid `metadata` field for IndexWorkerMetadata"),
-        };
-
-        let metadata_type = match fields.remove("metadata_type") {
-            Some(ConvexValue::String(metadata_type)) => metadata_type,
-            _ => anyhow::bail!("Missing or invalid `metadata_type` field for IndexWorkerMetadata"),
-        };
-
-        Ok(match metadata_type.to_string().as_str() {
+    fn try_from(value: SerializedIndexWorkerMetadata) -> Result<Self, Self::Error> {
+        let metadata = IndexWorkerBatchMetadata::try_from(value.metadata)?;
+        Ok(match value.metadata_type.as_str() {
             "text_search" => IndexWorkerMetadata::TextSearch(metadata),
             "vector_search" => IndexWorkerMetadata::VectorSearch(metadata),
-            _ => anyhow::bail!(
+            metadata_type => anyhow::bail!(
                 "Invalid `metadata_type` field value for IndexWorkerMetadata: {metadata_type}",
             ),
         })
@@ -280,60 +255,29 @@ impl TryFrom<ConvexObject> for IndexWorkerMetadata {
 /// batches on an ongoing basis.
 ///
 /// For now this is vector and text search.
-#[derive(Debug)]
-#[cfg_attr(
-    any(test, feature = "testing"),
-    derive(proptest_derive::Arbitrary, Clone, PartialEq)
-)]
+#[derive(Debug, Clone)]
 pub struct IndexWorkerBatchMetadata {
     fast_forward_ts: Timestamp,
 }
 
-impl TryFrom<IndexWorkerBatchMetadata> for ConvexObject {
-    type Error = anyhow::Error;
-
-    fn try_from(value: IndexWorkerBatchMetadata) -> Result<Self, Self::Error> {
-        let ts = ConvexValue::Int64(value.fast_forward_ts.into());
-        obj!(
-            "fast_forward_ts" => ts,
-        )
-    }
+#[derive(Serialize, Deserialize)]
+pub struct SerializedIndexWorkerBatchMetadata {
+    pub fast_forward_ts: i64,
 }
 
-impl TryFrom<ConvexObject> for IndexWorkerBatchMetadata {
-    type Error = anyhow::Error;
-
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
-        let mut fields: BTreeMap<_, _> = value.into();
-        let fast_forward_ts = match fields.remove("fast_forward_ts") {
-            Some(ConvexValue::Int64(ts)) => Timestamp::try_from(ts)?,
-            _ => {
-                anyhow::bail!("Missing or invalid `fast_forward_ts` field for IndexWorkerMetadata")
-            },
-        };
-        Ok(IndexWorkerBatchMetadata { fast_forward_ts })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-    use value::ConvexObject;
-
-    use crate::bootstrap_model::index_workers::IndexWorkerMetadataRecord;
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-        #[test]
-        fn test_metadata_roundtrip(v in any::<IndexWorkerMetadataRecord>()) {
-            let roundtripped = IndexWorkerMetadataRecord::try_from(
-                ConvexObject::try_from(v.clone()).unwrap()
-            ).unwrap();
-            assert_eq!(v, roundtripped);
+impl From<IndexWorkerBatchMetadata> for SerializedIndexWorkerBatchMetadata {
+    fn from(value: IndexWorkerBatchMetadata) -> Self {
+        SerializedIndexWorkerBatchMetadata {
+            fast_forward_ts: value.fast_forward_ts.into(),
         }
+    }
+}
 
+impl TryFrom<SerializedIndexWorkerBatchMetadata> for IndexWorkerBatchMetadata {
+    type Error = anyhow::Error;
+
+    fn try_from(value: SerializedIndexWorkerBatchMetadata) -> Result<Self, Self::Error> {
+        let fast_forward_ts = Timestamp::try_from(value.fast_forward_ts)?;
+        Ok(IndexWorkerBatchMetadata { fast_forward_ts })
     }
 }

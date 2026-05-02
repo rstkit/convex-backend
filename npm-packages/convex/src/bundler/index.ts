@@ -1,18 +1,21 @@
 import path from "path";
-import chalk from "chalk";
-import esbuild, { BuildFailure } from "esbuild";
+import { chalkStderr } from "chalk";
+import esbuild from "esbuild";
 import { parse as parseAST } from "@babel/parser";
 import { Identifier, ImportSpecifier } from "@babel/types";
 import * as Sentry from "@sentry/node";
 import { Filesystem, consistentPathSort } from "./fs.js";
-import { Context, logVerbose, logWarning } from "./context.js";
+import { Context } from "./context.js";
+import { logVerbose, logWarning } from "./log.js";
 import { wasmPlugin } from "./wasm.js";
+import { serverOnlyPlugin } from "./serverOnly.js";
 import {
   ExternalPackage,
   computeExternalPackages,
   createExternalPlugin,
   findExactVersionAndDependencies,
 } from "./external.js";
+import { innerEsbuild, isEsbuildBuildError } from "./debugBundle.js";
 export { nodeFs, RecordingFs } from "./fs.js";
 export type { Filesystem } from "./fs.js";
 
@@ -24,14 +27,18 @@ export const actionsDir = "actions";
 export function* walkDir(
   fs: Filesystem,
   dirPath: string,
+  shouldSkipDir?: (dirPath: string) => boolean,
   depth?: number,
 ): Generator<{ isDir: boolean; path: string; depth: number }, void, void> {
   depth = depth ?? 0;
   for (const dirEntry of fs.listDir(dirPath).sort(consistentPathSort)) {
     const childPath = path.join(dirPath, dirEntry.name);
     if (dirEntry.isDirectory()) {
+      if (shouldSkipDir && shouldSkipDir(childPath)) {
+        continue;
+      }
       yield { isDir: true, path: childPath, depth };
-      yield* walkDir(fs, childPath, depth + 1);
+      yield* walkDir(fs, childPath, shouldSkipDir, depth + 1);
     } else if (dirEntry.isFile()) {
       yield { isDir: false, path: childPath, depth };
     }
@@ -44,7 +51,7 @@ type ModuleEnvironment = "node" | "isolate";
 export interface Bundle {
   path: string;
   source: string;
-  sourceMap?: string;
+  sourceMap?: string | undefined;
   environment: ModuleEnvironment;
 }
 
@@ -62,38 +69,44 @@ type EsBuildResult = esbuild.BuildResult & {
   bundledModuleNames: Set<string>;
 };
 
-async function doEsbuild(
-  ctx: Context,
-  dir: string,
-  entryPoints: string[],
-  generateSourceMaps: boolean,
-  platform: esbuild.Platform,
-  chunksFolder: string,
-  externalPackages: Map<string, ExternalPackage>,
-  extraConditions: string[],
-): Promise<EsBuildResult> {
+async function doEsbuild({
+  ctx,
+  dir,
+  entryPoints,
+  generateSourceMaps,
+  platform,
+  chunksFolder,
+  externalPackages,
+  extraConditions,
+  includeSourcesContent,
+  splitting,
+}: {
+  ctx: Context;
+  dir: string;
+  entryPoints: string[];
+  generateSourceMaps: boolean;
+  platform: esbuild.Platform;
+  chunksFolder: string;
+  externalPackages: Map<string, ExternalPackage>;
+  extraConditions: string[];
+  includeSourcesContent: boolean;
+  splitting?: boolean | undefined;
+}): Promise<EsBuildResult> {
   const external = createExternalPlugin(ctx, externalPackages);
   try {
-    const result = await esbuild.build({
+    const result = await innerEsbuild({
       entryPoints,
-      bundle: true,
-      platform: platform,
-      format: "esm",
-      target: "esnext",
-      jsx: "automatic",
-      outdir: "out",
-      outbase: dir,
-      conditions: ["convex", "module", ...extraConditions],
-      // The wasmPlugin should be last so it doesn't run on external modules.
-      plugins: [external.plugin, wasmPlugin],
-      write: false,
-      sourcemap: generateSourceMaps,
-      splitting: true,
-      chunkNames: path.join(chunksFolder, "[hash]"),
-      treeShaking: true,
-      minify: false,
-      keepNames: true,
-      metafile: true,
+      platform,
+      generateSourceMaps,
+      chunksFolder,
+      extraConditions,
+      dir,
+      // serverOnlyPlugin runs first so `server-only` is always stubbed,
+      // even if it appears in the external packages list.
+      // wasmPlugin runs last so it doesn't run on external modules.
+      plugins: [serverOnlyPlugin, external.plugin, wasmPlugin],
+      includeSourcesContent,
+      splitting,
     });
 
     for (const [relPath, input] of Object.entries(result.metafile!.inputs)) {
@@ -102,7 +115,8 @@ async function doEsbuild(
       if (
         relPath.indexOf("(disabled):") !== -1 ||
         relPath.startsWith("wasm-binary:") ||
-        relPath.startsWith("wasm-stub:")
+        relPath.startsWith("wasm-stub:") ||
+        relPath.startsWith("server-only-stub:")
       ) {
         continue;
       }
@@ -110,7 +124,6 @@ async function doEsbuild(
       const st = ctx.fs.stat(absPath);
       if (st.size !== input.bytes) {
         logWarning(
-          ctx,
           `Bundled file ${absPath} changed right after esbuild invocation`,
         );
         // Consider this a transient error so we'll try again and hopefully
@@ -165,25 +178,29 @@ async function doEsbuild(
   }
 }
 
-function isEsbuildBuildError(e: any): e is BuildFailure {
-  return (
-    "errors" in e &&
-    "warnings" in e &&
-    Array.isArray(e.errors) &&
-    Array.isArray(e.warnings)
-  );
-}
-
-export async function bundle(
-  ctx: Context,
-  dir: string,
-  entryPoints: string[],
-  generateSourceMaps: boolean,
-  platform: esbuild.Platform,
+export async function bundle({
+  ctx,
+  dir,
+  entryPoints,
+  generateSourceMaps,
+  platform,
   chunksFolder = "_deps",
-  externalPackagesAllowList: string[] = [],
-  extraConditions: string[] = [],
-): Promise<{
+  externalPackagesAllowList = [],
+  extraConditions = [],
+  includeSourcesContent = false,
+  splitting,
+}: {
+  ctx: Context;
+  dir: string;
+  entryPoints: string[];
+  generateSourceMaps: boolean;
+  platform: esbuild.Platform;
+  chunksFolder?: string;
+  externalPackagesAllowList?: string[];
+  extraConditions?: string[];
+  includeSourcesContent?: boolean;
+  splitting?: boolean;
+}): Promise<{
   modules: Bundle[];
   externalDependencies: Map<string, string>;
   bundledModuleNames: Set<string>;
@@ -192,16 +209,19 @@ export async function bundle(
     ctx,
     externalPackagesAllowList,
   );
-  const result = await doEsbuild(
+  const result = await doEsbuild({
     ctx,
     dir,
     entryPoints,
     generateSourceMaps,
     platform,
     chunksFolder,
-    availableExternalPackages,
+    externalPackages: availableExternalPackages,
     extraConditions,
-  );
+    includeSourcesContent,
+    splitting,
+  });
+  // Some ESBuild errors won't show up here, instead crashing in doEsbuild().
   if (result.errors.length) {
     const errorMessage = result.errors
       .map((e) => `esbuild error: ${e.text}`)
@@ -213,7 +233,7 @@ export async function bundle(
     });
   }
   for (const warning of result.warnings) {
-    logWarning(ctx, chalk.yellow(`esbuild warning: ${warning.text}`));
+    logWarning(chalkStderr.yellow(`esbuild warning: ${warning.text}`));
   }
   const sourceMaps = new Map();
   const modules: Bundle[] = [];
@@ -292,15 +312,14 @@ export async function bundleSchema(
   if (!ctx.fs.exists(target)) {
     target = path.resolve(dir, "schema.js");
   }
-  const result = await bundle(
+  const result = await bundle({
     ctx,
     dir,
-    [target],
-    true,
-    "browser",
-    undefined,
+    entryPoints: [target],
+    generateSourceMaps: true,
+    platform: "browser",
     extraConditions,
-  );
+  });
   return result.modules;
 }
 
@@ -318,9 +337,23 @@ export async function bundleAuthConfig(ctx: Context, dir: string) {
     ? authConfigTsPath
     : authConfigPath;
   if (!ctx.fs.exists(chosenPath)) {
+    logVerbose(
+      chalkStderr.yellow(
+        `Found no auth config file at ${authConfigTsPath} or ${authConfigPath} so there are no configured auth providers`,
+      ),
+    );
     return [];
   }
-  const result = await bundle(ctx, dir, [chosenPath], true, "browser");
+  logVerbose(chalkStderr.yellow(`Bundling auth config found at ${chosenPath}`));
+  const result = await bundle({
+    ctx,
+    dir,
+    entryPoints: [chosenPath],
+    generateSourceMaps: true,
+    platform: "browser",
+    // The auth config must be one module
+    splitting: false,
+  });
   return result.modules;
 }
 
@@ -369,7 +402,22 @@ export async function entryPoints(
 ): Promise<string[]> {
   const entryPoints = [];
 
-  for (const { isDir, path: fpath, depth } of walkDir(ctx.fs, dir)) {
+  // Don't deploy directories in convex/ that define components
+  // as this leads to double-deploying.
+  const looksLikeNestedComponent = (dirPath: string): boolean => {
+    const config = path.join(dirPath, "convex.config.ts");
+    const isComponentDefinition = ctx.fs.exists(config);
+    if (isComponentDefinition) {
+      logVerbose(chalkStderr.yellow(`Skipping component directory ${dirPath}`));
+    }
+    return isComponentDefinition;
+  };
+
+  for (const { isDir, path: fpath, depth } of walkDir(
+    ctx.fs,
+    dir,
+    looksLikeNestedComponent,
+  )) {
     if (isDir) {
       continue;
     }
@@ -390,8 +438,7 @@ export async function entryPoints(
       const source = ctx.fs.readUtf8File(fpath);
       if (await doesImportConvexHttpRouter(source))
         logWarning(
-          ctx,
-          chalk.yellow(
+          chalkStderr.yellow(
             `Found ${fpath}. HTTP action routes will not be imported from this file. Did you mean to include http${extension}?`,
           ),
         );
@@ -403,29 +450,27 @@ export async function entryPoints(
 
     // This should match isEntryPoint in the convex eslint plugin.
     if (!ENTRY_POINT_EXTENSIONS.some((ext) => relPath.endsWith(ext))) {
-      logVerbose(ctx, chalk.yellow(`Skipping non-JS file ${fpath}`));
+      logVerbose(chalkStderr.yellow(`Skipping non-JS file ${fpath}`));
     } else if (relPath.startsWith("_generated" + path.sep)) {
-      logVerbose(ctx, chalk.yellow(`Skipping ${fpath}`));
+      logVerbose(chalkStderr.yellow(`Skipping ${fpath}`));
     } else if (base.startsWith(".")) {
-      logVerbose(ctx, chalk.yellow(`Skipping dotfile ${fpath}`));
+      logVerbose(chalkStderr.yellow(`Skipping dotfile ${fpath}`));
     } else if (base.startsWith("#")) {
-      logVerbose(ctx, chalk.yellow(`Skipping likely emacs tempfile ${fpath}`));
+      logVerbose(chalkStderr.yellow(`Skipping likely emacs tempfile ${fpath}`));
     } else if (base === "schema.ts" || base === "schema.js") {
-      logVerbose(ctx, chalk.yellow(`Skipping ${fpath}`));
+      logVerbose(chalkStderr.yellow(`Skipping ${fpath}`));
     } else if ((base.match(/\./g) || []).length > 1) {
       // `auth.config.ts` and `convex.config.ts` are important not to bundle.
       // `*.test.ts` `*.spec.ts` are common in developer code.
       logVerbose(
-        ctx,
-        chalk.yellow(`Skipping ${fpath} that contains multiple dots`),
+        chalkStderr.yellow(`Skipping ${fpath} that contains multiple dots`),
       );
     } else if (relPath.includes(" ")) {
       logVerbose(
-        ctx,
-        chalk.yellow(`Skipping ${relPath} because it contains a space`),
+        chalkStderr.yellow(`Skipping ${relPath} because it contains a space`),
       );
     } else {
-      logVerbose(ctx, chalk.green(`Preparing ${fpath}`));
+      logVerbose(chalkStderr.green(`Preparing ${fpath}`));
       entryPoints.push(fpath);
     }
   }
@@ -442,8 +487,7 @@ export async function entryPoints(
       return true;
     }
     logVerbose(
-      ctx,
-      chalk.yellow(
+      chalkStderr.yellow(
         `Skipping ${fpath} because it has no export or import to make it a valid TypeScript module`,
       ),
     );
@@ -491,7 +535,6 @@ function hasUseNodeDirective(ctx: Context, fpath: string): boolean {
 
     // Log that we failed to parse in verbose node if we need this for debugging.
     logVerbose(
-      ctx,
       `Failed to parse ${fpath}. Use node is set to ${lineMatches} based on regex. Parse error: ${error.toString()}.`,
     );
 

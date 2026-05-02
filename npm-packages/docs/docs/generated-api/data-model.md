@@ -1,6 +1,7 @@
 ---
 title: "dataModel.d.ts"
 sidebar_position: 1
+description: "Generated TypeScript types for your database schema and documents"
 ---
 
 <Admonition type="caution" title="This code is generated">
@@ -45,7 +46,8 @@ An identifier for a document in Convex.
 Convex documents are uniquely identified by their `Id`, which is accessible on
 the `_id` field. To learn more, see [Document IDs](/database/document-ids.mdx).
 
-Documents can be loaded using `db.get(id)` in query and mutation functions.
+Documents can be loaded using `db.get(tableName, id)` in query and mutation
+functions.
 
 IDs are just strings at runtime, but this type can be used to distinguish them
 from other strings when type checking.

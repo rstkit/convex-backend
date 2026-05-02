@@ -38,13 +38,16 @@
 .copyButtonIcon,
 .copyButtonSuccessIcon {
   position: absolute;
-  top: 0;
-  left: 0;
   fill: currentColor;
-  opacity: inherit;
   width: inherit;
   height: inherit;
   transition: all var(--ifm-transition-fast) ease;
+}
+
+.copyButtonIcon {
+  top: 0;
+  left: 0;
+  opacity: inherit;
 }
 
 .copyButtonSuccessIcon {

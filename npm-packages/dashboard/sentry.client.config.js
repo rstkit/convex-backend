@@ -12,18 +12,15 @@ const environment =
 
 Sentry.init({
   dsn: SENTRY_DSN,
-  profilesSampleRate: 0.5,
-  tracesSampleRate: 0.5,
+  profilesSampleRate: 0.05,
+  tracesSampleRate: 0.05,
   tunnel: `${process.env.NEXT_PUBLIC_BIG_BRAIN_URL}/sentry`,
   environment,
   integrations: [
     new Sentry.BrowserTracing({
       tracingOrigins: ["localhost", /^\//, /.*\.convex.cloud/],
     }),
-    new Sentry.Replay({ useCompression: false }),
   ],
-  replaysSessionSampleRate: 0.1,
-  replaysOnErrorSampleRate: 1.0,
   release: process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA,
   ignoreErrors: [
     "ResizeObserver loop completed with undelivered notifications.",

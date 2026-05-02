@@ -8,11 +8,6 @@
  * @module
  */
 
-import type {
-  ApiFromModules,
-  FilterApi,
-  FunctionReference,
-} from "convex/server";
 import type * as lib_dependentMiddlewareTemplate from "../lib/dependentMiddlewareTemplate.js";
 import type * as lib_mergeMiddlewareTemplate from "../lib/mergeMiddlewareTemplate.js";
 import type * as lib_middlewareTemplate from "../lib/middlewareTemplate.js";
@@ -24,14 +19,12 @@ import type * as lib_withSession from "../lib/withSession.js";
 import type * as lib_withUser from "../lib/withUser.js";
 import type * as sessions from "../sessions.js";
 
-/**
- * A utility for referencing Convex functions in your app's API.
- *
- * Usage:
- * ```js
- * const myFunctionReference = api.myModule.myFunction;
- * ```
- */
+import type {
+  ApiFromModules,
+  FilterApi,
+  FunctionReference,
+} from "convex/server";
+
 declare const fullApi: ApiFromModules<{
   "lib/dependentMiddlewareTemplate": typeof lib_dependentMiddlewareTemplate;
   "lib/mergeMiddlewareTemplate": typeof lib_mergeMiddlewareTemplate;
@@ -44,11 +37,31 @@ declare const fullApi: ApiFromModules<{
   "lib/withUser": typeof lib_withUser;
   sessions: typeof sessions;
 }>;
+
+/**
+ * A utility for referencing Convex functions in your app's public API.
+ *
+ * Usage:
+ * ```js
+ * const myFunctionReference = api.myModule.myFunction;
+ * ```
+ */
 export declare const api: FilterApi<
   typeof fullApi,
   FunctionReference<any, "public">
 >;
+
+/**
+ * A utility for referencing Convex functions in your app's internal API.
+ *
+ * Usage:
+ * ```js
+ * const myFunctionReference = internal.myModule.myFunction;
+ * ```
+ */
 export declare const internal: FilterApi<
   typeof fullApi,
   FunctionReference<any, "internal">
 >;
+
+export declare const components: {};

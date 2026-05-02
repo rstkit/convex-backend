@@ -1,11 +1,8 @@
 import { Command } from "@commander-js/extra-typings";
-import chalk from "chalk";
+import { chalkStderr } from "chalk";
 import { ensureHasConvexDependency } from "./lib/utils/utils.js";
 import { oneoffContext } from "../bundler/context.js";
-import {
-  deploymentSelectionWithinProjectFromOptions,
-  loadSelectedDeploymentCredentials,
-} from "./lib/api.js";
+import { loadSelectedDeploymentCredentials } from "./lib/api.js";
 import { deploymentDashboardUrlPage } from "./lib/dashboard.js";
 import { actionDescription } from "./lib/command.js";
 import { exportFromDeployment } from "./lib/convexExport.js";
@@ -25,18 +22,13 @@ export const convexExport = new Command("export")
     await ensureHasConvexDependency(ctx, "export");
 
     const deploymentSelection = await getDeploymentSelection(ctx, options);
-
-    const selectionWithinProject =
-      await deploymentSelectionWithinProjectFromOptions(ctx, options);
-
     const deployment = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      selectionWithinProject,
     );
 
     const deploymentNotice = options.prod
-      ? ` in your ${chalk.bold("prod")} deployment`
+      ? ` in your ${chalkStderr.bold("prod")} deployment`
       : "";
     await exportFromDeployment(ctx, {
       ...options,

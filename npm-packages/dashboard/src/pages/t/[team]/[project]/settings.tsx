@@ -3,20 +3,19 @@ import { PageContent } from "@common/elements/PageContent";
 import { Loading } from "@ui/Loading";
 import { Button } from "@ui/Button";
 import { Sheet } from "@ui/Sheet";
-import { LocalDevCallout } from "@common/elements/LocalDevCallout";
-import { Callout } from "@ui/Callout";
-import { DeploymentType } from "@common/features/settings/components/DeploymentUrl";
 import { useDeployments } from "api/deployments";
 import { useCurrentTeam, useTeamEntitlements } from "api/teams";
 import { useCurrentProject } from "api/projects";
 import {
-  useCreateTeamAccessToken,
-  useInstanceAccessTokens,
-  useProjectAccessTokens,
+  useCreatePreviewDeployKey,
+  useDeletePreviewDeployKey,
+  usePreviewDeployKeys,
+  useProjectAppAccessTokens,
+  useDeleteAppAccessTokenByName,
 } from "api/accessTokens";
 import { useHasProjectAdminPermissions } from "api/roles";
 import { useRouter } from "next/router";
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect } from "react";
 import { ProjectForm } from "components/projects/ProjectForm";
 import { TrashIcon } from "@radix-ui/react-icons";
 import {
@@ -25,140 +24,80 @@ import {
 } from "components/projects/modals/LostAccessModal";
 import { withAuthenticatedPage } from "lib/withAuthenticatedPage";
 import { DefaultEnvironmentVariables } from "components/projectSettings/DefaultEnvironmentVariables";
-import {
-  getAccessTokenBasedDeployKey,
-  getAccessTokenBasedDeployKeyForPreview,
-} from "components/deploymentSettings/DeployKeysForDeployment";
 import { ProjectDetails } from "generatedApi";
-import Link from "next/link";
-import { useDeploymentUris } from "hooks/useDeploymentUris";
+import { Link } from "@ui/Link";
 import Head from "next/head";
-import { useAccessToken } from "hooks/useServerSideData";
 import { MemberProjectRoles } from "components/projects/MemberProjectRoles";
 import { DeploymentAccessTokenList } from "components/deploymentSettings/DeploymentAccessTokenList";
 import { CustomDomains } from "components/projectSettings/CustomDomains";
 import { TransferProject } from "components/projects/TransferProject";
 import { cn } from "@ui/cn";
-import { AuthorizedApplications } from "components/projectSettings/AuthorizedApplications";
+import { AuthorizedApplications } from "components/AuthorizedApplications";
+import { HelpTooltip } from "@ui/HelpTooltip";
+
+export { getServerSideProps } from "lib/ssr";
+
+export function ProjectSettingsPage() {
+  return (
+    <PageContent>
+      <ProjectSettings />
+    </PageContent>
+  );
+}
+
+export default withAuthenticatedPage(ProjectSettingsPage);
 
 const SECTION_IDS = {
   projectForm: "project-form",
   projectRoles: "project-roles",
   projectUsage: "project-usage",
   customDomains: "custom-domains",
-  deployKeys: "deploy-keys",
-  authorizedApplications: "authorized-applications",
+  productionDeployKeys: "production-deploy-keys",
+  previewDeployKeys: "preview-deploy-keys",
+  authorizedApps: "applications",
   envVars: "env-vars",
   lostAccess: "lost-access",
   transferProject: "transfer-project",
   deleteProject: "delete-project",
 } as const;
 
-export { getServerSideProps } from "lib/ssr";
-
-export default withAuthenticatedPage(function SettingsPage() {
-  return (
-    <PageContent>
-      <ProjectSettings />
-    </PageContent>
-  );
-});
+const sections = [
+  { id: SECTION_IDS.projectForm, label: "Edit Project" },
+  { id: SECTION_IDS.projectRoles, label: "Project Admins" },
+  { id: SECTION_IDS.projectUsage, label: "Project Usage" },
+  { id: SECTION_IDS.customDomains, label: "Custom Domains" },
+  { id: SECTION_IDS.productionDeployKeys, label: "Production Deploy Keys" },
+  { id: SECTION_IDS.previewDeployKeys, label: "Preview Deploy Keys" },
+  {
+    id: SECTION_IDS.authorizedApps,
+    label: "Authorized Applications",
+  },
+  { id: SECTION_IDS.envVars, label: "Environment Variables" },
+  { id: SECTION_IDS.lostAccess, label: "Lost Access" },
+  { id: SECTION_IDS.transferProject, label: "Transfer Project" },
+  { id: SECTION_IDS.deleteProject, label: "Delete Project" },
+];
 
 function SettingsNavigation() {
-  const sections = useMemo(
-    () => [
-      { id: SECTION_IDS.projectForm, label: "Edit Project" },
-      { id: SECTION_IDS.projectRoles, label: "Project Admins" },
-      { id: SECTION_IDS.projectUsage, label: "Project Usage" },
-      { id: SECTION_IDS.customDomains, label: "Custom Domains" },
-      { id: SECTION_IDS.deployKeys, label: "Deploy Keys" },
-      {
-        id: SECTION_IDS.authorizedApplications,
-        label: "Authorized Applications",
-      },
-      { id: SECTION_IDS.envVars, label: "Environment Variables" },
-      { id: SECTION_IDS.lostAccess, label: "Lost Access" },
-      { id: SECTION_IDS.transferProject, label: "Transfer Project" },
-      { id: SECTION_IDS.deleteProject, label: "Delete Project" },
-    ],
-    [],
-  );
-
-  const [scrollPercentage, setScrollPercentage] = useState(0);
-  const [visibleSections, setVisibleSections] = useState<Set<string>>(
-    new Set(),
-  );
-
-  useEffect(() => {
-    const handleScroll = () => {
-      const contentContainer = document.querySelector(
-        "[data-settings-content]",
-      );
-      if (!contentContainer) return;
-
-      const { scrollTop, scrollHeight, clientHeight } = contentContainer;
-      const percentage = (scrollTop / (scrollHeight - clientHeight)) * 100;
-      setScrollPercentage(Math.min(100, Math.max(0, percentage)));
-
-      // Check which sections are visible
-      const visibleIds = new Set<string>();
-      sections.forEach(({ id }) => {
-        const element = document.getElementById(id);
-        if (!element) return;
-
-        const rect = element.getBoundingClientRect();
-        const containerRect = contentContainer.getBoundingClientRect();
-
-        // Calculate visibility percentage
-        const elementHeight = rect.height;
-        const visibleHeight =
-          Math.min(rect.bottom, containerRect.bottom) -
-          Math.max(rect.top, containerRect.top);
-        const visibilityPercentage = (visibleHeight / elementHeight) * 100;
-
-        // If at least 10% of the element is visible
-        if (visibilityPercentage >= 10) {
-          visibleIds.add(id);
-        }
-      });
-
-      setVisibleSections(visibleIds);
-    };
-
-    const contentContainer = document.querySelector("[data-settings-content]");
-    if (contentContainer) {
-      contentContainer.addEventListener("scroll", handleScroll);
-      handleScroll(); // Initial calculation
-      return () => contentContainer.removeEventListener("scroll", handleScroll);
-    }
-  }, [sections]);
-
   return (
     <nav
       data-settings-nav
-      className="sticky top-0 hidden h-fit w-[14rem] shrink-0 overflow-visible pr-8 md:block"
+      className="relative"
       aria-label="Settings navigation"
     >
       <div
-        className="absolute left-0 h-full w-0.5 rounded bg-background-tertiary"
+        className="absolute left-0 h-full w-0.5 rounded-sm bg-background-tertiary"
         aria-hidden="true"
       />
-      <div
-        className="absolute left-0 h-8 w-0.5 rounded bg-content-primary transition-transform duration-75"
-        style={{
-          top: `max(0%, calc(${scrollPercentage}% - 2rem))`,
-        }}
-        aria-hidden="true"
-      />
-      <ul className="space-y-1 pl-1 text-sm">
+      <SettingsNavigationScrollProgress />
+      <ul className="pl-1 text-sm">
         {sections.map(({ id, label }) => (
-          <li key={id}>
+          <li key={id} className="py-px">
             <a
               href={`#${id}`}
               className={cn(
-                "block rounded px-2 py-1.5 transition-all duration-200",
-                "text-content-secondary hover:bg-background-secondary hover:text-content-primary",
-                visibleSections.has(id) && "text-content-primary",
+                "block rounded-sm px-2 py-2 transition-all duration-200",
+                "text-content-primary hover:bg-background-secondary",
               )}
               onClick={(e) => {
                 e.preventDefault();
@@ -172,6 +111,8 @@ function SettingsNavigation() {
                     block: isInView ? "start" : "nearest",
                     inline: "nearest",
                   });
+
+                  window.history.pushState(null, "", `#${id}`);
                 }
               }}
             >
@@ -184,12 +125,181 @@ function SettingsNavigation() {
   );
 }
 
+function SettingsNavigationScrollProgress() {
+  const [transform, setTransform] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    const contentWrapper = document.querySelector(
+      "[data-settings-content-wrapper]",
+    );
+    const content = document.querySelector("[data-settings-content]");
+    if (!contentWrapper) return undefined;
+
+    const forceUpdate = () => {
+      // Don't show indicator until sections are rendered
+      const firstElement = document.getElementById(sections[0].id);
+      if (!firstElement) {
+        setTransform(undefined);
+        return;
+      }
+
+      const containerRect = contentWrapper.getBoundingClientRect();
+
+      const elementHeight = 1 / sections.length;
+
+      const firstBoundary = findScrollBoundary("first", containerRect);
+      const lastBoundary = findScrollBoundary("last", containerRect);
+
+      const y =
+        (firstBoundary.index + firstBoundary.topClippedFraction) *
+        elementHeight;
+      const height =
+        firstBoundary.index === lastBoundary.index
+          ? firstBoundary.visibilityFraction * elementHeight
+          : (firstBoundary.visibilityFraction +
+              lastBoundary.visibilityFraction +
+              lastBoundary.index -
+              firstBoundary.index -
+              1) *
+            elementHeight;
+
+      setTransform(`translateY(${y * 100}%) scaleY(${height})`);
+    };
+
+    forceUpdate(); // Initial calculation
+
+    const update = () => {
+      window.requestAnimationFrame(forceUpdate);
+    };
+    contentWrapper.addEventListener("scroll", update);
+    window.addEventListener("resize", update);
+
+    const resizeObserver = new ResizeObserver(update);
+    if (content) {
+      resizeObserver.observe(content);
+    }
+
+    return () => {
+      contentWrapper.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+      resizeObserver.disconnect();
+    };
+  }, []);
+
+  if (transform === undefined) return null;
+
+  return (
+    <div
+      className="absolute left-0 h-full w-0.5 origin-top rounded-sm bg-content-primary"
+      style={{
+        transform,
+      }}
+      aria-hidden="true"
+    />
+  );
+}
+
+function findScrollBoundary(
+  boundary: "first" | "last",
+  containerRect: DOMRect,
+) {
+  for (
+    let i = boundary === "first" ? 0 : sections.length - 1;
+    boundary === "first" ? i < sections.length : i >= 0;
+    boundary === "first" ? i++ : i--
+  ) {
+    const section = sections[i];
+    const element = document.getElementById(section.id);
+    if (!element) {
+      continue;
+    }
+
+    const rect = element.getBoundingClientRect();
+
+    const visibleHeight =
+      Math.min(rect.bottom, containerRect.bottom) -
+      Math.max(rect.top, containerRect.top);
+
+    if (visibleHeight > 0) {
+      const elementHeight = rect.height;
+      return {
+        index: i,
+        visibilityFraction: visibleHeight / elementHeight,
+        topClippedFraction:
+          Math.max(0, containerRect.top - rect.top) / elementHeight,
+      };
+    }
+  }
+
+  return {
+    index: 0,
+    visibilityFraction: 0,
+    topClippedFraction: 0,
+  };
+}
+
 function ProjectSettings() {
   const team = useCurrentTeam();
   const project = useCurrentProject();
   const entitlements = useTeamEntitlements(team?.id);
   const hasAdminPermissions = useHasProjectAdminPermissions(project?.id);
   const router = useRouter();
+
+  const projectAppAccessTokens = useProjectAppAccessTokens(project?.id);
+  const deleteAppAccessTokenByName = useDeleteAppAccessTokenByName({
+    projectId: project?.id,
+  });
+
+  const authorizedAppsExplainer = (
+    <>
+      <h3 className="mb-2">Authorized Applications</h3>
+      <p className="text-sm text-content-primary">
+        These 3rd-party applications have been authorized to access this project
+        on your behalf.
+      </p>
+      <div className="mt-2 mb-2 text-sm text-content-primary">
+        <span className="font-semibold">
+          What can authorized applications do?
+        </span>
+        <ul className="mt-1 list-disc pl-4">
+          <li>Create new deployments in this project</li>
+          <li>
+            <span className="flex items-center gap-1">
+              Manage this project
+              <HelpTooltip>
+                This includes actions like managing custom domains, managing
+                environment variable defaults, and managing cloud backups and
+                restores.
+              </HelpTooltip>
+            </span>
+          </li>
+          <li>
+            <span className="flex items-center gap-1">
+              Read and write data in any deployment in this project
+              <HelpTooltip>
+                Write access to Production deployments will depend on your
+                team-level and project-level roles.
+              </HelpTooltip>
+            </span>
+          </li>
+        </ul>
+      </div>
+      <p className="mt-1 mb-2 text-sm text-content-primary">
+        You cannot see applications that other members of your team have
+        authorized.
+      </p>
+      {team && (
+        <p className="mt-1 mb-2 text-xs text-content-secondary">
+          There may also be <b>team-wide authorized applications</b> that can
+          access all projects in this team. You can view them in{" "}
+          <Link href={`/t/${team.slug}/settings/applications`}>
+            Team Settings
+          </Link>
+          .
+        </p>
+      )}
+    </>
+  );
 
   useEffect(() => {
     // Handle initial scroll based on hash
@@ -209,6 +319,8 @@ function ProjectSettings() {
     }
   }, [team, project, router]); // Only run when team/project load since that's when content becomes available
 
+  const title = <h2 className="pointer-events-auto py-6">Project Settings</h2>;
+
   return (
     <>
       <Head>
@@ -216,79 +328,113 @@ function ProjectSettings() {
           <title>Project Settings | {project.name} | Convex Dashboard</title>
         )}
       </Head>
-      <div className="m-auto flex h-full max-w-[80rem] grow flex-col gap-6 px-6">
-        <h2 className="sticky top-0 z-10 bg-background-primary pt-6">
-          Project Settings
-        </h2>
-        <div className="flex grow flex-col items-start gap-6 overflow-y-hidden md:flex-row">
-          <SettingsNavigation />
-          <div
-            data-settings-content
-            className="flex h-full grow flex-col gap-6 overflow-y-auto pb-6 pr-2 scrollbar"
-          >
-            {team && project ? (
-              <div id={SECTION_IDS.projectForm}>
-                <ProjectForm
-                  team={team}
-                  project={project}
-                  hasAdminPermissions={hasAdminPermissions}
-                />
+      <div className="relative h-full [--container-px:--spacing(6)] [--container-width:80rem] [--sidebar-gap:--spacing(8)] [--sidebar-width:12rem]">
+        <div className="pointer-events-none absolute inset-0 top-0 z-10 hidden md:block">
+          <div className="mx-auto flex h-full max-w-(--container-width) gap-(--sidebar-gap) px-(--container-px)">
+            <div className="h-full w-(--sidebar-width)">
+              <div className="grid h-full grid-rows-[auto_1fr]">
+                {title}
+                <div className="scrollbar overflow-y-auto">
+                  <div className="pointer-events-auto pb-8">
+                    <SettingsNavigation />
+                  </div>
+                </div>
               </div>
-            ) : (
-              <Loading className="h-[50rem]" fullHeight={false} />
-            )}
-            <div id={SECTION_IDS.projectRoles}>
-              <MemberProjectRoles />
             </div>
-            {team && project && (
-              <Sheet id={SECTION_IDS.projectUsage}>
-                <h3 className="mb-4">Project Usage</h3>
-                <p className="text-sm">
-                  View this project's usage and limits on{" "}
-                  <Link
-                    className="text-content-link hover:underline"
-                    href={`/t/${team.slug}/settings/usage?projectSlug=${project.slug}`}
-                  >
-                    this team's usage page
-                  </Link>
-                  .
-                </p>
-              </Sheet>
-            )}
-            {team && entitlements && (
-              <div id={SECTION_IDS.customDomains}>
-                <CustomDomains
-                  team={team}
-                  hasEntitlement={entitlements.customDomainsEnabled ?? false}
-                />
+            <div className="grow" />
+          </div>
+        </div>
+        <div
+          className="scrollbar h-full overflow-y-auto"
+          data-settings-content-wrapper
+        >
+          <div className="m-auto flex min-h-0 max-w-(--container-width) gap-(--sidebar-gap) px-(--container-px)">
+            <div className="hidden w-(--sidebar-width) shrink-0 md:block" />
+
+            <div className="flex grow flex-col items-start">
+              <div className="md:hidden">{title}</div>
+
+              <div
+                data-settings-content
+                className="flex w-full grow flex-col gap-6 pr-2 pb-6 md:pt-20 [&>*]:scroll-mt-3"
+              >
+                {team && project ? (
+                  <div id={SECTION_IDS.projectForm}>
+                    <ProjectForm
+                      team={team}
+                      project={project}
+                      hasAdminPermissions={hasAdminPermissions}
+                    />
+                  </div>
+                ) : (
+                  <Loading className="h-[50rem]" fullHeight={false} />
+                )}
+                <div id={SECTION_IDS.projectRoles}>
+                  <MemberProjectRoles />
+                </div>
+                {team && project && (
+                  <Sheet id={SECTION_IDS.projectUsage}>
+                    <h3 className="mb-4">Project Usage</h3>
+                    <p className="text-sm">
+                      View this project's usage and limits on{" "}
+                      <Link
+                        href={`/t/${team.slug}/settings/usage?projectSlug=${project.slug}`}
+                      >
+                        this team's usage page
+                      </Link>
+                      .
+                    </p>
+                  </Sheet>
+                )}
+                {team && entitlements && (
+                  <div id={SECTION_IDS.customDomains}>
+                    <CustomDomains
+                      team={team}
+                      hasEntitlement={
+                        entitlements.customDomainsEnabled ?? false
+                      }
+                    />
+                  </div>
+                )}
+                {project && (
+                  <div id={SECTION_IDS.productionDeployKeys}>
+                    <ProductionDeployKeys project={project} />
+                  </div>
+                )}
+                {project && (
+                  <div id={SECTION_IDS.previewDeployKeys}>
+                    <PreviewDeployKeys project={project} />
+                  </div>
+                )}
+                {project && (
+                  <div id={SECTION_IDS.authorizedApps}>
+                    <AuthorizedApplications
+                      accessTokens={projectAppAccessTokens}
+                      explainer={authorizedAppsExplainer}
+                      onRevoke={async (token) => {
+                        await deleteAppAccessTokenByName({ name: token.name });
+                      }}
+                    />
+                  </div>
+                )}
+                <div id={SECTION_IDS.envVars}>
+                  <DefaultEnvironmentVariables />
+                </div>
+                {team && project && !project?.isDemo && (
+                  <div id={SECTION_IDS.lostAccess}>
+                    <LostAccess
+                      teamSlug={team.slug}
+                      projectSlug={project.slug}
+                    />
+                  </div>
+                )}
+                <div id={SECTION_IDS.transferProject}>
+                  <TransferProject />
+                </div>
+                <div id={SECTION_IDS.deleteProject}>
+                  <DeleteProject />
+                </div>
               </div>
-            )}
-            {project && (
-              <div id={SECTION_IDS.deployKeys}>
-                <GenerateDeployKey
-                  project={project}
-                  hasAdminPermissions={hasAdminPermissions}
-                />
-              </div>
-            )}
-            {project && (
-              <div id={SECTION_IDS.authorizedApplications}>
-                <AuthorizedApplications project={project} />
-              </div>
-            )}
-            <div id={SECTION_IDS.envVars}>
-              <DefaultEnvironmentVariables />
-            </div>
-            {team && project && !project?.isDemo && (
-              <div id={SECTION_IDS.lostAccess}>
-                <LostAccess teamSlug={team.slug} projectSlug={project.slug} />
-              </div>
-            )}
-            <div id={SECTION_IDS.transferProject}>
-              <TransferProject />
-            </div>
-            <div id={SECTION_IDS.deleteProject}>
-              <DeleteProject />
             </div>
           </div>
         </div>
@@ -358,136 +504,52 @@ function DeleteProject() {
   );
 }
 
-function GenerateDeployKey({
-  project,
-  hasAdminPermissions,
-}: {
-  project: ProjectDetails;
-  hasAdminPermissions: boolean;
-}) {
+function ProductionDeployKeys({ project }: { project: ProjectDetails }) {
+  const team = useCurrentTeam();
+
+  const { deployments } = useDeployments(project.id);
+  const defaultProdDeployment = deployments?.find(
+    (d) => d.kind === "cloud" && d.deploymentType === "prod" && d.isDefault,
+  );
+
   return (
-    <Sheet className="flex flex-col gap-4">
-      <h3>Deploy Keys</h3>
-      <div className="flex flex-col gap-4 divide-y">
-        <ProductionDeployKeys
-          project={project}
-          hasAdminPermissions={hasAdminPermissions}
-        />
-        <PreviewDeployKeys project={project} />
+    <Sheet>
+      <div className="flex flex-col gap-4">
+        <div>
+          <h3 className="mb-2">Production Deploy Keys</h3>
+          <p className="max-w-prose text-sm text-content-primary">
+            Configuration for production deploy keys has moved. You may generate
+            deploy keys in{" "}
+            {team && defaultProdDeployment ? (
+              <Link
+                href={`/t/${team.slug}/${project.slug}/${defaultProdDeployment.name}/settings`}
+              >
+                Deployment Settings
+              </Link>
+            ) : (
+              <span className="font-semibold">Deployment Settings</span>
+            )}
+            .
+          </p>
+        </div>
       </div>
     </Sheet>
   );
 }
 
-function ProductionDeployKeys({
-  project,
-  hasAdminPermissions,
-}: {
-  project: ProjectDetails;
-  hasAdminPermissions: boolean;
-}) {
-  const team = useCurrentTeam();
-  const [accessToken] = useAccessToken();
-
-  const { deployments } = useDeployments(project.id);
-  const prodDeployment = deployments?.find((d) => d.deploymentType === "prod");
-  const { prodHref } = useDeploymentUris(project.id, project.slug);
-
-  const disabledReason = !hasAdminPermissions ? "CannotManageProd" : null;
-
-  const accessTokens = useInstanceAccessTokens(
-    disabledReason === null ? prodDeployment?.name : undefined,
-  );
-  const createAccessTokenMutation = useCreateTeamAccessToken({
-    deploymentName: prodDeployment?.name || "",
-    kind: "deployment",
-  });
-
-  const deployKeyDescription = (
-    <p className="mb-2 text-sm text-content-primary">
-      This is the key for your{" "}
-      <Link passHref href={prodHref} className="text-content-link">
-        <DeploymentType deploymentType="prod" /> deployment
-      </Link>
-      . Generate and copy this key to configure Convex integrations, such as
-      automatically deploying to a{" "}
-      <Link
-        passHref
-        href="https://docs.convex.dev/production/hosting"
-        className="text-content-link"
-        target="_blank"
-      >
-        hosting provider
-      </Link>{" "}
-      (like Netlify or Vercel) or syncing data with{" "}
-      <Link
-        passHref
-        href="https://docs.convex.dev/database/import-export/streaming"
-        className="text-content-link"
-        target="_blank"
-      >
-        Fivetran or Airbyte
-      </Link>
-      .
-    </p>
-  );
-
-  return (
-    <div className="flex flex-col gap-2">
-      {team && prodDeployment ? (
-        <DeploymentAccessTokenList
-          header="Production"
-          description={deployKeyDescription}
-          disabledReason={disabledReason}
-          buttonProps={{
-            deploymentType: "prod",
-            getAdminKey: async (name: string) =>
-              getAccessTokenBasedDeployKey(
-                prodDeployment,
-                project,
-                team,
-                `prod:${prodDeployment.name}`,
-                accessToken,
-                createAccessTokenMutation,
-                name,
-              ),
-            disabledReason,
-          }}
-          identifier={prodDeployment.name}
-          tokenPrefix={`prod:${prodDeployment.name}`}
-          accessTokens={accessTokens}
-          kind="deployment"
-        />
-      ) : (
-        <div>
-          <h4 className="mb-2">Production</h4>
-          This project does not have a production deployment yet.
-        </div>
-      )}
-    </div>
-  );
-}
-
 function PreviewDeployKeys({ project }: { project: ProjectDetails }) {
-  const createProjectAccessTokenMutation = useCreateTeamAccessToken({
-    projectId: project.id,
-    kind: "project",
-  });
-  const [accessToken] = useAccessToken();
+  const createPreviewDeployKey = useCreatePreviewDeployKey(project.id);
+  const deletePreviewDeployKey = useDeletePreviewDeployKey(project.id);
   const team = useCurrentTeam();
-  const selectedTeamSlug = team?.slug;
 
-  const arePreviewDeploymentsAvailable =
-    useTeamEntitlements(team?.id)?.projectMaxPreviewDeployments !== 0;
-  const projectAccessTokens = useProjectAccessTokens(project.id);
+  const previewDeployKeys = usePreviewDeployKeys(project.id);
 
   const deployKeyDescription = (
-    <p className="mb-2 text-sm text-content-primary">
+    <p className="mb-2 max-w-prose text-sm text-content-primary">
       These keys are for creating{" "}
       <Link
         passHref
-        href="https://docs.convex.dev/production/hosting/preview-deployments"
-        className="text-content-link"
+        href="https://docs.convex.dev/production/multiple-deployments#preview"
         target="_blank"
       >
         preview deployments
@@ -496,7 +558,6 @@ function PreviewDeployKeys({ project }: { project: ProjectDetails }) {
       <Link
         passHref
         href="https://docs.convex.dev/production/hosting"
-        className="text-content-link"
         target="_blank"
       >
         hosting provider
@@ -506,62 +567,45 @@ function PreviewDeployKeys({ project }: { project: ProjectDetails }) {
     </p>
   );
 
-  if (!arePreviewDeploymentsAvailable) {
-    return (
-      <div className="pt-4">
-        <Callout>
-          <p>
-            <Link
-              passHref
-              href="https://docs.convex.dev/production/hosting/preview-deployments"
-              className="underline"
-              target="_blank"
-            >
-              Preview deployments
-            </Link>
-            {" are only available in paid plans. "}
-            <Link
-              href={`/${selectedTeamSlug}/settings/billing`}
-              className="underline"
-            >
-              Upgrade to get access.
-            </Link>
-          </p>
-        </Callout>
-        <LocalDevCallout
-          tipText="Tip: Run this to enable preview deployments locally:"
-          command={`cargo run --bin big-brain-tool -- --dev grant-entitlement --team-entitlement project_max_preview_deployments --team-id ${team?.id} --reason "local" 200 --for-real`}
-        />
-      </div>
-    );
-  }
-
   return (
-    <div className="flex flex-col gap-2 pt-4">
-      {team && accessToken && createProjectAccessTokenMutation && (
-        <DeploymentAccessTokenList
-          identifier={project.id.toString()}
-          tokenPrefix={`preview:${selectedTeamSlug}:${project.slug}`}
-          accessTokens={projectAccessTokens}
-          kind="project"
-          disabledReason={null}
-          buttonProps={{
-            deploymentType: "preview",
-            disabledReason: null,
-            getAdminKey: async (name: string) =>
-              getAccessTokenBasedDeployKeyForPreview(
-                project,
-                team,
-                `preview:${selectedTeamSlug}:${project.slug}`,
-                accessToken,
-                createProjectAccessTokenMutation,
-                name,
-              ),
-          }}
-          header="Preview"
-          description={deployKeyDescription}
-        />
-      )}
-    </div>
+    <Sheet className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2">
+        {team && (
+          <DeploymentAccessTokenList
+            deploymentType="preview"
+            onDelete={deletePreviewDeployKey}
+            deployKeys={previewDeployKeys}
+            disabledReason={null}
+            buttonProps={{
+              deploymentType: "preview",
+              disabledReason: null,
+              showCustomPermissions: false,
+              getAdminKey: async (
+                name: string,
+                _allowedOperations: string[] | undefined,
+                expiresAt: number | undefined,
+              ) => {
+                try {
+                  const result = await createPreviewDeployKey({
+                    name,
+                    ...(expiresAt !== undefined && { expiresAt }),
+                  });
+                  if (!result) return { ok: false as const };
+                  return {
+                    ok: true as const,
+                    adminKey: result.previewDeployKey,
+                  };
+                } catch {
+                  return { ok: false as const };
+                }
+              },
+            }}
+            header="Preview Deploy Keys"
+            headingLevel="h3"
+            description={deployKeyDescription}
+          />
+        )}
+      </div>
+    </Sheet>
   );
 }

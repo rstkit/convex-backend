@@ -62,6 +62,22 @@ pub fn float64(has_special_values: bool, value_format: ValueFormat) -> JsonValue
                     }
                 ]
             }),
+            ValueFormat::ConvexExportJSON => json!({
+                "$description": "float64",
+                "anyOf": [
+                    {"type": "number"},
+                    {
+                        "type": "object",
+                        "$description": "-inf, inf, or NaN",
+                        "properties": {
+                            "$float": {
+                                "$description": "float64 -> little-endian -> base64",
+                                "type": "string"
+                            },
+                        },
+                    }
+                ]
+            }),
         }
     } else {
         json!({"type": "number"})
@@ -84,6 +100,10 @@ pub fn int64(value_format: ValueFormat) -> JsonValue {
                 },
             }
         }),
+        ValueFormat::ConvexExportJSON => json!({
+            "$description": "int64",
+            "type": "number",
+        }),
     }
 }
 
@@ -101,7 +121,7 @@ pub fn bytes(value_format: ValueFormat) -> JsonValue {
             "$description": "base64 bytes",
             "type": "string",
         }),
-        ValueFormat::ConvexEncodedJSON => json!({
+        ValueFormat::ConvexEncodedJSON | ValueFormat::ConvexExportJSON => json!({
             "type": "object",
             "$description": "base64 bytes",
             "properties": {
@@ -115,34 +135,6 @@ pub fn array(element_schema: JsonValue) -> JsonValue {
     json!({
         "type": "array",
         "items": element_schema
-    })
-}
-
-pub fn set(element_schema: JsonValue) -> JsonValue {
-    json!({
-        "type": "object",
-        "$description": "Set",
-        "properties": {
-            "$set": {"type": "array", "items": element_schema}
-        }
-    })
-}
-
-pub fn map(key_schema: JsonValue, value_schema: JsonValue) -> JsonValue {
-    json!({
-        "type": "object",
-        "$description": "Map",
-        "properties": {
-            "$map": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "$description": "[key, value] tuple",
-                    "prefixItems": [key_schema, value_schema],
-                    "additionalItems": false,
-                }
-            }
-        }
     })
 }
 

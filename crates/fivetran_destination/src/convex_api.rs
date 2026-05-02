@@ -11,20 +11,14 @@ use chrono::{
     Utc,
 };
 use common::{
-    json::JsonSerializable,
+    json::JsonForm as _,
     schemas::{
         DatabaseSchema,
         TableDefinition,
     },
     value::TableName,
 };
-use convex_fivetran_common::config::Config;
-use convex_fivetran_destination::api_types::{
-    BatchWriteRow,
-    CreateTableArgs,
-    DeleteType,
-    TruncateTableArgs,
-};
+use fivetran_common::config::Config;
 use serde::{
     de::DeserializeOwned,
     Serialize,
@@ -33,6 +27,13 @@ use serde_json::Value as JsonValue;
 use tonic::codegen::http::{
     HeaderName,
     HeaderValue,
+};
+
+use crate::api_types::{
+    BatchWriteRow,
+    CreateTableArgs,
+    DeleteType,
+    TruncateTableArgs,
 };
 
 #[allow(clippy::declare_interior_mutable_const)]

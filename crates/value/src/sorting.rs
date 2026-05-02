@@ -27,9 +27,7 @@ use crate::{
     walk::{
         ConvexArrayWalker,
         ConvexBytesWalker,
-        ConvexMapWalker,
         ConvexObjectWalker,
-        ConvexSetWalker,
         ConvexStringWalker,
         ConvexValueType,
         ConvexValueWalker,
@@ -43,22 +41,14 @@ const UNDEFINED_TAG: u8 = 0x1;
 // const ID_TAG: u8 = 0x2;
 const NULL_TAG: u8 = 0x3;
 
-#[cfg(any(test, feature = "testing"))]
 const NEG_INT64_8_BYTE_TAG: u8 = 0x4;
-#[allow(unused)]
 const NEG_INT64_4_BYTE_TAG: u8 = 0x5;
-#[allow(unused)]
 const NEG_INT64_2_BYTE_TAG: u8 = 0x6;
-#[allow(unused)]
 const NEG_INT64_1_BYTE_TAG: u8 = 0x7;
 const ZERO_INT64_TAG: u8 = 0x8;
-#[allow(unused)]
 const POS_INT64_1_BYTE_TAG: u8 = 0x9;
-#[allow(unused)]
 const POS_INT64_2_BYTE_TAG: u8 = 0xA;
-#[allow(unused)]
 const POS_INT64_4_BYTE_TAG: u8 = 0xB;
-#[cfg(any(test, feature = "testing"))]
 const POS_INT64_8_BYTE_TAG: u8 = 0xC;
 
 const FLOAT64_TAG: u8 = 0xD;
@@ -69,20 +59,23 @@ const TRUE_BOOLEAN_TAG: u8 = 0xF;
 const STRING_TAG: u8 = 0x10;
 const BYTES_TAG: u8 = 0x11;
 const ARRAY_TAG: u8 = 0x12;
-const SET_TAG: u8 = 0x13;
-const MAP_TAG: u8 = 0x14;
+// Deprecated datatypes, now unused.
+// const SET_TAG: u8 = 0x13;
+// const MAP_TAG: u8 = 0x14;
 const OBJECT_TAG: u8 = 0x15;
 
 pub const TERMINATOR_BYTE: u8 = 0x0;
 const ESCAPE_BYTE: u8 = 0xFF;
 
 pub fn write_escaped_bytes(buf: &[u8], writer: &mut impl BufMut) {
-    for &byte in buf {
-        writer.put_u8(byte);
-        if byte == TERMINATOR_BYTE {
-            writer.put_u8(ESCAPE_BYTE);
-        }
+    let mut last = 0;
+    // Insert `ESCAPE_BYTE`s after each `TERMINATOR_BYTE`
+    for i in memchr::Memchr::new(TERMINATOR_BYTE, buf) {
+        writer.put_slice(&buf[last..=i]);
+        writer.put_u8(ESCAPE_BYTE);
+        last = i + 1;
     }
+    writer.put_slice(&buf[last..]);
     writer.put_u8(TERMINATOR_BYTE);
 }
 
@@ -123,46 +116,26 @@ pub fn values_to_bytes(values: &[Option<ConvexValue>]) -> Vec<u8> {
     out
 }
 
-/// Once a Value or IndexKey has been encoded for sorting, it should not be
-/// necessary to decode the Value or IndexKey again. Therefore this is
-/// test-only.
-#[cfg(any(test, feature = "testing"))]
 pub mod sorting_decode {
-    use std::{
-        cmp,
-        collections::{
-            BTreeMap,
-            BTreeSet,
-        },
-        io::{
-            self,
-            Read,
-        },
-    };
+    use std::collections::BTreeMap;
 
     use anyhow::bail;
-    use byteorder::{
-        BigEndian,
-        ReadBytesExt,
-    };
+    use bytes::Buf;
 
     use super::*;
     use crate::ConvexObject;
 
-    fn read_escaped_string<R: Read>(reader: &mut BytePeeker<R>) -> anyhow::Result<String> {
+    fn read_escaped_string<R: Buf>(reader: &mut R) -> anyhow::Result<String> {
         Ok(String::from_utf8(read_escaped_bytes(reader)?)?)
     }
 
-    fn read_terminated<R: Read, F>(
-        reader: &mut BytePeeker<R>,
-        mut read_element: F,
-    ) -> anyhow::Result<()>
+    fn read_terminated<R: Buf, F>(reader: &mut R, mut read_element: F) -> anyhow::Result<()>
     where
-        F: FnMut(&mut BytePeeker<R>) -> anyhow::Result<()>,
+        F: FnMut(&mut R) -> anyhow::Result<()>,
     {
         loop {
-            if let Some(TERMINATOR_BYTE) = reader.peek()? {
-                reader.read_u8()?;
+            if let Some(&TERMINATOR_BYTE) = reader.chunk().first() {
+                reader.get_u8();
                 break;
             }
             read_element(reader)?;
@@ -170,79 +143,68 @@ pub mod sorting_decode {
         Ok(())
     }
 
-    fn read_tagged_int<R: Read>(tag: u8, reader: &mut R) -> io::Result<i64> {
-        let is_negative = tag < ZERO_INT64_TAG;
-        let tag_diff = cmp::max(tag, ZERO_INT64_TAG) - cmp::min(tag, ZERO_INT64_TAG);
-        let num_bytes = 1 << (tag_diff - 1);
-        let mut buf = [if is_negative { 0xFF } else { 0x0 }; 8];
-        reader.read_exact(&mut buf[8 - num_bytes..])?;
-        Ok(i64::from_be_bytes(buf))
+    fn read_tagged_int<R: Buf>(tag: u8, reader: &mut R) -> anyhow::Result<i64> {
+        let val = match tag {
+            NEG_INT64_1_BYTE_TAG => reader.try_get_i8()? as i64,
+            NEG_INT64_2_BYTE_TAG => reader.try_get_i16()? as i64,
+            NEG_INT64_4_BYTE_TAG => reader.try_get_i32()? as i64,
+            NEG_INT64_8_BYTE_TAG => reader.try_get_i64()?,
+            ZERO_INT64_TAG => return Ok(0),
+            POS_INT64_1_BYTE_TAG => reader.try_get_i8()? as i64,
+            POS_INT64_2_BYTE_TAG => reader.try_get_i16()? as i64,
+            POS_INT64_4_BYTE_TAG => reader.try_get_i32()? as i64,
+            POS_INT64_8_BYTE_TAG => reader.try_get_i64()?,
+            _ => panic!("not a tagged int"),
+        };
+        // Check that the decoded value is in the expected range for `tag`
+        let in_range = match tag {
+            NEG_INT64_1_BYTE_TAG => val < 0,
+            NEG_INT64_2_BYTE_TAG => val < i8::MIN as i64,
+            NEG_INT64_4_BYTE_TAG => val < i16::MIN as i64,
+            NEG_INT64_8_BYTE_TAG => val < i32::MIN as i64,
+            POS_INT64_1_BYTE_TAG => val > 0,
+            POS_INT64_2_BYTE_TAG => val > i8::MAX as i64,
+            POS_INT64_4_BYTE_TAG => val > i16::MAX as i64,
+            POS_INT64_8_BYTE_TAG => val > i32::MAX as i64,
+            _ => unreachable!(),
+        };
+        anyhow::ensure!(in_range, "non-canonical tagged int {val} with tag {tag}");
+        Ok(val)
     }
 
-    /// Parse a `Vec<Value>` from it respective sort keys.
-    pub fn bytes_to_values<R: Read>(reader: &mut R) -> anyhow::Result<Vec<Option<ConvexValue>>> {
-        let reader = &mut BytePeeker::new(reader);
+    /// Parse a `Vec<Option<ConvexValue>>` from its respective sort keys.
+    pub fn bytes_to_values<R: Buf>(reader: &mut R) -> anyhow::Result<Vec<Option<ConvexValue>>> {
         let mut values = vec![];
-        while reader.peek()?.is_some() {
-            let value = ConvexValue::_read_sort_key(reader)?;
-            values.push(Some(value));
+        while reader.has_remaining() {
+            if reader.chunk()[0] == UNDEFINED_TAG {
+                reader.get_u8();
+                values.push(None);
+            } else {
+                let value = ConvexValue::read_sort_key(reader)?;
+                values.push(Some(value));
+            }
         }
         Ok(values)
     }
 
-    /// Reader that allow us to peak the next byte.
-    pub struct BytePeeker<R: Read> {
-        buf: Option<u8>,
-        reader: R,
-    }
-
-    impl<R: Read> BytePeeker<R> {
-        fn new(reader: R) -> Self {
-            Self { buf: None, reader }
-        }
-
-        pub fn peek(&mut self) -> io::Result<Option<u8>> {
-            if let Some(byte) = self.buf {
-                return Ok(Some(byte));
-            }
-            let mut buf = [0];
-            let n = self.reader.read(&mut buf)?;
-            if n == 0 {
-                return Ok(None);
-            }
-            let byte = buf[0];
-            self.buf = Some(byte);
-            Ok(Some(byte))
-        }
-    }
-
-    impl<R: Read> Read for BytePeeker<R> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            if let Some(byte) = self.buf.take() {
-                buf[0] = byte;
-                return Ok(1 + self.reader.read(&mut buf[1..])?);
-            }
-            self.reader.read(buf)
-        }
-    }
-
     /// Read an escaped, null-terminated byte string from the input stream.
-    pub fn read_escaped_bytes<R: Read>(reader: &mut BytePeeker<R>) -> io::Result<Vec<u8>> {
+    pub fn read_escaped_bytes<R: Buf>(reader: &mut R) -> anyhow::Result<Vec<u8>> {
         let mut out = vec![];
         loop {
-            let byte = reader.read_u8()?;
-            if byte == TERMINATOR_BYTE {
-                if let Some(ESCAPE_BYTE) = reader.peek()? {
-                    reader.read_u8()?;
+            anyhow::ensure!(reader.has_remaining(), "unexpected EOF");
+            let chunk = reader.chunk();
+            if let Some(i) = memchr::memchr(TERMINATOR_BYTE, chunk) {
+                out.extend_from_slice(&chunk[..i]);
+                reader.advance(i + 1);
+                if let Some(&ESCAPE_BYTE) = reader.chunk().first() {
+                    reader.advance(1);
                     out.push(TERMINATOR_BYTE);
                 } else {
                     break;
                 }
             } else {
-                out.push(byte);
+                out.extend_from_slice(chunk);
+                reader.advance(chunk.len());
             }
         }
         Ok(out)
@@ -250,21 +212,16 @@ pub mod sorting_decode {
 
     impl ConvexValue {
         /// Parse a `Value` from a sort key.
-        pub fn read_sort_key<R: Read>(reader: &mut R) -> anyhow::Result<Self> {
-            Self::_read_sort_key(&mut BytePeeker::new(reader))
-        }
-
-        fn _read_sort_key<R: Read>(reader: &mut BytePeeker<R>) -> anyhow::Result<Self> {
-            let tag = reader.read_u8()?;
+        pub fn read_sort_key<R: Buf>(reader: &mut R) -> anyhow::Result<Self> {
+            let tag = reader.try_get_u8()?;
             let r = match tag {
                 NULL_TAG => Self::Null,
 
-                ZERO_INT64_TAG => Self::from(0),
                 NEG_INT64_8_BYTE_TAG..=POS_INT64_8_BYTE_TAG => {
                     ConvexValue::from(read_tagged_int(tag, reader)?)
                 },
                 FLOAT64_TAG => {
-                    let mut n = reader.read_u64::<BigEndian>()?;
+                    let mut n = reader.try_get_u64()?;
                     // If the sign bit was set, just turn off the sign bit.
                     if n & (1 << 63) != 0 {
                         n &= !(1 << 63);
@@ -291,43 +248,30 @@ pub mod sorting_decode {
                 ARRAY_TAG => {
                     let mut elements = vec![];
                     read_terminated(reader, |reader| {
-                        elements.push(Self::_read_sort_key(reader)?);
+                        elements.push(Self::read_sort_key(reader)?);
                         Ok(())
                     })?;
                     ConvexValue::Array(elements.try_into()?)
                 },
-                SET_TAG => {
-                    let mut elements = BTreeSet::new();
-                    read_terminated(reader, |reader| {
-                        if !elements.insert(Self::_read_sort_key(reader)?) {
-                            anyhow::bail!("Duplicate element in encoded set");
-                        }
-                        Ok(())
-                    })?;
-                    ConvexValue::Set(elements.try_into()?)
-                },
-                MAP_TAG => {
-                    let mut elements = BTreeMap::new();
-                    read_terminated(reader, |reader| {
-                        let key = Self::_read_sort_key(reader)?;
-                        let value = Self::_read_sort_key(reader)?;
-                        if elements.insert(key, value).is_some() {
-                            anyhow::bail!("Duplicate element in encoded map");
-                        }
-                        Ok(())
-                    })?;
-                    ConvexValue::Map(elements.try_into()?)
-                },
                 OBJECT_TAG => {
                     let mut elements = BTreeMap::new();
-                    read_terminated(reader, |reader| {
-                        let field = read_escaped_string(reader)?.parse()?;
-                        let value = Self::_read_sort_key(reader)?;
+                    loop {
+                        let field = if let Some(&TERMINATOR_BYTE) = reader.chunk().first() {
+                            reader.get_u8();
+                            if let Some(&ESCAPE_BYTE) = reader.chunk().first() {
+                                reader.get_u8();
+                                "".parse()?
+                            } else {
+                                break;
+                            }
+                        } else {
+                            read_escaped_string(reader)?.try_into()?
+                        };
+                        let value = Self::read_sort_key(reader)?;
                         if elements.insert(field, value).is_some() {
                             anyhow::bail!("Duplicate element in encoded object");
                         }
-                        Ok(())
-                    })?;
+                    }
                     ConvexValue::Object(ConvexObject::try_from(elements)?)
                 },
 
@@ -401,27 +345,19 @@ pub fn write_sort_key<V: ConvexValueWalker>(
             }
             writer.put_u8(TERMINATOR_BYTE);
         },
-        ConvexValueType::Set(set) => {
-            writer.put_u8(SET_TAG);
-            for element in set.walk() {
-                write_sort_key(element?, writer)?;
-            }
-            writer.put_u8(TERMINATOR_BYTE);
-        },
-        ConvexValueType::Map(map) => {
-            writer.put_u8(MAP_TAG);
-            for pair in map.walk() {
-                let (key, value) = pair?;
-                write_sort_key(key, writer)?;
-                write_sort_key(value, writer)?;
-            }
-            writer.put_u8(TERMINATOR_BYTE);
-        },
         ConvexValueType::Object(object) => {
             writer.put_u8(OBJECT_TAG);
             for pair in object.walk() {
                 let (field, value) = pair?;
-                write_escaped_string(field.as_str(), writer);
+                let field = field.as_str();
+                write_escaped_string(field, writer);
+                // Distinguish the case of an empty FieldName from an empty
+                // object. Note that this encoding looks like an escaped `\0`
+                // byte, but valid FieldNames only contain non-control ASCII
+                // characters so this is not ambiguous.
+                if field.is_empty() {
+                    writer.put_u8(ESCAPE_BYTE);
+                }
                 write_sort_key(value, writer)?;
             }
             writer.put_u8(TERMINATOR_BYTE);
@@ -460,8 +396,6 @@ impl Ord for ConvexValue {
                 ConvexValue::String(..) => 5,
                 ConvexValue::Bytes(..) => 6,
                 ConvexValue::Array(..) => 7,
-                ConvexValue::Set(..) => 8,
-                ConvexValue::Map(..) => 9,
                 ConvexValue::Object(..) => 10,
             }
         }
@@ -512,18 +446,6 @@ impl Ord for ConvexValue {
                 };
                 self_.cmp(other_)
             },
-            ConvexValue::Set(self_) => {
-                let ConvexValue::Set(other_) = other else {
-                    panic!("Invalid value: {other:?}");
-                };
-                self_.cmp(other_)
-            },
-            ConvexValue::Map(self_) => {
-                let ConvexValue::Map(other_) = other else {
-                    panic!("Invalid value: {other:?}");
-                };
-                self_.cmp(other_)
-            },
             ConvexValue::Object(self_) => {
                 let ConvexValue::Object(other_) = other else {
                     panic!("Invalid value: {other:?}");
@@ -549,7 +471,6 @@ impl PartialEq for ConvexValue {
 impl Eq for ConvexValue {}
 
 #[derive(Clone, Debug)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct TotalOrdF64(f64);
 
 impl Ord for TotalOrdF64 {
@@ -582,187 +503,5 @@ impl From<f64> for TotalOrdF64 {
 impl From<TotalOrdF64> for f64 {
     fn from(f: TotalOrdF64) -> f64 {
         f.0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::{
-            BTreeMap,
-            BTreeSet,
-        },
-        fmt::Debug,
-    };
-
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-
-    use crate::{
-        id_v6::DeveloperDocumentId,
-        sorting::{
-            sorting_decode::bytes_to_values,
-            TotalOrdF64,
-        },
-        values_to_bytes,
-        ConvexArray,
-        ConvexBytes,
-        ConvexMap,
-        ConvexObject,
-        ConvexSet,
-        ConvexString,
-        ConvexValue,
-        InternalId,
-        ResolvedDocumentId,
-        TableNumber,
-        TabletId,
-    };
-
-    #[test]
-    fn test_roundtrip_trophies() -> anyhow::Result<()> {
-        // The random portion of this ID starts with the 0xFF byte which
-        // used to break our sorting serialization.
-        let id_str = "074wwt1x3qmwz35bvscy44eq2yngrt8";
-        let id = DeveloperDocumentId::decode(id_str)?;
-        let trophies = vec![ConvexValue::from(-1), ConvexValue::from(id)];
-        for v in trophies {
-            assert_eq!(
-                ConvexValue::read_sort_key(&mut &v.sort_key()[..]).unwrap(),
-                v
-            );
-        }
-        Ok(())
-    }
-
-    fn test_compatible_with_ord<F: Ord + TryInto<ConvexValue>>(l: F, r: F)
-    where
-        <F as TryInto<ConvexValue>>::Error: Debug,
-    {
-        let ord1 = l.cmp(&r);
-
-        let lv: ConvexValue = l.try_into().unwrap();
-        let rv: ConvexValue = r.try_into().unwrap();
-
-        let ord2 = lv.sort_key().cmp(&rv.sort_key());
-        assert_eq!(ord1, ord2);
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, .. ProptestConfig::default() })]
-
-        #[test]
-        fn test_roundtrips(v in any::<ConvexValue>(),) {
-            assert_eq!(ConvexValue::read_sort_key(&mut &v.sort_key()[..], ).unwrap(), v);
-        }
-
-        #[test]
-        fn test_vector_roundtrips(v in any::<Vec<ConvexValue>>()) {
-            let values: Vec<_> = v.clone().into_iter().map(Some).collect();
-            let bytes = values_to_bytes(&values);
-            assert_eq!(
-                bytes_to_values(&mut &bytes[..]).unwrap(),
-                v.into_iter().map(Some).collect::<Vec<_>>(),
-            );
-        }
-
-        #[test]
-        fn test_integer_roundtrips(v in any::<i64>()) {
-            let v = ConvexValue::from(v);
-            assert_eq!(ConvexValue::read_sort_key(&mut &v.sort_key()[..]).unwrap(), v);
-        }
-
-        #[test]
-        fn test_id_roundtrips(v in any::<DeveloperDocumentId>()) {
-            let v: ConvexValue = v.into();
-            assert_eq!(ConvexValue::read_sort_key(&mut &v.sort_key()[..]).unwrap(), v);
-        }
-
-
-        #[test]
-        fn test_compatible_with_manual_impl(
-            l in any::<ConvexValue>(),
-            r in any::<ConvexValue>(),
-        ) {
-            let ord1 = l.cmp(&r);
-            let ord2 = l.sort_key().cmp(&r.sort_key());
-            assert_eq!(ord1, ord2);
-        }
-
-        #[test]
-        fn test_compatible_with_float(l in any::<f64>(), r in any::<f64>()) {
-            test_compatible_with_ord(TotalOrdF64(l), TotalOrdF64(r));
-        }
-
-        #[test]
-        fn test_compatible_with_bool(l in any::<bool>(), r in any::<bool>())  {
-            test_compatible_with_ord(l, r)
-        }
-
-        #[test]
-        fn test_compatible_with_str(l in any::<ConvexString>(), r in any::<ConvexString>())  {
-            test_compatible_with_ord(String::from(l), String::from(r))
-        }
-
-        #[test]
-        fn test_compatible_with_bytes(l in any::<ConvexBytes>(), r in any::<ConvexBytes>())  {
-            test_compatible_with_ord(Vec::from(l), Vec::from(r))
-        }
-
-        #[test]
-        fn test_compatible_with_id_string(
-            l in any::<DeveloperDocumentId>(),
-            r in any::<DeveloperDocumentId>(),
-        )  {
-            test_compatible_with_ord(l.encode(), r.encode())
-        }
-
-        #[test]
-        fn test_compatible_with_internal_id(l in any::<InternalId>(), r in any::<InternalId>())  {
-            let tablet_id = TabletId::MIN;
-            let table_number = TableNumber::MIN;
-            let l = ResolvedDocumentId {
-                tablet_id,
-                developer_id: DeveloperDocumentId::new(table_number, l),
-            };
-            let r = ResolvedDocumentId {
-                tablet_id,
-                developer_id: DeveloperDocumentId::new(table_number, r),
-            };
-            test_compatible_with_ord(ConvexValue::from(l), ConvexValue::from(r))
-        }
-
-    }
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig {
-                cases: 16 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1),
-                failure_persistence: None,
-                .. ProptestConfig::default()
-            }
-        )]
-
-        #[test]
-        fn test_compatible_with_arr(l in any::<ConvexArray>(), r in any::<ConvexArray>())  {
-            test_compatible_with_ord(Vec::from(l), Vec::from(r))
-        }
-
-        #[test]
-        fn test_compatible_with_set(l in any::<ConvexSet>(), r in any::<ConvexSet>())  {
-            test_compatible_with_ord(BTreeSet::from(l), BTreeSet::from(r))
-        }
-
-        #[test]
-        fn test_compatible_with_map(l in any::<ConvexMap>(), r in any::<ConvexMap>())  {
-            test_compatible_with_ord(BTreeMap::from(l), BTreeMap::from(r))
-        }
-
-        #[test]
-        fn test_compatible_with_object(
-            l in any::<ConvexObject>(),
-            r in any::<ConvexObject>(),
-        )  {
-            test_compatible_with_ord(BTreeMap::from(l), BTreeMap::from(r))
-        }
     }
 }

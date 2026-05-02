@@ -28,6 +28,19 @@ pub fn log_websocket_message_in() {
     log_counter(&BACKEND_WS_IN_TOTAL, 1);
 }
 
+register_convex_histogram!(
+    WS_CLIENT_MESSAGE_BYTES,
+    "Size of client message received by the sync socket",
+    &["type"]
+);
+pub fn log_websocket_client_message_bytes(bytes: usize, message_type: String) {
+    log_distribution_with_labels(
+        &WS_CLIENT_MESSAGE_BYTES,
+        bytes as f64,
+        vec![StaticMetricLabel::new("type", message_type)],
+    );
+}
+
 register_convex_counter!(BACKEND_PING_TOTAL, "Number of websocket pings sent");
 pub fn log_websocket_ping() {
     log_counter(&BACKEND_PING_TOTAL, 1);
@@ -67,6 +80,7 @@ register_convex_counter!(
 pub fn log_websocket_message_out(message: &ServerMessage, delay: Duration) {
     let endpoint = match message {
         ServerMessage::Transition { .. } => "Transition",
+        ServerMessage::TransitionChunk { .. } => "TransitionChunk",
         ServerMessage::MutationResponse { .. } => "MutationResponse",
         ServerMessage::ActionResponse { .. } => "ActionResponse",
         ServerMessage::AuthError { .. } => "AuthError",
@@ -84,49 +98,55 @@ pub fn log_websocket_message_out(message: &ServerMessage, delay: Duration) {
 
 register_convex_counter!(
     BACKEND_WS_CLOSED_TOTAL,
-    "Number of times the websocket was closed"
+    "Number of times the websocket was closed",
+    &["partition_id"],
 );
-pub fn log_websocket_closed() {
-    log_counter(&BACKEND_WS_CLOSED_TOTAL, 1);
+pub fn log_websocket_closed(partition_id: String) {
+    log_counter_with_labels(
+        &BACKEND_WS_CLOSED_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("partition_id", partition_id)],
+    );
 }
 
 register_convex_counter!(
     BACKEND_WS_SERVER_ERROR_TOTAL,
     "Count of websocket server errors",
-    &["type"]
+    &["type", "partition_id"]
 );
-pub fn log_websocket_server_error(tag: StaticMetricLabel) {
-    log_counter_with_labels(&BACKEND_WS_SERVER_ERROR_TOTAL, 1, vec![tag]);
+pub fn log_websocket_server_error(tag: StaticMetricLabel, partition_id: String) {
+    log_counter_with_labels(
+        &BACKEND_WS_SERVER_ERROR_TOTAL,
+        1,
+        vec![tag, StaticMetricLabel::new("partition_id", partition_id)],
+    );
 }
 
 register_convex_counter!(
     BACKEND_WS_CONNECTION_CLOSED_ERROR_NOT_REPORTED_TOTAL,
-    "Count of connection closed errors not reported"
+    "Count of connection closed errors not reported",
+    &["partition_id"],
 );
-pub fn log_websocket_closed_error_not_reported() {
-    log_counter(&BACKEND_WS_CONNECTION_CLOSED_ERROR_NOT_REPORTED_TOTAL, 1);
+pub fn log_websocket_closed_error_not_reported(partition_id: String) {
+    log_counter_with_labels(
+        &BACKEND_WS_CONNECTION_CLOSED_ERROR_NOT_REPORTED_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("partition_id", partition_id)],
+    );
 }
 
 register_convex_gauge!(
     SYNC_PROTOCOL_WEBSOCKETS_TOTAL,
     "Number of WebSocket connected to a backend",
+    &["partition_id"],
 );
-pub fn log_sync_protocol_websockets_total(delta: i8) {
-    SYNC_PROTOCOL_WEBSOCKETS_TOTAL.add(delta as f64)
+pub fn log_sync_protocol_websockets_total(partition_id: &str, delta: i8) {
+    SYNC_PROTOCOL_WEBSOCKETS_TOTAL
+        .with_label_values(&[partition_id])
+        .add(delta as f64)
 }
 
 register_convex_counter!(pub WEBSOCKET_CONNECTION_RESET_TOTAL, "Number of websocket connection resets");
 pub fn log_websocket_connection_reset() {
     log_counter(&WEBSOCKET_CONNECTION_RESET_TOTAL, 1)
-}
-
-register_convex_gauge!(
-    DEBUG_SYNC_PROTOCOL_WEBSOCKETS_TOTAL,
-    "Number of WebSocket connected to a backend at a given state",
-    &["tag"]
-);
-pub fn log_debug_sync_protocol_websockets_total(tag: &'static str, delta: i8) {
-    DEBUG_SYNC_PROTOCOL_WEBSOCKETS_TOTAL
-        .with_label_values(&[tag])
-        .add(delta as f64)
 }

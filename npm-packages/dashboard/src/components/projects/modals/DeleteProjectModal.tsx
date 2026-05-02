@@ -8,11 +8,12 @@ import { useDeployments } from "api/deployments";
 import { useTeamMembers } from "api/teams";
 import { useDeleteProject } from "api/projects";
 import { useQuery } from "convex/react";
-import { ProjectDetails, Team } from "generatedApi";
+import { ProjectDetails, TeamResponse } from "generatedApi";
 import udfs from "@common/udfs";
 import { useState } from "react";
 import { DeploymentInfoProvider } from "providers/DeploymentInfoProvider";
 import { MaybeDeploymentApiProvider } from "providers/MaybeDeploymentApiProvider";
+import { usePostHog } from "hooks/usePostHog";
 
 export function DeleteProjectModal({
   onClose,
@@ -22,9 +23,10 @@ export function DeleteProjectModal({
 }: {
   onClose: () => void;
   onDelete?: () => void;
-  team: Team;
+  team: TeamResponse;
   project: ProjectDetails;
 }) {
+  const { capture } = usePostHog();
   const deleteProject = useDeleteProject(
     team.id,
     project.id,
@@ -32,18 +34,23 @@ export function DeleteProjectModal({
   );
 
   const handleDelete = async () => {
-    onDelete && onDelete();
+    onDelete?.();
     await deleteProject();
+    capture("deleted_projects");
     onClose();
   };
   const { deployments } = useDeployments(project.id);
-  const prodDeployment = deployments?.find((d) => d.deploymentType === "prod");
+  const defaultProdDeployment = deployments?.find(
+    (d) => d.kind === "cloud" && d.deploymentType === "prod" && d.isDefault,
+  );
 
-  return deployments && prodDeployment ? (
-    <DeploymentInfoProvider deploymentOverride={prodDeployment.name}>
-      <MaybeDeploymentApiProvider deploymentOverride={prodDeployment.name}>
+  return deployments && defaultProdDeployment ? (
+    <DeploymentInfoProvider deploymentOverride={defaultProdDeployment.name}>
+      <MaybeDeploymentApiProvider
+        deploymentOverride={defaultProdDeployment.name}
+      >
         <WaitForDeploymentApi sizeClass="hidden">
-          <DeleteProjectModalContentWithProd
+          <DeleteProjectModalContentWithDefaultProd
             team={team}
             project={project}
             onClose={onClose}
@@ -56,20 +63,24 @@ export function DeleteProjectModal({
     <DeleteProjectDialog
       onClose={onClose}
       onConfirm={handleDelete}
-      validationText={project.isDemo ? undefined : project.name}
+      validationText={
+        project.isDemo
+          ? undefined
+          : `Delete ${project.name} and data in all deployments, including Production`
+      }
     >
       <DeleteProjectModalContent team={team} />
     </DeleteProjectDialog>
   );
 }
 
-function DeleteProjectModalContentWithProd({
+function DeleteProjectModalContentWithDefaultProd({
   team,
   project,
   onClose,
   handleDelete,
 }: {
-  team: Team;
+  team: TeamResponse;
   project: ProjectDetails;
   onClose: () => void;
   handleDelete: () => Promise<void>;
@@ -93,7 +104,11 @@ function DeleteProjectModalContentWithProd({
     <DeleteProjectDialog
       onClose={onClose}
       onConfirm={handleDelete}
-      validationText={shouldDisable ? undefined : project.name}
+      validationText={
+        shouldDisable
+          ? undefined
+          : `Delete ${project.name} and data in all deployments, including Production`
+      }
       disableConfirm={shouldDisable}
     >
       <LoadingTransition
@@ -155,7 +170,7 @@ function DeleteProjectModalContent({
   team,
   additionalBody,
 }: {
-  team: Team;
+  team: TeamResponse;
   additionalBody?: React.ReactNode;
 }) {
   const members = useTeamMembers(team?.id);

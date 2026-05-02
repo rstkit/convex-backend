@@ -1,5 +1,3 @@
-#![feature(let_chains)]
-
 use std::time::Duration;
 
 use clap::Parser;
@@ -7,11 +5,16 @@ use cmd_util::env::config_service;
 use common::{
     errors::MainError,
     http::ConvexHttpService,
+    knobs::HTTP_SERVER_TIMEOUT_DURATION,
     runtime::Runtime,
+    sentry::set_sentry_tags,
     shutdown::ShutdownSignal,
     version::SERVER_VERSION_STR,
 };
-use db_connection::connect_persistence;
+use db_connection::{
+    connect_persistence,
+    ConnectPersistenceFlags,
+};
 use futures::{
     future::{
         self,
@@ -44,7 +47,7 @@ fn main() -> Result<(), MainError> {
             "The self-host Convex backend will periodically communicate with a remote beacon \
              server. This is to help Convex understand and improve the product. You can disable \
              this telemetry by setting the --disable-beacon flag or the DISABLE_BEACON \
-             environment variable if you are self-hosting using the Docker image."
+             environment variable."
         );
     }
     let sentry = sentry::init(sentry::ClientOptions {
@@ -59,14 +62,15 @@ fn main() -> Result<(), MainError> {
                 .map(|dsn| dsn.project_id().to_string())
                 .unwrap_or("unknown".to_string())
         );
-        if let Some(sentry_identifier) = config.sentry_identifier.clone() {
-            sentry::configure_scope(|scope| {
+        sentry::configure_scope(|scope| {
+            if let Some(sentry_identifier) = config.sentry_identifier.clone() {
                 scope.set_user(Some(sentry::User {
                     id: Some(sentry_identifier),
                     ..Default::default()
                 }));
-            });
-        }
+            }
+            set_sentry_tags(scope);
+        });
     } else {
         tracing::info!("Sentry is not enabled.")
     }
@@ -106,8 +110,11 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     let persistence = connect_persistence(
         config.db,
         &config.db_spec,
-        !config.do_not_require_ssl,
-        false, /* allow_read_only */
+        ConnectPersistenceFlags {
+            require_ssl: !config.do_not_require_ssl,
+            allow_read_only: false,
+            skip_index_creation: false,
+        },
         &config.name(),
         runtime.clone(),
         preempt_signal.clone(),
@@ -128,10 +135,10 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
         "backend",
         SERVER_VERSION_STR.to_string(),
         MAX_CONCURRENT_REQUESTS,
-        Duration::from_secs(125),
+        *HTTP_SERVER_TIMEOUT_DURATION,
         HttpActionRouteMapper,
     );
-    let serve_http_future = http_service.serve(config.http_bind_address().into(), async move {
+    let serve_http_future = http_service.serve(config.http_bind_address(), async move {
         let _ = shutdown_rx_.recv().await;
     });
     let proxy_future = dev_site_proxy(

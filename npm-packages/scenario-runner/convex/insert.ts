@@ -31,6 +31,7 @@ async function insertMessageHelper(
   }
 }
 export const insertMessage = mutation({
+  args: {},
   handler: async ({ db }): Promise<void> => {
     await insertMessageHelper(
       db,
@@ -45,6 +46,7 @@ export const insertMessage = mutation({
 });
 
 export const insertMessageWithSearch = mutation({
+  args: {},
   handler: async ({ db }): Promise<void> => {
     await insertMessageHelper(
       db,
@@ -95,5 +97,33 @@ export const insertMessageWithArgs = mutation({
       count,
       table as TableNamesInDataModel<DataModel>,
     );
+  },
+});
+
+export const insertMessagesWithArgs = mutation({
+  args: {
+    channel: v.string(),
+    timestamp: v.number(),
+    rand: v.number(),
+    ballastCount: v.number(),
+    count: v.number(),
+    table: v.string(),
+    n: v.number(),
+  },
+  handler: async (
+    ctx,
+    { channel, timestamp, rand, ballastCount, count, table, n },
+  ) => {
+    for (let i = 0; i < n; i++) {
+      await insertMessageHelper(
+        ctx.db,
+        channel,
+        timestamp,
+        rand,
+        ballastCount,
+        count,
+        table as TableNamesInDataModel<DataModel>,
+      );
+    }
   },
 });

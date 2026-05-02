@@ -2,6 +2,8 @@ import { Infer } from "convex/values";
 import {
   axiomConfig,
   datadogConfig,
+  postHogErrorTrackingConfig,
+  postHogLogsConfig,
   udfType,
   udfVisibility,
   webhookConfig,
@@ -28,6 +30,24 @@ export type StructuredLogLine = {
 };
 export type LogLine = string | StructuredLogLine;
 
+export type UsageStats = {
+  memoryUsedMb: number | null;
+  databaseReadBytes: number;
+  databaseWriteBytes: number;
+  databaseIoReadBytes: number;
+  databaseIoWriteBytes: number;
+  databaseReadDocuments: number;
+  storageReadBytes: number;
+  storageWriteBytes: number;
+  vectorIndexReadBytes: number;
+  vectorIndexWriteBytes: number;
+  textIndexQueryBytes: number;
+  textIndexWriteQueryBytes: number;
+  vectorIndexReadQueryBytes: number;
+  vectorIndexWriteQueryBytes: number;
+  networkEgressBytes: number;
+};
+
 export type FunctionExecutionCompletion = {
   kind: "Completion";
   componentPath?: string;
@@ -51,6 +71,13 @@ export type FunctionExecutionCompletion = {
 
   requestId: string;
   executionId: string;
+  usageStats?: UsageStats;
+  returnBytes?: number;
+  caller: string;
+  environment: string;
+  identityType: string;
+  parentExecutionId: string | null;
+  executionTimestamp?: number;
 };
 
 export type FunctionExecutionProgess = {
@@ -115,12 +142,17 @@ export type UdfConfig = Doc<"_udf_config">;
 
 export type Integration = Doc<"_log_sinks">;
 
+// Note: doesn't include exports or auth
 export type IntegrationConfig = Integration["config"];
 
 // Export integrations aren't configured on convex's side, so they don't use _log_sinks table
 export type ExportIntegrationType = "airbyte" | "fivetran";
-
-export type IntegrationType = IntegrationConfig["type"] | ExportIntegrationType;
+// WorkOS environment mappings live in api.convex.dev for now
+export type AuthIntegrationType = "workos";
+export type IntegrationType =
+  | IntegrationConfig["type"]
+  | ExportIntegrationType
+  | AuthIntegrationType;
 
 export type DatadogConfig = Infer<typeof datadogConfig>;
 
@@ -129,3 +161,9 @@ export type DatadogSiteLocation = DatadogConfig["siteLocation"];
 export type WebhookConfig = Infer<typeof webhookConfig>;
 
 export type AxiomConfig = Infer<typeof axiomConfig>;
+
+export type PostHogLogsConfig = Infer<typeof postHogLogsConfig>;
+
+export type PostHogErrorTrackingConfig = Infer<
+  typeof postHogErrorTrackingConfig
+>;

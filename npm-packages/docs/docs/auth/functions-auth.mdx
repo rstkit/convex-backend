@@ -1,12 +1,12 @@
 ---
 title: "Auth in Functions"
 sidebar_label: "Functions"
-sidebar_position: 40
+sidebar_position: 100
+description: "Access user authentication in Convex functions"
 ---
 
 import Example from "!!raw-loader!@site/../private-demos/snippets/convex/authFunctions.ts";
-import FieldsTS from "!!raw-loader!@site/../private-demos/snippets/convex/authFunctionsFields.ts";
-import FieldsJS from "!!raw-loader!@site/../private-demos/snippets/convex/authFunctionsFieldsJS.js";
+import Fields from "!!raw-loader!@site/../private-demos/snippets/convex/authFunctionsFields.ts";
 import Fetch from "!!raw-loader!@site/../private-demos/snippets/src/httpAuthCall.ts";
 
 _If you're using Convex Auth, see the
@@ -18,11 +18,7 @@ property of the [`QueryCtx`](/generated-api/server#queryctx),
 [`MutationCtx`](/generated-api/server#mutationctx), or
 [`ActionCtx`](/generated-api/server#actionctx) object:
 
-<TSAndJSSnippet
-  sourceTS={Example}
-  sourceJS={Example}
-  title="convex/myFunctions.ts"
-/>
+<Snippet source={Example} title="convex/myFunctions.ts" />
 
 ## User identity fields
 
@@ -41,17 +37,13 @@ following fields will be present: `familyName`, `givenName`, `nickname`,
 standard definition in the
 [OpenID docs](https://openid.net/specs/openid-connect-core-1_0.html#StandardClaims).
 
-<TSAndJSSnippet
-  sourceTS={FieldsTS}
-  sourceJS={FieldsJS}
-  title="convex/myFunctions.ts"
-/>
+<Snippet source={Fields} title="convex/myFunctions.ts" />
 
 ### Clerk claims configuration
 
 If you're using Clerk, the fields returned by `getUserIdentity` are determined
-by your JWT template's _Claims_ config. If you've set custom claims, they will
-be returned by `getUserIdentity` as well.
+by the claims configured in your Clerk integration. If you've set custom claims,
+they will be returned by `getUserIdentity` as well.
 
 ### Custom JWT Auth
 
@@ -65,6 +57,6 @@ You can also access the user identity from an HTTP action
 [`ctx.auth.getUserIdentity()`](/api/interfaces/server.Auth#getuseridentity), by
 calling your endpoint with an `Authorization` header including a JWT token:
 
-<TSAndJSSnippet sourceTS={Fetch} sourceJS={Fetch} title="myPage.ts" />
+<Snippet source={Fetch} title="myPage.ts" />
 
 <StackPosts query="authentication functions" />

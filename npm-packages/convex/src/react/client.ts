@@ -1,6 +1,11 @@
 import { BaseConvexClient } from "../browser/index.js";
-import type { OptimisticUpdate, QueryToken } from "../browser/index.js";
-import React, { useContext, useMemo } from "react";
+import type {
+  OptimisticUpdate,
+  PaginatedQueryToken,
+  QueryToken,
+  PaginationStatus,
+} from "../browser/index.js";
+import React, { useCallback, useContext, useMemo } from "react";
 import { convexToJson, Value } from "../values/index.js";
 import { QueryJournal } from "../browser/sync/protocol.js";
 import {
@@ -10,6 +15,7 @@ import {
 } from "../browser/sync/client.js";
 import type { UserIdentityAttributes } from "../browser/sync/protocol.js";
 import { RequestForQueries, useQueries } from "./use_queries.js";
+import { useSubscription } from "./use_subscription.js";
 import { parseArgs } from "../common/index.js";
 import {
   ArgsAndOptions,
@@ -26,6 +32,16 @@ import {
   instantiateNoopLogger,
   Logger,
 } from "../browser/logging.js";
+import type { QueryOptions } from "../browser/query_options.js";
+import { LoadMoreOfPaginatedQuery } from "../browser/sync/pagination.js";
+import {
+  PaginatedQueryClient,
+  ExtendedTransition,
+} from "../browser/sync/paginated_query_client.js";
+
+// When no arguments are passed, extend subscriptions (for APIs that do this by default)
+// for this amount after the subscription would otherwise be dropped.
+const DEFAULT_EXTEND_SUBSCRIPTION_FOR = 5_000;
 
 if (typeof React === "undefined") {
   throw new Error("Required dependency 'react' not found");
@@ -129,6 +145,8 @@ function createAction(
   } as ReactAction<any>;
 }
 
+// Watches should be stateless: in QueriesObserver we create a watch just to get
+// the current value.
 /**
  * A watch on the output of a Convex query function.
  *
@@ -177,6 +195,37 @@ export interface Watch<T> {
 }
 
 /**
+ * A watch on the output of a paginated Convex query function.
+ *
+ * @public
+ */
+export interface PaginatedWatch<T> {
+  /**
+   * Initiate a watch on the output of a paginated query.
+   *
+   * This will subscribe to this query and call
+   * the callback whenever the query result changes.
+   *
+   * @param callback - Function that is called whenever the query result changes.
+   * @returns - A function that disposes of the subscription.
+   */
+  onUpdate(callback: () => void): () => void;
+
+  /**
+   * Get the current result of a paginated query.
+   *
+   * @returns The current results, status, and loadMore function, or `undefined` if not loaded.
+   */
+  localQueryResult():
+    | {
+        results: T[];
+        status: PaginationStatus;
+        loadMore: LoadMoreOfPaginatedQuery;
+      }
+    | undefined;
+}
+
+/**
  * Options for {@link ConvexReactClient.watchQuery}.
  *
  * @public
@@ -198,6 +247,27 @@ export interface WatchQueryOptions {
 }
 
 /**
+ * Options for {@link ConvexReactClient.watchPaginatedQuery}.
+ *
+ * @internal
+ */
+export interface WatchPaginatedQueryOptions {
+  /**
+   * The initial number of items to load.
+   */
+  initialNumItems: number;
+
+  // We may be able to remove this in the future, but to preserve the existing behavior of
+  // usePaginatedQuery() it's still here.
+  id: number;
+
+  /**
+   * @internal
+   */
+  componentPath?: string;
+}
+
+/**
  * Options for {@link ConvexReactClient.mutation}.
  *
  * @public
@@ -209,7 +279,7 @@ export interface MutationOptions<Args extends Record<string, Value>> {
    * An optimistic update locally updates queries while a mutation is pending.
    * Once the mutation completes, the update will be rolled back.
    */
-  optimisticUpdate?: OptimisticUpdate<Args>;
+  optimisticUpdate?: OptimisticUpdate<Args> | undefined;
 }
 
 /**
@@ -228,14 +298,16 @@ export interface ConvexReactClientOptions extends BaseConvexClientOptions {}
  */
 export class ConvexReactClient {
   private address: string;
-  private cachedSync?: BaseConvexClient;
-  private listeners: Map<QueryToken, Set<() => void>>;
+  private cachedSync?: BaseConvexClient | undefined;
+  private cachedPaginatedQueryClient?: PaginatedQueryClient | undefined;
+  private listeners: Map<QueryToken | PaginatedQueryToken, Set<() => void>>;
   private options: ConvexReactClientOptions;
+  // "closed" means this client is done, not just that the underlying WS connection is closed.
   private closed = false;
   private _logger: Logger;
 
   private adminAuth?: string;
-  private fakeUserIdentity?: UserIdentityAttributes;
+  private fakeUserIdentity?: UserIdentityAttributes | undefined;
 
   /**
    * @param address - The url of your Convex deployment, often provided
@@ -294,15 +366,35 @@ export class ConvexReactClient {
     if (this.cachedSync) {
       return this.cachedSync;
     }
+    // BaseConvexClient and paginated query client are always created together.
     this.cachedSync = new BaseConvexClient(
       this.address,
-      (updatedQueries) => this.transition(updatedQueries),
+      () => {}, // Use the PaginatedQueryClient's transition instead.
       this.options,
     );
     if (this.adminAuth) {
       this.cachedSync.setAdminAuth(this.adminAuth, this.fakeUserIdentity);
     }
+    this.cachedPaginatedQueryClient = new PaginatedQueryClient(
+      this.cachedSync,
+      (transition) => this.handleTransition(transition),
+    );
     return this.cachedSync;
+  }
+
+  /**
+   * Lazily instantiate the `PaginatedQueryClient` so we don't create it
+   * when server-side rendering.
+   *
+   * @internal
+   */
+  get paginatedQueryClient() {
+    // access sync to instantiate the clients
+    this.sync;
+    if (this.cachedPaginatedQueryClient) {
+      return this.cachedPaginatedQueryClient;
+    }
+    throw new Error("Should already be instantiated");
   }
 
   /**
@@ -359,6 +451,8 @@ export class ConvexReactClient {
    * **Most application code should not call this method directly. Instead use
    * the {@link useQuery} hook.**
    *
+   * The act of creating a watch does nothing, a Watch is stateless.
+   *
    * @param query - A {@link server.FunctionReference} for the public query to run.
    * @param args - An arguments object for the query. If this is omitted,
    * the arguments will be `{}`.
@@ -372,6 +466,7 @@ export class ConvexReactClient {
   ): Watch<FunctionReturnType<Query>> {
     const [args, options] = argsAndOptions;
     const name = getFunctionName(query);
+
     return {
       onUpdate: (callback) => {
         const { queryToken, unsubscribe } = this.sync.subscribe(
@@ -422,6 +517,88 @@ export class ConvexReactClient {
           return this.cachedSync.queryJournal(name, args);
         }
         return undefined;
+      },
+    };
+  }
+
+  // Let's try out a queryOptions-style API.
+  // This method is similar to the React Query API `queryClient.prefetchQuery()`.
+  // In the future an ensureQueryData(): Promise<Data> method could exist.
+  /**
+   * Indicates likely future interest in a query subscription.
+   *
+   * The implementation currently immediately subscribes to a query. In the future this method
+   * may prioritize some queries over others, fetch the query result without subscribing, or
+   * do nothing in slow network connections or high load scenarios.
+   *
+   * To use this in a React component, call useQuery() and ignore the return value.
+   *
+   * @param queryOptions - A query (function reference from an api object) and its args, plus
+   * an optional extendSubscriptionFor for how long to subscribe to the query.
+   */
+  prewarmQuery<Query extends FunctionReference<"query">>(
+    queryOptions: QueryOptions<Query> & { extendSubscriptionFor?: number },
+  ) {
+    const extendSubscriptionFor =
+      queryOptions.extendSubscriptionFor ?? DEFAULT_EXTEND_SUBSCRIPTION_FOR;
+    const watch = this.watchQuery(queryOptions.query, queryOptions.args || {});
+    const unsubscribe = watch.onUpdate(() => {});
+    setTimeout(unsubscribe, extendSubscriptionFor);
+  }
+
+  /**
+   * Construct a new {@link PaginatedWatch} on a Convex paginated query function.
+   *
+   * **Most application code should not call this method directly. Instead use
+   * the {@link usePaginatedQuery} hook.**
+   *
+   * The act of creating a watch does nothing, a Watch is stateless.
+   *
+   * @param query - A {@link server.FunctionReference} for the public query to run.
+   * @param args - An arguments object for the query. If this is omitted,
+   * the arguments will be `{}`.
+   * @param options - A {@link WatchPaginatedQueryOptions} options object for this query.
+   *
+   * @returns The {@link PaginatedWatch} object.
+   *
+   * @internal
+   */
+  watchPaginatedQuery<Query extends FunctionReference<"query">>(
+    query: Query,
+    args: Query["_args"],
+    options: WatchPaginatedQueryOptions,
+  ): PaginatedWatch<FunctionReturnType<Query>> {
+    const name = getFunctionName(query);
+
+    return {
+      onUpdate: (callback) => {
+        const { paginatedQueryToken, unsubscribe } =
+          this.paginatedQueryClient.subscribe(name, args || {}, options);
+
+        const currentListeners = this.listeners.get(paginatedQueryToken);
+        if (currentListeners !== undefined) {
+          currentListeners.add(callback);
+        } else {
+          this.listeners.set(paginatedQueryToken, new Set([callback]));
+        }
+
+        return () => {
+          if (this.closed) {
+            return;
+          }
+
+          const currentListeners = this.listeners.get(paginatedQueryToken)!;
+          currentListeners.delete(callback);
+          if (currentListeners.size === 0) {
+            this.listeners.delete(paginatedQueryToken);
+          }
+          unsubscribe();
+        };
+      },
+
+      localQueryResult: () => {
+        // Use our new paginated query client
+        return this.paginatedQueryClient.localQueryResult(name, args, options);
       },
     };
   }
@@ -509,6 +686,24 @@ export class ConvexReactClient {
   }
 
   /**
+   * Subscribe to the {@link ConnectionState} between the client and the Convex
+   * backend, calling a callback each time it changes.
+   *
+   * Subscribed callbacks will be called when any part of ConnectionState changes.
+   * ConnectionState may grow in future versions (e.g. to provide a array of
+   * inflight requests) in which case callbacks would be called more frequently.
+   * ConnectionState may also *lose* properties in future versions as we figure
+   * out what information is most useful. As such this API is considered unstable.
+   *
+   * @returns An unsubscribe function to stop listening.
+   */
+  subscribeToConnectionState(
+    cb: (connectionState: ConnectionState) => void,
+  ): () => void {
+    return this.sync.subscribeToConnectionState(cb);
+  }
+
+  /**
    * Get the logger for this client.
    *
    * @returns The {@link Logger} for this client.
@@ -529,6 +724,9 @@ export class ConvexReactClient {
     this.closed = true;
     // Prevent outstanding React batched updates from invoking listeners.
     this.listeners = new Map();
+    if (this.cachedPaginatedQueryClient) {
+      this.cachedPaginatedQueryClient = undefined;
+    }
     if (this.cachedSync) {
       const sync = this.cachedSync;
       this.cachedSync = undefined;
@@ -536,7 +734,17 @@ export class ConvexReactClient {
     }
   }
 
-  private transition(updatedQueries: QueryToken[]) {
+  /**
+   * Handle transitions from both base client and paginated client.
+   * This ensures all transitions are processed synchronously and in order.
+   */
+  private handleTransition(transition: ExtendedTransition) {
+    const simple = transition.queries.map((q) => q.token);
+    const paginated = transition.paginatedQueries.map((q) => q.token);
+    this.transition([...simple, ...paginated]);
+  }
+
+  private transition(updatedQueries: (QueryToken | PaginatedQueryToken)[]) {
     for (const queryToken of updatedQueries) {
       const callbacks = this.listeners.get(queryToken);
       if (callbacks) {
@@ -592,19 +800,65 @@ export type OptionalRestArgsOrSkip<FuncRef extends FunctionReference<any>> =
     : [args: FuncRef["_args"] | "skip"];
 
 /**
+ * Result returned by object-form {@link useQuery_experimental}.
+ *
+ * @public
+ */
+export type UseQueryResult<QueryResult, ThrowOnError extends boolean = false> =
+  | { status: "pending" }
+  | { status: "success"; data: QueryResult }
+  | (ThrowOnError extends true ? never : { status: "error"; error: Error });
+
+type UseQueryOptions<
+  Query extends FunctionReference<"query">,
+  ThrowOnError extends boolean,
+> = {
+  query: Query;
+  args: FunctionArgs<Query> | "skip";
+  throwOnError?: ThrowOnError;
+};
+
+/**
  * Load a reactive query within a React component.
  *
- * This React hook contains internal state that will cause a rerender
- * whenever the query result changes.
+ * This React hook subscribes to a Convex query and causes a rerender whenever
+ * the query result changes. The subscription is managed automatically --
+ * it starts when the component mounts and stops when it unmounts.
  *
  * Throws an error if not used under {@link ConvexProvider}.
  *
+ * @example
+ * ```tsx
+ * import { useQuery } from "convex/react";
+ * import { api } from "../convex/_generated/api";
+ *
+ * function TaskList() {
+ *   // Reactively loads tasks, re-renders when data changes:
+ *   const tasks = useQuery(api.tasks.list, { completed: false });
+ *
+ *   // Returns `undefined` while loading:
+ *   if (tasks === undefined) return <div>Loading...</div>;
+ *
+ *   return tasks.map((task) => <div key={task._id}>{task.text}</div>);
+ * }
+ *
+ * // Pass "skip" to conditionally disable the query:
+ * function MaybeProfile({ userId }: { userId?: Id<"users"> }) {
+ *   const profile = useQuery(
+ *     api.users.get,
+ *     userId ? { userId } : "skip",
+ *   );
+ *   // ...
+ * }
+ * ```
+ *
  * @param query - a {@link server.FunctionReference} for the public query to run
  * like `api.dir1.dir2.filename.func`.
- * @param args - The arguments to the query function or the string "skip" if the
+ * @param args - The arguments to the query function or the string `"skip"` if the
  * query should not be loaded.
- * @returns the result of the query. If the query is loading returns `undefined`.
+ * @returns the result of the query. Returns `undefined` while loading.
  *
+ * @see https://docs.convex.dev/client/react#fetching-data
  * @public
  */
 export function useQuery<Query extends FunctionReference<"query">>(
@@ -613,7 +867,6 @@ export function useQuery<Query extends FunctionReference<"query">>(
 ): Query["_returnType"] | undefined {
   const skip = args[0] === "skip";
   const argsObject = args[0] === "skip" ? {} : parseArgs(args[0]);
-
   const queryReference =
     typeof query === "string"
       ? makeFunctionReference<"query", any, any>(query)
@@ -634,6 +887,7 @@ export function useQuery<Query extends FunctionReference<"query">>(
 
   const results = useQueries(queries);
   const result = results["query"];
+
   if (result instanceof Error) {
     throw result;
   }
@@ -641,22 +895,130 @@ export function useQuery<Query extends FunctionReference<"query">>(
 }
 
 /**
+ * Load a reactive query within a React component using an options object.
+ *
+ * This is an experimental form of {@link useQuery} that accepts a single
+ * {@link UseQueryOptions} object instead of positional arguments.
+ *
+ * Consumers are expected to check the returned object `status` field to
+ * make proper use of the result. If an error occurs, it will be present
+ * in the result object unless `throwOnError` is `true`, in which case
+ * the error will be thrown instead.
+ *
+ * @example
+ * ```tsx
+ * import { useQuery_experimental as useQuery } from "convex/react";
+ * import { api } from "../convex/_generated/api";
+ *
+ * function TaskList() {
+ *   const state = useQuery({ query: api.tasks.list, args: { completed: false } });
+ *
+ *   if (state.status === "pending") return <div>Loading...</div>;
+ *   if (state.status === "error") return <div>Error: {state.error.message}</div>;
+ *   return state.data.map((task) => <div key={task._id}>{task.text}</div>);
+ * }
+ * ```
+ *
+ * @param options - Query options. Pass `args: "skip"` to disable the query.
+ * @returns the current query state as a {@link UseQueryResult} object.
+ *
+ * @see https://docs.convex.dev/client/react#fetching-data
+ * @public
+ */
+export function useQuery_experimental<
+  Query extends FunctionReference<"query">,
+  ThrowOnError extends boolean = false,
+>(
+  options: UseQueryOptions<Query, ThrowOnError>,
+): UseQueryResult<Query["_returnType"], ThrowOnError>;
+
+export function useQuery_experimental<
+  Query extends FunctionReference<"query">,
+  ThrowOnError extends boolean = false,
+>(
+  options: UseQueryOptions<Query, ThrowOnError>,
+): UseQueryResult<Query["_returnType"], false> {
+  const throwOnError = options.throwOnError ?? false;
+  const queryReference =
+    typeof options.query === "string"
+      ? (makeFunctionReference<"query", any, any>(options.query) as Query)
+      : options.query;
+  const skip = options.args === "skip";
+  const argsObject = !skip
+    ? parseArgs(options.args as Record<string, Value>)
+    : {};
+
+  const queryName = getFunctionName(queryReference);
+  const queries = useMemo(
+    () =>
+      skip
+        ? ({} as RequestForQueries)
+        : { query: { query: queryReference, args: argsObject } },
+    // Stringify args so args that are semantically the same don't trigger a
+    // rerender. Saves developers from adding `useMemo` on every args usage.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [JSON.stringify(convexToJson(argsObject)), queryName, skip],
+  );
+
+  const results = useQueries(queries);
+  const result = results["query"];
+
+  if (result instanceof Error) {
+    if (throwOnError) {
+      throw result;
+    }
+    return {
+      error: result,
+      status: "error",
+    };
+  }
+
+  if (result === undefined) {
+    return {
+      status: "pending",
+    };
+  }
+
+  return {
+    data: result,
+    status: "success",
+  };
+}
+
+/**
  * Construct a new {@link ReactMutation}.
  *
- * Mutation objects can be called like functions to request execution of the
- * corresponding Convex function, or further configured with
- * [optimistic updates](https://docs.convex.dev/using/optimistic-updates).
+ * Returns a function that you can call to execute a Convex mutation. The
+ * returned function is stable across renders (same reference identity), so
+ * it can be safely used in dependency arrays and memoization.
  *
- * The value returned by this hook is stable across renders, so it can be used
- * by React dependency arrays and memoization logic relying on object identity
- * without causing rerenders.
+ * Mutations can optionally be configured with
+ * [optimistic updates](https://docs.convex.dev/client/react/optimistic-updates)
+ * for instant UI feedback.
  *
  * Throws an error if not used under {@link ConvexProvider}.
+ *
+ * @example
+ * ```tsx
+ * import { useMutation } from "convex/react";
+ * import { api } from "../convex/_generated/api";
+ *
+ * function CreateTask() {
+ *   const createTask = useMutation(api.tasks.create);
+ *
+ *   const handleClick = async () => {
+ *     await createTask({ text: "New task" });
+ *   };
+ *
+ *   return <button onClick={handleClick}>Add Task</button>;
+ * }
+ * ```
  *
  * @param mutation - A {@link server.FunctionReference} for the public mutation
  * to run like `api.dir1.dir2.filename.func`.
  * @returns The {@link ReactMutation} object with that name.
  *
+ * @see https://docs.convex.dev/client/react#editing-data
  * @public
  */
 export function useMutation<Mutation extends FunctionReference<"mutation">>(
@@ -685,19 +1047,47 @@ export function useMutation<Mutation extends FunctionReference<"mutation">>(
 /**
  * Construct a new {@link ReactAction}.
  *
- * Action objects can be called like functions to request execution of the
- * corresponding Convex function.
+ * Returns a function that you can call to execute a Convex action. Actions
+ * can call third-party APIs and perform side effects. The returned function
+ * is stable across renders (same reference identity).
  *
- * The value returned by this hook is stable across renders, so it can be used
- * by React dependency arrays and memoization logic relying on object identity
- * without causing rerenders.
+ * **Error handling:** Actions can fail (e.g., if an external API is down).
+ * Always wrap action calls in try/catch or handle the rejected promise.
+ *
+ * **Note:** In most cases, calling an action directly from a client is an
+ * anti-pattern. Prefer having the client call a mutation that captures the
+ * user's intent (by writing to the database) and then schedules the action
+ * via `ctx.scheduler.runAfter`. This ensures the intent is durably recorded
+ * even if the client disconnects.
  *
  * Throws an error if not used under {@link ConvexProvider}.
+ *
+ * @example
+ * ```tsx
+ * import { useAction } from "convex/react";
+ * import { api } from "../convex/_generated/api";
+ *
+ * function GenerateSummary() {
+ *   const generate = useAction(api.ai.generateSummary);
+ *
+ *   const handleClick = async () => {
+ *     try {
+ *       const summary = await generate({ text: "Some long text..." });
+ *       console.log(summary);
+ *     } catch (error) {
+ *       console.error("Action failed:", error);
+ *     }
+ *   };
+ *
+ *   return <button onClick={handleClick}>Generate</button>;
+ * }
+ * ```
  *
  * @param action - A {@link server.FunctionReference} for the public action
  * to run like `api.dir1.dir2.filename.func`.
  * @returns The {@link ReactAction} object with that name.
  *
+ * @see https://docs.convex.dev/functions/actions#calling-actions-from-clients
  * @public
  */
 export function useAction<Action extends FunctionReference<"action">>(
@@ -721,6 +1111,48 @@ export function useAction<Action extends FunctionReference<"action">>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [convex, getFunctionName(actionReference)],
   );
+}
+
+/**
+ * React hook to get the current {@link ConnectionState} and subscribe to changes.
+ *
+ * This hook returns the current connection state and automatically rerenders
+ * when any part of the connection state changes (e.g., when going online/offline,
+ * when requests start/complete, etc.).
+ *
+ * The shape of ConnectionState may change in the future which may cause this
+ * hook to rerender more frequently.
+ *
+ * Throws an error if not used under {@link ConvexProvider}.
+ *
+ * @returns The current {@link ConnectionState} with the Convex backend.
+ *
+ * @public
+ */
+export function useConvexConnectionState(): ConnectionState {
+  const convex = useContext(ConvexContext);
+  if (convex === undefined) {
+    throw new Error(
+      "Could not find Convex client! `useConvexConnectionState` must be used in the React component " +
+        "tree under `ConvexProvider`. Did you forget it? " +
+        "See https://docs.convex.dev/quick-start#set-up-convex-in-your-react-app",
+    );
+  }
+
+  const getCurrentValue = useCallback(() => {
+    return convex.connectionState();
+  }, [convex]);
+
+  const subscribe = useCallback(
+    (callback: () => void) => {
+      return convex.subscribeToConnectionState(() => {
+        callback();
+      });
+    },
+    [convex],
+  );
+
+  return useSubscription({ getCurrentValue, subscribe });
 }
 
 // When a function is called with a single argument that looks like a

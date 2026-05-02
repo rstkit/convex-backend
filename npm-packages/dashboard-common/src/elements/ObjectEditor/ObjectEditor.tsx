@@ -4,7 +4,6 @@ import Editor, {
   EditorProps,
 } from "@monaco-editor/react";
 import { ValidatorJSON, Value } from "convex/values";
-import { useTheme } from "next-themes";
 import isEqual from "lodash/isEqual";
 import React, {
   useCallback,
@@ -16,8 +15,9 @@ import React, {
 
 import isArray from "lodash/isArray";
 import isPlainObject from "lodash/isPlainObject";
-import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/patchDocumentsFields";
+import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/lib/values";
 import { stringifyValue } from "@common/lib/stringifyValue";
+import { useCurrentTheme } from "@common/lib/useCurrentTheme";
 import { cn } from "@ui/cn";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 import {
@@ -96,7 +96,7 @@ export function ObjectEditor(props: ObjectEditorProps) {
 
   // Initialize all markers on mount.
   useEffect(() => {
-    monaco &&
+    if (monaco) {
       handleCodeChange(
         defaultValueString,
         mode,
@@ -110,6 +110,7 @@ export function ObjectEditor(props: ObjectEditorProps) {
         onChange,
         getDocumentRefs,
       );
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [monaco]);
 
@@ -163,7 +164,7 @@ export function ObjectEditor(props: ObjectEditorProps) {
   const handleChange = useCallback(
     (code?: string) => {
       // Hook to inform the parent component of the inner text of the editor.
-      onChangeInnerText && onChangeInnerText(code ?? "");
+      onChangeInnerText?.(code ?? "");
 
       setNumLines(code ? numLinesFromCode(code) : 1);
       handleCodeChange(
@@ -192,9 +193,9 @@ export function ObjectEditor(props: ObjectEditorProps) {
     ],
   );
 
-  const { deploymentsURI } = useContext(DeploymentInfoContext);
+  const { deploymentsURI, captureMessage } = useContext(DeploymentInfoContext);
 
-  const { resolvedTheme: currentTheme } = useTheme();
+  const currentTheme = useCurrentTheme();
   const prefersDark = currentTheme === "dark";
 
   return (
@@ -203,9 +204,9 @@ export function ObjectEditor(props: ObjectEditorProps) {
       className={cn(
         // Setting a min-h makes sure the editor is able to properly resize when the
         // parent is resized.
-        "border rounded min-h-4 w-full h-full max-w-full relative",
+        "relative h-full min-h-4 w-full max-w-full rounded-sm border",
         className,
-        disabled && "bg-background-tertiary cursor-not-allowed",
+        disabled && "cursor-not-allowed bg-background-tertiary",
         numLines > 2 && multilineClasses,
       )}
       style={{
@@ -226,7 +227,7 @@ export function ObjectEditor(props: ObjectEditorProps) {
           editorClassname,
           size === "sm" && "mt-[1px]",
           disabled &&
-            "disabled bg-background-tertiary text-content-secondary cursor-not-allowed",
+            "disabled cursor-not-allowed bg-background-tertiary text-content-secondary",
         )}
         defaultLanguage="javascript"
         defaultValue={defaultValueString}
@@ -265,7 +266,7 @@ export function ObjectEditor(props: ObjectEditorProps) {
           setMonaco(m);
         }}
         onMount={(editor, m) => {
-          registerIdCommands(m, deploymentsURI);
+          registerIdCommands({ monaco: m, deploymentsURI, captureMessage });
 
           editor.onKeyDown((e) => {
             if (e.keyCode === m.KeyCode.Tab) {
@@ -398,7 +399,9 @@ function handleCodeChange(
       shouldSurfaceValidatorErrors,
     );
     const hasSurfacedErrors = handleError(astErrors);
-    !hasSurfacedErrors && onChange(result);
+    if (!hasSurfacedErrors) {
+      onChange(result);
+    }
     getDocumentRefs(newIds);
   } catch (e: any) {
     if (e instanceof SyntaxError) {
@@ -519,7 +522,7 @@ function moveFocus(forward = true) {
     document.querySelectorAll(
       'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
     ),
-    // @ts-expect-error
+    // @ts-expect-error -- we assume `.disabled` and `.offsetParent` to be present on all elements
   ).filter((el) => !el.disabled && el.offsetParent !== null);
 
   const currentIndex = document.activeElement

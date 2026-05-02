@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use common::{
-    json::JsonSerializable,
+    json::JsonForm as _,
     knobs::{
         DATABASE_UDF_SYSTEM_TIMEOUT,
         DATABASE_UDF_USER_TIMEOUT,
@@ -17,9 +20,14 @@ use common::{
         missing_schema_export_error,
         DatabaseSchema,
     },
+    try_anyhow,
 };
 use deno_core::{
-    v8,
+    v8::{
+        self,
+        scope,
+        scope_with_context,
+    },
     ModuleSpecifier,
 };
 use errors::{
@@ -44,7 +52,6 @@ use value::NamespacedTableMapping;
 
 use super::ModuleCodeCacheResult;
 use crate::{
-    concurrency_limiter::ConcurrencyPermit,
     environment::{
         helpers::syscall_error::{
             syscall_description_for_error,
@@ -94,6 +101,20 @@ impl<RT: Runtime> IsolateEnvironment<RT> for SchemaEnvironment {
         Ok(self.unix_timestamp)
     }
 
+    fn performance_now(&mut self) -> anyhow::Result<Duration> {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "NoPerformanceInSchema",
+            "The Performance API is not supported when evaluating schema"
+        ))
+    }
+
+    fn performance_time_origin(&mut self) -> anyhow::Result<UnixTimestamp> {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "NoPerformanceInSchema",
+            "The Performance API is not supported when evaluating schema"
+        ))
+    }
+
     fn get_environment_variable(
         &mut self,
         _name: EnvVarName,
@@ -115,8 +136,7 @@ impl<RT: Runtime> IsolateEnvironment<RT> for SchemaEnvironment {
         &mut self,
         path: &str,
         _timeout: &mut Timeout<RT>,
-        _permit: &mut Option<ConcurrencyPermit>,
-    ) -> anyhow::Result<Option<(FullModuleSource, ModuleCodeCacheResult)>> {
+    ) -> anyhow::Result<Option<(Arc<FullModuleSource>, ModuleCodeCacheResult)>> {
         if path != "schema.js" {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "NoImportModuleInSchema",
@@ -124,10 +144,10 @@ impl<RT: Runtime> IsolateEnvironment<RT> for SchemaEnvironment {
             ))
         }
         Ok(Some((
-            FullModuleSource {
+            Arc::new(FullModuleSource {
                 source: self.schema_bundle.clone(),
                 source_map: self.source_map.clone(),
-            },
+            }),
             ModuleCodeCacheResult::noop(),
         )))
     }
@@ -195,14 +215,12 @@ impl SchemaEnvironment {
             unix_timestamp,
         };
         let client_id = Arc::new(client_id);
-        let (handle, state) = isolate.start_request(client_id, environment).await?;
-        let mut handle_scope = isolate.handle_scope();
-        let v8_context = v8::Local::new(&mut handle_scope, v8_context);
-        let mut context_scope = v8::ContextScope::new(&mut handle_scope, v8_context);
+        let (handle, state, mut timeout) = isolate.start_request(client_id, environment).await?;
+        scope_with_context!(let context_scope, isolate.isolate(), v8_context);
         let mut isolate_context =
-            RequestScope::new(&mut context_scope, handle.clone(), state, false).await?;
+            RequestScope::new(context_scope, handle.clone(), state, false).await?;
         let handle = isolate_context.handle();
-        let result = Self::run_evaluate_schema(&mut isolate_context).await;
+        let result = Self::run_evaluate_schema(&mut isolate_context, &mut timeout).await;
 
         // Drain the microtask queue, to clean up the isolate.
         isolate_context.checkpoint();
@@ -213,35 +231,37 @@ impl SchemaEnvironment {
         // If the microtask queue is somehow nonempty after this point but before
         // the next request starts, the isolate may panic.
         drop(isolate_context);
+        drop(timeout);
 
         handle.take_termination_error(None, "schema")??;
         result
     }
 
     async fn run_evaluate_schema<RT: Runtime>(
-        isolate: &mut RequestScope<'_, '_, RT, Self>,
+        isolate: &mut RequestScope<'_, '_, '_, RT, Self>,
+        timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<DatabaseSchema> {
-        let mut v8_scope = isolate.scope();
-        let mut scope = RequestScope::<RT, Self>::enter(&mut v8_scope);
+        scope!(let v8_scope, isolate.scope());
+        let mut scope = RequestScope::<RT, Self>::enter(v8_scope);
 
         let schema_url = ModuleSpecifier::parse(&format!("{CONVEX_SCHEME}:/schema.js"))?;
-        let module = scope.eval_module(&schema_url).await?;
+        let module = scope.eval_module(&schema_url, timeout).await?;
         let namespace = module
             .get_module_namespace()
-            .to_object(&mut scope)
+            .to_object(&scope)
             .ok_or_else(|| anyhow!("Module namespace wasn't an object?"))?;
-        let default_str = strings::default.create(&mut scope)?;
+        let default_str = strings::default.create(&scope)?;
         let schema_val: v8::Local<v8::Value> = namespace
-            .get(&mut scope, default_str.into())
+            .get(&scope, default_str.into())
             .ok_or_else(missing_schema_export_error)?;
         if schema_val.is_null_or_undefined() {
             anyhow::bail!(missing_schema_export_error());
         }
-        let export_str = strings::export.create(&mut scope)?;
-        let v8_schema_result: anyhow::Result<v8::Local<v8::String>> = try {
+        let export_str = strings::export.create(&scope)?;
+        let v8_schema_result: anyhow::Result<v8::Local<v8::String>> = try_anyhow!({
             let schema_obj: v8::Local<v8::Object> = schema_val.try_into()?;
             let export_function: v8::Local<v8::Function> = schema_obj
-                .get(&mut scope, export_str.into())
+                .get(&scope, export_str.into())
                 .ok_or_else(|| anyhow!("Couldn't find 'export' method on schema object"))?
                 .try_into()?;
 
@@ -251,14 +271,14 @@ impl SchemaEnvironment {
                     "Missing return value from successful function call"
                 )),
             }?
-        };
+        });
         // If we can't export the schema into a string, probably there is
         // something funky in their `schema.ts` file, so throw
         // `invalid_schema_export_error`
         let v8_schema_str: v8::Local<v8::String> =
             v8_schema_result.map_err(|_| invalid_schema_export_error())?;
 
-        let result_str = helpers::to_rust_string(&mut scope, &v8_schema_str)?;
+        let result_str = helpers::to_rust_string(&scope, &v8_schema_str)?;
         DatabaseSchema::json_deserialize(&result_str).map_err(|e| {
             if e.is_bad_request() {
                 e

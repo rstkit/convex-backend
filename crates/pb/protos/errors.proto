@@ -18,6 +18,8 @@ enum ErrorCode {
   MISDIRECTED_REQUEST = 12;
   AUTH_UPDATE_FAILED = 13;
   CONFLICT = 14;
+  FEATURE_TEMPORARILY_UNAVAILABLE = 15;
+  TOO_EARLY = 16;
 }
 
 message OccInfo {
@@ -25,6 +27,8 @@ message OccInfo {
   optional string document_id = 2;
   optional string write_source = 3;
   bool is_system = 4;
+  optional uint64 write_ts = 5;
+  optional string component_path = 6;
 }
 
 message ErrorMetadata {

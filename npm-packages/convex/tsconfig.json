@@ -11,11 +11,12 @@
     "stripInternal": true,
     "outDir": "./dist/types",
     "rootDir": "./src",
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
     /* Strict Type-Checking Options */
     "strict": true,
+    "exactOptionalPropertyTypes": true,
     /* Module Resolution Options */
     "esModuleInterop": true,
     /* Advanced Options */

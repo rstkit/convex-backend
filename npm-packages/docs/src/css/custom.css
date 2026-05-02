@@ -1,14 +1,67 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
 /* stylelint-disable docusaurus/copyright-header */
+
+/* Customize the search button in nav and modal */
+@import url("./search.css");
+
+/* @import "tailwindcss"; but without preflight */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+@source "../**/*.{js,jsx,ts,tsx}";
+
+@theme {
+  --color-neutral-white: #ffffff;
+  --color-neutral-n1: #f6f6f6;
+  --color-neutral-n2: #f1f1f1;
+  --color-neutral-n3: #e5e5e5;
+  --color-neutral-n4: #d7d7d7;
+  --color-neutral-n5: #c2c2c2;
+  --color-neutral-n6: #a9a9ac;
+  --color-neutral-n7: #8b8b8e;
+  --color-neutral-n8: #6d6d70;
+  --color-neutral-n9: #4f4f52;
+  --color-neutral-n10: #38383a;
+  --color-neutral-n11: #292929;
+  --color-neutral-n12: #141414;
+  --color-neutral-n13: #111111;
+  --color-neutral-black: #000000;
+
+  --color-plum-p1: #f4e9f1;
+  --color-plum-p2: #e3d0df;
+  --color-plum-p3: #d7b3cf;
+  --color-plum-p4: #8d2676;
+  --color-plum-p5: #711e5e;
+  --color-plum-p6: #47133b;
+
+  --color-yellow-y1: #fdefd2;
+  --color-yellow-y2: #f8d077;
+  --color-yellow-y3: #f3b01c;
+  --color-yellow-y4: #e7a71b;
+
+  --color-red-r1: #fcd6d5;
+  --color-red-r2: #f15d59;
+  --color-red-r3: #ee342f;
+  --color-red-r4: #d62f2a;
+
+  --color-green-g1: #e5f3dc;
+  --color-green-g2: #72c043;
+  --color-green-g3: #4fb014;
+  --color-green-g4: #479e12;
+
+  --color-transparent: transparent;
+
+  --font-sans: "Inter", "sans-serif";
+}
+
+/* Apply the dark mode when [data-theme="dark"] is present */
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *));
+
 /**
  * Any CSS included here will be global. The classic template
  * bundles Infima by default. Infima is a CSS framework designed to
  * work well for content-centric websites.
  */
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap");
 @font-face {
   font-family: "GT America";
   font-weight: 400;
@@ -201,9 +254,6 @@ for when the whole page is scrolled down */
   border-bottom: 1px solid var(--ifm-toc-border-color);
 }
 
-/* Customize the search button in nav and modal */
-@import url("./search.css");
-
 /* START: Icon links in top nav */
 @media (min-width: 997px) {
   .navbar__items .convex-icon-link {
@@ -302,6 +352,7 @@ nav.menu {
 /* reset padding on container because we added footer inside of it */
 main > .container {
   padding: 0 !important;
+  max-width: unset !important;
 }
 
 /* Increase the padding on the main text */
@@ -673,30 +724,17 @@ ul.menu__list {
   display: none;
 }
 
-/* Tutorial is special, it forwards to an internal page. Remove all this when we ban section pages. */
-.convex-sidebar-tutorial .menu__list-item-collapsible--active {
-  background: var(--ifm-background-color);
-}
-.convex-sidebar-tutorial .menu__list-item-collapsible--active:hover {
-  background: var(--ifm-menu-color-background-hover);
-}
-.convex-sidebar-tutorial
-  .menu__list-item-collapsible--active
-  > .menu__link--active {
-  font-weight: 400;
-}
-
-/* Understanding is special, it forwards to an internal page. Remove all this when we ban section pages. */
-.convex-sidebar-understand .menu__list-item-collapsible--active {
+/* Fix the active state of categories that forward to an internal page in the category. */
+.convex-sidebar-no-category-page > .menu__list-item-collapsible--active {
   background: var(--ifm-background-color);
 }
 
-.convex-sidebar-understand .menu__list-item-collapsible--active:hover {
+.convex-sidebar-no-category-page > .menu__list-item-collapsible--active:hover {
   background: var(--ifm-menu-color-background-hover);
 }
 
-.convex-sidebar-understand
-  .menu__list-item-collapsible--active
+.convex-sidebar-no-category-page
+  > .menu__list-item-collapsible--active
   > .menu__link--active {
   font-weight: 400;
 }
@@ -737,6 +775,17 @@ html[data-theme="dark"] .convex-menu-header {
   width: 1rem;
   height: 1.0625rem;
   content: var(--convex-icon);
+  filter: var(--convex-sidebar-icon-filter);
+}
+
+.theme-doc-sidebar-item-link-level-2 > a::before,
+.theme-doc-sidebar-item-category-level-2 > div > a::before {
+  padding-left: 0.125rem;
+  padding-right: 0.5rem;
+  padding-top: 0;
+  width: 1rem;
+  height: 1.0625rem;
+  content: var(--inner-convex-icon);
   filter: var(--convex-sidebar-icon-filter);
 }
 
@@ -839,6 +888,9 @@ html[data-theme="dark"] .convex-menu-header {
 .convex-sidebar-ai-agents {
   --convex-icon: url("../../static/img/sidebar-icons/bot.svg");
 }
+.convex-sidebar-platform-apis {
+  --convex-icon: url("../../static/img/sidebar-icons/grid.svg");
+}
 
 .convex-sidebar-production {
   --convex-icon: url("../../static/img/sidebar-icons/paper-plane.svg");
@@ -864,11 +916,16 @@ html[data-theme="dark"] .convex-menu-header {
   --convex-icon: url("../../static/img/sidebar-icons/vue.svg");
 }
 
+.convex-sidebar-vue {
+  --inner-convex-icon: url("../../static/img/sidebar-icons/nuxt.svg");
+}
+
 .convex-sidebar-open-api {
   --convex-icon: url("../../static/img/sidebar-icons/open-api.svg");
 }
 
-.convex-sidebar-vue a:after {
+.convex-sidebar-vue a:after,
+.convex-sidebar-nuxt a:after {
   font-weight: 400;
   font-size: 0.6em;
   margin-left: 1em;
@@ -877,14 +934,30 @@ html[data-theme="dark"] .convex-menu-header {
   border: solid 1px gray;
   padding: 2px 8px;
   float: right;
+  /* overriding collaps-y caret */
+  transform: rotateZ(0deg) !important;
 }
 
-.convex-sidebar-vue .menu__link--active:after {
+/* Vue */
+.convex-sidebar-vue
+  .menu__list-item
+  > .menu__link--active:not(.menu__link--sublist):after,
+.convex-sidebar-vue
+  .menu__list-item-collapsible--active
+  > .menu__link--active:after {
   /* shift left to compensate for text to the left being bold */
-  margin-left: 0.85em;
+  margin-left: 0.9em;
+}
+/* Nuxt */
+.convex-sidebar-vue
+  .theme-doc-sidebar-item-link-level-2
+  > .menu__link--active:after {
+  /* shift left to compensate for text to the left being bold */
+  margin-left: 0.9em;
 }
 
-.convex-sidebar-cli .menu__list .menu__link:after {
+.convex-sidebar-cli .menu__list li:first-child .menu__link:after,
+.convex-sidebar-cli .menu__list li:nth-child(2) .menu__link:after {
   font-weight: 400;
   font-size: 0.6em;
   margin-left: 1em;
@@ -895,29 +968,22 @@ html[data-theme="dark"] .convex-menu-header {
   float: right;
 }
 
-.convex-sidebar-cli .menu__list .menu__link--active:after {
+.convex-sidebar-cli .menu__list li:first-child .menu__link--active:after {
   /* shift left to compensate for text to the left being bold */
   margin-left: 0.7em;
 }
 
-.convex-sidebar-eslint .menu__link:after {
-  font-weight: 400;
-  font-size: 0.6em;
-  margin-left: 1em;
-  content: "Beta";
-  border-radius: 10px;
-  border: solid 1px gray;
-  padding: 2px 8px;
-  float: right;
-}
-
-.convex-sidebar-eslint .menu__link--active:after {
+.convex-sidebar-cli .menu__list li:nth-child(2) .menu__link--active:after {
   /* shift left to compensate for text to the left being bold */
-  margin-left: 0.88em;
+  margin-left: 0.8em;
 }
 
 .convex-sidebar-svelte {
   --convex-icon: url("../../static/img/sidebar-icons/svelte.svg");
+}
+
+.convex-sidebar-nextjs {
+  --convex-icon: url("../../static/img/sidebar-icons/nextjs.svg");
 }
 
 .convex-sidebar-tanstack {
@@ -1132,6 +1198,26 @@ main .container .col[class*="docItemCol"] {
   opacity: 1;
 }
 
+/*
+Fix Docusaurus copy button icon cascade in production CSS:
+some optimized builds reorder shared icon rules after success-state rules.
+Keep this scoped to code blocks so inline custom copy buttons remain module-driven.
+*/
+.theme-code-block svg[class*="copyButtonSuccessIcon"] {
+  top: 50% !important;
+  left: 50% !important;
+  opacity: 0 !important;
+  transform: translate(-50%, -50%) scale(0.33) !important;
+}
+
+.theme-code-block
+  button[class*="copyButtonCopied"]
+  svg[class*="copyButtonSuccessIcon"] {
+  opacity: 1 !important;
+  transform: translate(-50%, -50%) scale(1) !important;
+  transition-delay: 0.075s !important;
+}
+
 /* START: TourGuide styling */
 
 .convex-tour-guide {
@@ -1251,9 +1337,28 @@ h2.zen-header {
   margin: 0 auto;
 }
 
-/* Fix pages should not be too wide, except for all the quick starts */
-html:not([class*="docs-doc-id-quickstart/"]) main > .container > .row .col {
+/* Fix pages should not be too wide, except for all the quick starts and management API docs */
+html:not([class*="docs-doc-id-quickstart/"]):not(
+    [class*="docs-doc-id-management-api/"]
+  ):not([class*="docs-doc-id-deployment-api/"])
+  main
+  > .container
+  > .row
+  .col {
   max-width: 800px !important;
+  margin: 0 auto;
+}
+
+@media (min-width: 997px) {
+  html:not([class*="docs-doc-id-quickstart/"]):not(
+      [class*="docs-doc-id-management-api/"]
+    ):not([class*="docs-doc-id-deployment-api/"])
+    main
+    > .container
+    > .row
+    .col {
+    margin: unset;
+  }
 }
 
 /* Border for screenshots that are confusing if left on white background */
@@ -1261,14 +1366,6 @@ html:not([class*="docs-doc-id-quickstart/"]) main > .container > .row .col {
   border-radius: var(--ifm-code-border-radius);
   box-shadow: var(--ifm-global-shadow-lw);
 }
-
-/* Make space for language selector in code blocks */
-.codeblock-header {
-  display: flex;
-  justify-content: space-between;
-}
-
-@import url("./language-selector.css");
 
 /* FROM HERE ON: Dark mode styles */
 
@@ -1527,4 +1624,26 @@ a.video-card h2 {
   font-family: var(--ifm-font-family-base);
   letter-spacing: normal;
   max-height: 2.4em;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .animate-slideToTop {
+    animation: slideToTop 0.15s ease-in-out;
+  }
+}
+
+@keyframes slideToTop {
+  from {
+    transform: translateY(80%);
+    opacity: 0.5;
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+table > caption {
+  font-weight: 500;
+  font-size: 105%;
+  margin-bottom: 0.5em;
 }

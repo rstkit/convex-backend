@@ -1,13 +1,14 @@
-import { Meta, StoryObj } from "@storybook/react";
+import { Meta, StoryObj } from "@storybook/nextjs";
 import {
   AuditLogAction,
   AuditLogEventResponse,
   MemberResponse,
-  Team,
+  TeamResponse,
 } from "generatedApi";
 import { AuditLogItem } from "./AuditLogItem";
+import { Sheet } from "@ui/Sheet";
 
-const team: Team = {
+const team: TeamResponse = {
   id: 1,
   slug: "team-slug",
   name: "Team Name",
@@ -24,17 +25,25 @@ const member: MemberResponse = {
   email: "member@convex.dev",
 };
 
-export default {
+const meta = {
   component: AuditLogItem,
   args: {
     team,
     memberId: 1,
     members: [member],
-    projects: [],
   },
+  parameters: { a11y: { test: "todo" } },
+  decorators: [
+    (Story) => (
+      <Sheet>
+        <Story />
+      </Sheet>
+    ),
+  ],
 } satisfies Meta<typeof AuditLogItem>;
 
-type Story = StoryObj<typeof AuditLogItem>;
+export default meta;
+type Story = StoryObj<typeof meta>;
 
 export const SpendingLimitChange: Story = {
   args: {

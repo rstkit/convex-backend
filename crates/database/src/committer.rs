@@ -8,6 +8,7 @@ use std::{
 
 use ::metrics::{
     StatusTimer,
+    Subgauge,
     Timer,
 };
 use anyhow::Context as _;
@@ -31,6 +32,8 @@ use common::{
     errors::{
         recapture_stacktrace,
         report_error,
+        DatabaseOperationalError,
+        DatabaseTimeoutError,
     },
     fastrace_helpers::{
         initialize_root_from_parent,
@@ -48,6 +51,7 @@ use common::{
         DocumentLogEntry,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceIndexEntry,
         PersistenceReader,
         RepeatablePersistence,
         RetentionValidator,
@@ -55,7 +59,7 @@ use common::{
     },
     runtime::{
         block_in_place,
-        try_join,
+        tokio_spawn,
         Runtime,
         SpawnHandle,
     },
@@ -71,12 +75,9 @@ use common::{
         Timestamp,
         WriteTimestamp,
     },
-    value::ResolvedDocumentId,
+    virtual_system_mapping::VirtualSystemMapping,
 };
-use errors::{
-    ErrorMetadata,
-    ErrorMetadataAnyhowExt,
-};
+use errors::ErrorMetadata;
 use fastrace::prelude::*;
 use futures::{
     future::{
@@ -90,9 +91,11 @@ use futures::{
     TryStreamExt,
 };
 use indexing::index_registry::IndexRegistry;
+use itertools::Itertools;
 use parking_lot::Mutex;
 use prometheus::VMHistogram;
 use rand::Rng;
+use search::TextIndexWriteSize;
 use tokio::sync::{
     mpsc::{
         self,
@@ -100,15 +103,15 @@ use tokio::sync::{
     },
     oneshot,
 };
+use tokio_util::task::AbortOnDropHandle;
 use usage_tracking::FunctionUsageTracker;
 use value::{
-    heap_size::WithHeapSize,
     id_v6::DeveloperDocumentId,
     InternalDocumentId,
     TableMapping,
     TableName,
 };
-use vector::DocInVectorIndex;
+use vector::VectorIndexWriteSize;
 
 use crate::{
     bootstrap_model::defaults::BootstrapTableIds,
@@ -119,6 +122,7 @@ use crate::{
         finish_bootstrap_update,
         next_commit_ts_seconds,
         table_summary_finish_bootstrap_timer,
+        user_documents_size_subgauge,
     },
     reads::ReadSet,
     search_index_bootstrap::{
@@ -131,18 +135,22 @@ use crate::{
     },
     transaction::FinalTransaction,
     write_log::{
+        index_keys_from_full_documents,
         LogWriter,
+        OrderedIndexKeyWrites,
         PackedDocumentUpdate,
         PendingWriteHandle,
         PendingWrites,
         WriteSource,
     },
-    writes::DocumentWrite,
     ComponentRegistry,
     Snapshot,
     Transaction,
     TransactionReadSet,
 };
+
+const INITIAL_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_PERSISTENCE_WRITES_BACKOFF: Duration = Duration::from_secs(60);
 
 enum PersistenceWrite {
     Commit {
@@ -151,6 +159,7 @@ enum PersistenceWrite {
         result: oneshot::Sender<anyhow::Result<Timestamp>>,
         parent_trace: EncodedSpan,
         commit_id: usize,
+        write_bytes: u64,
     },
     MaxRepeatableTimestamp {
         new_max_repeatable: Timestamp,
@@ -186,6 +195,9 @@ pub struct Committer<RT: Runtime> {
     persistence_writes: FuturesOrdered<BoxFuture<'static, anyhow::Result<PersistenceWrite>>>,
 
     retention_validator: Arc<dyn RetentionValidator>,
+    virtual_system_mapping: VirtualSystemMapping,
+
+    user_documents_size_gauge: Subgauge,
 }
 
 impl<RT: Runtime> Committer<RT> {
@@ -196,9 +208,10 @@ impl<RT: Runtime> Committer<RT> {
         runtime: RT,
         retention_validator: Arc<dyn RetentionValidator>,
         shutdown: ShutdownSignal,
+        virtual_system_mapping: VirtualSystemMapping,
     ) -> CommitterClient {
         let persistence_reader = persistence.reader();
-        let conflict_checker = PendingWrites::new(persistence_reader.version());
+        let conflict_checker = PendingWrites::new();
         let (tx, rx) = mpsc::channel(*COMMITTER_QUEUE_SIZE);
         let snapshot_reader = snapshot_manager.reader();
         let committer = Self {
@@ -210,6 +223,8 @@ impl<RT: Runtime> Committer<RT> {
             last_assigned_ts: Timestamp::MIN,
             persistence_writes: FuturesOrdered::new(),
             retention_validator: retention_validator.clone(),
+            virtual_system_mapping,
+            user_documents_size_gauge: user_documents_size_subgauge(),
         };
         let handle = runtime.spawn("committer", async move {
             if let Err(err) = committer.go(rx).await {
@@ -270,9 +285,10 @@ impl<RT: Runtime> Committer<RT> {
                     self.bump_max_repeatable_ts(tx, commit_id, committer_span);
                     commit_id += 1;
                     last_bumped_repeatable_ts = self.runtime.monotonic_now();
-                }
+                },
                 result = self.persistence_writes.select_next_some() => {
-                    let pending_commit = result.context("Write failed. Unsure if transaction committed to disk.")?;
+                    let pending_commit =
+                        result.context("Write failed. Unsure if transaction committed to disk.")?;
                     let pending_commit_id = pending_commit.commit_id();
                     match pending_commit {
                         PersistenceWrite::Commit {
@@ -280,13 +296,21 @@ impl<RT: Runtime> Committer<RT> {
                             commit_timer,
                             result,
                             parent_trace,
+                            write_bytes,
                             ..
                         } => {
-                            let parent_span = initialize_root_from_parent("Committer::publish_commit", parent_trace);
-                            let publish_commit_span = committer_span.as_ref().map(|root| Span::enter_with_parents("publish_commit", [root, &parent_span])).unwrap_or_else(|| parent_span);
+                            let publish_commit_span = initialize_root_from_parent(
+                                "Committer::publish_commit",
+                                parent_trace,
+                            );
+                            if let Some(root) = &committer_span
+                                && let Some(ctx) = SpanContext::from_span(root)
+                            {
+                                publish_commit_span.add_link(ctx);
+                            }
                             let _guard = publish_commit_span.set_local_parent();
                             let commit_ts = pending_write.must_commit_ts();
-                            self.publish_commit(pending_write);
+                            self.publish_commit(pending_write, write_bytes);
                             let _ = result.send(Ok(commit_ts));
 
                             // When we next get free cycles and there is no ongoing bump,
@@ -302,33 +326,45 @@ impl<RT: Runtime> Committer<RT> {
                             result,
                             ..
                         } => {
-                            let span = committer_span.as_ref().map(|root| Span::enter_with_parent("publish_max_repeatable_ts", root)).unwrap_or_else(Span::noop);
+                            let span = committer_span
+                                .as_ref()
+                                .map(|root| {
+                                    Span::enter_with_parent("publish_max_repeatable_ts", root)
+                                })
+                                .unwrap_or_else(Span::noop);
                             span.set_local_parent();
                             self.publish_max_repeatable_ts(new_max_repeatable)?;
                             let base_period = *MAX_REPEATABLE_TIMESTAMP_IDLE_FREQUENCY;
                             next_bump_wait = Some(
-                                self.runtime.rng().random_range(base_period..base_period * 2),
+                                self.runtime
+                                    .rng()
+                                    .random_range(base_period..base_period * 2),
                             );
                             let _ = result.send(new_max_repeatable);
                             drop(timer);
                         },
                     }
                     // Report the trace if it is longer than the threshold
-                    if let Some(id) = span_commit_id && id == pending_commit_id {
-                        if let Some(span) = committer_span.take() {
-                            if span.elapsed() < Some(*COMMIT_TRACE_THRESHOLD) {
-                                tracing::debug!("Not sending span to honeycomb because it is below the threshold");
-                                span.cancel();
-                            } else {
-                                tracing::debug!("Sending trace to honeycomb");
-                            }
+                    if let Some(id) = span_commit_id
+                        && id == pending_commit_id
+                        && let Some(span) = committer_span.take()
+                    {
+                        if span.elapsed() < Some(*COMMIT_TRACE_THRESHOLD) {
+                            tracing::debug!(
+                                "Not sending span to honeycomb because it is below the threshold"
+                            );
+                            span.cancel();
+                        } else {
+                            tracing::debug!("Sending trace to honeycomb");
                         }
                     }
-                }
+                },
                 maybe_message = rx.recv().fuse() => {
                     match maybe_message {
                         None => {
-                            tracing::info!("All clients have gone away, shutting down committer...");
+                            tracing::info!(
+                                "All clients have gone away, shutting down committer..."
+                            );
                             return Ok(());
                         },
                         Some(CommitterMessage::Commit {
@@ -338,39 +374,45 @@ impl<RT: Runtime> Committer<RT> {
                             write_source,
                             parent_trace,
                         }) => {
-
-                            let parent_span = initialize_root_from_parent("handle_commit_message", parent_trace.clone())
-                                .with_property(|| ("time_in_queue_ms", format!("{}", queue_timer.elapsed().as_secs_f64() * 1000.0)));
+                            let start_commit_span = initialize_root_from_parent(
+                                "handle_commit_message",
+                                parent_trace.clone(),
+                            )
+                            .with_property(|| {
+                                (
+                                    "time_in_queue_ms",
+                                    format!("{}", queue_timer.elapsed().as_secs_f64() * 1000.0),
+                                )
+                            });
                             let committer_span_ref = committer_span.get_or_insert_with(|| {
                                 span_commit_id = Some(commit_id);
                                 Span::root("commit", SpanContext::random())
                             });
-                            let start_commit_span =
-                                Span::enter_with_parents("start_commit", [committer_span_ref, &parent_span]);
+                            if let Some(ctx) = SpanContext::from_span(committer_span_ref) {
+                                start_commit_span.add_link(ctx);
+                            }
                             let _guard = start_commit_span.set_local_parent();
                             drop(queue_timer);
-                            if let Some(persistence_write_future) = self.start_commit(transaction,
+                            if let Some(persistence_write_future) = self.start_commit(
+                                transaction,
                                 result,
                                 write_source,
                                 parent_trace,
                                 commit_id,
-                                committer_span_ref) {
-                                    self.persistence_writes.push_back(persistence_write_future);
-                                    commit_id += 1;
+                                committer_span_ref,
+                            ) {
+                                self.persistence_writes.push_back(persistence_write_future);
+                                commit_id += 1;
                             } else if span_commit_id == Some(commit_id) {
-                                // If the span_commit_id is the same as the commit_id, that means we created a root span in this block
-                                // and it didn't get incremented, so it's not a write to persistence and we should not trace it.
+                                // If the span_commit_id is the same as the commit_id, that means we
+                                // created a root span in this block
+                                // and it didn't get incremented, so it's not a write to persistence
+                                // and we should not trace it.
                                 // We also need to reset the span_commit_id and committer_span.
                                 committer_span_ref.cancel();
                                 committer_span = None;
                                 span_commit_id = None;
                             }
-                        },
-                        #[cfg(any(test, feature = "testing"))]
-                        Some(CommitterMessage::BumpMaxRepeatableTs { result }) => {
-                            let span = Span::noop();
-                            self.bump_max_repeatable_ts(result, commit_id, &span);
-                            commit_id += 1;
                         },
                         Some(CommitterMessage::FinishTextAndVectorBootstrap {
                             bootstrapped_indexes,
@@ -380,20 +422,17 @@ impl<RT: Runtime> Committer<RT> {
                             self.finish_search_and_vector_bootstrap(
                                 bootstrapped_indexes,
                                 bootstrap_ts,
-                                result
-                            ).await;
+                                result,
+                            )
+                            .await;
                         },
-                        Some(CommitterMessage::FinishTableSummaryBootstrap {
-                            result,
-                        }) => {
+                        Some(CommitterMessage::FinishTableSummaryBootstrap { result }) => {
                             self.finish_table_summary_bootstrap(result).await;
                         },
-                        Some(CommitterMessage::LoadIndexesIntoMemory {
-                            tables, result
-                        }) => {
+                        Some(CommitterMessage::LoadIndexesIntoMemory { tables, result }) => {
                             let response = self.load_indexes_into_memory(tables).await;
                             let _ = result.send(response);
-                        }
+                        },
                     }
                 },
             }
@@ -419,7 +458,7 @@ impl<RT: Runtime> Committer<RT> {
             !vector_index_manager.is_bootstrapping(),
             "Trying to update vector index while it's still bootstrapping"
         );
-        let range = TimestampRange::new((Bound::Excluded(bootstrap_ts), Bound::Unbounded))?;
+        let range = TimestampRange::new((Bound::Excluded(bootstrap_ts), Bound::Unbounded));
 
         let revision_stream =
             stream_revision_pairs_for_indexes(tables_with_indexes, &persistence, range);
@@ -529,10 +568,12 @@ impl<RT: Runtime> Committer<RT> {
         if latest_ts != snapshot_manager.latest_ts() {
             panic!("Snapshots were changed concurrently during commit?");
         }
-        snapshot_manager.overwrite_last_snapshot_table_summary(
-            table_summary_snapshot,
-            &mut self.pending_writes,
-        );
+        if let Err(e) = snapshot_manager
+            .overwrite_last_snapshot_table_summary(table_summary_snapshot, &mut self.pending_writes)
+        {
+            let _ = result.send(Err(e));
+            return;
+        }
         tracing::info!("Bootstrapped table summaries at ts {}", latest_ts);
         let _ = result.send(Ok(()));
     }
@@ -609,7 +650,10 @@ impl<RT: Runtime> Committer<RT> {
                 // succceed.  We don't want to kill the committer and reload the
                 // instance if we can avoid it, as that would exacerbate any
                 // load-related issues.
-                let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
+                let mut backoff = Backoff::new(
+                    INITIAL_PERSISTENCE_WRITES_BACKOFF,
+                    MAX_PERSISTENCE_WRITES_BACKOFF,
+                );
                 loop {
                     match persistence
                         .write_persistence_global(
@@ -653,7 +697,7 @@ impl<RT: Runtime> Committer<RT> {
         if snapshot_manager.bump_persisted_max_repeatable_ts(new_max_repeatable)? {
             self.log.append(
                 new_max_repeatable,
-                WithHeapSize::default(),
+                OrderedIndexKeyWrites::empty(),
                 "publish_max_repeatable_ts".into(),
             );
         }
@@ -676,7 +720,11 @@ impl<RT: Runtime> Committer<RT> {
             *transaction.begin_timestamp,
             commit_ts,
         )? {
-            anyhow::bail!(conflicting_read.into_error(&transaction.table_mapping, &write_source));
+            anyhow::bail!(conflicting_read.into_error(
+                &transaction.table_mapping,
+                &transaction.component_registry,
+                &write_source
+            ));
         }
         timer.finish();
 
@@ -685,10 +733,10 @@ impl<RT: Runtime> Committer<RT> {
         // which is the same order they should be applied to database metadata
         // and index data structures
         let mut ordered_updates = updates;
-        ordered_updates.sort_by_key(|(id, update)| {
+        ordered_updates.sort_by_key(|update| {
             table_dependency_sort_key(
                 BootstrapTableIds::new(&transaction.table_mapping),
-                InternalDocumentId::from(**id),
+                InternalDocumentId::from(update.id),
                 update.new_document.as_ref(),
             )
         });
@@ -707,7 +755,7 @@ impl<RT: Runtime> Committer<RT> {
             commit_ts,
             ordered_updates
                 .into_iter()
-                .map(|(&id, update)| (id, PackedDocumentUpdate::pack(update)))
+                .map(|update| (update.id, PackedDocumentUpdate::pack(update)))
                 .collect(),
             write_source,
             snapshot,
@@ -725,7 +773,7 @@ impl<RT: Runtime> Committer<RT> {
     fn compute_writes(
         &self,
         commit_ts: Timestamp,
-        ordered_updates: &Vec<(&ResolvedDocumentId, &DocumentUpdateWithPrevTs)>,
+        ordered_updates: &Vec<&DocumentUpdateWithPrevTs>,
     ) -> anyhow::Result<(
         Vec<ValidatedDocumentWrite>,
         BTreeSet<(Timestamp, DatabaseIndexUpdate)>,
@@ -744,17 +792,16 @@ impl<RT: Runtime> Committer<RT> {
             .pending_writes
             .latest_snapshot()
             .unwrap_or_else(|| self.snapshot_manager.read().latest_snapshot());
-        for &(id, document_update) in ordered_updates.iter() {
-            let (updates, doc_in_vector_index) =
+        for &document_update in ordered_updates.iter() {
+            let (updates, vector_index_write_size, text_index_write_size) =
                 latest_pending_snapshot.update(document_update, commit_ts)?;
             index_writes.extend(updates);
             document_writes.push(ValidatedDocumentWrite {
                 commit_ts,
-                id: (*id).into(),
-                write: DocumentWrite {
-                    document: document_update.new_document.clone(),
-                },
-                doc_in_vector_index,
+                id: document_update.id.into(),
+                write: document_update.new_document.clone(),
+                vector_index_write_size,
+                text_index_write_size,
                 prev_ts: document_update.old_document.as_ref().map(|&(_, ts)| ts),
             });
         }
@@ -790,22 +837,19 @@ impl<RT: Runtime> Committer<RT> {
     /// has been written to persistence.
     async fn write_to_persistence(
         persistence: Arc<dyn Persistence>,
-        index_writes: BTreeSet<(Timestamp, DatabaseIndexUpdate)>,
-        document_writes: Vec<ValidatedDocumentWrite>,
+        index_writes: Arc<Vec<PersistenceIndexEntry>>,
+        document_writes: Arc<Vec<DocumentLogEntry>>,
+        write_source: WriteSource,
     ) -> anyhow::Result<()> {
         let timer = metrics::commit_persistence_write_timer();
-        let document_writes = document_writes
-            .into_iter()
-            .map(|write| DocumentLogEntry {
-                ts: write.commit_ts,
-                id: write.id,
-                value: write.write.document,
-                prev_ts: write.prev_ts,
-            })
-            .collect();
         persistence
-            .write(document_writes, index_writes, ConflictStrategy::Error)
-            .await?;
+            .write(
+                document_writes.as_slice(),
+                &index_writes,
+                ConflictStrategy::Error,
+            )
+            .await
+            .with_context(|| format!("Commit ({write_source:?}) failed to write to persistence"))?;
 
         timer.finish();
         Ok(())
@@ -814,7 +858,7 @@ impl<RT: Runtime> Committer<RT> {
     /// After writing the new rows to persistence, mark the commit as complete
     /// and allow the updated rows to be read by other transactions.
     #[fastrace::trace]
-    fn publish_commit(&mut self, pending_write: PendingWriteHandle) {
+    fn publish_commit(&mut self, pending_write: PendingWriteHandle, write_bytes: u64) {
         let apply_timer = metrics::commit_apply_timer();
         let commit_ts = pending_write.must_commit_ts();
 
@@ -831,18 +875,28 @@ impl<RT: Runtime> Committer<RT> {
 
         // Write transaction state at the commit ts to the document store.
         metrics::commit_rows(ordered_updates.len() as u64);
+
+        let timer = metrics::pending_writes_to_write_log_timer();
+        // See the comment in `writes_overlap_by_index` for why it’s safe
+        // to use indexes from the current snapshot.
+        let writes = index_keys_from_full_documents(ordered_updates, &new_snapshot.index_registry);
+        drop(timer);
+        metrics::write_log_commit_bytes(write_bytes as usize);
+
         let timer = metrics::write_log_append_timer();
-        self.log.append(commit_ts, ordered_updates, write_source);
+        self.log.append(commit_ts, writes, write_source);
         drop(timer);
 
         if let Some(table_summaries) = new_snapshot.table_summaries.as_ref() {
             metrics::log_num_keys(table_summaries.num_user_documents);
-            metrics::log_document_store_size(table_summaries.user_size);
+            metrics::log_user_table_documents_size(table_summaries.user_tables_size);
+            self.user_documents_size_gauge
+                .set(table_summaries.user_docs_size as i64);
         }
 
         // Publish the new version of our database metadata and the index.
         let mut snapshot_manager = self.snapshot_manager.write();
-        snapshot_manager.push(commit_ts, new_snapshot);
+        snapshot_manager.push(commit_ts, new_snapshot, write_bytes);
 
         apply_timer.finish();
     }
@@ -883,7 +937,7 @@ impl<RT: Runtime> Committer<RT> {
             index_writes,
             document_writes,
             pending_write,
-        } = match block_in_place(|| self.validate_commit(transaction, write_source)) {
+        } = match block_in_place(|| self.validate_commit(transaction, write_source.clone())) {
             Ok(v) => v,
             Err(e) => {
                 let _ = result.send(Err(e));
@@ -894,12 +948,14 @@ impl<RT: Runtime> Committer<RT> {
         // necessary because this value is moved
         let parent_trace_copy = parent_trace.clone();
         let persistence = self.persistence.clone();
-        let request_span = initialize_root_from_parent(
-            "Committer::persistence_writes_future",
-            parent_trace.clone(),
-        );
-        let outer_span = Span::enter_with_parents("outer_write_commit", [root_span, &request_span]);
+        let outer_span =
+            initialize_root_from_parent("Committer::persistence_writes_future", parent_trace);
+        if let Some(ctx) = SpanContext::from_span(root_span) {
+            outer_span.add_link(ctx);
+        }
         let pause_client = self.runtime.pause_client();
+        let rt = self.runtime.clone();
+        let virtual_system_mapping = self.virtual_system_mapping.clone();
         Some(
             async move {
                 Self::track_commit(
@@ -908,24 +964,77 @@ impl<RT: Runtime> Committer<RT> {
                     &document_writes,
                     &table_mapping,
                     &component_registry,
+                    &virtual_system_mapping,
                 );
 
-                try_join(
-                    "Committer::write_to_persistence",
-                    Self::write_to_persistence(persistence, index_writes, document_writes),
-                )
-                .await?;
-                pause_client.wait(AFTER_PENDING_WRITE_SNAPSHOT).await;
-                Ok(PersistenceWrite::Commit {
-                    pending_write,
-                    commit_timer,
-                    result,
-                    parent_trace: parent_trace_copy,
-                    commit_id,
-                })
+                let mut backoff = Backoff::new(
+                    INITIAL_PERSISTENCE_WRITES_BACKOFF,
+                    MAX_PERSISTENCE_WRITES_BACKOFF,
+                );
+                let mut write_bytes: u64 = 0;
+                let document_writes = Arc::new(
+                    document_writes
+                        .into_iter()
+                        .map(|write| {
+                            let entry = DocumentLogEntry {
+                                ts: write.commit_ts,
+                                id: write.id,
+                                value: write.write,
+                                prev_ts: write.prev_ts,
+                            };
+                            write_bytes += entry.size();
+                            entry
+                        })
+                        .collect_vec(),
+                );
+                let index_writes = Arc::new(
+                    index_writes
+                        .into_iter()
+                        .map(|(ts, update)| {
+                            let entry = PersistenceIndexEntry::from_index_update(ts, &update);
+                            write_bytes += entry.size();
+                            entry
+                        })
+                        .collect_vec(),
+                );
+                loop {
+                    // Inline try_join so we don't recapture the stacktrace on error
+                    let name = "Commit::write_to_persistence";
+                    let handle = AbortOnDropHandle::new(tokio_spawn(
+                        name,
+                        Self::write_to_persistence(
+                            persistence.clone(),
+                            index_writes.clone(),
+                            document_writes.clone(),
+                            write_source.clone(),
+                        )
+                        .in_span(Span::enter_with_local_parent(name)),
+                    ));
+                    if let Err(mut e) = handle.await? {
+                        if e.is::<DatabaseTimeoutError>() || e.is::<DatabaseOperationalError>() {
+                            let delay = backoff.fail(&mut rt.rng());
+                            tracing::error!(
+                                "Failed to write to persistence because database timed out"
+                            );
+                            report_error(&mut e).await;
+                            rt.wait(delay).await;
+                        } else {
+                            return Err(e);
+                        }
+                    } else {
+                        pause_client.wait(AFTER_PENDING_WRITE_SNAPSHOT).await;
+                        return Ok(PersistenceWrite::Commit {
+                            pending_write,
+                            commit_timer,
+                            result,
+                            parent_trace: parent_trace_copy,
+                            commit_id,
+                            write_bytes,
+                        });
+                    }
+                }
             }
             .in_span(outer_span)
-            .in_span(request_span)
             .boxed(),
         )
     }
@@ -937,6 +1046,7 @@ impl<RT: Runtime> Committer<RT> {
         document_writes: &Vec<ValidatedDocumentWrite>,
         table_mapping: &TableMapping,
         component_registry: &ComponentRegistry,
+        virtual_system_mapping: &VirtualSystemMapping,
     ) {
         for (_, index_write) in index_writes {
             if let DatabaseIndexValue::NonClustered(doc) = index_write.value {
@@ -952,26 +1062,41 @@ impl<RT: Runtime> Committer<RT> {
                 if let Ok(table_name) = table_mapping.tablet_name(tablet_id) {
                     // Index metadata is never a vector
                     // Database bandwidth for index writes
-                    usage_tracker.track_database_ingress_size(
-                        component_path,
+                    usage_tracker.track_database_ingress(
+                        component_path.clone(),
                         table_name.to_string(),
                         index_write.key.size() as u64,
                         // Exclude indexes on system tables or reserved system indexes on user
                         // tables
                         table_name.is_system() || index_write.is_system_index,
                     );
+                    usage_tracker.track_database_ingress_v2(
+                        component_path.clone(),
+                        table_name.to_string(),
+                        index_write.key.size() as u64,
+                        table_name.is_system() || index_write.is_system_index,
+                    );
+                    if let Some(virtual_table_name) =
+                        virtual_system_mapping.associated_virtual_table_name(&table_name)
+                    {
+                        usage_tracker.track_virtual_table_ingress(
+                            component_path,
+                            virtual_table_name.to_string(),
+                            index_write.key.size() as u64,
+                        );
+                    }
                 }
             }
         }
         for validated_write in document_writes {
             let ValidatedDocumentWrite {
-                id: document_id,
-                write: DocumentWrite { document },
-                doc_in_vector_index,
+                write: document,
+                vector_index_write_size,
+                text_index_write_size,
                 ..
             } = validated_write;
             if let Some(document) = document {
-                let document_write_size = document_id.size() + document.size();
+                let document_write_size = document.size();
                 let tablet_id = document.id().tablet_id;
                 let Ok(table_namespace) = table_mapping.tablet_namespace(tablet_id) else {
                     continue;
@@ -983,18 +1108,41 @@ impl<RT: Runtime> Committer<RT> {
                     .unwrap_or(ComponentPath::root());
                 if let Ok(table_name) = table_mapping.tablet_name(tablet_id) {
                     // Database bandwidth for document writes
-                    if *doc_in_vector_index == DocInVectorIndex::Absent {
-                        usage_tracker.track_database_ingress_size(
-                            component_path,
+                    usage_tracker.track_database_ingress(
+                        component_path.clone().clone(),
+                        table_name.to_string(),
+                        document_write_size as u64,
+                        table_name.is_system(),
+                    );
+                    usage_tracker.track_database_ingress_v2(
+                        component_path.clone(),
+                        table_name.to_string(),
+                        document_write_size as u64,
+                        table_name.is_system(),
+                    );
+                    if let Some(virtual_table_name) =
+                        virtual_system_mapping.associated_virtual_table_name(&table_name)
+                    {
+                        usage_tracker.track_virtual_table_ingress(
+                            component_path.clone(),
+                            virtual_table_name.to_string(),
+                            document_write_size as u64,
+                        );
+                    }
+                    if vector_index_write_size.0 > 0 {
+                        usage_tracker.track_vector_ingress(
+                            component_path.clone(),
                             table_name.to_string(),
                             document_write_size as u64,
+                            vector_index_write_size.0,
                             table_name.is_system(),
                         );
-                    } else {
-                        usage_tracker.track_vector_ingress_size(
-                            component_path,
+                    }
+                    if text_index_write_size.0 > 0 {
+                        usage_tracker.track_text_ingress(
+                            component_path.clone(),
                             table_name.to_string(),
-                            document_write_size as u64,
+                            text_index_write_size.0,
                             table_name.is_system(),
                         );
                     }
@@ -1035,8 +1183,9 @@ impl<RT: Runtime> Committer<RT> {
 struct ValidatedDocumentWrite {
     commit_ts: Timestamp,
     id: InternalDocumentId,
-    write: DocumentWrite,
-    doc_in_vector_index: DocInVectorIndex,
+    write: Option<ResolvedDocument>,
+    vector_index_write_size: VectorIndexWriteSize,
+    text_index_write_size: TextIndexWriteSize,
     prev_ts: Option<Timestamp>,
 }
 
@@ -1099,7 +1248,7 @@ impl CommitterClient {
         &self,
         transaction: Transaction<RT>,
         write_source: WriteSource,
-    ) -> BoxFuture<anyhow::Result<Timestamp>> {
+    ) -> BoxFuture<'_, anyhow::Result<Timestamp>> {
         self._commit(transaction, write_source).boxed()
     }
 
@@ -1113,7 +1262,13 @@ impl CommitterClient {
         self.check_generated_ids(&transaction).await?;
 
         // Finish reading everything from persistence.
-        let transaction = transaction.finalize(self.snapshot_reader.clone()).await?;
+        let transaction = transaction.finalize()?;
+
+        // Note that we do a best effort validation for memory index sizes. We
+        // use the latest snapshot instead of the transaction base snapshot. This
+        // is both more accurate and also avoids pedant hitting transient errors.
+        let latest_snapshot = self.snapshot_reader.lock().latest_snapshot();
+        transaction.validate_memory_index_sizes(&latest_snapshot)?;
 
         let queue_timer = metrics::commit_queue_timer();
         let (tx, rx) = oneshot::channel();
@@ -1132,29 +1287,13 @@ impl CommitterClient {
             anyhow::bail!(metrics::shutdown_error());
         };
         if let Err(e) = result {
-            // For OCC and other known commit failure error types,
-            // replace the committer's stacktrace with the caller's stack trace as
-            // that will be more helpful
-            if e.is_occ() {
-                return Err(recapture_stacktrace(e));
-            }
-            return Err(e);
+            return Err(recapture_stacktrace(e).await);
         }
         result
     }
 
     pub fn shutdown(&self) {
         self.handle.lock().shutdown();
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    pub async fn bump_max_repeatable_ts(&self) -> anyhow::Result<Timestamp> {
-        let (tx, rx) = oneshot::channel();
-        let message = CommitterMessage::BumpMaxRepeatableTs { result: tx };
-        self.sender
-            .try_send(message)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(rx.await?)
     }
 
     async fn check_generated_ids<RT: Runtime>(
@@ -1225,8 +1364,6 @@ enum CommitterMessage {
         write_source: WriteSource,
         parent_trace: EncodedSpan,
     },
-    #[cfg(any(test, feature = "testing"))]
-    BumpMaxRepeatableTs { result: oneshot::Sender<Timestamp> },
     LoadIndexesIntoMemory {
         tables: BTreeSet<TableName>,
         result: oneshot::Sender<anyhow::Result<()>>,

@@ -68,7 +68,6 @@ const optionsForBuild = {
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  swcMinify: true,
   transpilePackages: [],
   reactStrictMode: true,
   ...(process.env.BUILD_TYPE === "export" ? optionsForExport : optionsForBuild),
@@ -106,6 +105,19 @@ const nextConfig = {
         ...config.output.environment,
         asyncFunction: true,
       };
+    }
+
+    if (
+      !isServer &&
+      process.env.NEXT_PUBLIC_LOAD_MONACO_INTERNALLY === "true"
+    ) {
+      const MonacoWebpackPlugin = require("monaco-editor-webpack-plugin");
+      config.plugins.push(
+        new MonacoWebpackPlugin({
+          languages: ["json", "typescript", "javascript"],
+          filename: "static/[name].worker.js",
+        }),
+      );
     }
 
     return config;

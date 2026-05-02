@@ -5,6 +5,7 @@
 
 #![feature(coroutines)]
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
 #![feature(impl_trait_in_assoc_type)]
 
 use std::{
@@ -23,13 +24,15 @@ use value::{
 };
 
 pub mod migr_119;
+pub mod migr_121;
+pub mod migr_124;
 
 pub type DatabaseVersion = i64;
 // The version for the format of the database. We support all previous
 // migrations unless explicitly dropping support.
 // Add a user name next to the version when you make a change to highlight merge
 // conflicts.
-pub const DATABASE_VERSION: DatabaseVersion = 119; // nipunn
+pub const DATABASE_VERSION: DatabaseVersion = 124; // reece
 
 pub struct MigrationExecutor<RT: Runtime> {
     pub db: Database<RT>,
@@ -59,6 +62,37 @@ impl<RT: Runtime> MigrationExecutor<RT> {
                 migr_119::run_migration(&mut tx).await?;
                 self.db
                     .commit_with_write_source(tx, "migration_119")
+                    .await?;
+                MigrationCompletionCriterion::MigrationComplete(to_version)
+            },
+            120 => {
+                // This is an empty migration because we added a new system
+                // table, _index_backfills
+                MigrationCompletionCriterion::MigrationComplete(to_version)
+            },
+            121 => {
+                let mut tx = self.db.begin_system().await?;
+                migr_121::run_migration(&mut tx).await?;
+                self.db
+                    .commit_with_write_source(tx, "migration_121")
+                    .await?;
+                MigrationCompletionCriterion::MigrationComplete(to_version)
+            },
+            122 => {
+                // This is an empty migration because we added a new system
+                // table for each component, _schema_validation_progress
+                MigrationCompletionCriterion::MigrationComplete(to_version)
+            },
+            123 => {
+                // This is an empty migration because we added a new system
+                // table for each component, _scheduled_job_args
+                MigrationCompletionCriterion::MigrationComplete(to_version)
+            },
+            124 => {
+                let mut tx = self.db.begin_system().await?;
+                migr_124::run_migration(&mut tx).await?;
+                self.db
+                    .commit_with_write_source(tx, "migration_124")
                     .await?;
                 MigrationCompletionCriterion::MigrationComplete(to_version)
             },

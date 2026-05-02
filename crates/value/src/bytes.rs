@@ -46,7 +46,7 @@ impl Deref for ConvexBytes {
 impl fmt::Display for ConvexBytes {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let encoded = base64::encode(&self.0);
-        write!(f, "b{:?}", encoded)
+        write!(f, "b{encoded:?}")
     }
 }
 
@@ -63,19 +63,5 @@ impl Size for ConvexBytes {
 impl HeapSize for ConvexBytes {
     fn heap_size(&self) -> usize {
         self.0.heap_size()
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for ConvexBytes {
-    type Parameters = (proptest::collection::SizeRange, ());
-
-    type Strategy = impl proptest::strategy::Strategy<Value = ConvexBytes>;
-
-    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
-        use proptest::strategy::Strategy;
-        Vec::<u8>::arbitrary_with(args).prop_filter_map("Bytes weren't a valid Convex value", |s| {
-            ConvexBytes::try_from(s).ok()
-        })
     }
 }

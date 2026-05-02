@@ -10,7 +10,7 @@ export function ReferralProgress({ referralState }: ReferralProgressProps) {
   const referralsComplete = referralsCount >= 5;
 
   return (
-    <>
+    <div className="hidden flex-col gap-1 md:flex">
       {!referralsComplete ? (
         <>
           <ProgressBar
@@ -19,15 +19,15 @@ export function ReferralProgress({ referralState }: ReferralProgressProps) {
             variant="solid"
             className="w-full"
           />
-          <span className="whitespace-nowrap text-sm font-medium">
+          <span className="text-sm font-medium whitespace-nowrap">
             {referralsCount}/5 referral boosts applied
           </span>
         </>
       ) : (
-        <p className="max-w-[24ch] text-balance text-right text-sm font-medium xl:max-w-none">
+        <p className="max-w-[24ch] text-right text-sm font-medium text-balance xl:max-w-none">
           🎉 Congrats, your app limits have been boosted 5 times!
         </p>
       )}
-    </>
+    </div>
   );
 }

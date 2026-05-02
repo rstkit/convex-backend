@@ -19,16 +19,17 @@ use std::{
 };
 
 use common::{
-    document::{
-        CreationTime,
-        PackedDocument,
-        ResolvedDocument,
+    document_index_keys::{
+        DatabaseIndexWrite,
+        DocumentIndexKeys,
+        IndexKeyUpdate,
+        TextIndexWrite,
     },
     testing::TestIdGenerator,
     types::{
         GenericIndexName,
         IndexDescriptor,
-        PersistenceVersion,
+        TabletIndexName,
     },
 };
 use criterion::{
@@ -40,6 +41,7 @@ use criterion::{
 use database::{
     subscription::SubscriptionManager,
     Token,
+    WriteSource,
 };
 use humansize::{
     FormatSize,
@@ -49,14 +51,16 @@ use itertools::Itertools;
 use search::{
     convex_en,
     query::{
-        FuzzyDistance,
+        tokenize,
         TextQueryTerm,
     },
 };
 use serde::Deserialize;
+use sync_types::Timestamp;
 use tokio::runtime::Runtime;
 use value::{
-    assert_obj,
+    heap_size::WithHeapSize,
+    ConvexString,
     DeveloperDocumentId,
     FieldPath,
     InternalId,
@@ -79,20 +83,14 @@ fn path() -> String {
     )
 }
 
-fn prefix_and_max_distances() -> Vec<(bool, FuzzyDistance)> {
-    let mut result = vec![];
-    for prefix in vec![true, false] {
-        for distance in vec![FuzzyDistance::Zero, FuzzyDistance::One, FuzzyDistance::Two] {
-            result.push((prefix, distance));
-        }
-    }
-    result
+fn prefixes() -> Vec<bool> {
+    vec![true, false]
 }
 
 fn load_datasets(
     table_id: TabletIdAndTableNumber,
     max_size: usize,
-) -> anyhow::Result<BTreeMap<String, (Vec<PackedDocument>, Vec<String>)>> {
+) -> anyhow::Result<BTreeMap<String, (Vec<(ResolvedDocumentId, DocumentIndexKeys)>, Vec<String>)>> {
     let mut next_id = 0u64;
     let mut alloc_id = || {
         let mut result = [0; 16];
@@ -137,10 +135,18 @@ fn load_datasets(
                     *frequency_map.entry(token.text.clone()).or_default() += 1;
                 }
             }
-            let value = assert_obj!("body" => d.text);
-            let creation_time = CreationTime::try_from(1.)?;
-            let document = ResolvedDocument::new(id, creation_time, value)?;
-            documents.push(PackedDocument::pack(&document));
+
+            let field_path = FieldPath::from_str("body")?;
+            documents.push((
+                id,
+                DocumentIndexKeys::with_search_index_for_test_with_filters(
+                    id,
+                    index_name(table_id.tablet_id),
+                    field_path,
+                    tokenize(ConvexString::try_from(d.text).unwrap()),
+                    BTreeMap::new(),
+                ),
+            ));
         }
 
         let terms_by_frequency: Vec<String> = frequency_map
@@ -165,23 +171,20 @@ fn load_datasets(
     Ok(loaded)
 }
 
-fn create_subscription_token(
-    tablet_id: TabletId,
-    prefix: bool,
-    max_distance: FuzzyDistance,
-    token: String,
-) -> Token {
-    let index_name: GenericIndexName<TabletId> =
-        GenericIndexName::new(tablet_id, IndexDescriptor::new("index").unwrap()).unwrap();
+fn index_name(tablet_id: TabletId) -> TabletIndexName {
+    GenericIndexName::new(tablet_id, IndexDescriptor::new("index").unwrap()).unwrap()
+}
 
+fn create_subscription_token(tablet_id: TabletId, prefix: bool, token: String) -> Token {
+    let term = if prefix {
+        TextQueryTerm::Prefix(token)
+    } else {
+        TextQueryTerm::Exact(token)
+    };
     Token::text_search_token(
-        index_name,
+        index_name(tablet_id),
         FieldPath::from_str("body").unwrap(),
-        vec![TextQueryTerm::Fuzzy {
-            token,
-            prefix,
-            max_distance,
-        }],
+        vec![term],
     )
 }
 
@@ -189,7 +192,6 @@ fn create_tokens(
     tablet_id: TabletId,
     terms_by_frequency: &Vec<String>,
     prefix: bool,
-    max_distance: FuzzyDistance,
     count: usize,
 ) -> Vec<Token> {
     let total_unique_terms = terms_by_frequency.len();
@@ -202,7 +204,7 @@ fn create_tokens(
         .take(count)
         .map(|chunk| {
             let token = chunk.into_iter().next().unwrap();
-            create_subscription_token(tablet_id, prefix, max_distance, token.clone())
+            create_subscription_token(tablet_id, prefix, token.clone())
         })
         .collect::<Vec<_>>()
 }
@@ -211,11 +213,10 @@ fn create_subscriptions(
     tablet_id: TabletId,
     terms_by_frequency: &Vec<String>,
     prefix: bool,
-    max_distance: FuzzyDistance,
     count: usize,
 ) -> SubscriptionManager {
     let mut subscription_manager = SubscriptionManager::new_for_testing();
-    let tokens = create_tokens(tablet_id, terms_by_frequency, prefix, max_distance, count);
+    let tokens = create_tokens(tablet_id, terms_by_frequency, prefix, count);
     for token in tokens {
         // this drops the Subscription but in these tests we don't run the
         // worker that removes dropped subscriptions
@@ -233,14 +234,13 @@ fn bench_query(c: &mut Criterion) {
 
     let datasets = load_datasets(table_id, MAX_LOAD_SIZE).unwrap();
 
-    for (prefix, max_distance) in prefix_and_max_distances() {
+    for prefix in prefixes() {
         for (dataset, (data, terms_by_frequency)) in &datasets {
             let subscription_manager = rt.block_on(async {
                 create_subscriptions(
                     table_id.tablet_id,
                     terms_by_frequency,
                     prefix,
-                    max_distance,
                     TOTAL_SUBSCRIPTIONS,
                 )
             });
@@ -248,26 +248,61 @@ fn bench_query(c: &mut Criterion) {
             let mut group = c.benchmark_group("subscriptions");
 
             group.throughput(criterion::Throughput::Elements(data.len() as u64));
-            // Set the sample size higher when the cost isn't prohibitive.
-            group.sample_size(if !prefix && max_distance != FuzzyDistance::Two {
-                100
-            } else {
-                10
-            });
+            group.sample_size(if prefix { 10 } else { 100 });
             group.bench_with_input(
-                BenchmarkId::from_parameter(format!(
-                    "{TOTAL_SUBSCRIPTIONS}/{dataset}/{prefix}_{max_distance:?}"
-                )),
+                BenchmarkId::from_parameter(format!("{TOTAL_SUBSCRIPTIONS}/{dataset}/{prefix}")),
                 data,
                 |b, documents| {
                     b.to_async(&rt).iter(|| async {
-                        for doc in documents {
+                        let dummy_ts = Timestamp::MIN;
+                        for (_doc_id, doc_index_keys) in documents {
                             let mut to_notify = BTreeSet::new();
-                            subscription_manager.overlapping_for_testing(
-                                doc,
-                                &mut to_notify,
-                                PersistenceVersion::V5,
-                            );
+                            for (idx_name, idx_key_update) in &doc_index_keys.0 {
+                                match &idx_key_update.update {
+                                    IndexKeyUpdate::Database(u) => {
+                                        let update = DatabaseIndexWrite {
+                                            document_id: idx_key_update.document_id,
+                                            update: u.clone(),
+                                            new_document: idx_key_update.new_document.clone(),
+                                        };
+                                        let write = (
+                                            WithHeapSize::from(imbl::vector![update]),
+                                            WriteSource::system("bench"),
+                                        );
+                                        let interval_map =
+                                            subscription_manager.interval_map(idx_name).unwrap();
+                                        SubscriptionManager::overlapping_database(
+                                            interval_map,
+                                            std::iter::once((&dummy_ts, &write)),
+                                            &mut |id, _ts, _ws| {
+                                                to_notify.insert(id);
+                                            },
+                                            &mut 0,
+                                        );
+                                    },
+                                    IndexKeyUpdate::Text(u) => {
+                                        let update = TextIndexWrite {
+                                            document_id: idx_key_update.document_id,
+                                            update: u.clone(),
+                                        };
+                                        let write = (
+                                            WithHeapSize::from(imbl::vector![update]),
+                                            WriteSource::system("bench"),
+                                        );
+                                        let text_subscription = subscription_manager
+                                            .text_subscription_for_index(idx_name)
+                                            .unwrap();
+                                        subscription_manager.overlapping_text(
+                                            text_subscription,
+                                            std::iter::once((&dummy_ts, &write)),
+                                            &mut |id, _ts, _ws| {
+                                                to_notify.insert(id);
+                                            },
+                                            &mut 0,
+                                        );
+                                    },
+                                }
+                            }
                         }
                     })
                 },

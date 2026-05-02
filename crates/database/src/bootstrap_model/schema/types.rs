@@ -1,5 +1,5 @@
 use common::{
-    json::JsonSerializable as _,
+    json::JsonForm as _,
     schemas::DatabaseSchema,
 };
 use serde::{
@@ -7,7 +7,6 @@ use serde::{
     Serialize,
 };
 
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaDiff {
     pub previous_schema: Option<DatabaseSchema>,

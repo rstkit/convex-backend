@@ -10,7 +10,7 @@ use chrono::{
 };
 use common::{
     bootstrap_model::index::{
-        database_index::DeveloperDatabaseIndexConfig,
+        database_index::DatabaseIndexSpec,
         DeveloperIndexMetadata,
         IndexConfig,
     },
@@ -26,7 +26,15 @@ use common::{
     },
     runtime::Runtime,
 };
-use convex_fivetran_destination::{
+use database::{
+    IndexModel,
+    PatchValue,
+    ResolvedQuery,
+    Transaction,
+    UserFacingModel,
+};
+use errors::ErrorMetadata;
+use fivetran_destination::{
     api_types::{
         BatchWriteOperation,
         BatchWriteRow,
@@ -43,14 +51,6 @@ use convex_fivetran_destination::{
         SYNCED_FIELD_PATH,
     },
 };
-use database::{
-    IndexModel,
-    PatchValue,
-    ResolvedQuery,
-    Transaction,
-    UserFacingModel,
-};
-use errors::ErrorMetadata;
 use value::{
     ConvexObject,
     ConvexValue,
@@ -174,7 +174,7 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
             })?;
 
         let IndexConfig::Database {
-            developer_config: DeveloperDatabaseIndexConfig { fields },
+            spec: DatabaseIndexSpec { fields },
             ..
         } = index.config
         else {
@@ -248,7 +248,7 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
         }
 
         let IndexConfig::Database {
-            developer_config: DeveloperDatabaseIndexConfig { fields },
+            spec: DatabaseIndexSpec { fields },
             ..
         } = index.config
         else {
@@ -276,7 +276,7 @@ impl<'a, RT: Runtime> FivetranImportModel<'a, RT> {
                 if let Some(delete_before) = delete_before {
                     range.push(IndexRangeExpression::Lt(
                         field_path.clone(),
-                        ConvexValue::Float64(delete_before.timestamp_millis() as f64),
+                        ConvexValue::Float64(delete_before.timestamp_millis() as f64).into(),
                     ));
                 }
             } else if *field_path == *SOFT_DELETE_FIELD_PATH {
@@ -362,138 +362,4 @@ fn mark_as_soft_deleted(object: ConvexObject) -> anyhow::Result<ConvexObject> {
         )?)?),
     );
     new_value.try_into()
-}
-
-#[cfg(test)]
-mod tests {
-    use database::PatchValue;
-    use value::{
-        assert_obj,
-        ConvexValue,
-    };
-
-    use crate::fivetran_import::{
-        fivetran_patch_value,
-        mark_as_soft_deleted,
-    };
-
-    #[test]
-    fn test_mark_as_soft_deleted_for_object_with_fivetran_field() -> anyhow::Result<()> {
-        assert_eq!(
-            mark_as_soft_deleted(assert_obj!(
-                "top_level_field" => ConvexValue::Int64(42),
-                "fivetran" => assert_obj!(
-                    "id" => ConvexValue::Int64(1),
-                    "synced" => ConvexValue::Float64(1715336497241.0),
-                    "deleted" => ConvexValue::Boolean(false),
-                ),
-            ))?,
-            assert_obj!(
-                "top_level_field" => ConvexValue::Int64(42),
-                "fivetran" => assert_obj!(
-                    "id" => ConvexValue::Int64(1),
-                    "synced" => ConvexValue::Float64(1715336497241.0),
-                    "deleted" => ConvexValue::Boolean(true),
-                ),
-            )
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_mark_as_soft_deleted_for_object_without_fivetran_field() -> anyhow::Result<()> {
-        assert_eq!(
-            mark_as_soft_deleted(assert_obj!(
-                "top_level_field" => ConvexValue::Int64(42),
-            ))?,
-            assert_obj!(
-                "top_level_field" => ConvexValue::Int64(42),
-                "fivetran" => assert_obj!(
-                    "deleted" => ConvexValue::Boolean(true),
-                ),
-            )
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_fivetran_patch_value_with_no_metadata_field() {
-        assert_eq!(
-            fivetran_patch_value(
-                assert_obj!(
-                    "id" => 42,
-                    "name" => "Nathan",
-                ),
-                assert_obj!("name" => "Nicolas")
-            ),
-            PatchValue::from(assert_obj!("name" => "Nicolas"))
-        );
-    }
-
-    #[test]
-    fn test_fivetran_patch_value_with_metadata_field_only_on_existing() {
-        assert_eq!(
-            fivetran_patch_value(
-                assert_obj!(
-                    "id" => 42,
-                    "name" => "Nathan",
-                    "fivetran" => assert_obj!("synced" => 1716672331152),
-                ),
-                assert_obj!("name" => "Nicolas")
-            ),
-            PatchValue::from(assert_obj!("name" => "Nicolas"))
-        );
-    }
-
-    #[test]
-    fn test_fivetran_patch_value_with_metadata_field_only_on_patch() {
-        assert_eq!(
-            fivetran_patch_value(
-                assert_obj!(
-                    "id" => 42,
-                    "name" => "Nathan",
-                ),
-                assert_obj!(
-                    "name" => "Nicolas",
-                    "fivetran" => assert_obj!("synced" => 1716672331152),
-                )
-            ),
-            PatchValue::from(assert_obj!(
-                "name" => "Nicolas",
-                "fivetran" => assert_obj!("synced" => 1716672331152),
-            ))
-        );
-    }
-
-    #[test]
-    fn test_fivetran_patch_value_merge() {
-        assert_eq!(
-            fivetran_patch_value(
-                assert_obj!(
-                    "id" => 42,
-                    "name" => "Nathan",
-                    "fivetran" => assert_obj!(
-                        "id" => 42,
-                        "deleted" => false,
-                        "synced" => 1716672331152,
-                    ),
-                ),
-                assert_obj!(
-                    "name" => "Nicolas",
-                    "fivetran" => assert_obj!(
-                        "id" => 42,
-                        "synced" => 1716672354859,
-                    ),
-                )
-            ),
-            PatchValue::from(assert_obj!(
-                "name" => "Nicolas",
-                "fivetran" => assert_obj!(
-                    "id" => 42,
-                    "deleted" => false,
-                    "synced" => 1716672354859,
-                ),
-            ))
-        );
-    }
 }

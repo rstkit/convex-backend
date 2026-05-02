@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
     convert::Infallible,
+    future::Future,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -23,7 +25,7 @@ use tokio::{
 use tokio_stream::wrappers::BroadcastStream;
 use url::Url;
 
-use self::worker::AuthenticateRequest;
+pub use crate::base_client::AuthTokenFetcher;
 #[cfg(doc)]
 use crate::SubscriberId;
 use crate::{
@@ -349,15 +351,42 @@ impl ConvexClient {
     /// Set it with a token that you get from your auth provider via their login
     /// flow. If `None` is passed as the token, then auth is unset (logging
     /// out).
+    ///
+    /// Internally this wraps the static token in a trivial callback and the
+    /// same token is re-sent on websocket reconnect.
+    ///
+    /// <div class="warning">
+    ///
+    /// Prefer [`ConvexClient::set_auth_callback``] - it will allow fetching a
+    /// fresh token after a websocket reconnect. That's important because
+    /// the original token might have expired while the socket was
+    /// disconnected.
+    ///
+    /// </div>
     pub async fn set_auth(&mut self, token: Option<String>) {
-        let req = AuthenticateRequest {
-            token: match token {
-                None => AuthenticationToken::None,
-                Some(token) => AuthenticationToken::User(token),
-            },
-        };
+        let fetcher: Option<AuthTokenFetcher> = token.map(|t| {
+            Box::new(move |_force_refresh: bool| {
+                let t = t.clone();
+                Box::pin(async move { Ok(AuthenticationToken::User(t)) })
+                    as Pin<Box<dyn Future<Output = anyhow::Result<AuthenticationToken>> + Send>>
+            }) as AuthTokenFetcher
+        });
         self.request_sender
-            .send(ClientRequest::Authenticate(req))
+            .send(ClientRequest::Authenticate(fetcher))
+            .expect("INTERNAL BUG: Worker has gone away");
+    }
+
+    /// Set an auth token fetcher callback for use when calling Convex
+    /// functions.
+    ///
+    /// The callback is invoked immediately (with `force_refresh=false`) and
+    /// again on every websocket reconnect (with `force_refresh=true`),
+    /// allowing dynamic token refresh.
+    ///
+    /// Pass `None` to clear the callback and log out.
+    pub async fn set_auth_callback(&mut self, fetcher: Option<AuthTokenFetcher>) {
+        self.request_sender
+            .send(ClientRequest::Authenticate(fetcher))
             .expect("INTERNAL BUG: Worker has gone away");
     }
 
@@ -373,11 +402,13 @@ impl ConvexClient {
         deploy_key: String,
         acting_as: Option<UserIdentityAttributes>,
     ) {
-        let req = AuthenticateRequest {
-            token: AuthenticationToken::Admin(deploy_key, acting_as),
-        };
+        let fetcher: AuthTokenFetcher = Box::new(move |_force_refresh: bool| {
+            let deploy_key = deploy_key.clone();
+            let acting_as = acting_as.clone();
+            Box::pin(async move { Ok(AuthenticationToken::Admin(deploy_key, acting_as)) })
+        });
         self.request_sender
-            .send(ClientRequest::Authenticate(req))
+            .send(ClientRequest::Authenticate(Some(fetcher)))
             .expect("INTERNAL BUG: Worker has gone away");
     }
 }
@@ -437,556 +468,5 @@ impl ConvexClientBuilder {
     /// ```
     pub async fn build(self) -> anyhow::Result<ConvexClient> {
         ConvexClient::new_from_builder(self).await
-    }
-}
-
-#[cfg(test)]
-pub mod tests {
-    use std::{
-        str::FromStr,
-        sync::Arc,
-        time::Duration,
-    };
-
-    use convex_sync_types::{
-        AuthenticationToken,
-        ClientMessage,
-        LogLinesMessage,
-        Query,
-        QueryId,
-        QuerySetModification,
-        SessionId,
-        StateModification,
-        StateVersion,
-        UdfPath,
-        UserIdentityAttributes,
-    };
-    use futures::StreamExt;
-    use maplit::btreemap;
-    use pretty_assertions::assert_eq;
-    use serde_json::json;
-    use tokio::sync::{
-        broadcast,
-        mpsc,
-    };
-
-    use super::ConvexClient;
-    use crate::{
-        base_client::FunctionResult,
-        client::{
-            deployment_to_ws_url,
-            worker::worker,
-            BaseConvexClient,
-        },
-        sync::{
-            testing::TestProtocolManager,
-            ServerMessage,
-            SyncProtocol,
-        },
-        value::Value,
-    };
-
-    impl ConvexClient {
-        pub async fn with_test_protocol() -> anyhow::Result<(Self, TestProtocolManager)> {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-                .try_init();
-
-            // Channels for the `listen` background thread
-            let (response_sender, response_receiver) = mpsc::channel(1);
-            let (request_sender, request_receiver) = mpsc::unbounded_channel();
-
-            // Listener for when each transaction completes
-            let (watch_sender, watch_receiver) = broadcast::channel(1);
-
-            let test_protocol = TestProtocolManager::open(
-                "ws://test.com".parse()?,
-                response_sender,
-                None,
-                "rust-0.0.1",
-            )
-            .await?;
-            let base_client = BaseConvexClient::new();
-
-            let listen_handle = tokio::spawn(worker(
-                response_receiver,
-                request_receiver,
-                watch_sender,
-                base_client,
-                test_protocol.clone(),
-            ));
-
-            let client = ConvexClient {
-                listen_handle: Some(Arc::new(listen_handle)),
-                request_sender,
-                watch_receiver,
-            };
-            Ok((client, test_protocol))
-        }
-    }
-
-    fn fake_mutation_response(result: FunctionResult) -> (ServerMessage, ServerMessage) {
-        let (transition_response, new_version) = fake_transition(StateVersion::initial(), vec![]);
-        let mutation_response = ServerMessage::MutationResponse {
-            request_id: 0,
-            result: result.into(),
-            ts: Some(new_version.ts),
-            log_lines: LogLinesMessage(vec![]),
-        };
-        (mutation_response, transition_response)
-    }
-
-    fn fake_action_response(result: FunctionResult) -> ServerMessage {
-        ServerMessage::ActionResponse {
-            request_id: 0,
-            result: result.into(),
-            log_lines: LogLinesMessage(vec![]),
-        }
-    }
-
-    fn fake_transition(
-        start_version: StateVersion,
-        modifications: Vec<(QueryId, Value)>,
-    ) -> (ServerMessage, StateVersion) {
-        let end_version = StateVersion {
-            ts: start_version.ts.succ().expect("Succ failed"),
-            ..start_version
-        };
-        (
-            ServerMessage::Transition {
-                start_version,
-                end_version,
-                modifications: modifications
-                    .into_iter()
-                    .map(|(query_id, value)| StateModification::QueryUpdated {
-                        query_id,
-                        value,
-                        journal: None,
-                        log_lines: LogLinesMessage(vec![]),
-                    })
-                    .collect(),
-            },
-            end_version,
-        )
-    }
-
-    #[tokio::test]
-    async fn test_mutation() -> anyhow::Result<()> {
-        let (mut client, mut test_protocol) = ConvexClient::with_test_protocol().await?;
-        test_protocol.take_sent().await;
-
-        let mut res =
-            tokio::spawn(async move { client.mutation("incrementCounter", btreemap! {}).await });
-        test_protocol.wait_until_n_messages_sent(1).await;
-
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![ClientMessage::Mutation {
-                request_id: 0,
-                udf_path: UdfPath::from_str("incrementCounter")?,
-                args: vec![json!({})],
-                component_path: None,
-            }]
-        );
-
-        let mutation_result = FunctionResult::Value(Value::Null);
-        let (mut_resp, transition) = fake_mutation_response(mutation_result.clone());
-        test_protocol.fake_server_response(mut_resp).await?;
-        // Should not be ready until transition completes.
-        tokio::time::timeout(Duration::from_millis(50), &mut res)
-            .await
-            .unwrap_err();
-
-        // Once transition is sent, it is ready.
-        test_protocol.fake_server_response(transition).await?;
-        assert_eq!(res.await??, mutation_result);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_mutation_error() -> anyhow::Result<()> {
-        let (mut client, mut test_protocol) = ConvexClient::with_test_protocol().await?;
-        test_protocol.take_sent().await;
-
-        let res =
-            tokio::spawn(async move { client.mutation("incrementCounter", btreemap! {}).await });
-        test_protocol.wait_until_n_messages_sent(1).await;
-        test_protocol.take_sent().await;
-
-        let mutation_result = FunctionResult::ErrorMessage("JEEPERS".into());
-        let (mut_resp, _transition) = fake_mutation_response(mutation_result.clone());
-        test_protocol.fake_server_response(mut_resp).await?;
-        // Errors should be ready immediately (no transition needed)
-        assert_eq!(res.await??, mutation_result);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_action() -> anyhow::Result<()> {
-        let (mut client, mut test_protocol) = ConvexClient::with_test_protocol().await?;
-        test_protocol.take_sent().await;
-
-        let action_result = FunctionResult::Value(Value::Null);
-        let server_message = fake_action_response(action_result.clone());
-
-        let res = tokio::spawn(async move { client.action("runAction:hello", btreemap! {}).await });
-        test_protocol.wait_until_n_messages_sent(1).await;
-
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![ClientMessage::Action {
-                request_id: 0,
-                udf_path: UdfPath::from_str("runAction:hello")?,
-                args: vec![json!({})],
-                component_path: None,
-            }]
-        );
-
-        test_protocol.fake_server_response(server_message).await?;
-        assert_eq!(res.await??, action_result);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_auth() -> anyhow::Result<()> {
-        let (mut client, test_protocol) = ConvexClient::with_test_protocol().await?;
-        test_protocol.take_sent().await;
-
-        // Set token
-        client.set_auth(Some("myauthtoken".into())).await;
-        test_protocol.wait_until_n_messages_sent(1).await;
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![ClientMessage::Authenticate {
-                base_version: 0,
-                token: AuthenticationToken::User("myauthtoken".into()),
-            }]
-        );
-
-        // Unset token
-        client.set_auth(None).await;
-        test_protocol.wait_until_n_messages_sent(1).await;
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![ClientMessage::Authenticate {
-                base_version: 1,
-                token: AuthenticationToken::None,
-            }]
-        );
-
-        // Set admin auth
-        client.set_admin_auth("myadminauth".into(), None).await;
-        test_protocol.wait_until_n_messages_sent(1).await;
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![ClientMessage::Authenticate {
-                base_version: 2,
-                token: AuthenticationToken::Admin("myadminauth".into(), None),
-            }]
-        );
-
-        // Set admin auth acting as user
-        let acting_as = UserIdentityAttributes {
-            name: Some("Barbara Liskov".into()),
-            ..Default::default()
-        };
-        client
-            .set_admin_auth("myadminauth".into(), Some(acting_as.clone()))
-            .await;
-        test_protocol.wait_until_n_messages_sent(1).await;
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![ClientMessage::Authenticate {
-                base_version: 3,
-                token: AuthenticationToken::Admin("myadminauth".into(), Some(acting_as)),
-            }]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_client_single_subscription() -> anyhow::Result<()> {
-        let (mut client, mut test_protocol) = ConvexClient::with_test_protocol().await?;
-
-        let mut subscription1 = client.subscribe("getValue1", btreemap! {}).await?;
-        let query_id = subscription1.query_id();
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![
-                ClientMessage::Connect {
-                    session_id: SessionId::nil(),
-                    connection_count: 0,
-                    last_close_reason: "InitialConnect".to_string(),
-                    max_observed_timestamp: None,
-                },
-                ClientMessage::ModifyQuerySet {
-                    base_version: 0,
-                    new_version: 1,
-                    modifications: vec![QuerySetModification::Add(Query {
-                        query_id,
-                        udf_path: "getValue1".parse()?,
-                        args: vec![json!({})],
-                        journal: None,
-                        component_path: None,
-                    })]
-                },
-            ]
-        );
-
-        test_protocol
-            .fake_server_response(
-                fake_transition(
-                    StateVersion::initial(),
-                    vec![(subscription1.query_id(), 10.into())],
-                )
-                .0,
-            )
-            .await?;
-        assert_eq!(
-            subscription1.next().await,
-            Some(FunctionResult::Value(10.into()))
-        );
-        assert_eq!(
-            client.query("getValue1", btreemap! {}).await?,
-            FunctionResult::Value(10.into())
-        );
-
-        drop(subscription1);
-        test_protocol.wait_until_n_messages_sent(1).await;
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![ClientMessage::ModifyQuerySet {
-                base_version: 1,
-                new_version: 2,
-                modifications: vec![QuerySetModification::Remove { query_id }],
-            }]
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_client_consistent_view_watch() -> anyhow::Result<()> {
-        let (mut client, mut test_protocol) = ConvexClient::with_test_protocol().await?;
-        let subscription1 = client.subscribe("getValue1", btreemap! {}).await?;
-        let subscription2a = client.subscribe("getValue2", btreemap! {}).await?;
-        let subscription2b = client.subscribe("getValue2", btreemap! {}).await?;
-        let subscription3 = client.subscribe("getValue3", btreemap! {}).await?;
-        test_protocol.take_sent().await;
-        let mut watch = client.watch_all();
-
-        test_protocol
-            .fake_server_response(
-                fake_transition(
-                    StateVersion::initial(),
-                    vec![(QueryId::new(0), 10.into()), (QueryId::new(1), 20.into())],
-                )
-                .0,
-            )
-            .await?;
-
-        let results = watch.next().await.expect("Watch should have results");
-        assert_eq!(
-            results.get(&subscription1),
-            Some(&FunctionResult::Value(10.into()))
-        );
-        assert_eq!(
-            results.get(&subscription2a),
-            Some(&FunctionResult::Value(20.into()))
-        );
-        assert_eq!(
-            results.get(&subscription2b),
-            Some(&FunctionResult::Value(20.into()))
-        );
-        assert_eq!(results.get(&subscription3), None);
-        assert_eq!(
-            results.iter().collect::<Vec<_>>(),
-            vec![
-                (subscription1.id(), Some(&FunctionResult::Value(10.into()))),
-                (subscription2a.id(), Some(&FunctionResult::Value(20.into()))),
-                (subscription2b.id(), Some(&FunctionResult::Value(20.into()))),
-                (subscription3.id(), None,),
-            ]
-        );
-
-        // Ideally a new watch should immediately give you results, but we don't have
-        // that yet. Need to replace tokio::broadcast with something that buffers 1
-        // item.
-        //let mut watch2 = client.watch();
-        //let results = watch.next().await.expect("Watch should have results");
-        //assert_eq!(results.len(), 3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_drop_client() -> anyhow::Result<()> {
-        let (mut client, _test_protocol) = ConvexClient::with_test_protocol().await?;
-        let mut subscription1 = client.subscribe("getValue1", btreemap! {}).await?;
-        drop(client);
-        tokio::task::yield_now().await;
-        assert!(subscription1.next().await.is_none());
-        drop(subscription1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_client_separate_queries() -> anyhow::Result<()> {
-        let (mut client, test_protocol) = ConvexClient::with_test_protocol().await?;
-
-        // All three of these should be considered separate
-        let subscription1 = client.subscribe("getValue1", btreemap! {}).await?;
-        let subscription2 = client.subscribe("getValue2", btreemap! {}).await?;
-        let subscription3 = client
-            .subscribe("getValue2", btreemap! {"hello".into() => "world".into()})
-            .await?;
-        assert_ne!(subscription1.query_id(), subscription2.query_id());
-        assert_ne!(subscription2.query_id(), subscription3.query_id());
-
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![
-                ClientMessage::Connect {
-                    session_id: SessionId::nil(),
-                    connection_count: 0,
-                    last_close_reason: "InitialConnect".to_string(),
-                    max_observed_timestamp: None,
-                },
-                ClientMessage::ModifyQuerySet {
-                    base_version: 0,
-                    new_version: 1,
-                    modifications: vec![QuerySetModification::Add(Query {
-                        query_id: subscription1.query_id(),
-                        udf_path: "getValue1".parse()?,
-                        args: vec![json!({})],
-                        journal: None,
-                        component_path: None,
-                    })]
-                },
-                ClientMessage::ModifyQuerySet {
-                    base_version: 1,
-                    new_version: 2,
-                    modifications: vec![QuerySetModification::Add(Query {
-                        query_id: subscription2.query_id(),
-                        udf_path: "getValue2".parse()?,
-                        args: vec![json!({})],
-                        journal: None,
-                        component_path: None,
-                    })]
-                },
-                ClientMessage::ModifyQuerySet {
-                    base_version: 2,
-                    new_version: 3,
-                    modifications: vec![QuerySetModification::Add(Query {
-                        query_id: subscription3.query_id(),
-                        udf_path: "getValue2".parse()?,
-                        args: vec![json!({"hello": "world"})],
-                        journal: None,
-                        component_path: None,
-                    })]
-                },
-            ]
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_client_two_identical_queries() -> anyhow::Result<()> {
-        let (mut client, mut test_protocol) = ConvexClient::with_test_protocol().await?;
-
-        // These two should be considered the same query.
-        let mut subscription1 = client.subscribe("getValue", btreemap! {}).await?;
-        let mut subscription2 = client.subscribe("getValue", btreemap! {}).await?;
-
-        assert_ne!(subscription1.subscriber_id, subscription2.subscriber_id);
-        assert_eq!(subscription1.query_id(), subscription2.query_id());
-        let query_id = subscription1.query_id();
-
-        assert_eq!(
-            test_protocol.take_sent().await,
-            vec![
-                ClientMessage::Connect {
-                    session_id: SessionId::nil(),
-                    connection_count: 0,
-                    last_close_reason: "InitialConnect".to_string(),
-                    max_observed_timestamp: None,
-                },
-                ClientMessage::ModifyQuerySet {
-                    base_version: 0,
-                    new_version: 1,
-                    modifications: vec![QuerySetModification::Add(Query {
-                        query_id,
-                        udf_path: "getValue".parse()?,
-                        args: vec![json!({})],
-                        journal: None,
-                        component_path: None,
-                    })]
-                },
-            ]
-        );
-
-        let mut version = StateVersion::initial();
-        for i in 1..5 {
-            let (transition, new_version) = fake_transition(version, vec![(query_id, i.into())]);
-            test_protocol.fake_server_response(transition).await?;
-            version = new_version;
-
-            assert_eq!(
-                subscription1.next().await,
-                Some(FunctionResult::Value(i.into()))
-            );
-            assert_eq!(
-                subscription2.next().await,
-                Some(FunctionResult::Value(i.into()))
-            );
-        }
-
-        // A new subscription should auto-initialize with the value if available
-        let mut subscription3 = client.subscribe("getValue", btreemap! {}).await?;
-        assert_eq!(
-            subscription3.next().await,
-            Some(FunctionResult::Value(4.into())),
-        );
-
-        // Dropping sub1 and sub2 should still maintain subscription
-        drop(subscription1);
-        drop(subscription2);
-        let (transition, _new_version) = fake_transition(version, vec![(query_id, 5.into())]);
-        test_protocol.fake_server_response(transition).await?;
-        assert_eq!(
-            subscription3.next().await,
-            Some(FunctionResult::Value(5.into())),
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_deployment_url() -> anyhow::Result<()> {
-        assert_eq!(
-            deployment_to_ws_url("http://flying-shark-123.convex.cloud".parse()?)?.to_string(),
-            "ws://flying-shark-123.convex.cloud/api/sync",
-        );
-        assert_eq!(
-            deployment_to_ws_url("https://flying-shark-123.convex.cloud".parse()?)?.to_string(),
-            "wss://flying-shark-123.convex.cloud/api/sync",
-        );
-        assert_eq!(
-            deployment_to_ws_url("ws://flying-shark-123.convex.cloud".parse()?)?.to_string(),
-            "ws://flying-shark-123.convex.cloud/api/sync",
-        );
-        assert_eq!(
-            deployment_to_ws_url("wss://flying-shark-123.convex.cloud".parse()?)?.to_string(),
-            "wss://flying-shark-123.convex.cloud/api/sync",
-        );
-        assert_eq!(
-            deployment_to_ws_url("ftp://flying-shark-123.convex.cloud".parse()?)
-                .unwrap_err()
-                .to_string(),
-            "Unknown scheme ftp. Expected http or https.",
-        );
-        Ok(())
     }
 }

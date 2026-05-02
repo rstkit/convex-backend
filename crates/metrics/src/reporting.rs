@@ -6,6 +6,7 @@ use prometheus::{
     GaugeVec,
     IntCounter,
     IntCounterVec,
+    IntGauge,
     VMHistogram,
     VMHistogramVec,
 };
@@ -56,6 +57,38 @@ pub fn log_gauge_with_labels(prometheus_gauge: &GaugeVec, value: f64, labels: La
     }
 }
 
+pub fn add_to_gauge_with_labels(prometheus_gauge: &GaugeVec, delta: f64, labels: Labels<'_>) {
+    match prometheus_gauge.get_metric_with(
+        &labels
+            .iter()
+            .map(MetricLabel::split_key_value)
+            .collect::<HashMap<_, _, ahash::RandomState>>(),
+    ) {
+        Ok(metric) => metric.add(delta),
+        Err(e) => {
+            log_invalid_metric(get_desc(prometheus_gauge), e);
+        },
+    }
+}
+
+pub fn subtract_from_gauge_with_labels(
+    prometheus_gauge: &GaugeVec,
+    delta: f64,
+    labels: Labels<'_>,
+) {
+    match prometheus_gauge.get_metric_with(
+        &labels
+            .iter()
+            .map(MetricLabel::split_key_value)
+            .collect::<HashMap<_, _, ahash::RandomState>>(),
+    ) {
+        Ok(metric) => metric.sub(delta),
+        Err(e) => {
+            log_invalid_metric(get_desc(prometheus_gauge), e);
+        },
+    }
+}
+
 pub fn log_distribution(prometheus_histogram: &VMHistogram, value: f64) {
     prometheus_histogram.observe(value);
 }
@@ -75,6 +108,31 @@ pub fn log_distribution_with_labels(
         Err(e) => {
             log_invalid_metric(get_desc(prometheus_histogram), e);
         },
+    }
+}
+
+/// Slices up an `IntGauge` into many independently-`set`table pieces.
+/// The final gauge value is the sum of all the live `Subgauge`s' values.
+///
+/// When using this, don't call `set` directly on the underlying gauge.
+pub struct Subgauge {
+    gauge: IntGauge,
+    value: i64,
+}
+impl Subgauge {
+    pub fn new(gauge: IntGauge) -> Subgauge {
+        Subgauge { gauge, value: 0 }
+    }
+
+    pub fn set(&mut self, new_value: i64) {
+        let difference = new_value.wrapping_sub(self.value);
+        self.gauge.add(difference);
+        self.value = new_value;
+    }
+}
+impl Drop for Subgauge {
+    fn drop(&mut self) {
+        self.gauge.sub(self.value);
     }
 }
 

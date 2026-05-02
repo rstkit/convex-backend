@@ -32,7 +32,7 @@ export function useCurrentBillingPeriod(teamId: number) {
   return data;
 }
 
-const USAGE_REFRESH_INTERVAL_MS =
+export const USAGE_REFRESH_INTERVAL_MS =
   getURLConfigInt("usage_refresh_secs", 60 * 10) * 1000;
 
 export type DatabricksQueryId = string;
@@ -60,7 +60,7 @@ export function useUsageQuery({
   deploymentName?: string;
   skip?: boolean;
 }) {
-  return useBBQuery({
+  const result = useBBQuery({
     path: "/teams/{team_id}/usage/query",
     pathParams: { team_id: teamId.toString() },
     queryParams: {
@@ -83,6 +83,12 @@ export function useUsageQuery({
       isPaused: () => skip ?? false,
     },
   });
+  return {
+    ...result,
+    data: result.data?.map((row) => row.map((cell) => cell ?? "")) as
+      | string[][]
+      | undefined,
+  };
 }
 
 function getURLConfigInt(name: string, default_value: number) {

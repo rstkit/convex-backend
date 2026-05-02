@@ -3,7 +3,7 @@ import { ValidatorJSON, Value } from "convex/values";
 import { GenericDocument } from "convex/server";
 import isEqual from "lodash/isEqual";
 import omitBy from "lodash/omitBy";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import { createGlobalState } from "react-use";
 import { JavascriptDocumentsForm } from "@common/features/data/components/Table/EditDocumentPanel/JavascriptDocumentsForm";
 import { useNents } from "@common/lib/useNents";
@@ -45,7 +45,11 @@ export function EditDocumentPanel({
 }: EditDocumentPanelProps) {
   const [drafts, setDrafts] = useDocumentDrafts();
   const defaultDocumentWithoutSystemFields = useMemo(
-    () => omitBy(defaultDocument, (v, key) => key.startsWith("_")),
+    () =>
+      omitBy(
+        defaultDocument,
+        (v, key) => typeof key === "string" && key.startsWith("_"),
+      ),
     [defaultDocument],
   );
 
@@ -110,7 +114,7 @@ export function EditDocumentPanel({
       data-testid="editDocumentPanel"
       title={
         editing ? (
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-baseline gap-2">
             Edit{" "}
             <code className="text-xs" aria-label="Document ID">
               {defaultDocument._id as undefined | string}
@@ -126,7 +130,6 @@ export function EditDocumentPanel({
         <Link
           passHref
           href={`https://docs.convex.dev/dashboard/deployments/data#${docsSection}`}
-          className="text-content-link"
           target="_blank"
         >
           Learn more

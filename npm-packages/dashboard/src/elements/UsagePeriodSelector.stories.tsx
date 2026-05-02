@@ -1,20 +1,22 @@
-import type { Meta, StoryObj } from "@storybook/react";
+import type { Meta, StoryObj } from "@storybook/nextjs";
+import { fn } from "storybook/test";
 
 import { useState } from "react";
 import { Period, UsagePeriodSelector } from "./UsagePeriodSelector";
 
 const currentBillingPeriod = { start: "2023-10-01", end: "2023-10-31" };
 
-const meta: Meta<typeof UsagePeriodSelector> = {
+const meta = {
   component: UsagePeriodSelector,
   args: {
     currentBillingPeriod,
-    onChange: () => {},
+    onChange: fn(),
   },
-};
+  parameters: { a11y: { test: "todo" } },
+} satisfies Meta<typeof UsagePeriodSelector>;
 
 export default meta;
-type Story = StoryObj<typeof UsagePeriodSelector>;
+type Story = StoryObj<typeof meta>;
 
 export const CurrentBillingPeriod: Story = {
   args: {
@@ -62,5 +64,12 @@ function InteractiveDemo() {
 }
 
 export const Interactive: Story = {
+  args: {
+    period: {
+      type: "currentBillingPeriod",
+      from: "2023-10-01",
+      to: "2023-10-31",
+    },
+  },
   render: () => <InteractiveDemo />,
 };

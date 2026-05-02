@@ -1,4 +1,8 @@
-import { encodeDeploymentSelector, RequestContext } from "../requestContext.js";
+import {
+  encodeDeploymentSelector,
+  getMcpDeploymentSelection,
+  RequestContext,
+} from "../requestContext.js";
 import {
   DeploymentSelectionWithinProject,
   deploymentSelectionWithinProjectFromOptions,
@@ -26,6 +30,7 @@ const outputSchema = z.object({
       deploymentSelector: z.string(),
       url: z.string(),
       dashboardUrl: z.string().optional(),
+      readOnly: z.boolean().optional(),
     }),
   ),
 });
@@ -42,6 +47,12 @@ production ({"kind": "prod"}) deployment. Generally default to using the develop
 deployment unless you'd specifically like to debug issues in production.
 
 When running locally, there will be a single "urlWithAdminKey" deployment.
+
+If a deployment has "readOnly: true", it can only be used with read-only tools
+that don't expose PII (\`insights\`, \`functionSpec\`, \`tables\`). Tools that read
+user data (\`data\`, \`logs\`, \`runOneoffQuery\`) and mutating tools will reject it.
+
+If "readOnly" is false or absent, all tools can be used with the deployment.
 `.trim();
 
 export const StatusTool: ConvexTool<typeof inputSchema, typeof outputSchema> = {
@@ -60,13 +71,13 @@ export const StatusTool: ConvexTool<typeof inputSchema, typeof outputSchema> = {
       });
     }
     process.chdir(projectDir);
-    const selectionWithinProject =
-      await deploymentSelectionWithinProjectFromOptions(ctx, ctx.options);
+    const selectionWithinProject = deploymentSelectionWithinProjectFromOptions(
+      ctx.options,
+    );
     const deploymentSelection = await getDeploymentSelection(ctx, ctx.options);
     const credentials = await loadSelectedDeploymentCredentials(
       ctx,
       deploymentSelection,
-      selectionWithinProject,
     );
     let availableDeployments = [
       {
@@ -86,27 +97,32 @@ export const StatusTool: ConvexTool<typeof inputSchema, typeof outputSchema> = {
     ];
     // Also get the prod cloud deployment if we're using a cloud-hosted dev-deployment
     if (
-      selectionWithinProject.kind === "ownDev" &&
+      selectionWithinProject.kind === "unspecified" &&
       !(
         deploymentSelection.kind === "existingDeployment" &&
         deploymentSelection.deploymentToActOn.deploymentFields === null
       )
     ) {
-      const prodDeployment: DeploymentSelectionWithinProject = { kind: "prod" };
+      const prodSelectionWithinProject: DeploymentSelectionWithinProject = {
+        kind: "prod",
+      };
+      const prodDeploymentSelection = await getMcpDeploymentSelection(
+        ctx,
+        prodSelectionWithinProject,
+      );
       const prodCredentials = await loadSelectedDeploymentCredentials(
         ctx,
-        deploymentSelection,
-        prodDeployment,
+        prodDeploymentSelection,
       );
       if (
         prodCredentials.deploymentFields?.deploymentName &&
         prodCredentials.deploymentFields.deploymentType
       ) {
         availableDeployments.push({
-          kind: prodDeployment.kind,
+          kind: prodSelectionWithinProject.kind,
           deploymentSelector: encodeDeploymentSelector(
             projectDir,
-            prodDeployment,
+            prodSelectionWithinProject,
           ),
           url: prodCredentials.url,
           dashboardUrl: deploymentDashboardUrlPage(
@@ -117,9 +133,12 @@ export const StatusTool: ConvexTool<typeof inputSchema, typeof outputSchema> = {
       }
     }
     if (ctx.productionDeploymentsDisabled) {
-      availableDeployments = availableDeployments.filter(
-        (d) => d.kind !== "prod",
-      );
+      const readOnly = ctx.productionPiiAllowed ? false : true;
+      return {
+        availableDeployments: availableDeployments.map((d) =>
+          d.kind === "prod" ? { ...d, readOnly } : d,
+        ),
+      };
     }
     return { availableDeployments };
   },

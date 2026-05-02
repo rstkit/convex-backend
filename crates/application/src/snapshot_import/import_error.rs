@@ -17,9 +17,6 @@ static IMPORT_SIZE_LIMIT: LazyLock<String> =
 
 #[derive(AsRefStr, Debug, thiserror::Error)]
 pub enum ImportError {
-    #[error("Only deployment admins can import new tables")]
-    Unauthorized,
-
     #[error(
         "Table {0} already exists. Please choose a new table name or use replace/append modes."
     )]
@@ -30,6 +27,9 @@ pub enum ImportError {
 
     #[error("Import wasn't valid UTF8: {0}")]
     NotUtf8(std::io::Error),
+
+    #[error("UTF-8 BOM is not supported. Please save your file without BOM.")]
+    Utf8BomNotSupported,
 
     #[error(
         "Import is too large for JSON ({0} bytes > maximum {limit}). Consider converting data to JSONLines",
@@ -44,19 +44,19 @@ pub enum ImportError {
     CsvInvalidHeader(String, anyhow::Error),
 
     #[error("Failed to parse CSV row {0}: {1}")]
-    CsvInvalidRow(usize, csv_async::Error),
+    CsvInvalidRow(u64, csv_async::Error),
 
     #[error("CSV row {0} doesn't have all of the fields in the header")]
-    CsvRowMissingFields(usize),
+    CsvRowMissingFields(u64),
 
     #[error("Row {0} wasn't valid JSON: {1}")]
-    JsonInvalidRow(usize, serde_json::Error),
+    JsonInvalidRow(u64, serde_json::Error),
 
     #[error("Row {0} wasn't a valid Convex value: {1}")]
-    InvalidConvexValue(usize, anyhow::Error),
+    InvalidConvexValue(u64, anyhow::Error),
 
     #[error("Row {0} wasn't an object")]
-    NotAnObject(usize),
+    NotAnObject(u64),
 
     #[error("Not a JSON array")]
     NotJsonArray,
@@ -67,12 +67,7 @@ pub enum ImportError {
 
 impl ImportError {
     pub fn error_metadata(&self) -> ErrorMetadata {
-        match self {
-            ImportError::Unauthorized => {
-                ErrorMetadata::forbidden(self.as_ref().to_string(), self.to_string())
-            },
-            _ => ErrorMetadata::bad_request(self.as_ref().to_string(), self.to_string()),
-        }
+        ErrorMetadata::bad_request(self.as_ref().to_string(), self.to_string())
     }
 }
 

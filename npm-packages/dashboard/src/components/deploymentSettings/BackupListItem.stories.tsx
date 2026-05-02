@@ -1,5 +1,5 @@
-import { Meta, StoryObj } from "@storybook/react";
-import { DeploymentResponse, Team } from "generatedApi";
+import { Meta, StoryObj } from "@storybook/nextjs";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
 import { Sheet } from "@ui/Sheet";
 import { useAccessToken } from "hooks/useServerSideData";
 import { Id } from "system-udfs/convex/_generated/dataModel";
@@ -22,30 +22,26 @@ const backup: BackupResponse = {
   state: "complete",
   requestedTime: +now,
   expirationTime: +inOneWeek,
+  includeStorage: true,
 };
 
-const targetDeployment: DeploymentResponse = {
+const targetDeployment: PlatformDeploymentResponse = {
   kind: "cloud",
+  class: "s16",
   id: 1,
   name: "joyful-capybara-123",
+  deploymentUrl: "https://joyful-capybara-123.convex.cloud",
   deploymentType: "prod",
   createTime: +oneWeekAgo,
   projectId: 1,
   creator: 1,
   previewIdentifier: null,
+  region: "aws-us-east-1",
+  isDefault: true,
+  reference: "production",
 };
 
-const team: Team = {
-  id: 1,
-  creator: 1,
-  slug: "team",
-  name: "Team",
-  suspended: false,
-  referralCode: "TEAM123",
-  referredBy: null,
-};
-
-export default {
+const meta = {
   component: BackupListItem,
   args: {
     backup,
@@ -57,14 +53,16 @@ export default {
       requestedTime: +oneWeekAgo,
     },
     targetDeployment,
-    team,
     canPerformActions: true,
     getZipExportUrl: () => "",
+    maxCloudBackups: 2,
+    progressMessage: null,
   },
   render: StoryRender,
-} as Meta<typeof BackupListItem>;
+} satisfies Meta<typeof BackupListItem>;
 
-type Story = StoryObj<typeof BackupListItem>;
+export default meta;
+type Story = StoryObj<typeof meta>;
 
 export const RestorableWithNoWarning: Story = {
   args: {

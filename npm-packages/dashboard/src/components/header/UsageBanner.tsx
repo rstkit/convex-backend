@@ -9,9 +9,8 @@ import { useUnpauseTeam } from "api/teams";
 import { useTeamUsageState } from "api/usage";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { Team } from "generatedApi";
+import { TeamResponse } from "generatedApi";
 import { useGetSpendingLimits } from "api/billing";
-import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 
 export type Variant =
   | "Approaching"
@@ -23,10 +22,7 @@ export type Variant =
 export function useCurrentUsageBanner(teamId: number | null): Variant | null {
   const { isDismissed } = useDismiss(teamId);
 
-  const { spendingLimits: areSpendingLimitsEnabled } = useLaunchDarkly();
-  const spendingLimits = useGetSpendingLimits(
-    areSpendingLimitsEnabled ? teamId : null,
-  );
+  const spendingLimits = useGetSpendingLimits(teamId);
 
   const currentVariantPro =
     spendingLimits.spendingLimits?.state === "Disabled"
@@ -51,7 +47,7 @@ export function UsageBanner({
   team,
 }: {
   variant: Variant;
-  team: Team;
+  team: TeamResponse;
 }) {
   const { dismiss } = useDismiss(team.id);
 
@@ -69,7 +65,7 @@ export function UsageBanner({
       size: "sm",
     }),
     primaryButtonClass,
-    "px-2.5 py-2 rounded text-sm font-medium",
+    "px-2.5 py-2 rounded-sm text-sm font-medium",
     "ml-2",
   );
   const secondaryButtonClassFull = classNames(
@@ -78,7 +74,7 @@ export function UsageBanner({
       size: "sm",
     }),
     "hover:opacity-75",
-    "px-1 py-2 rounded text-xs font-medium",
+    "px-1 py-2 rounded-sm text-xs font-medium",
     secondaryButtonClass,
   );
 
@@ -141,8 +137,7 @@ export function UsageBanner({
 
         {isDismissable(variant) && (
           <Button
-            // eslint-disable-next-line tailwindcss/migration-from-tailwind-2
-            className="ml-2 h-fit hover:bg-opacity-50"
+            className="ml-2 h-fit"
             variant="neutral"
             size="xs"
             inline
@@ -181,7 +176,7 @@ function getVariantDetails(variant: Variant): {
     case "Approaching":
       return {
         title:
-          "Your projects are approaching the Starter plan limits. Consider upgrading to avoid service interruption.",
+          "Your projects are approaching the Free plan limits. Consider upgrading to avoid service interruption.",
         containerClass: "bg-blue-100 dark:bg-blue-900",
         primaryButtonClass: "",
         secondaryButtonClass: "text-blue-900 text-content-primary",
@@ -190,7 +185,7 @@ function getVariantDetails(variant: Variant): {
     case "Exceeded":
       return {
         title:
-          "Your projects are above the Starter plan limits. Decrease your usage or upgrade to avoid service interruption.",
+          "Your projects are above the Free plan limits. Decrease your usage or upgrade to avoid service interruption.",
         containerClass: "bg-background-warning dark:text-white",
         primaryButtonClass:
           "bg-yellow-500 text-black hover:bg-yellow-700 hover:text-white",
@@ -200,14 +195,14 @@ function getVariantDetails(variant: Variant): {
     case "Disabled":
       return {
         title:
-          "Your projects are disabled because the team exceeded Starter plan limits. Decrease your usage or upgrade to re-enable your projects.",
+          "Your projects are disabled because the team exceeded Free plan limits. Decrease your usage or upgrade to re-enable your projects.",
         ...dangerStyle,
       };
     case "Paused":
       return {
         title:
           // This is shown as disabled to the user to not confuse them
-          "Your projects are disabled because the team previously exceeded Starter plan limits.",
+          "Your projects are disabled because the team previously exceeded Free plan limits.",
         ...dangerStyle,
       };
     case "ExceededSpendingLimit":
@@ -217,7 +212,7 @@ function getVariantDetails(variant: Variant): {
         ...dangerStyle,
       };
     default: {
-      const _exhaustiveCheck: never = variant;
+      variant satisfies never;
       throw new Error("Unexpected variant");
     }
   }

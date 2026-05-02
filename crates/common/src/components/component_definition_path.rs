@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     ops::Deref,
     path::{
         Component as PathComponent,
@@ -102,6 +103,12 @@ impl Deref for ComponentDefinitionPath {
     }
 }
 
+impl fmt::Display for ComponentDefinitionPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", &**self)
+    }
+}
+
 impl From<ComponentDefinitionPath> for String {
     fn from(value: ComponentDefinitionPath) -> Self {
         value
@@ -109,33 +116,5 @@ impl From<ComponentDefinitionPath> for String {
             .into_os_string()
             .into_string()
             .expect("Invalid Unicode in ComponentDefinitionPath?")
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl proptest::arbitrary::Arbitrary for ComponentDefinitionPath {
-    type Parameters = ();
-
-    type Strategy = impl proptest::strategy::Strategy<Value = ComponentDefinitionPath>;
-
-    fn arbitrary_with((): Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-
-        (
-            0..=4,
-            prop::collection::vec(any::<super::ComponentName>(), 0..=4),
-        )
-            .prop_map(|(depth, components)| {
-                let mut path = String::new();
-                for _ in 0..depth {
-                    path.push_str("../");
-                }
-                for component in components {
-                    path.push_str(&component);
-                    path.push('/');
-                }
-                path.parse().unwrap()
-            })
-            .boxed()
     }
 }

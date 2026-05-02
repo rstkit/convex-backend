@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     fmt::Display,
     str::FromStr,
@@ -15,6 +16,8 @@ use serde_json::{
     json,
     Value as JsonValue,
 };
+use tonic::async_trait;
+use utoipa::ToSchema;
 use value::heap_size::HeapSize;
 
 use crate::{
@@ -29,23 +32,15 @@ use crate::{
     types::{
         ModuleEnvironment,
         UdfType,
+        UdfTypeJson,
     },
 };
 
 /// Public worker for the LogManager.
+#[async_trait]
 pub trait LogSender: Send + Sync {
     fn send_logs(&self, logs: Vec<LogEvent>);
-    fn shutdown(&self) -> anyhow::Result<()>;
-}
-
-pub struct NoopLogSender;
-
-impl LogSender for NoopLogSender {
-    fn send_logs(&self, _logs: Vec<LogEvent>) {}
-
-    fn shutdown(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
+    async fn shutdown(&self) -> anyhow::Result<()>;
 }
 
 /// Structured log
@@ -68,22 +63,85 @@ pub struct LogEvent {
 pub struct AggregatedFunctionUsageStats {
     pub database_read_bytes: u64,
     pub database_write_bytes: u64,
+    pub database_io_read_bytes: u64,
+    pub database_io_write_bytes: u64,
     pub database_read_documents: u64,
     pub storage_read_bytes: u64,
     pub storage_write_bytes: u64,
     pub vector_index_read_bytes: u64,
     pub vector_index_write_bytes: u64,
-    pub action_memory_used_mb: Option<u64>,
+    pub text_index_write_query_bytes: u64,
+    pub text_index_query_bytes: u64,
+    pub vector_index_read_query_bytes: u64,
+    pub vector_index_write_query_bytes: u64,
+    pub network_egress_bytes: u64,
+    pub memory_used_mb: u64,
+    pub return_bytes: Option<u64>,
 }
 
-#[derive(Serialize, Debug, Clone)]
-pub struct OccInfo {
+pub use errors::OccInfo;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OccInfoJson {
     pub table_name: Option<String>,
     pub document_id: Option<String>,
     pub write_source: Option<String>,
-    pub retry_count: u64,
+    pub component_path: Option<String>,
+    pub retry_count: Option<u64>,
 }
 
+impl From<OccInfo> for OccInfoJson {
+    fn from(info: OccInfo) -> Self {
+        Self {
+            table_name: info.table_name,
+            document_id: info.document_id,
+            write_source: info.write_source,
+            component_path: info.component_path,
+            retry_count: info.retry_count,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageStatsJson {
+    pub database_read_bytes: u64,
+    pub database_write_bytes: u64,
+    pub database_io_read_bytes: u64,
+    pub database_io_write_bytes: u64,
+    pub database_read_documents: u64,
+    pub storage_read_bytes: u64,
+    pub storage_write_bytes: u64,
+    pub vector_index_read_bytes: u64,
+    pub vector_index_write_bytes: u64,
+    pub text_index_query_bytes: u64,
+    pub text_index_write_query_bytes: u64,
+    pub vector_index_read_query_bytes: u64,
+    pub vector_index_write_query_bytes: u64,
+    pub network_egress_bytes: u64,
+    pub memory_used_mb: u64,
+}
+
+// Nothing yet. Can add information like parent scheduled job, scheduler lag,
+// etc.
+#[derive(Serialize, Debug, Clone)]
+pub struct SchedulerInfo {
+    pub job_id: String,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FunctionConcurrencyStats {
+    pub num_running: u64,
+    pub num_queued: u64,
+}
+
+// When adding a new event type:
+// - add a Schema type in the tests at the bottom of this file
+// - consider adding formatting of it in the CLI
+// - add it to the docs
+//
+// Also consider getting rid of the V1 format!
 #[derive(Debug, Clone)]
 pub enum StructuredLogEvent {
     /// Topic for verification logs. These are issued on sink startup and are
@@ -101,8 +159,11 @@ pub enum StructuredLogEvent {
         source: FunctionEventSource,
         error: Option<JsError>,
         execution_time: Duration,
+        user_execution_time: Option<Duration>,
         usage_stats: AggregatedFunctionUsageStats,
         occ_info: Option<OccInfo>,
+        will_retry: bool,
+        scheduler_info: Option<SchedulerInfo>,
     },
     /// Topic for exceptions. These happen when a UDF raises an exception from
     /// JS
@@ -118,8 +179,49 @@ pub enum StructuredLogEvent {
         action: String,
         metadata: serde_json::Map<String, JsonValue>,
     },
+    /// Topic for global stats from the scheduler. For function-specific stats,
+    /// look in FunctionExecution
+    SchedulerStats {
+        lag_seconds: Duration,
+        num_running_jobs: u64,
+    },
     ScheduledJobLag {
         lag_seconds: Duration,
+    },
+    /// Topic for storage usage metrics. These are periodic snapshots of current
+    /// storage state aggregated across all tables.
+    CurrentStorageUsage {
+        total_document_size_bytes: u64,
+        total_index_size_bytes: u64,
+        total_vector_storage_bytes: u64,
+        total_text_storage_bytes: u64,
+        total_file_storage_bytes: u64,
+        total_backup_storage_bytes: u64,
+        total_system_table_document_size_bytes: BTreeMap<String, u64>,
+    },
+    /// Topic for function concurrency metrics. These are periodic snapshots of
+    /// running and queued functions for each function type.
+    ConcurrencyStats {
+        query: FunctionConcurrencyStats,
+        mutation: FunctionConcurrencyStats,
+        action: FunctionConcurrencyStats,
+        node_action: FunctionConcurrencyStats,
+        http_action: FunctionConcurrencyStats,
+    },
+    /// Topic for storage API bandwidth. These are emitted for direct
+    /// /api/storage/* calls (not UDF-attributed storage operations).
+    StorageApiBandwidth {
+        storage_id: String,
+        egress_bytes: u64,
+    },
+    /// Topic for log stream egress. Emitted when a log sink sends a batch
+    /// of events to an external service, reporting the egress bytes used.
+    LogStreamEgress {
+        egress_bytes: u64,
+    },
+    /// Topic for user-defined audit logs emitted via `audit.log` in UDFs.
+    CustomAudit {
+        body: JsonValue,
     },
     // User-specified topics -- not yet implemented.
     // See here for more details: https://www.notion.so/Log-Streaming-in-Convex-19a1dfadd6924c33b29b2796b0f5b2e2
@@ -129,8 +231,7 @@ pub enum StructuredLogEvent {
     // },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
 pub enum LogEventFormatVersion {
     V1,
     V2,
@@ -157,47 +258,12 @@ impl Display for LogEventFormatVersion {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Default for LogEventFormatVersion {
-    fn default() -> Self {
-        Self::V2
-    }
-}
-
 /// Structured log
 impl LogEvent {
     pub fn default_for_verification<RT: Runtime>(runtime: &RT) -> anyhow::Result<Self> {
         Ok(Self {
             event: StructuredLogEvent::Verification,
             timestamp: runtime.unix_timestamp(),
-        })
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    pub fn sample_exception<RT: Runtime>(runtime: &RT) -> anyhow::Result<Self> {
-        use sync_types::UserIdentifier;
-
-        let source = FunctionEventSource {
-            context: ExecutionContext::new_for_test(),
-            component_path: ComponentPath::test_user(),
-            udf_path: "test".to_string(),
-            udf_type: UdfType::Action,
-            module_environment: ModuleEnvironment::Isolate,
-            cached: None,
-            mutation_queue_length: None,
-            mutation_retry_count: None,
-        };
-        Ok(Self {
-            timestamp: runtime.unix_timestamp(),
-            event: StructuredLogEvent::Exception {
-                error: JsError::from_frames_for_test(
-                    "test_message",
-                    vec!["test_frame_1", "test_frame_2"],
-                ),
-                user_identifier: Some(UserIdentifier("test|user".to_string())),
-                source,
-                udf_server_version: Some(semver::Version::new(1, 5, 1)),
-            },
         })
     }
 
@@ -253,14 +319,18 @@ impl LogEvent {
                     source,
                     error,
                     execution_time,
+                    user_execution_time,
                     usage_stats,
-                    ..
+                    occ_info: _,
+                    will_retry: _,
+                    scheduler_info: _,
                 } => {
                     let (reason, status) = match error {
                         Some(err) => (Some(err.to_string()), "failure"),
                         None => (None, "success"),
                     };
                     let execution_time_ms = execution_time.as_millis();
+                    let user_execution_time_ms = user_execution_time.map(|d| d.as_millis());
                     serialize_map!({
                         "_timestamp": ms,
                         "_topic":  "_execution_record",
@@ -270,10 +340,14 @@ impl LogEvent {
                         "status": status,
                         "reason": reason,
                         "executionTimeMs": execution_time_ms,
+                        "userExecutionTimeMs": user_execution_time_ms,
                         "databaseReadBytes": usage_stats.database_read_bytes,
                         "databaseWriteBytes": usage_stats.database_write_bytes,
+                        "databaseIoReadBytes": usage_stats.database_io_read_bytes,
+                        "databaseIoWriteBytes": usage_stats.database_io_write_bytes,
                         "storageReadBytes": usage_stats.storage_read_bytes,
                         "storageWriteBytes": usage_stats.storage_write_bytes,
+                        "networkEgressBytes": usage_stats.network_egress_bytes,
                     })
                 },
                 StructuredLogEvent::Exception {
@@ -307,11 +381,74 @@ impl LogEvent {
                         "actionMetadata": metadata
                     })
                 },
+                StructuredLogEvent::SchedulerStats {
+                    lag_seconds,
+                    num_running_jobs,
+                } => serialize_map!({
+                    "_timestamp": ms,
+                    "_topic":  "_scheduler_stats",
+                    "lag_seconds": lag_seconds.as_secs(), "num_running_jobs": num_running_jobs
+                }),
                 StructuredLogEvent::ScheduledJobLag { lag_seconds } => {
                     serialize_map!({
                         "_timestamp": ms,
                         "_topic":  "_scheduled_job_lag",
                         "lag_seconds": lag_seconds.as_secs()
+                    })
+                },
+                StructuredLogEvent::CurrentStorageUsage {
+                    total_document_size_bytes,
+                    total_index_size_bytes,
+                    total_vector_storage_bytes,
+                    total_text_storage_bytes,
+                    total_file_storage_bytes,
+                    total_backup_storage_bytes,
+                    total_system_table_document_size_bytes,
+                } => serialize_map!({
+                    "_timestamp": ms,
+                    "_topic": "_current_storage_usage",
+                    "total_document_size_bytes": total_document_size_bytes,
+                    "total_index_size_bytes": total_index_size_bytes,
+                    "total_vector_storage_bytes": total_vector_storage_bytes,
+                    "total_text_storage_bytes": total_text_storage_bytes,
+                    "total_file_storage_bytes": total_file_storage_bytes,
+                    "total_backup_storage_bytes": total_backup_storage_bytes,
+                    "total_system_table_document_size_bytes": total_system_table_document_size_bytes,
+                }),
+                StructuredLogEvent::ConcurrencyStats {
+                    query,
+                    mutation,
+                    action,
+                    node_action,
+                    http_action,
+                } => serialize_map!({
+                    "_timestamp": ms,
+                    "_topic": "_concurrency_stats",
+                    "query": query,
+                    "mutation": mutation,
+                    "action": action,
+                    "node_action": node_action,
+                    "http_action": http_action,
+                }),
+                StructuredLogEvent::StorageApiBandwidth {
+                    storage_id,
+                    egress_bytes,
+                } => serialize_map!({
+                    "_timestamp": ms,
+                    "_topic": "_storage_api_bandwidth",
+                    "storage_id": storage_id,
+                    "egress_bytes": egress_bytes
+                }),
+                StructuredLogEvent::LogStreamEgress { egress_bytes } => serialize_map!({
+                    "_timestamp": ms,
+                    "_topic": "_log_stream_egress",
+                    "egress_bytes": egress_bytes
+                }),
+                StructuredLogEvent::CustomAudit { body } => {
+                    serialize_map!({
+                        "_timestamp": ms,
+                        "_topic": "_custom_audit",
+                        "body": body
                     })
                 },
             },
@@ -349,8 +486,11 @@ impl LogEvent {
                     source,
                     error,
                     execution_time,
+                    user_execution_time,
                     usage_stats,
                     occ_info,
+                    will_retry,
+                    scheduler_info,
                 } => {
                     let function_source = source.to_json_map();
                     let (status, error_message) = match error {
@@ -361,30 +501,58 @@ impl LogEvent {
                     struct Usage {
                         database_read_bytes: u64,
                         database_write_bytes: u64,
+                        database_io_read_bytes: u64,
+                        database_io_write_bytes: u64,
                         database_read_documents: u64,
                         file_storage_read_bytes: u64,
                         file_storage_write_bytes: u64,
                         vector_storage_read_bytes: u64,
                         vector_storage_write_bytes: u64,
+                        text_search_query_bytes: u64,
+                        text_search_write_query_bytes: u64,
+                        vector_search_query_bytes: u64,
+                        vector_search_write_query_bytes: u64,
+                        network_egress_bytes: u64,
+                        memory_used_mb: u64,
                         action_memory_used_mb: Option<u64>,
                     }
+                    let action_memory_used_mb = if source.udf_type == UdfType::Action
+                        || source.udf_type == UdfType::HttpAction
+                    {
+                        Some(usage_stats.memory_used_mb)
+                    } else {
+                        None
+                    };
+                    let user_execution_time_ms = user_execution_time.map(|d| d.as_millis());
                     serialize_map!({
                         "timestamp": ms,
                         "topic": "function_execution",
                         "function": function_source,
                         "execution_time_ms": execution_time.as_millis(),
+                        "user_execution_time_ms": user_execution_time_ms,
                         "status": status,
                         "error_message": error_message,
                         "occ_info": occ_info,
+                        "will_retry": will_retry,
+                        "scheduler_info": scheduler_info,
                         "usage": Usage {
                             database_read_bytes: usage_stats.database_read_bytes,
                             database_write_bytes: usage_stats.database_write_bytes,
+                            database_io_read_bytes: usage_stats.database_io_read_bytes,
+                            database_io_write_bytes: usage_stats.database_io_write_bytes,
                             database_read_documents: usage_stats.database_read_documents,
                             file_storage_read_bytes: usage_stats.storage_read_bytes,
                             file_storage_write_bytes: usage_stats.storage_write_bytes,
                             vector_storage_read_bytes: usage_stats.vector_index_read_bytes,
                             vector_storage_write_bytes: usage_stats.vector_index_write_bytes,
-                            action_memory_used_mb: usage_stats.action_memory_used_mb
+                            text_search_query_bytes: usage_stats.text_index_query_bytes,
+                            text_search_write_query_bytes: usage_stats.text_index_write_query_bytes,
+                            vector_search_query_bytes: usage_stats.vector_index_read_query_bytes,
+                            vector_search_write_query_bytes: usage_stats
+                                .vector_index_write_query_bytes,
+                            network_egress_bytes: usage_stats.network_egress_bytes,
+                            memory_used_mb: usage_stats.memory_used_mb,
+                            action_memory_used_mb,
                         }
                     })
                 },
@@ -422,11 +590,85 @@ impl LogEvent {
                         "audit_log_metadata": serde_json::to_string(metadata).map_err(serde::ser::Error::custom)?
                     })
                 },
+                StructuredLogEvent::SchedulerStats {
+                    lag_seconds,
+                    num_running_jobs,
+                } => {
+                    serialize_map!({
+                        "topic": "scheduler_stats",
+                        "timestamp": ms,
+                        "lag_seconds": lag_seconds.as_secs(),
+                        "num_running_jobs": num_running_jobs
+                    })
+                },
                 StructuredLogEvent::ScheduledJobLag { lag_seconds } => {
                     serialize_map!({
                         "timestamp": ms,
                         "topic": "scheduled_job_lag",
                         "lag_seconds": lag_seconds.as_secs()
+                    })
+                },
+                StructuredLogEvent::CurrentStorageUsage {
+                    total_document_size_bytes,
+                    total_index_size_bytes,
+                    total_vector_storage_bytes,
+                    total_text_storage_bytes,
+                    total_file_storage_bytes,
+                    total_backup_storage_bytes,
+                    total_system_table_document_size_bytes,
+                } => {
+                    serialize_map!({
+                        "timestamp": ms,
+                        "topic": "current_storage_usage",
+                        "total_document_size_bytes": total_document_size_bytes,
+                        "total_index_size_bytes": total_index_size_bytes,
+                        "total_vector_storage_bytes": total_vector_storage_bytes,
+                        "total_text_storage_bytes": total_text_storage_bytes,
+                        "total_file_storage_bytes": total_file_storage_bytes,
+                        "total_backup_storage_bytes": total_backup_storage_bytes,
+                        "total_system_table_document_size_bytes": total_system_table_document_size_bytes,
+                    })
+                },
+                StructuredLogEvent::ConcurrencyStats {
+                    query,
+                    mutation,
+                    action,
+                    node_action,
+                    http_action,
+                } => {
+                    serialize_map!({
+                        "timestamp": ms,
+                        "topic": "concurrency_stats",
+                        "query": query,
+                        "mutation": mutation,
+                        "action": action,
+                        "node_action": node_action,
+                        "http_action": http_action,
+                    })
+                },
+                StructuredLogEvent::StorageApiBandwidth {
+                    storage_id,
+                    egress_bytes,
+                } => {
+                    serialize_map!({
+                        "timestamp": ms,
+                        "topic": "storage_api_bandwidth",
+                        "storage_id": storage_id,
+                        "egress_bytes": egress_bytes
+                    })
+                },
+                StructuredLogEvent::LogStreamEgress { egress_bytes } => {
+                    serialize_map!({
+                        "timestamp": ms,
+                        "topic": "log_stream_egress",
+                        "egress_bytes": egress_bytes
+                    })
+                },
+                StructuredLogEvent::CustomAudit { body } => {
+                    serialize_map!({
+                        "timestamp": ms,
+                        "topic": "custom_audit",
+                        "body": body
                     })
                 },
             },
@@ -435,14 +677,12 @@ impl LogEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum EventSource {
     Function(FunctionEventSource),
     System,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct FunctionEventSource {
     pub context: ExecutionContext,
     pub component_path: ComponentPath,
@@ -461,20 +701,6 @@ pub struct FunctionEventSource {
 }
 
 impl FunctionEventSource {
-    #[cfg(any(test, feature = "testing"))]
-    pub fn new_for_test() -> Self {
-        Self {
-            context: ExecutionContext::new_for_test(),
-            component_path: ComponentPath::test_user(),
-            udf_path: "path/to/file:myFunction".to_string(),
-            udf_type: UdfType::Mutation,
-            module_environment: ModuleEnvironment::Isolate,
-            cached: None,
-            mutation_queue_length: None,
-            mutation_retry_count: None,
-        }
-    }
-
     pub fn to_json_map(&self) -> serde_json::Map<String, JsonValue> {
         let udf_type = match self.udf_type {
             UdfType::Query => "query",
@@ -512,82 +738,62 @@ impl HeapSize for FunctionEventSource {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use serde_json::{
-        json,
-        Value as JsonValue,
-    };
+// Types for the /api/stream_function_logs
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "kind")]
+pub enum FunctionExecutionJson {
+    #[serde(rename_all = "camelCase")]
+    Completion {
+        udf_type: UdfTypeJson,
+        component_path: Option<String>,
+        identifier: String,
+        log_lines: Vec<JsonValue>,
+        timestamp: f64,
+        cached_result: bool,
+        caller: String,
+        parent_execution_id: Option<String>,
+        execution_time: f64,
+        user_execution_time: Option<f64>,
+        success: Option<JsonValue>,
+        error: Option<String>,
+        request_id: String,
+        execution_id: String,
+        usage_stats: UsageStatsJson,
+        return_bytes: Option<f64>,
+        occ_info: Option<OccInfoJson>,
+        will_retry: bool,
+        execution_timestamp: f64,
+        identity_type: String,
+        environment: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Progress {
+        udf_type: UdfTypeJson,
+        component_path: Option<String>,
+        identifier: String,
+        timestamp: f64,
+        log_lines: Vec<JsonValue>,
+        request_id: String,
+        execution_id: String,
+    },
+}
 
-    use crate::{
-        components::ComponentPath,
-        execution_context::ExecutionContext,
-        log_lines::{
-            LogLevel,
-            LogLineStructured,
-        },
-        log_streaming::{
-            FunctionEventSource,
-            LogEvent,
-            LogEventFormatVersion,
-            StructuredLogEvent,
-        },
-        runtime::UnixTimestamp,
-        types::{
-            ModuleEnvironment,
-            UdfType,
-        },
-    };
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamUdfExecutionResponse {
+    pub entries: Vec<FunctionExecutionJson>,
+    pub new_cursor: f64,
+}
 
-    #[test]
-    fn test_serialization_of_console_log_event() -> anyhow::Result<()> {
-        let timestamp = UnixTimestamp::from_millis(1000);
-        let context = ExecutionContext::new_for_test();
-        let request_id = context.request_id.clone();
-        let event = LogEvent {
-            timestamp,
-            event: StructuredLogEvent::Console {
-                source: FunctionEventSource {
-                    context,
-                    component_path: ComponentPath::test_user(),
-                    udf_path: "test:test".to_string(),
-                    udf_type: UdfType::Query,
-                    module_environment: ModuleEnvironment::Isolate,
-                    cached: Some(true),
-                    mutation_queue_length: None,
-                    mutation_retry_count: None,
-                },
-                log_line: LogLineStructured::new_developer_log_line(
-                    LogLevel::Log,
-                    vec!["my test log".to_string()],
-                    timestamp,
-                ),
-            },
-        };
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamFunctionLogs {
+    pub cursor: f64,
+    pub session_id: Option<String>,
+    pub client_request_counter: Option<u32>,
+}
 
-        // Test serialization
-        let fields: serde_json::Map<String, JsonValue> =
-            event.to_json_map(LogEventFormatVersion::default())?;
-        let value = serde_json::to_value(&fields)?;
-        assert_eq!(
-            value,
-            json!({
-                "topic": "console",
-                "timestamp": 1000,
-                "function": json!({
-                    "path": "test:test",
-                    "type": "query",
-                    "cached": true,
-                    "request_id": request_id.to_string(),
-                    "mutation_queue_length": null,
-                    "mutation_retry_count": null
-                }),
-                "log_level": "LOG",
-                "message": "my test log",
-                "is_truncated": false,
-                "system_code": JsonValue::Null
-            })
-        );
-        Ok(())
-    }
+#[derive(Deserialize, Debug)]
+pub struct StreamUdfExecutionQueryArgs {
+    pub cursor: f64,
 }

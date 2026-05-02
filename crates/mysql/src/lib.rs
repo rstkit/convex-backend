@@ -2,14 +2,15 @@
 #![feature(proc_macro_hygiene)]
 #![feature(stmt_expr_attributes)]
 #![feature(type_alias_impl_trait)]
-#![feature(let_chains)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(try_blocks)]
+#![feature(try_blocks_heterogeneous)]
+#![feature(if_let_guard)]
 mod chunks;
 mod connection;
+mod document_encoding;
 mod metrics;
-#[cfg(test)]
-mod tests;
+mod sql;
 use std::{
     cmp,
     collections::{
@@ -17,18 +18,17 @@ use std::{
         BTreeSet,
         HashMap,
     },
-    fmt::Write,
-    future::Future,
     iter,
-    ops::Bound,
-    pin::Pin,
+    ops::{
+        Bound,
+        Deref,
+    },
     sync::{
         atomic::{
             AtomicBool,
             Ordering::SeqCst,
         },
         Arc,
-        LazyLock,
     },
     time::{
         SystemTime,
@@ -38,17 +38,13 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
-use chunks::{
-    smart_chunk_sizes,
-    ApproxSize,
-};
+use chunks::ApproxSize;
 use common::{
     document::{
         InternalId,
         ResolvedDocument,
     },
     errors::lease_lost_error,
-    heap_size::HeapSize,
     index::{
         IndexEntry,
         IndexKeyBytes,
@@ -56,11 +52,11 @@ use common::{
         MAX_INDEX_KEY_PREFIX_LEN,
     },
     interval::{
-        End,
+        BinaryKey,
         Interval,
-        StartIncluded,
     },
     knobs::{
+        MYSQL_FALLBACK_PAGE_SIZE,
         MYSQL_MAX_QUERY_BATCH_SIZE,
         MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE,
         MYSQL_MIN_QUERY_BATCH_SIZE,
@@ -69,31 +65,37 @@ use common::{
         ConflictStrategy,
         DocumentLogEntry,
         DocumentPrevTsQuery,
+        DocumentRevisionStream,
         DocumentStream,
         IndexStream,
         LatestDocument,
         Persistence,
         PersistenceGlobalKey,
+        PersistenceIndexEntry,
         PersistenceReader,
         PersistenceTableSize,
         RetentionValidator,
         TimestampRange,
     },
+    persistence_helpers::{
+        DocumentRevision,
+        RevisionPair,
+    },
     query::Order,
-    runtime::Runtime,
+    runtime::{
+        CoopStreamExt as _,
+        Runtime,
+    },
     sha256::Sha256,
     shutdown::ShutdownSignal,
+    try_anyhow,
     types::{
-        DatabaseIndexUpdate,
-        DatabaseIndexValue,
         IndexId,
         PersistenceVersion,
         Timestamp,
     },
     value::{
-        ConvexValue,
         InternalDocumentId,
-        ResolvedDocumentId,
         TabletId,
     },
 };
@@ -109,15 +111,13 @@ use futures::{
         StreamExt,
         TryStreamExt,
     },
-    FutureExt,
 };
 use futures_async_stream::try_stream;
-use itertools::{
-    iproduct,
-    Itertools,
-};
 use metrics::write_persistence_global_timer;
-use mysql_async::Row;
+use mysql_async::{
+    Row,
+    Value,
+};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
@@ -128,7 +128,55 @@ use crate::{
         log_prev_revisions_row_read,
         QueryIndexStats,
     },
+    sql::index_point_query,
 };
+
+/// Checks if an error is the Vitess "message too large" error that occurs
+/// when query results exceed 64MiB.
+fn is_message_too_large_error(error: &anyhow::Error) -> Option<&mysql_async::ServerError> {
+    error
+        .chain()
+        .find_map(|e| e.downcast_ref::<mysql_async::ServerError>())
+        .filter(|db_err| {
+            // matches both "trying to send message larger than max" and "received message
+            // larger than max"
+            db_err.state == "HY000"
+                && db_err.code == 1105
+                && db_err.message.contains("message larger than max")
+        })
+}
+
+#[derive(Clone, Debug)]
+pub struct MySqlInstanceName {
+    raw: String,
+}
+
+impl Deref for MySqlInstanceName {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl<T: ToString> From<T> for MySqlInstanceName {
+    fn from(raw: T) -> Self {
+        Self::new(raw.to_string())
+    }
+}
+
+impl MySqlInstanceName {
+    pub fn new(raw: String) -> Self {
+        Self { raw }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Copy, Clone)]
+enum BoundType {
+    Unbounded,
+    Included,
+    Excluded,
+}
 
 pub struct MySqlPersistence<RT: Runtime> {
     newly_created: AtomicBool,
@@ -138,6 +186,8 @@ pub struct MySqlPersistence<RT: Runtime> {
     read_pool: Arc<ConvexMySqlPool<RT>>,
     db_name: String,
     version: PersistenceVersion,
+    instance_name: MySqlInstanceName,
+    multitenant: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -152,13 +202,16 @@ pub enum ConnectError {
 pub struct MySqlOptions {
     pub allow_read_only: bool,
     pub version: PersistenceVersion,
-    pub use_prepared_statements: bool,
+    pub instance_name: MySqlInstanceName,
+    pub multitenant: bool,
 }
 
 #[derive(Debug)]
 pub struct MySqlReaderOptions {
     pub db_should_be_leader: bool,
     pub version: PersistenceVersion,
+    pub instance_name: MySqlInstanceName,
+    pub multitenant: bool,
 }
 
 impl<RT: Runtime> MySqlPersistence<RT> {
@@ -171,39 +224,82 @@ impl<RT: Runtime> MySqlPersistence<RT> {
         let newly_created = {
             let mut client = pool.acquire("init_sql", &db_name).await?;
             let table_count: usize = client
-                .query_optional(GET_TABLE_COUNT, vec![])
-                .await
-                .map_err(Into::<anyhow::Error>::into)?
+                .query_optional(sql::GET_TABLE_COUNT, vec![(&db_name).into()])
+                .await?
                 .context("GET_TABLE_COUNT query returned no rows?")?
                 .get(0)
                 .context("GET_TABLE_COUNT query returned zero columns?")?;
             // Only run INIT_SQL if we have less tables than we expect. We suspect
             // CREATE TABLE IF EXISTS is creating lock contention due to acquiring
             // an exclusive lock https://bugs.mysql.com/bug.php?id=63144.
-            if table_count < EXPECTED_TABLE_COUNT {
+            if table_count < sql::EXPECTED_TABLE_COUNT {
                 tracing::info!("Initializing MySQL Persistence...");
                 client
-                    .execute_many(INIT_SQL)
-                    .await
-                    .map_err(Into::<anyhow::Error>::into)?;
+                    .execute_many(sql::init_sql(options.multitenant))
+                    .await?;
             } else {
                 tracing::info!("MySQL Persistence already initialized");
             }
-            Self::check_newly_created(&mut client).await?
+            client
+                .exec_iter(
+                    sql::init_lease(options.multitenant),
+                    if options.multitenant {
+                        vec![(&options.instance_name.raw).into()]
+                    } else {
+                        vec![]
+                    },
+                )
+                .await?;
+            Self::check_newly_created(&mut client, options.multitenant, &options.instance_name)
+                .await?
         };
         let mut client = pool.acquire("read_only", &db_name).await?;
-        if !options.allow_read_only && Self::is_read_only(&mut client).await? {
+        if !options.allow_read_only
+            && Self::is_read_only(&mut client, options.multitenant, &options.instance_name).await?
+        {
             return Err(ConnectError::ReadOnly);
         }
 
-        let lease = Lease::acquire(pool.clone(), db_name.clone(), lease_lost_shutdown).await?;
+        let lease = Lease::acquire(
+            pool.clone(),
+            db_name.clone(),
+            options.instance_name.clone(),
+            options.multitenant,
+            lease_lost_shutdown,
+        )
+        .await?;
         Ok(Self {
             newly_created: newly_created.into(),
             lease,
             read_pool: pool,
             db_name,
             version: options.version,
+            instance_name: options.instance_name,
+            multitenant: options.multitenant,
         })
+    }
+
+    pub async fn set_read_only(
+        pool: Arc<ConvexMySqlPool<RT>>,
+        db_name: String,
+        options: MySqlOptions,
+        read_only: bool,
+    ) -> anyhow::Result<()> {
+        let multitenant = options.multitenant;
+        let instance_name = mysql_async::Value::from(&options.instance_name.raw);
+        let params = if multitenant {
+            vec![instance_name]
+        } else {
+            vec![]
+        };
+        let mut conn = pool.acquire("set_read_only", &db_name).await?;
+        let statement = if read_only {
+            sql::set_read_only(multitenant)
+        } else {
+            sql::unset_read_only(multitenant)
+        };
+        conn.exec_iter(statement, params).await?;
+        Ok(())
     }
 
     pub fn new_reader(
@@ -216,37 +312,41 @@ impl<RT: Runtime> MySqlPersistence<RT> {
             read_pool: pool,
             db_should_be_leader: options.db_should_be_leader,
             version: options.version,
+            instance_name: options.instance_name,
+            multitenant: options.multitenant,
         }
     }
 
-    async fn is_read_only(client: &mut MySqlConnection<'_>) -> anyhow::Result<bool> {
+    async fn is_read_only(
+        client: &mut MySqlConnection<'_, RT>,
+        multitenant: bool,
+        instance_name: &MySqlInstanceName,
+    ) -> anyhow::Result<bool> {
+        let mut params = vec![];
+        if multitenant {
+            params.push((&instance_name.raw).into());
+        }
         Ok(client
-            .query_optional(CHECK_IS_READ_ONLY, vec![])
+            .query_optional(sql::check_is_read_only(multitenant), params)
             .await?
             .is_some())
     }
 
-    async fn check_newly_created(client: &mut MySqlConnection<'_>) -> anyhow::Result<bool> {
+    async fn check_newly_created(
+        client: &mut MySqlConnection<'_, RT>,
+        multitenant: bool,
+        instance_name: &MySqlInstanceName,
+    ) -> anyhow::Result<bool> {
+        let mut params = vec![];
+        if multitenant {
+            params.push((&instance_name.raw).into());
+        }
         Ok(client
-            .query_optional(CHECK_NEWLY_CREATED, vec![])
+            .query_optional(sql::check_newly_created(multitenant), params)
             .await?
             .is_none())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn get_table_count(&self) -> anyhow::Result<usize> {
-        let mut client = self
-            .read_pool
-            .acquire("get_table_count", &self.db_name)
-            .await?;
-        client
-            .query_optional(GET_TABLE_COUNT, vec![])
-            .await
-            .map_err(Into::<anyhow::Error>::into)?
-            .context("GET_TABLE_COUNT query returned no rows?")?
-            .get(0)
-            .context("GET_TABLE_COUNT query returned zero columns?")
-    }
 }
 
 #[async_trait]
@@ -261,149 +361,139 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
             read_pool: self.read_pool.clone(),
             db_should_be_leader: true,
             version: self.version,
+            instance_name: self.instance_name.clone(),
+            multitenant: self.multitenant,
         })
     }
 
     #[fastrace::trace]
-    async fn write(
+    async fn write<'a>(
         &self,
-        documents: Vec<DocumentLogEntry>,
-        indexes: BTreeSet<(Timestamp, DatabaseIndexUpdate)>,
+        documents: &'a [DocumentLogEntry],
+        indexes: &'a [PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(documents.len() <= MAX_INSERT_SIZE);
+        anyhow::ensure!(documents.len() <= sql::MAX_INSERT_SIZE);
         let mut write_size = 0;
-        for update in &documents {
+        for update in documents {
             match &update.value {
                 Some(doc) => {
                     anyhow::ensure!(update.id == doc.id_with_table_id());
-                    write_size += doc.heap_size();
+                    write_size += doc.size();
                 },
                 None => {},
             }
         }
         metrics::log_write_bytes(write_size);
+        let index_write_size = indexes.iter().map(|entry| entry.approx_size()).sum();
+        metrics::log_index_write_bytes(index_write_size);
         metrics::log_write_documents(documents.len());
-        LocalSpan::add_event(Event::new("write_to_persistence_size").with_properties(|| {
+        LocalSpan::add_properties(|| {
             [
                 ("num_documents", documents.len().to_string()),
                 ("write_size", write_size.to_string()),
             ]
-        }));
+        });
 
         // True, the below might end up failing and not changing anything.
         self.newly_created.store(false, SeqCst);
         let cluster_name = self.read_pool.cluster_name().to_owned();
+        let multitenant = self.multitenant;
+        let instance_name = mysql_async::Value::from(&self.instance_name.raw);
         self.lease
-            .transact(move |tx| {
-                async move {
-                    {
-                        // First, process all of the full document chunks.
-                        let mut document_chunks = smart_chunks(&documents);
-                        for chunk in &mut document_chunks {
-                            let chunk_bytes: usize =
-                                chunk.iter().map(|item| item.approx_size()).sum();
-                            let insert_chunk_query = match conflict_strategy {
-                                ConflictStrategy::Error => insert_document_chunk(chunk.len()),
-                                ConflictStrategy::Overwrite => {
-                                    insert_overwrite_document_chunk(chunk.len())
-                                },
-                            };
-                            let mut insert_document_chunk = vec![];
-                            for update in chunk {
-                                insert_document_chunk = document_params(
-                                    insert_document_chunk,
-                                    update.ts,
-                                    update.id,
-                                    update.value.clone(),
-                                    update.prev_ts,
-                                )?;
-                            }
-                            let future = async {
-                                let timer =
-                                    metrics::insert_document_chunk_timer(cluster_name.as_str());
-                                tx.exec_drop(insert_chunk_query, insert_document_chunk)
-                                    .await?;
-                                timer.finish();
-                                LocalSpan::add_event(
-                                    Event::new("document_smart_chunks").with_properties(|| {
-                                        [
-                                            ("chunk_length", chunk.len().to_string()),
-                                            ("chunk_bytes", chunk_bytes.to_string()),
-                                        ]
-                                    }),
-                                );
-                                Ok::<_, anyhow::Error>(())
-                            };
-                            future
-                                .in_span(Span::enter_with_local_parent(format!(
-                                    "{}::document_chunk_write",
-                                    func_path!()
-                                )))
-                                .await?;
-                        }
-
-                        let index_vec = indexes.into_iter().collect_vec();
-                        let mut index_chunks = smart_chunks(&index_vec);
-                        for chunk in &mut index_chunks {
-                            let chunk_bytes: usize =
-                                chunk.iter().map(|item| item.approx_size()).sum();
-                            let insert_chunk_query = insert_index_chunk(chunk.len());
-                            let insert_overwrite_chunk_query =
-                                insert_overwrite_index_chunk(chunk.len());
-                            let insert_index_chunk = match conflict_strategy {
-                                ConflictStrategy::Error => &insert_chunk_query,
-                                ConflictStrategy::Overwrite => &insert_overwrite_chunk_query,
-                            };
-                            let mut insert_index_chunk_params = vec![];
-                            for (ts, update) in chunk {
-                                let update = update.clone();
-                                index_params(&mut insert_index_chunk_params, *ts, update);
-                            }
-                            let future = async {
-                                let timer =
-                                    metrics::insert_index_chunk_timer(cluster_name.as_str());
-                                tx.exec_drop(insert_index_chunk, insert_index_chunk_params)
-                                    .await?;
-                                timer.finish();
-                                LocalSpan::add_event(
-                                    Event::new("index_smart_chunks").with_properties(|| {
-                                        [
-                                            ("chunk_length", chunk.len().to_string()),
-                                            ("chunk_bytes", chunk_bytes.to_string()),
-                                        ]
-                                    }),
-                                );
-                                Ok::<_, anyhow::Error>(())
-                            };
-                            future
-                                .in_span(Span::enter_with_local_parent(format!(
-                                    "{}::index_chunk_write",
-                                    func_path!()
-                                )))
-                                .await?;
-                        }
-                    }
-                    Ok(())
-                }
-                .boxed()
-            })
-            .await
-    }
-
-    async fn set_read_only(&self, read_only: bool) -> anyhow::Result<()> {
-        self.lease
-            .transact(move |tx| {
-                async move {
-                    let statement = if read_only {
-                        SET_READ_ONLY
-                    } else {
-                        UNSET_READ_ONLY
+            .transact(async move |tx| {
+                // First, process all of the full document chunks.
+                let mut document_chunks = smart_chunks(documents);
+                for chunk in &mut document_chunks {
+                    let chunk_bytes: usize = chunk.iter().map(|item| item.approx_size()).sum();
+                    let insert_chunk_query = match conflict_strategy {
+                        ConflictStrategy::Error => {
+                            sql::insert_document_chunk(chunk.len(), multitenant)
+                        },
+                        ConflictStrategy::Overwrite => {
+                            sql::insert_overwrite_document_chunk(chunk.len(), multitenant)
+                        },
                     };
-                    tx.exec_drop(statement, vec![]).await?;
-                    Ok(())
+                    let mut insert_document_chunk = Vec::with_capacity(
+                        chunk.len() * (sql::INSERT_DOCUMENT_COLUMN_COUNT + (multitenant as usize)),
+                    );
+                    for update in chunk {
+                        if multitenant {
+                            insert_document_chunk.push(instance_name.clone());
+                        }
+                        insert_document_chunk = document_params(
+                            insert_document_chunk,
+                            update.ts,
+                            update.id,
+                            update.value.as_ref(),
+                            update.prev_ts,
+                        )?;
+                    }
+                    let future = async {
+                        let timer = metrics::insert_document_chunk_timer(cluster_name.as_str());
+                        tx.exec_drop(insert_chunk_query, insert_document_chunk)
+                            .await?;
+                        timer.finish();
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    future
+                        .in_span(
+                            Span::enter_with_local_parent(format!(
+                                "{}::document_chunk_write",
+                                func_path!()
+                            ))
+                            .with_properties(|| {
+                                [
+                                    ("chunk_length", chunk.len().to_string()),
+                                    ("chunk_bytes", chunk_bytes.to_string()),
+                                ]
+                            }),
+                        )
+                        .await?;
                 }
-                .boxed()
+
+                let mut index_chunks = smart_chunks(indexes);
+                for chunk in &mut index_chunks {
+                    let chunk_bytes: usize = chunk.iter().map(|item| item.approx_size()).sum();
+                    let insert_chunk_query = sql::insert_index_chunk(chunk.len(), multitenant);
+                    let insert_overwrite_chunk_query =
+                        sql::insert_overwrite_index_chunk(chunk.len(), multitenant);
+                    let insert_index_chunk = match conflict_strategy {
+                        ConflictStrategy::Error => &insert_chunk_query,
+                        ConflictStrategy::Overwrite => &insert_overwrite_chunk_query,
+                    };
+                    let mut insert_index_chunk_params = Vec::with_capacity(
+                        chunk.len() * (sql::INSERT_INDEX_COLUMN_COUNT + (multitenant as usize)),
+                    );
+                    for update in chunk {
+                        if multitenant {
+                            insert_index_chunk_params.push(instance_name.clone());
+                        }
+                        index_params(&mut insert_index_chunk_params, update);
+                    }
+                    let future = async {
+                        let timer = metrics::insert_index_chunk_timer(cluster_name.as_str());
+                        tx.exec_drop(insert_index_chunk, insert_index_chunk_params)
+                            .await?;
+                        timer.finish();
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    future
+                        .in_span(
+                            Span::enter_with_local_parent(format!(
+                                "{}::index_chunk_write",
+                                func_path!()
+                            ))
+                            .with_properties(|| {
+                                [
+                                    ("chunk_length", chunk.len().to_string()),
+                                    ("chunk_bytes", chunk_bytes.to_string()),
+                                ]
+                            }),
+                        )
+                        .await?;
+                }
+                Ok(())
             })
             .await
     }
@@ -413,16 +503,20 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
         key: PersistenceGlobalKey,
         value: JsonValue,
     ) -> anyhow::Result<()> {
-        let timer = write_persistence_global_timer(self.read_pool.cluster_name());
+        let timer = write_persistence_global_timer(self.read_pool.cluster_name(), key);
+        let multitenant = self.multitenant;
+        let instance_name = mysql_async::Value::from(&self.instance_name.raw);
         self.lease
-            .transact(move |tx| {
-                async move {
-                    let stmt = WRITE_PERSISTENCE_GLOBAL;
-                    let params = vec![String::from(key).into(), value.into()];
-                    tx.exec_drop(stmt, params).await?;
-                    Ok(())
-                }
-                .boxed()
+            .transact(async move |tx| {
+                let stmt = sql::write_persistence_global(multitenant);
+                let mut params = if multitenant {
+                    vec![instance_name]
+                } else {
+                    vec![]
+                };
+                params.extend([String::from(key).into(), value.into()]);
+                tx.exec_drop(stmt, params).await?;
+                Ok(())
             })
             .await?;
         timer.finish();
@@ -438,35 +532,41 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
             .read_pool
             .acquire("load_index_chunk", &self.db_name)
             .await?;
-        let stmt = LOAD_INDEXES_PAGE;
+        let stmt = sql::load_indexes_page(self.multitenant);
         let mut params = MySqlReader::<RT>::_index_cursor_params(cursor.as_ref());
+        if self.multitenant {
+            params.push(self.instance_name.to_string().into());
+        }
         params.push((chunk_size as i64).into());
-        let row_stream = client.query_stream(stmt, params, chunk_size).await?;
-
-        let parsed = row_stream.map(|row| parse_row(&row?));
-        parsed.try_collect().await
+        client
+            .query_collect(stmt, params, chunk_size, |mut row| parse_row(&mut row))
+            .await
     }
 
     async fn delete_index_entries(
         &self,
         expired_entries: Vec<IndexEntry>,
     ) -> anyhow::Result<usize> {
+        let multitenant = self.multitenant;
+        let instance_name = mysql_async::Value::from(&self.instance_name.raw);
         self.lease
-            .transact(move |tx| {
-                async move {
-                    let mut deleted_count = 0;
-                    for chunk in smart_chunks(&expired_entries) {
-                        let mut params = vec![];
-                        for index_entry in chunk.iter() {
-                            MySqlReader::<RT>::_index_delete_params(&mut params, index_entry);
+            .transact(async move |tx| {
+                let mut deleted_count = 0;
+                for chunk in smart_chunks(&expired_entries) {
+                    let mut params = Vec::with_capacity(
+                        chunk.len() * (sql::DELETE_INDEX_COLUMN_COUNT + (multitenant as usize)),
+                    );
+                    for index_entry in chunk.iter() {
+                        MySqlReader::<RT>::_index_delete_params(&mut params, index_entry);
+                        if multitenant {
+                            params.push(instance_name.clone());
                         }
-                        deleted_count += tx
-                            .exec_iter(delete_index_chunk(chunk.len()), params)
-                            .await?;
                     }
-                    Ok(deleted_count as usize)
+                    deleted_count += tx
+                        .exec_iter(sql::delete_index_chunk(chunk.len(), multitenant), params)
+                        .await?;
                 }
-                .boxed()
+                Ok(deleted_count as usize)
             })
             .await
     }
@@ -475,22 +575,52 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
         &self,
         documents: Vec<(Timestamp, InternalDocumentId)>,
     ) -> anyhow::Result<usize> {
+        let multitenant = self.multitenant;
+        let instance_name = mysql_async::Value::from(&self.instance_name.raw);
         self.lease
-            .transact(move |tx| {
-                async move {
-                    let mut deleted_count = 0;
-                    for chunk in smart_chunks(&documents) {
-                        let mut params = vec![];
-                        for doc in chunk.iter() {
-                            MySqlReader::<RT>::_document_delete_params(&mut params, doc);
+            .transact(async move |tx| {
+                let mut deleted_count = 0;
+                for chunk in smart_chunks(&documents) {
+                    let mut params = Vec::with_capacity(
+                        chunk.len() * (sql::DELETE_DOCUMENT_COLUMN_COUNT + (multitenant as usize)),
+                    );
+                    for doc in chunk.iter() {
+                        MySqlReader::<RT>::_document_delete_params(&mut params, doc);
+                        if multitenant {
+                            params.push(instance_name.clone());
                         }
-                        deleted_count += tx
-                            .exec_iter(delete_document_chunk(chunk.len()), params)
-                            .await?;
                     }
-                    Ok(deleted_count as usize)
+                    deleted_count += tx
+                        .exec_iter(sql::delete_document_chunk(chunk.len(), multitenant), params)
+                        .await?;
                 }
-                .boxed()
+                Ok(deleted_count as usize)
+            })
+            .await
+    }
+
+    async fn delete_tablet_documents(
+        &self,
+        tablet_id: TabletId,
+        chunk_size: usize,
+    ) -> anyhow::Result<usize> {
+        let multitenant = self.multitenant;
+        let instance_name = mysql_async::Value::from(&self.instance_name.raw);
+        self.lease
+            .transact(async move |tx| {
+                let mut deleted_count = 0;
+                let mut params =
+                    Vec::with_capacity(sql::DELETE_TABLE_COLUMN_COUNT + (multitenant as usize));
+                let tablet_id: Vec<u8> = tablet_id.0.into();
+                params.push(tablet_id.into());
+                if multitenant {
+                    params.push(instance_name.clone());
+                }
+                params.push(chunk_size.into());
+                deleted_count += tx
+                    .exec_iter(sql::delete_tablet_chunk(multitenant), params)
+                    .await?;
+                Ok(deleted_count as usize)
             })
             .await
     }
@@ -500,6 +630,8 @@ impl<RT: Runtime> Persistence for MySqlPersistence<RT> {
 pub struct MySqlReader<RT: Runtime> {
     read_pool: Arc<ConvexMySqlPool<RT>>,
     db_name: String,
+    instance_name: MySqlInstanceName,
+    multitenant: bool,
     /// Set `db_should_be_leader` if this PostgresReader should be connected
     /// to the database leader. In particular, we protect against heterogenous
     /// connection pools where one connection is to the leader and another is to
@@ -507,6 +639,20 @@ pub struct MySqlReader<RT: Runtime> {
     #[allow(unused)]
     db_should_be_leader: bool,
     version: PersistenceVersion,
+}
+
+fn maybe_bytes_col(row: &Row, col: usize) -> anyhow::Result<Option<&[u8]>> {
+    match row.as_ref(col) {
+        Some(Value::Bytes(b)) => Ok(Some(b)),
+        Some(Value::NULL) => Ok(None),
+        _ => anyhow::bail!("row[{col}] must be Bytes or NULL"),
+    }
+}
+fn bytes_col(row: &Row, col: usize) -> anyhow::Result<&[u8]> {
+    match row.as_ref(col) {
+        Some(Value::Bytes(b)) => Ok(b),
+        _ => anyhow::bail!("row[{col}] must be Bytes"),
+    }
 }
 
 impl<RT: Runtime> MySqlReader<RT> {
@@ -518,69 +664,53 @@ impl<RT: Runtime> MySqlReader<RT> {
     }
 
     fn row_to_document(
-        &self,
-        row: Row,
+        row: &Row,
     ) -> anyhow::Result<(
         Timestamp,
         InternalDocumentId,
         Option<ResolvedDocument>,
         Option<Timestamp>,
     )> {
-        let (ts, id, doc, prev_ts) = self.row_to_document_inner(row)?;
-        Ok((ts, id, doc, prev_ts))
-    }
-
-    fn row_to_document_inner(
-        &self,
-        row: Row,
-    ) -> anyhow::Result<(
-        Timestamp,
-        InternalDocumentId,
-        Option<ResolvedDocument>,
-        Option<Timestamp>,
-    )> {
-        let bytes: Vec<u8> = row.get(0).unwrap();
-        let internal_id = InternalId::try_from(bytes)?;
-        let ts: i64 = row.get(1).unwrap();
+        let internal_id = InternalId::try_from(bytes_col(row, 0)?)?;
+        let ts: i64 = row.get_opt(1).context("row[1]")??;
         let ts = Timestamp::try_from(ts)?;
-        let table_b: Vec<u8> = row.get(2).unwrap();
-        let json_value: Vec<u8> = row.get(3).unwrap();
-        let json_value: JsonValue = serde_json::from_slice(&json_value)?;
-        let deleted: bool = row.get(4).unwrap();
-        let table = TabletId(table_b.try_into()?);
+        let table_b = bytes_col(row, 2)?;
+        let encoded_value = bytes_col(row, 3)?;
+        let deleted: bool = row.get_opt(4).context("row[4]")??;
+        let table = TabletId(table_b[..].try_into()?);
         let document_id = InternalDocumentId::new(table, internal_id);
         let document = if !deleted {
-            let value: ConvexValue = json_value.try_into()?;
-            Some(ResolvedDocument::from_database(table, value)?)
+            Some(
+                document_encoding::decode(encoded_value, table)?
+                    .context("deleted=false but value is empty")?,
+            )
         } else {
             None
         };
-        let prev_ts: Option<i64> = row.get(5).unwrap();
+        let prev_ts: Option<i64> = row.get_opt(5).context("row[5]")??;
         let prev_ts = prev_ts.map(Timestamp::try_from).transpose()?;
         Ok((ts, document_id, document, prev_ts))
     }
 
-    #[allow(clippy::needless_lifetimes)]
+    // If `include_prev_rev` is false then the returned
+    // RevisionPair.prev_rev.document will always be None (but prev_rev.ts will
+    // still be correct)
     #[try_stream(
-        ok = DocumentLogEntry,
+        ok = RevisionPair,
         error = anyhow::Error,
     )]
     async fn _load_documents(
         &self,
+        tablet_id: Option<TabletId>,
+        include_prev_rev: bool,
         range: TimestampRange,
         order: Order,
-        page_size: u32,
-        tablet_id: Option<TabletId>,
+        mut page_size: u32,
         retention_validator: Arc<dyn RetentionValidator>,
     ) {
         anyhow::ensure!(page_size > 0); // 0 size pages loop forever.
         let timer = metrics::load_documents_timer(self.read_pool.cluster_name());
-        let mut client = self
-            .read_pool
-            .acquire("load_documents", &self.db_name)
-            .await?;
         let mut num_returned = 0;
-        let mut num_skipped_by_table = 0;
         let mut last_ts = match order {
             Order::Asc => Timestamp::MIN,
             Order::Desc => Timestamp::MAX,
@@ -588,13 +718,26 @@ impl<RT: Runtime> MySqlReader<RT> {
         let mut last_tablet_id_param = Self::initial_id_param(order);
         let mut last_id_param = Self::initial_id_param(order);
         loop {
-            let mut rows_loaded = 0;
+            // Avoid holding connections across yield points, to limit lifetime
+            // and improve fairness.
+            let mut client = self
+                .read_pool
+                .acquire("load_documents", &self.db_name)
+                .await?;
 
             let query = match order {
-                Order::Asc => &LOAD_DOCS_BY_TS_PAGE_ASC,
-                Order::Desc => &LOAD_DOCS_BY_TS_PAGE_DESC,
+                Order::Asc => sql::load_docs_by_ts_page_asc(
+                    self.multitenant,
+                    tablet_id.is_some(),
+                    include_prev_rev,
+                ),
+                Order::Desc => sql::load_docs_by_ts_page_desc(
+                    self.multitenant,
+                    tablet_id.is_some(),
+                    include_prev_rev,
+                ),
             };
-            let params = vec![
+            let mut params = vec![
                 i64::from(range.min_timestamp_inclusive()).into(),
                 i64::from(range.max_timestamp_exclusive()).into(),
                 i64::from(last_ts).into(),
@@ -602,48 +745,85 @@ impl<RT: Runtime> MySqlReader<RT> {
                 last_tablet_id_param.clone().into(),
                 last_tablet_id_param.clone().into(),
                 last_id_param.clone().into(),
-                (page_size as i64).into(),
             ];
-            let row_stream = client
-                .query_stream(query, params, page_size as usize)
-                .await?;
+            if let Some(tablet_id) = tablet_id {
+                params.push(tablet_id.0 .0.into());
+            }
+            if self.multitenant {
+                params.push(self.instance_name.to_string().into());
+            }
+            params.push((page_size as i64).into());
+            let rows = match client
+                .query_collect(query, params, page_size as usize, Ok)
+                .await
+            {
+                Ok(rows) => Ok(rows),
+                Err(ref e) if let Some(db_err) = is_message_too_large_error(e) => {
+                    if page_size == 1 {
+                        anyhow::bail!(
+                            "Failed to load documents with minimum page size `1`: {}",
+                            db_err.message,
+                        );
+                    }
+                    if page_size == *MYSQL_FALLBACK_PAGE_SIZE {
+                        tracing::warn!(
+                            "Falling back to page size `1` due to repeated server error: {}",
+                            db_err.message
+                        );
+                        page_size = 1;
+                    } else {
+                        tracing::warn!(
+                            "Falling back to page size `{}` due to server error: {}",
+                            *MYSQL_FALLBACK_PAGE_SIZE,
+                            db_err.message
+                        );
+                        page_size = *MYSQL_FALLBACK_PAGE_SIZE;
+                    }
+                    continue;
+                },
+                Err(e) => Err(e),
+            }?;
+            drop(client);
 
             retention_validator
                 .validate_document_snapshot(range.min_timestamp_inclusive())
                 .await?;
 
-            futures::pin_mut!(row_stream);
-
-            while let Some(row) = row_stream.try_next().await? {
-                let (ts, document_id, document, prev_ts) = self.row_to_document(row)?;
-                rows_loaded += 1;
+            let rows_loaded = rows.len();
+            for row in rows {
+                let (ts, document_id, document, prev_ts) = Self::row_to_document(&row)?;
+                let prev_rev_document: Option<ResolvedDocument> = if include_prev_rev {
+                    maybe_bytes_col(&row, 6)?
+                        .map(|v| {
+                            // N.B.: previous revisions should never be deleted, so we don't check
+                            // that.
+                            anyhow::Ok(
+                                document_encoding::decode(v, document_id.table())?
+                                    .context("previous revisions should never be deleted")?,
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
                 last_ts = ts;
                 last_tablet_id_param = internal_id_param(document_id.table().0);
                 last_id_param = internal_doc_id_param(document_id);
                 num_returned += 1;
-                if let Some(tablet_id) = tablet_id
-                    && document_id.table() != tablet_id
-                {
-                    num_skipped_by_table += 1;
-                    continue;
-                } else {
-                    yield DocumentLogEntry {
-                        ts,
-                        id: document_id,
-                        value: document,
-                        prev_ts,
-                    }
+                yield RevisionPair {
+                    id: document_id,
+                    rev: DocumentRevision { ts, document },
+                    prev_rev: prev_ts.map(|prev_ts| DocumentRevision {
+                        ts: prev_ts,
+                        document: prev_rev_document,
+                    }),
                 }
             }
-            if rows_loaded < page_size {
+            if rows_loaded < page_size as usize {
                 break;
             }
         }
 
-        metrics::mysql_load_documents_skipped_wrong_table(
-            num_skipped_by_table,
-            self.read_pool.cluster_name(),
-        );
         metrics::finish_load_documents_timer(timer, num_returned, self.read_pool.cluster_name());
     }
 
@@ -659,6 +839,19 @@ impl<RT: Runtime> MySqlReader<RT> {
         size_hint: usize,
         retention_validator: Arc<dyn RetentionValidator>,
     ) {
+        if let Some(key) = interval.is_singleton()
+            && key.len() <= MAX_INDEX_KEY_PREFIX_LEN
+        {
+            // Fast path for looking up a single value
+            if let Some(doc) = self
+                .index_point_query(index_id, key, read_timestamp, retention_validator)
+                .await?
+            {
+                anyhow::ensure!(doc.value.id().tablet_id == tablet_id);
+                yield (IndexKeyBytes(key.to_vec()), doc);
+            }
+            return Ok(());
+        }
         let scan = self._index_scan_inner(
             index_id,
             read_timestamp,
@@ -668,8 +861,8 @@ impl<RT: Runtime> MySqlReader<RT> {
             retention_validator,
         );
         pin_mut!(scan);
-        while let Some((key, ts, value, prev_ts)) = scan.try_next().await? {
-            let document = ResolvedDocument::from_database(tablet_id, value)?;
+        while let Some((key, ts, document, prev_ts)) = scan.try_next().await? {
+            anyhow::ensure!(document.id().tablet_id == tablet_id);
             yield (
                 key,
                 LatestDocument {
@@ -683,7 +876,7 @@ impl<RT: Runtime> MySqlReader<RT> {
 
     #[allow(clippy::needless_lifetimes)]
     #[try_stream(
-        ok = (IndexKeyBytes, Timestamp, ConvexValue, Option<Timestamp>),
+        ok = (IndexKeyBytes, Timestamp, ResolvedDocument, Option<Timestamp>),
         error = anyhow::Error
     )]
     async fn _index_scan_inner(
@@ -696,7 +889,7 @@ impl<RT: Runtime> MySqlReader<RT> {
         retention_validator: Arc<dyn RetentionValidator>,
     ) {
         let _timer = metrics::query_index_timer(self.read_pool.cluster_name());
-        let (mut lower, mut upper) = to_sql_bounds(interval.clone());
+        let (mut lower, mut upper) = sql::to_sql_bounds(interval.clone());
 
         let mut stats = QueryIndexStats::new(self.read_pool.cluster_name());
 
@@ -704,159 +897,239 @@ impl<RT: Runtime> MySqlReader<RT> {
         // common case we should do a single query. Exceptions are if the size_hint
         // is wrong or if we truncate it or if we observe too many deletes.
         let mut batch_size =
-            size_hint.clamp(*MYSQL_MIN_QUERY_BATCH_SIZE, *MYSQL_MAX_QUERY_BATCH_SIZE);
+            size_hint.clamp(*MYSQL_MIN_QUERY_BATCH_SIZE, *MYSQL_MAX_QUERY_BATCH_SIZE) as u32;
 
         // We iterate results in (key_prefix, key_sha256) order while we actually
         // need them in (key_prefix, key_suffix order). key_suffix is not part of the
         // primary key so we do the sort here. If see any record with maximum length
         // prefix, we should buffer it until we reach a different prefix.
-        let mut result_buffer: Vec<(IndexKeyBytes, Timestamp, ConvexValue, Option<Timestamp>)> =
-            Vec::new();
+        let mut result_buffer: Vec<(
+            IndexKeyBytes,
+            Timestamp,
+            ResolvedDocument,
+            Option<Timestamp>,
+        )> = Vec::new();
         let mut has_more = true;
+        let mut fallback = false;
         while has_more {
-            let page = {
-                let mut to_yield = vec![];
-                // Avoid holding connections across yield points, to limit lifetime
-                // and improve fairness.
-                let mut client = self.read_pool.acquire("index_scan", &self.db_name).await?;
-                stats.sql_statements += 1;
-                let (query, params) = index_query(
-                    index_id,
-                    read_timestamp,
-                    lower.clone(),
-                    upper.clone(),
-                    order,
-                    batch_size,
-                );
+            // Avoid holding connections across yield points, to limit lifetime
+            // and improve fairness.
+            let mut client = self.read_pool.acquire("index_scan", &self.db_name).await?;
+            stats.sql_statements += 1;
+            let (query, params) = sql::index_query(
+                index_id,
+                read_timestamp,
+                lower.clone(),
+                upper.clone(),
+                order,
+                batch_size as usize,
+                self.multitenant,
+                &self.instance_name,
+            );
 
-                let prepare_timer =
-                    metrics::query_index_sql_prepare_timer(self.read_pool.cluster_name());
-                prepare_timer.finish();
+            let prepare_timer =
+                metrics::query_index_sql_prepare_timer(self.read_pool.cluster_name());
+            prepare_timer.finish();
 
-                let execute_timer =
-                    metrics::query_index_sql_execute_timer(self.read_pool.cluster_name());
-                let row_stream = client.query_stream(query, params, batch_size).await?;
-                execute_timer.finish();
-
-                let retention_validate_timer =
-                    metrics::retention_validate_timer(self.read_pool.cluster_name());
-                retention_validator
-                    .validate_snapshot(read_timestamp)
-                    .await?;
-                retention_validate_timer.finish();
-
-                futures::pin_mut!(row_stream);
-
-                let mut batch_rows = 0;
-                while let Some(row) = row_stream.try_next().await? {
-                    batch_rows += 1;
-                    stats.rows_read += 1;
-
-                    // Fetch
-                    let internal_row = parse_row(&row)?;
-
-                    // Yield buffered results if applicable.
-                    if let Some((buffer_key, ..)) = result_buffer.first() {
-                        if buffer_key[..MAX_INDEX_KEY_PREFIX_LEN] != internal_row.key_prefix {
-                            // We have exhausted all results that share the same key prefix
-                            // we can sort and yield the buffered results.
-                            result_buffer.sort_by(|a, b| a.0.cmp(&b.0));
-                            for (key, ts, doc, prev_ts) in order.apply(result_buffer.drain(..)) {
-                                if interval.contains(&key) {
-                                    stats.rows_returned += 1;
-                                    to_yield.push((key, ts, doc, prev_ts));
-                                } else {
-                                    stats.rows_skipped_out_of_range += 1;
-                                }
-                            }
-                        }
+            let execute_timer =
+                metrics::query_index_sql_execute_timer(self.read_pool.cluster_name());
+            let rows = match client
+                .query_collect(query, params, batch_size as usize, Ok)
+                .await
+            {
+                Ok(rows) => Ok(rows),
+                Err(ref e) if let Some(db_err) = is_message_too_large_error(e) => {
+                    if batch_size == 1 {
+                        anyhow::bail!(
+                            "Failed to load index rows with minimum page size `1`: {}",
+                            db_err.message
+                        );
                     }
-
-                    // Update the bounds for future queries.
-                    let bound = Bound::Excluded(SqlKey {
-                        prefix: internal_row.key_prefix.clone(),
-                        sha256: internal_row.key_sha256.clone(),
-                    });
-                    match order {
-                        Order::Asc => lower = bound,
-                        Order::Desc => upper = bound,
-                    }
-
-                    // Filter if needed.
-                    if internal_row.deleted {
-                        stats.rows_skipped_deleted += 1;
-                        continue;
-                    }
-
-                    // Construct key.
-                    let mut key = internal_row.key_prefix;
-                    if let Some(key_suffix) = internal_row.key_suffix {
-                        key.extend(key_suffix);
-                    };
-                    let ts = internal_row.ts;
-
-                    // Fetch the remaining columns and construct the document
-                    let table_b: Option<Vec<u8>> = row.get(7).unwrap();
-                    table_b.ok_or_else(|| {
-                        anyhow::anyhow!("Dangling index reference for {:?} {:?}", key, ts)
-                    })?;
-                    let json_value: Vec<u8> = row.get(8).unwrap();
-                    let json_value: JsonValue = serde_json::from_slice(&json_value)?;
-                    anyhow::ensure!(
-                        json_value != serde_json::Value::Null,
-                        "Index reference to deleted document {:?} {:?}",
-                        key,
-                        ts
-                    );
-                    let value: ConvexValue = json_value.try_into()?;
-
-                    let prev_ts: Option<i64> = row.get(9).unwrap();
-                    let prev_ts = prev_ts.map(Timestamp::try_from).transpose()?;
-
-                    if key.len() < MAX_INDEX_KEY_PREFIX_LEN {
-                        assert!(result_buffer.is_empty());
-                        if interval.contains(&key) {
-                            stats.rows_returned += 1;
-                            to_yield.push((IndexKeyBytes(key), ts, value, prev_ts));
-                        } else {
-                            stats.rows_skipped_out_of_range += 1;
-                        }
+                    if batch_size == *MYSQL_FALLBACK_PAGE_SIZE {
+                        tracing::warn!(
+                            "Falling back to page size `1` due to repeated server error: {}",
+                            db_err.message
+                        );
+                        batch_size = 1;
                     } else {
-                        // There might be other records with the same key_prefix that
-                        // are ordered before this result. Buffer it.
-                        result_buffer.push((IndexKeyBytes(key), ts, value, prev_ts));
-                        stats.max_rows_buffered =
-                            cmp::max(result_buffer.len(), stats.max_rows_buffered);
+                        tracing::warn!(
+                            "Falling back to page size `{}` due to server error: {}",
+                            *MYSQL_FALLBACK_PAGE_SIZE,
+                            db_err.message
+                        );
+                        batch_size = *MYSQL_FALLBACK_PAGE_SIZE;
                     }
-                }
+                    fallback = true;
+                    continue;
+                },
+                Err(e) => Err(e),
+            }?;
+            execute_timer.finish();
+            drop(client);
 
-                if batch_rows < batch_size {
-                    // Yield any remaining values.
+            let retention_validate_timer =
+                metrics::retention_validate_timer(self.read_pool.cluster_name());
+            retention_validator
+                .validate_snapshot(read_timestamp)
+                .await?;
+            retention_validate_timer.finish();
+
+            let batch_rows = rows.len();
+            for mut row in rows {
+                stats.rows_read += 1;
+
+                // Fetch
+                let internal_row = parse_row(&mut row)?;
+
+                // Yield buffered results if applicable.
+                if let Some((buffer_key, ..)) = result_buffer.first()
+                    && buffer_key[..MAX_INDEX_KEY_PREFIX_LEN] != internal_row.key_prefix
+                {
+                    // We have exhausted all results that share the same key prefix
+                    // we can sort and yield the buffered results.
                     result_buffer.sort_by(|a, b| a.0.cmp(&b.0));
                     for (key, ts, doc, prev_ts) in order.apply(result_buffer.drain(..)) {
                         if interval.contains(&key) {
                             stats.rows_returned += 1;
-                            to_yield.push((key, ts, doc, prev_ts));
+                            yield (key, ts, doc, prev_ts);
                         } else {
                             stats.rows_skipped_out_of_range += 1;
                         }
                     }
-                    has_more = false;
                 }
 
-                to_yield
-            };
-            for document in page {
-                yield document;
+                // Update the bounds for future queries.
+                let bound = Bound::Excluded(sql::SqlKey {
+                    prefix: internal_row.key_prefix.clone(),
+                    sha256: internal_row.key_sha256.clone(),
+                });
+                match order {
+                    Order::Asc => lower = bound,
+                    Order::Desc => upper = bound,
+                }
+
+                // Filter if needed.
+                if internal_row.deleted {
+                    stats.rows_skipped_deleted += 1;
+                    continue;
+                }
+
+                // Construct key.
+                let mut key = internal_row.key_prefix;
+                if let Some(key_suffix) = internal_row.key_suffix {
+                    key.extend(key_suffix);
+                };
+                let ts = internal_row.ts;
+
+                // Fetch the remaining columns and construct the document
+                let table_b = maybe_bytes_col(&row, 7)?;
+                let table = TabletId(
+                    table_b
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Dangling index reference for {:?} {:?}", key, ts)
+                        })?
+                        .try_into()?,
+                );
+                let doc =
+                    document_encoding::decode(bytes_col(&row, 8)?, table)?.with_context(|| {
+                        format!("Index reference to deleted document {key:?} {ts:?}")
+                    })?;
+
+                let prev_ts: Option<i64> = row.get_opt(9).context("row[9]")??;
+                let prev_ts = prev_ts.map(Timestamp::try_from).transpose()?;
+
+                if key.len() < MAX_INDEX_KEY_PREFIX_LEN {
+                    assert!(result_buffer.is_empty());
+                    if interval.contains(&key) {
+                        stats.rows_returned += 1;
+                        yield (IndexKeyBytes(key), ts, doc, prev_ts);
+                    } else {
+                        stats.rows_skipped_out_of_range += 1;
+                    }
+                } else {
+                    // There might be other records with the same key_prefix that
+                    // are ordered before this result. Buffer it.
+                    result_buffer.push((IndexKeyBytes(key), ts, doc, prev_ts));
+                    stats.max_rows_buffered =
+                        cmp::max(result_buffer.len(), stats.max_rows_buffered);
+                }
             }
+
+            if batch_rows < batch_size as usize {
+                // Yield any remaining values.
+                result_buffer.sort_by(|a, b| a.0.cmp(&b.0));
+                for (key, ts, doc, prev_ts) in order.apply(result_buffer.drain(..)) {
+                    if interval.contains(&key) {
+                        stats.rows_returned += 1;
+                        yield (key, ts, doc, prev_ts);
+                    } else {
+                        stats.rows_skipped_out_of_range += 1;
+                    }
+                }
+                has_more = false;
+            }
+
             // Double the batch size every iteration until we max dynamic batch size. This
             // helps correct for tombstones, long prefixes and wrong client
             // size estimates.
-            // TODO: Take size into consideration and increase the max dynamic batch size.
-            if batch_size < *MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE {
-                batch_size = (batch_size * 2).min(*MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE);
+            // If we've had to fall back to the fallback page size, stay there without
+            // doubling. TODO: Take size into consideration and increase the max
+            // dynamic batch size.
+            if batch_size < *MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE as u32 && !fallback {
+                batch_size = (batch_size * 2).min(*MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE as u32);
             }
         }
+    }
+
+    async fn index_point_query(
+        &self,
+        index_id: IndexId,
+        key: &BinaryKey,
+        read_timestamp: Timestamp,
+        retention_validator: Arc<dyn RetentionValidator>,
+    ) -> anyhow::Result<Option<LatestDocument>> {
+        let mut client = self
+            .read_pool
+            .acquire("index_lookup", &self.db_name)
+            .await?;
+        let key_prefix = key.to_vec();
+        anyhow::ensure!(key_prefix.len() <= MAX_INDEX_KEY_PREFIX_LEN);
+        let key_sha256 = Sha256::hash(key);
+        let execute_timer =
+            metrics::query_index_point_sql_execute_timer(self.read_pool.cluster_name());
+        let mut params: Vec<mysql_async::Value> = vec![
+            internal_id_param(index_id).into(),
+            key_prefix.into(),
+            key_sha256.to_vec().into(),
+            i64::from(read_timestamp).into(),
+        ];
+        if self.multitenant {
+            params.push(self.instance_name.to_string().into());
+        }
+        let maybe_row = client
+            .query_optional(index_point_query(self.multitenant), params)
+            .await?;
+        execute_timer.finish();
+
+        let retention_validate_timer =
+            metrics::retention_validate_timer(self.read_pool.cluster_name());
+        retention_validator
+            .validate_snapshot(read_timestamp)
+            .await?;
+        retention_validate_timer.finish();
+
+        let Some(row) = maybe_row else {
+            return Ok(None);
+        };
+        let ts = Timestamp::try_from(row.get_opt::<i64, _>(0).context("row[0]")??)?;
+        let tablet_id = TabletId(bytes_col(&row, 1)?.try_into()?);
+        let value = maybe_bytes_col(&row, 2)?
+            .ok_or_else(|| anyhow::anyhow!("Dangling index reference for {:?} {:?}", key, ts))?;
+        let prev_ts: Option<i64> = row.get_opt(3).context("row[3]")??;
+        let prev_ts = prev_ts.map(Timestamp::try_from).transpose()?;
+        let value = document_encoding::decode(value, tablet_id)?
+            .with_context(|| format!("Index reference to deleted document {key:?} {ts:?}"))?;
+        Ok(Some(LatestDocument { ts, value, prev_ts }))
     }
 
     fn _index_cursor_params(cursor: Option<&IndexEntry>) -> Vec<mysql_async::Value> {
@@ -909,16 +1182,16 @@ impl<RT: Runtime> MySqlReader<RT> {
     }
 }
 
-fn parse_row(row: &Row) -> anyhow::Result<IndexEntry> {
-    let bytes: Vec<u8> = row.get(0).unwrap();
-    let index_id = InternalId::try_from(bytes).context("index_id wrong size")?;
+/// Takes the key columns out of the `Row`
+fn parse_row(row: &mut Row) -> anyhow::Result<IndexEntry> {
+    let index_id = InternalId::try_from(bytes_col(row, 0)?).context("index_id wrong size")?;
 
-    let key_prefix: Vec<u8> = row.get(1).unwrap();
-    let key_sha256: Vec<u8> = row.get(2).unwrap();
-    let key_suffix: Option<Vec<u8>> = row.get(3).unwrap();
-    let ts: i64 = row.get(4).unwrap();
+    let key_prefix: Vec<u8> = row.take_opt(1).context("row[1]")??;
+    let key_sha256: Vec<u8> = row.take_opt(2).context("row[2]")??;
+    let key_suffix: Option<Vec<u8>> = row.take_opt(3).context("row[3]")??;
+    let ts: i64 = row.get_opt(4).context("row[4]")??;
     let ts = Timestamp::try_from(ts)?;
-    let deleted: bool = row.get(5).unwrap();
+    let deleted: bool = row.get_opt(5).context("row[5]")??;
     Ok(IndexEntry {
         index_id,
         key_prefix,
@@ -938,8 +1211,17 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
         page_size: u32,
         retention_validator: Arc<dyn RetentionValidator>,
     ) -> DocumentStream<'_> {
-        self._load_documents(range, order, page_size, None, retention_validator)
-            .boxed()
+        self._load_documents(
+            None,  /* tablet_id */
+            false, /* include_prev_rev */
+            range,
+            order,
+            page_size,
+            retention_validator,
+        )
+        .map_ok(RevisionPair::into_log_entry)
+        .cooperative()
+        .boxed()
     }
 
     fn load_documents_from_table(
@@ -951,12 +1233,35 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
         retention_validator: Arc<dyn RetentionValidator>,
     ) -> DocumentStream<'_> {
         self._load_documents(
+            Some(tablet_id),
+            false, /* include_prev_rev */
             range,
             order,
             page_size,
-            Some(tablet_id),
             retention_validator,
         )
+        .map_ok(RevisionPair::into_log_entry)
+        .cooperative()
+        .boxed()
+    }
+
+    fn load_revision_pairs(
+        &self,
+        tablet_id: Option<TabletId>,
+        range: TimestampRange,
+        order: Order,
+        page_size: u32,
+        retention_validator: Arc<dyn RetentionValidator>,
+    ) -> DocumentRevisionStream<'_> {
+        self._load_documents(
+            tablet_id,
+            true, /* include_prev_rev */
+            range,
+            order,
+            page_size,
+            retention_validator,
+        )
+        .cooperative()
         .boxed()
     }
 
@@ -967,16 +1272,37 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
     ) -> anyhow::Result<BTreeMap<DocumentPrevTsQuery, DocumentLogEntry>> {
         let timer = metrics::previous_revisions_of_documents_timer(self.read_pool.cluster_name());
 
-        let mut client = self
-            .read_pool
-            .acquire("previous_revisions_of_documents", &self.db_name)
-            .await?;
         let ids: Vec<_> = ids.into_iter().collect();
 
         let mut result = BTreeMap::new();
 
-        for chunk in smart_chunks(&ids) {
-            let mut params = Vec::with_capacity(chunk.len() * 3);
+        let multitenant = self.multitenant;
+        let instance_name: mysql_async::Value = (&self.instance_name.raw).into();
+
+        // Track remaining items to process and fallback chunk size
+        let mut remaining: &[DocumentPrevTsQuery] = &ids;
+        let mut fallback_chunk_size: Option<usize> = None;
+
+        while !remaining.is_empty() {
+            // Avoid holding connections across yield points, to limit lifetime
+            // and improve fairness.
+            let mut client = self
+                .read_pool
+                .acquire("previous_revisions_of_documents", &self.db_name)
+                .await?;
+
+            // Determine chunk - either use smart_chunks or fallback size
+            let chunk = if let Some(max_size) = fallback_chunk_size {
+                let len = remaining.len().min(max_size);
+                &remaining[..len]
+            } else {
+                // Use first chunk from smart_chunks
+                smart_chunks(remaining).next().unwrap()
+            };
+
+            let mut params = Vec::with_capacity(
+                chunk.len() * (sql::EXACT_REV_CHUNK_PARAMS + multitenant as usize),
+            );
             let mut id_ts_to_query: HashMap<
                 (InternalDocumentId, Timestamp),
                 SmallVec<[DocumentPrevTsQuery; 1]>,
@@ -985,16 +1311,51 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
                 params.push(internal_id_param(id.table().0).into());
                 params.push(internal_doc_id_param(id).into());
                 params.push(i64::from(prev_ts).into());
+                if multitenant {
+                    params.push(instance_name.clone());
+                }
                 // the underlying query does not care about `ts` and will
                 // deduplicate, so create a map from DB results back to queries
                 id_ts_to_query.entry((id, prev_ts)).or_default().push(*q);
             }
-            let result_stream = client
-                .query_stream(exact_rev_chunk(chunk.len()), params, chunk.len())
-                .await?;
-            pin_mut!(result_stream);
-            while let Some(row) = result_stream.try_next().await? {
-                let (prev_ts, id, maybe_doc, prev_prev_ts) = self.row_to_document(row)?;
+            let results = match client
+                .query_collect(
+                    sql::exact_rev_chunk(chunk.len(), multitenant),
+                    params,
+                    chunk.len(),
+                    |row| Self::row_to_document(&row),
+                )
+                .await
+            {
+                Ok(r) => Ok(r),
+                Err(ref e) if let Some(db_err) = is_message_too_large_error(e) => {
+                    let current_size = fallback_chunk_size.unwrap_or(chunk.len());
+                    if current_size == 1 {
+                        anyhow::bail!(
+                            "Failed to load previous revisions of documents with minimum chunk \
+                             size `1`: {}",
+                            db_err.message,
+                        );
+                    }
+                    if current_size <= *MYSQL_FALLBACK_PAGE_SIZE as usize {
+                        tracing::warn!(
+                            "Falling back to chunk size `1` due to repeated server error: {}",
+                            db_err.message
+                        );
+                        fallback_chunk_size = Some(1);
+                    } else {
+                        tracing::warn!(
+                            "Falling back to chunk size `{}` due to server error: {}",
+                            *MYSQL_FALLBACK_PAGE_SIZE,
+                            db_err.message
+                        );
+                        fallback_chunk_size = Some(*MYSQL_FALLBACK_PAGE_SIZE as usize);
+                    }
+                    continue;
+                },
+                Err(e) => Err(e),
+            }?;
+            for (prev_ts, id, maybe_doc, prev_prev_ts) in results {
                 let entry = DocumentLogEntry {
                     ts: prev_ts,
                     id,
@@ -1010,6 +1371,9 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
                     anyhow::ensure!(result.insert(q, entry).is_none());
                 }
             }
+
+            // Advance past the processed chunk
+            remaining = &remaining[chunk.len()..];
         }
 
         if let Some(min_ts) = ids.iter().map(|DocumentPrevTsQuery { ts, .. }| *ts).min() {
@@ -1030,10 +1394,6 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
     ) -> anyhow::Result<BTreeMap<(InternalDocumentId, Timestamp), DocumentLogEntry>> {
         let timer = metrics::prev_revisions_timer(self.read_pool.cluster_name());
 
-        let mut client = self
-            .read_pool
-            .acquire("previous_revisions", &self.db_name)
-            .await?;
         let ids: Vec<_> = ids.into_iter().collect();
 
         let mut result = BTreeMap::new();
@@ -1041,27 +1401,89 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
         let mut results = vec![];
 
         let mut min_ts = Timestamp::MAX;
-        for chunk in smart_chunks(&ids) {
-            let mut params = vec![];
+        let multitenant = self.multitenant;
+        let instance_name: mysql_async::Value = (&self.instance_name.raw).into();
+
+        // Track remaining items to process and fallback chunk size
+        let mut remaining: &[(InternalDocumentId, Timestamp)] = &ids;
+        let mut fallback_chunk_size: Option<usize> = None;
+
+        while !remaining.is_empty() {
+            // Avoid holding connections across yield points, to limit lifetime
+            // and improve fairness.
+            let mut client = self
+                .read_pool
+                .acquire("previous_revisions", &self.db_name)
+                .await?;
+
+            // Determine chunk - either use smart_chunks or fallback size
+            let chunk = if let Some(max_size) = fallback_chunk_size {
+                let len = remaining.len().min(max_size);
+                &remaining[..len]
+            } else {
+                // Use first chunk from smart_chunks
+                smart_chunks(remaining).next().unwrap()
+            };
+
+            let mut params = Vec::with_capacity(
+                chunk.len() * (sql::PREV_REV_CHUNK_PARAMS + multitenant as usize),
+            );
             for (id, ts) in chunk {
                 params.push(i64::from(*ts).into());
                 params.push(internal_id_param(id.table().0).into());
                 params.push(internal_doc_id_param(*id).into());
                 params.push(i64::from(*ts).into());
+                if multitenant {
+                    params.push(instance_name.clone());
+                }
                 min_ts = cmp::min(*ts, min_ts);
             }
-            let result_stream = client
-                .query_stream(prev_rev_chunk(chunk.len()), params, chunk.len())
-                .await?;
-            pin_mut!(result_stream);
-            while let Some(result) = result_stream.try_next().await? {
-                results.push(result);
-            }
+            let rows = match client
+                .query_collect(
+                    sql::prev_rev_chunk(chunk.len(), multitenant),
+                    params,
+                    chunk.len(),
+                    Ok,
+                )
+                .await
+            {
+                Ok(r) => Ok(r),
+                Err(ref e) if let Some(db_err) = is_message_too_large_error(e) => {
+                    let current_size = fallback_chunk_size.unwrap_or(chunk.len());
+                    if current_size == 1 {
+                        anyhow::bail!(
+                            "Failed to load previous revisions with minimum chunk size `1`: {}",
+                            db_err.message,
+                        );
+                    }
+                    if current_size <= *MYSQL_FALLBACK_PAGE_SIZE as usize {
+                        tracing::warn!(
+                            "Falling back to chunk size `1` due to repeated server error: {}",
+                            db_err.message
+                        );
+                        fallback_chunk_size = Some(1);
+                    } else {
+                        tracing::warn!(
+                            "Falling back to chunk size `{}` due to server error: {}",
+                            *MYSQL_FALLBACK_PAGE_SIZE,
+                            db_err.message
+                        );
+                        fallback_chunk_size = Some(*MYSQL_FALLBACK_PAGE_SIZE as usize);
+                    }
+                    continue;
+                },
+                Err(e) => Err(e),
+            }?;
+
+            results.extend(rows);
+
+            // Advance past the processed chunk
+            remaining = &remaining[chunk.len()..];
         }
         for row in results.into_iter() {
-            let ts: i64 = row.get(6).unwrap();
+            let ts: i64 = row.get_opt(6).context("row[6]")??;
             let ts = Timestamp::try_from(ts)?;
-            let (prev_ts, id, maybe_doc, prev_prev_ts) = self.row_to_document(row)?;
+            let (prev_ts, id, maybe_doc, prev_prev_ts) = Self::row_to_document(&row)?;
             anyhow::ensure!(result
                 .insert(
                     (id, ts),
@@ -1105,6 +1527,7 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
         .boxed()
     }
 
+    #[fastrace::trace(properties = {"key": "{key:?}"})]
     async fn get_persistence_global(
         &self,
         key: PersistenceGlobalKey,
@@ -1113,16 +1536,17 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
             .read_pool
             .acquire("get_persistence_global", &self.db_name)
             .await?;
-        let params = vec![String::from(key).into()];
-        let row_stream = client
-            .query_stream(GET_PERSISTENCE_GLOBAL, params, 1)
+        let mut params = vec![String::from(key).into()];
+        if self.multitenant {
+            params.push(self.instance_name.to_string().into());
+        }
+        let rows = client
+            .query_collect(sql::get_persistence_global(self.multitenant), params, 1, Ok)
             .await?;
-        futures::pin_mut!(row_stream);
-
-        let row = row_stream.try_next().await?;
+        let row = rows.into_iter().next();
         let value = row.map(|r| -> anyhow::Result<JsonValue> {
-            let binary_value: Vec<u8> = r.get(0).unwrap();
-            let mut json_deserializer = serde_json::Deserializer::from_slice(&binary_value);
+            let binary_value = bytes_col(&r, 0)?;
+            let mut json_deserializer = serde_json::Deserializer::from_slice(binary_value);
             // XXX: this is bad, but shapes can get much more nested than convex values
             json_deserializer.disable_recursion_limit();
             let json_value = JsonValue::deserialize(&mut json_deserializer)
@@ -1143,18 +1567,19 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
             .acquire("table_size_stats", &self.db_name)
             .await?;
         let stats = client
-            .query_stream(TABLE_SIZE_QUERY, vec![self.db_name.clone().into()], 5)
-            .await?
-            .map(|row| {
-                let row = row?;
-                anyhow::Ok(PersistenceTableSize {
-                    table_name: row.get_opt(0).unwrap()?,
-                    data_bytes: row.get_opt(1).unwrap()?,
-                    index_bytes: row.get_opt(2).unwrap()?,
-                    row_count: row.get_opt(3).unwrap()?,
-                })
-            })
-            .try_collect()
+            .query_collect(
+                sql::TABLE_SIZE_QUERY,
+                vec![self.db_name.clone().into()],
+                5,
+                |row| {
+                    anyhow::Ok(PersistenceTableSize {
+                        table_name: row.get_opt(0).context("row[0]")??,
+                        data_bytes: row.get_opt(1).context("row[1]")??,
+                        index_bytes: row.get_opt(2).context("row[2]")??,
+                        row_count: row.get_opt(3).context("row[3]")??,
+                    })
+                },
+            )
             .await?;
         Ok(stats)
     }
@@ -1175,6 +1600,8 @@ impl<RT: Runtime> PersistenceReader for MySqlReader<RT> {
 struct Lease<RT: Runtime> {
     pool: Arc<ConvexMySqlPool<RT>>,
     db_name: String,
+    instance_name: MySqlInstanceName,
+    multitenant: bool,
     lease_ts: i64,
     lease_lost_shutdown: ShutdownSignal,
 }
@@ -1185,6 +1612,8 @@ impl<RT: Runtime> Lease<RT> {
     async fn acquire(
         pool: Arc<ConvexMySqlPool<RT>>,
         db_name: String,
+        instance_name: MySqlInstanceName,
+        multitenant: bool,
         lease_lost_shutdown: ShutdownSignal,
     ) -> anyhow::Result<Self> {
         let timer = metrics::lease_acquire_timer(pool.cluster_name());
@@ -1195,8 +1624,12 @@ impl<RT: Runtime> Lease<RT> {
             .as_nanos() as i64;
 
         tracing::info!("attempting to acquire lease");
+        let mut params = vec![ts.into(), ts.into()];
+        if multitenant {
+            params.push((&instance_name.raw).into());
+        }
         let rows_modified = client
-            .exec_iter(LEASE_ACQUIRE, vec![ts.into(), ts.into()])
+            .exec_iter(sql::lease_acquire(multitenant), params)
             .await?;
         anyhow::ensure!(
             rows_modified == 1,
@@ -1210,6 +1643,8 @@ impl<RT: Runtime> Lease<RT> {
             pool,
             lease_ts: ts,
             lease_lost_shutdown,
+            instance_name,
+            multitenant,
         })
     }
 
@@ -1224,39 +1659,44 @@ impl<RT: Runtime> Lease<RT> {
     #[fastrace::trace]
     async fn transact<F, T>(&self, f: F) -> anyhow::Result<T>
     where
-        F: for<'b> FnOnce(
-            &'b mut MySqlTransaction<'_>,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'b>>,
+        F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
         let mut client = self.pool.acquire("transact", &self.db_name).await?;
-        let mut tx = client.transaction(&self.db_name).await?;
+        let r = try_anyhow!({
+            let mut tx = client.transaction(self.pool.cluster_name()).await?;
 
-        let timer = metrics::lease_precond_timer(self.pool.cluster_name());
-        let rows: Option<Row> = tx
-            .exec_first(LEASE_PRECOND, vec![mysql_async::Value::Int(self.lease_ts)])
-            .in_span(Span::enter_with_local_parent(format!(
-                "{}::lease_precondition",
-                func_path!()
-            )))
-            .await?;
-        if rows.is_none() {
-            self.lease_lost_shutdown.signal(lease_lost_error());
-            anyhow::bail!(lease_lost_error());
-        }
-        timer.finish();
+            let timer = metrics::lease_precond_timer(self.pool.cluster_name());
+            let mut params = vec![mysql_async::Value::Int(self.lease_ts)];
+            if self.multitenant {
+                params.push((&self.instance_name.raw).into());
+            }
+            let rows: Option<Row> = tx
+                .exec_first(sql::lease_precond(self.multitenant), params)
+                .in_span(Span::enter_with_local_parent(format!(
+                    "{}::lease_precondition",
+                    func_path!()
+                )))
+                .await?;
+            if rows.is_none() {
+                self.lease_lost_shutdown.signal(lease_lost_error());
+                anyhow::bail!(lease_lost_error());
+            }
+            timer.finish();
 
-        let result = f(&mut tx)
-            .in_span(Span::enter_with_local_parent(format!(
-                "{}::execute_function",
-                func_path!()
-            )))
-            .await?;
+            let result = f(&mut tx)
+                .in_span(Span::enter_with_local_parent(format!(
+                    "{}::execute_function",
+                    func_path!()
+                )))
+                .await?;
 
-        let timer = metrics::commit_timer(self.pool.cluster_name());
-        tx.commit().await?;
-        timer.finish();
+            let timer = metrics::commit_timer(self.pool.cluster_name());
+            tx.commit().await?;
+            timer.finish();
 
-        Ok(result)
+            result
+        });
+        client.handle_errors(r).await
     }
 }
 
@@ -1264,18 +1704,20 @@ fn document_params(
     mut query: Vec<mysql_async::Value>,
     ts: Timestamp,
     id: InternalDocumentId,
-    maybe_doc: Option<ResolvedDocument>,
+    maybe_doc: Option<&ResolvedDocument>,
     prev_ts: Option<Timestamp>,
 ) -> anyhow::Result<Vec<mysql_async::Value>> {
-    let (json_str, deleted) = match maybe_doc {
-        Some(document) => (document.value().json_serialize()?, false),
-        None => (serde_json::Value::Null.to_string(), true),
-    };
+    let deleted = maybe_doc.is_none();
+    let encoded_doc = document_encoding::encode(maybe_doc)?;
+    anyhow::ensure!(
+        document_encoding::decode(&encoded_doc, id.table())?.as_ref() == maybe_doc,
+        "failed to roundtrip document encoding"
+    );
 
     query.push(internal_doc_id_param(id).into());
     query.push(i64::from(ts).into());
     query.push(internal_id_param(id.table().0).into());
-    query.push(mysql_async::Value::Bytes(json_str.into_bytes()));
+    query.push(mysql_async::Value::Bytes(encoded_doc));
     query.push(deleted.into());
     query.push(prev_ts.map(i64::from).into());
     Ok(query)
@@ -1288,25 +1730,22 @@ fn internal_id_param(id: InternalId) -> Vec<u8> {
 fn internal_doc_id_param(id: InternalDocumentId) -> Vec<u8> {
     internal_id_param(id.internal_id())
 }
-fn resolved_id_param(id: &ResolvedDocumentId) -> Vec<u8> {
-    internal_id_param(id.internal_id())
-}
 
-fn index_params(query: &mut Vec<mysql_async::Value>, ts: Timestamp, update: DatabaseIndexUpdate) {
-    let key: Vec<u8> = update.key.to_bytes().0;
+fn index_params(query: &mut Vec<mysql_async::Value>, update: &PersistenceIndexEntry) {
+    let key: Vec<u8> = update.key.to_vec();
     let key_sha256 = Sha256::hash(&key);
     let key = SplitKey::new(key);
 
     let (deleted, tablet_id, doc_id) = match &update.value {
-        DatabaseIndexValue::Deleted => (true, None, None),
-        DatabaseIndexValue::NonClustered(doc_id) => (
+        None => (true, None, None),
+        Some(doc_id) => (
             false,
-            Some(internal_id_param(doc_id.tablet_id.0)),
-            Some(resolved_id_param(doc_id)),
+            Some(internal_id_param(doc_id.table().0)),
+            Some(internal_doc_id_param(*doc_id)),
         ),
     };
     query.push(internal_id_param(update.index_id).into());
-    query.push(i64::from(ts).into());
+    query.push(i64::from(update.ts).into());
     query.push(key.prefix.into());
     query.push(
         match key.suffix {
@@ -1319,594 +1758,4 @@ fn index_params(query: &mut Vec<mysql_async::Value>, ts: Timestamp, update: Data
     query.push(deleted.into());
     query.push(tablet_id.into());
     query.push(doc_id.into());
-}
-
-const GET_TABLE_COUNT: &str = r#"
-    SELECT COUNT(1) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '@db_name';
-"#;
-
-// Expected table count after INIT_SQL is ran.
-const EXPECTED_TABLE_COUNT: usize = 5;
-
-// This runs (currently) every time a MySqlPersistence is created, so it
-// needs to not only be idempotent but not to affect any already-resident data.
-// IF NOT EXISTS and ON CONFLICT are helpful.
-const INIT_SQL: &str = r#"
-        CREATE TABLE IF NOT EXISTS @db_name.documents (
-            id VARBINARY(32) NOT NULL,
-            ts BIGINT NOT NULL,
-
-            table_id VARBINARY(32) NOT NULL,
-
-            json_value LONGBLOB NOT NULL,
-            deleted BOOLEAN DEFAULT false,
-
-            prev_ts BIGINT,
-
-            PRIMARY KEY (ts, table_id, id),
-            INDEX documents_by_table_and_id (table_id, id, ts)
-        ) ROW_FORMAT=DYNAMIC;
-
-        CREATE TABLE IF NOT EXISTS @db_name.indexes (
-            /* ids should be serialized as bytes but we keep it compatible with documents */
-            index_id VARBINARY(32) NOT NULL,
-            ts BIGINT NOT NULL,
-
-            /*
-            MySQL maximum primary key length is 3072 bytes with DYNAMIC row format,
-            which is why we split up the key. The first 2500 bytes are stored in key_prefix,
-            and the remaining ones are stored in key suffix if applicable.
-            NOTE: The key_prefix + key_suffix is store all values of IndexKey including
-            the id.
-            */
-            key_prefix VARBINARY(2500) NOT NULL,
-            key_suffix LONGBLOB NULL,
-
-            /* key_sha256 of the full key, used in primary key to avoid duplicates in case
-            of key_prefix collision. */
-            key_sha256 BINARY(32) NOT NULL,
-
-            deleted BOOLEAN,
-            /* table_id and document_id should be populated iff deleted is false. */
-            table_id VARBINARY(32) NULL,
-            document_id VARBINARY(32) NULL,
-
-            PRIMARY KEY (index_id, key_prefix, key_sha256, ts)
-        ) ROW_FORMAT=DYNAMIC;
-        CREATE TABLE IF NOT EXISTS @db_name.leases (
-            id BIGINT NOT NULL,
-            ts BIGINT NOT NULL,
-
-            PRIMARY KEY (id)
-        ) ROW_FORMAT=DYNAMIC;
-        INSERT IGNORE INTO @db_name.leases (id, ts) VALUES (1, 0);
-        CREATE TABLE IF NOT EXISTS @db_name.read_only (
-            id BIGINT NOT NULL,
-
-            PRIMARY KEY (id)
-        ) ROW_FORMAT=DYNAMIC;
-        CREATE TABLE IF NOT EXISTS @db_name.persistence_globals (
-            `key` VARCHAR(255) NOT NULL,
-            json_value LONGBLOB NOT NULL,
-
-            PRIMARY KEY (`key`)
-        ) ROW_FORMAT=DYNAMIC;"#;
-/// Load a page of documents, where timestamps are bounded by [$1, $2),
-/// and ($3, $4, $5) is the (ts, table_id, id) from the last document read.
-const LOAD_DOCS_BY_TS_PAGE_ASC: &str = r#"SELECT id, ts, table_id, json_value, deleted, prev_ts
-    FROM @db_name.documents
-    FORCE INDEX FOR ORDER BY (PRIMARY)
-    WHERE ts >= ?
-    AND ts < ?
-    AND (ts > ? OR (ts = ? AND (table_id > ? OR (table_id = ? AND id > ?))))
-    ORDER BY ts ASC, table_id ASC, id ASC
-    LIMIT ?
-"#;
-
-const LOAD_DOCS_BY_TS_PAGE_DESC: &str = r#"SELECT id, ts, table_id, json_value, deleted, prev_ts
-    FROM @db_name.documents
-    FORCE INDEX FOR ORDER BY (PRIMARY)
-    WHERE ts >= ?
-    AND ts < ?
-    AND (ts < ? OR (ts = ? AND (table_id < ? OR (table_id = ? AND id < ?))))
-    ORDER BY ts DESC, table_id DESC, id DESC
-    LIMIT ?
-"#;
-
-static INSERT_DOCUMENT_CHUNK_QUERIES: LazyLock<HashMap<usize, String>> = LazyLock::new(|| {
-    smart_chunk_sizes()
-        .map(|chunk_size| {
-            let values = (1..=chunk_size)
-                .map(|_| format!("(?, ?, ?, ?, ?, ?)"))
-                .join(", ");
-            let query = format!(
-                r#"INSERT INTO @db_name.documents
-    (id, ts, table_id, json_value, deleted, prev_ts)
-    VALUES {values}"#
-            );
-            (chunk_size, query)
-        })
-        .collect()
-});
-
-fn insert_document_chunk(chunk_size: usize) -> &'static str {
-    INSERT_DOCUMENT_CHUNK_QUERIES.get(&chunk_size).unwrap()
-}
-
-static INSERT_OVERWRITE_DOCUMENT_CHUNK_QUERIES: LazyLock<HashMap<usize, String>> =
-    LazyLock::new(|| {
-        smart_chunk_sizes()
-            .map(|chunk_size| {
-                let values = (1..=chunk_size)
-                    .map(|_| format!("(?, ?, ?, ?, ?, ?)"))
-                    .join(", ");
-                let query = format!(
-                    r#"REPLACE INTO @db_name.documents
-    (id, ts, table_id, json_value, deleted, prev_ts)
-    VALUES {values}"#
-                );
-                (chunk_size, query)
-            })
-            .collect()
-    });
-
-fn insert_overwrite_document_chunk(chunk_size: usize) -> &'static str {
-    INSERT_OVERWRITE_DOCUMENT_CHUNK_QUERIES
-        .get(&chunk_size)
-        .unwrap()
-}
-
-const LOAD_INDEXES_PAGE: &str = r#"
-SELECT
-    index_id, key_prefix, key_sha256, key_suffix, ts, deleted
-    FROM @db_name.indexes
-    FORCE INDEX FOR ORDER BY (PRIMARY)
-    WHERE index_id > ? OR (index_id = ? AND
-        (key_prefix > ? OR (key_prefix = ? AND
-        (key_sha256 > ? OR (key_sha256 = ? AND
-        ts > ?)))))
-    ORDER BY index_id ASC, key_prefix ASC, key_sha256 ASC, ts ASC
-    LIMIT ?
-"#;
-
-static INSERT_INDEX_CHUNK_QUERIES: LazyLock<HashMap<usize, String>> = LazyLock::new(|| {
-    smart_chunk_sizes()
-        .map(|chunk_size| {
-            let values = (1..=chunk_size)
-                .map(|_| format!("(?, ?, ?, ?, ?, ?, ?, ?)"))
-                .join(", ");
-            let query = format!(
-                r#"INSERT INTO @db_name.indexes
-            (index_id, ts, key_prefix, key_suffix, key_sha256, deleted, table_id, document_id)
-            VALUES {values}"#
-            );
-            (chunk_size, query)
-        })
-        .collect()
-});
-
-// Note that on conflict, there's no need to update any of the columns that are
-// part of the primary key, nor `key_suffix` as `key_sha256` is derived from the
-// prefix and suffix.
-// Only the fields that could have actually changed need to be updated.
-fn insert_index_chunk(chunk_size: usize) -> &'static str {
-    INSERT_INDEX_CHUNK_QUERIES.get(&chunk_size).unwrap()
-}
-
-static INSERT_OVERWRITE_INDEX_CHUNK_QUERIES: LazyLock<HashMap<usize, String>> =
-    LazyLock::new(|| {
-        smart_chunk_sizes()
-            .map(|chunk_size| {
-                let values = (1..=chunk_size)
-                    .map(|_| format!("(?, ?, ?, ?, ?, ?, ?, ?)"))
-                    .join(", ");
-                let query = format!(
-                    r#"INSERT INTO @db_name.indexes
-            (index_id, ts, key_prefix, key_suffix, key_sha256, deleted, table_id, document_id)
-            VALUES
-                {values}
-                ON DUPLICATE KEY UPDATE
-                deleted = VALUES(deleted),
-                table_id = VALUES(table_id),
-                document_id = VALUES(document_id)
-        "#
-                );
-                (chunk_size, query)
-            })
-            .collect()
-    });
-
-fn insert_overwrite_index_chunk(chunk_size: usize) -> &'static str {
-    INSERT_OVERWRITE_INDEX_CHUNK_QUERIES
-        .get(&chunk_size)
-        .unwrap()
-}
-
-static DELETE_INDEX_CHUNK_QUERIES: LazyLock<HashMap<usize, String>> = LazyLock::new(|| {
-    smart_chunk_sizes()
-        .map(|chunk_size| {
-            let where_clauses = (1..=chunk_size)
-                .map(|_| "(index_id = ? AND key_prefix = ? AND key_sha256 = ? AND ts <= ?)")
-                .join(" OR ");
-            (
-                chunk_size,
-                format!("DELETE FROM @db_name.indexes WHERE {where_clauses}"),
-            )
-        })
-        .collect()
-});
-
-fn delete_index_chunk(chunk_size: usize) -> &'static str {
-    DELETE_INDEX_CHUNK_QUERIES.get(&chunk_size).unwrap()
-}
-
-static DELETE_DOCUMENT_CHUNK_QUERIES: LazyLock<HashMap<usize, String>> = LazyLock::new(|| {
-    smart_chunk_sizes()
-        .map(|chunk_size| {
-            let where_clauses = (1..=chunk_size)
-                .map(|_| "(table_id = ? AND id = ? AND ts <= ?)")
-                .join(" OR ");
-            (
-                chunk_size,
-                // Note the use of "multi-table DELETE syntax" (`DELETE table
-                // FROM table WHERE ...`) which MySQL requires for FORCE INDEX
-                // syntax
-                format!(
-                    "DELETE @db_name.documents FROM @db_name.documents FORCE INDEX \
-                     (documents_by_table_and_id) WHERE {where_clauses}"
-                ),
-            )
-        })
-        .collect()
-});
-
-fn delete_document_chunk(chunk_size: usize) -> &'static str {
-    DELETE_DOCUMENT_CHUNK_QUERIES.get(&chunk_size).unwrap()
-}
-
-const WRITE_PERSISTENCE_GLOBAL: &str = r#"INSERT INTO @db_name.persistence_globals
-    (`key`, json_value)
-    VALUES (?, ?)
-    ON DUPLICATE KEY UPDATE
-    json_value = VALUES(json_value)
-"#;
-
-const GET_PERSISTENCE_GLOBAL: &str =
-    "SELECT json_value FROM @db_name.persistence_globals FORCE INDEX (PRIMARY) WHERE `key` = ?";
-
-const MAX_INSERT_SIZE: usize = 16384;
-
-// Gross: after initialization, the first thing database does is insert metadata
-// documents.
-const CHECK_NEWLY_CREATED: &str = "SELECT 1 FROM @db_name.documents LIMIT 1";
-
-// This table has no rows (not read_only) or 1 row (read_only), so if this query
-// returns any results, the persistence is read_only.
-const CHECK_IS_READ_ONLY: &str = "SELECT 1 FROM @db_name.read_only LIMIT 1";
-const SET_READ_ONLY: &str = "INSERT INTO @db_name.read_only (id) VALUES (1)";
-const UNSET_READ_ONLY: &str = "DELETE FROM @db_name.read_only WHERE id = 1";
-
-// If this query returns a result, the lease is still valid and will remain so
-// until the end of the transaction.
-const LEASE_PRECOND: &str =
-    "SELECT 1 FROM @db_name.leases FORCE INDEX (PRIMARY) WHERE id=1 AND ts=? FOR SHARE";
-
-// Acquire the lease unless acquire by someone with a higher timestamp.
-const LEASE_ACQUIRE: &str = "UPDATE @db_name.leases SET ts=? WHERE id=1 AND ts<?";
-
-#[derive(PartialEq, Eq, Hash, Copy, Clone)]
-enum BoundType {
-    Unbounded,
-    Included,
-    Excluded,
-}
-
-// Pre-build queries with various parameters.
-static INDEX_QUERIES: LazyLock<HashMap<(BoundType, BoundType, Order), String>> = LazyLock::new(
-    || {
-        let mut queries = HashMap::new();
-        // Tricks that convince MySQL to choose good query plans:
-        // 1. All queries are ordered by a prefix of columns in the primary key. If you
-        //    say `WHERE col1 = 'a' ORDER BY col2 ASC` it might not use the index, but
-        //    `WHERE col1 = 'a' ORDER BY col1 ASC, col2 ASC` which is completely
-        //    equivalent, does use the index.
-        // 2. LEFT JOIN and FORCE INDEX FOR JOIN makes the join use the index for
-        //    lookups. Despite having all index columns with equality checks, MySQL will
-        //    do a hash join if you do an INNER JOIN or a plain FORCE INDEX.
-        // 3. Tuple comparisons `(key_prefix, key_sha256) >= (?, ?)` are required for
-        //    Postgres to choose the correct query plan, but MySQL requires the other
-        //    format `(key_prefix > ? OR (key_prefix = ? AND key_sha256 >= ?))`.
-
-        let bounds = [
-            BoundType::Unbounded,
-            BoundType::Included,
-            BoundType::Excluded,
-        ];
-        let orders = [Order::Asc, Order::Desc];
-
-        // Note, we always paginate using (key_prefix, key_sha256), which doesn't
-        // necessary give us the order we need for long keys that have
-        // key_suffix.
-        for (lower, upper, order) in iproduct!(bounds.iter(), bounds.iter(), orders.iter()) {
-            // Construct the where clause imperatively.
-            let mut where_clause = String::new();
-            write!(where_clause, "index_id = ? AND ts <= ?").unwrap();
-            // Note the following clauses could be written as
-            // (key_prefix, key_sha256) {comparator} (?, ?)
-            match lower {
-                BoundType::Unbounded => {},
-                BoundType::Included => {
-                    write!(
-                        where_clause,
-                        " AND (key_prefix > ? OR (key_prefix = ? AND key_sha256 >= ?))",
-                    )
-                    .unwrap();
-                },
-                BoundType::Excluded => {
-                    write!(
-                        where_clause,
-                        " AND (key_prefix > ? OR (key_prefix = ? AND key_sha256 > ?))"
-                    )
-                    .unwrap();
-                },
-            };
-            match upper {
-                BoundType::Unbounded => {},
-                BoundType::Included => {
-                    write!(
-                        where_clause,
-                        " AND (key_prefix < ? OR (key_prefix = ? AND key_sha256 <= ?))"
-                    )
-                    .unwrap();
-                },
-                BoundType::Excluded => {
-                    write!(
-                        where_clause,
-                        " AND (key_prefix < ? OR (key_prefix = ? AND key_sha256 < ?))"
-                    )
-                    .unwrap();
-                },
-            };
-            let order_str = match order {
-                Order::Asc => "ASC",
-                Order::Desc => "DESC",
-            };
-            let query = format!(
-                r#"
-SELECT I2.index_id, I2.key_prefix, I2.key_sha256, I2.key_suffix, I2.ts, I2.deleted, I2.document_id, D.table_id, D.json_value, D.prev_ts FROM
-(
-    SELECT
-        I1.index_id, I1.key_prefix, I1.key_sha256, I1.key_suffix, I1.ts,
-        I1.deleted, I1.table_id, I1.document_id
-    FROM
-    (
-        SELECT index_id, key_prefix, key_sha256, MAX(ts) as ts_at_snapshot FROM @db_name.indexes
-        FORCE INDEX FOR GROUP BY (PRIMARY)
-        WHERE {where_clause}
-        GROUP BY index_id, key_prefix, key_sha256
-        ORDER BY index_id {order_str}, key_prefix {order_str}, key_sha256 {order_str}
-        LIMIT ?
-    ) snapshot
-    LEFT JOIN @db_name.indexes I1 FORCE INDEX FOR JOIN (PRIMARY)
-    ON
-    (I1.index_id, I1.key_prefix, I1.key_sha256, I1.ts) = (snapshot.index_id, snapshot.key_prefix, snapshot.key_sha256, snapshot.ts_at_snapshot)
-) I2
-LEFT JOIN @db_name.documents D FORCE INDEX FOR JOIN (PRIMARY)
-ON
-D.ts = I2.ts AND D.table_id = I2.table_id AND D.id = I2.document_id
-"#
-            );
-            queries.insert((*lower, *upper, *order), query);
-        }
-
-        queries
-    },
-);
-
-static EXACT_REV_CHUNK_QUERIES: LazyLock<HashMap<usize, String>> = LazyLock::new(|| {
-    smart_chunk_sizes()
-        .map(|chunk_size| {
-            let where_clause = iter::repeat("(table_id = ? AND id = ? AND ts = ?)")
-                .take(chunk_size)
-                .join(" OR ");
-            (
-                chunk_size,
-                format!(
-                    "SELECT id, ts, table_id, json_value, deleted, prev_ts
-FROM @db_name.documents FORCE INDEX (PRIMARY)
-WHERE {where_clause}
-ORDER BY ts ASC, table_id ASC, id ASC"
-                ),
-            )
-        })
-        .collect()
-});
-
-fn exact_rev_chunk(chunk_size: usize) -> &'static str {
-    EXACT_REV_CHUNK_QUERIES.get(&chunk_size).unwrap()
-}
-
-static PREV_REV_CHUNK_QUERIES: LazyLock<HashMap<usize, String>> = LazyLock::new(|| {
-    smart_chunk_sizes()
-        .map(|chunk_size| {
-            let select = r#"
-SELECT id, ts, table_id, json_value, deleted, prev_ts, ? as query_ts
-FROM @db_name.documents FORCE INDEX FOR ORDER BY (documents_by_table_and_id)
-WHERE table_id = ? AND id = ? and ts < ?
-ORDER BY table_id DESC, id DESC, ts DESC LIMIT 1
-"#;
-            let queries = (1..=chunk_size)
-                .map(|i| format!("q{i} AS ({select})"))
-                .join(", ");
-            let union_all = (1..=chunk_size)
-                .map(|i| {
-                    format!(
-                        "SELECT id, ts, table_id, json_value, deleted, prev_ts, query_ts FROM q{i}"
-                    )
-                })
-                .join(" UNION ALL ");
-            (chunk_size, format!("WITH {queries} {union_all}"))
-        })
-        .collect()
-});
-
-fn prev_rev_chunk(chunk_size: usize) -> &'static str {
-    PREV_REV_CHUNK_QUERIES.get(&chunk_size).unwrap()
-}
-
-const TABLE_SIZE_QUERY: &str = "
-SELECT table_name, data_length, index_length, table_rows
-FROM information_schema.tables
-WHERE table_schema = ?
-";
-
-const MIN_SHA256: [u8; 32] = [0; 32];
-const MAX_SHA256: [u8; 32] = [255; 32];
-
-// The key we use to paginate in SQL, note that we can't use key_prefix since
-// it is not part of the primary key. We use key_sha256 instead.
-#[derive(Clone)]
-struct SqlKey {
-    prefix: Vec<u8>,
-    sha256: Vec<u8>,
-}
-
-impl SqlKey {
-    // Returns the maximum possible
-    fn min_with_same_prefix(key: Vec<u8>) -> Self {
-        let key = SplitKey::new(key);
-        Self {
-            prefix: key.prefix,
-            sha256: MIN_SHA256.to_vec(),
-        }
-    }
-
-    fn max_with_same_prefix(key: Vec<u8>) -> Self {
-        let key = SplitKey::new(key);
-        Self {
-            prefix: key.prefix,
-            sha256: MAX_SHA256.to_vec(),
-        }
-    }
-}
-
-// Translates a range to a SqlKey bounds we can use to get records in that
-// range. Note that because the SqlKey does not sort the same way as IndexKey
-// for very long keys, the returned range might contain extra keys that needs to
-// be filtered application side.
-fn to_sql_bounds(interval: Interval) -> (Bound<SqlKey>, Bound<SqlKey>) {
-    let lower = match interval.start {
-        StartIncluded(key) => {
-            // This can potentially include more results than needed.
-            Bound::Included(SqlKey::min_with_same_prefix(key.into()))
-        },
-    };
-    let upper = match interval.end {
-        End::Excluded(key) => {
-            if key.len() < MAX_INDEX_KEY_PREFIX_LEN {
-                Bound::Excluded(SqlKey::min_with_same_prefix(key.into()))
-            } else {
-                // We can't exclude the bound without potentially excluding other
-                // keys that fall within the range.
-                Bound::Included(SqlKey::max_with_same_prefix(key.into()))
-            }
-        },
-        End::Unbounded => Bound::Unbounded,
-    };
-    (lower, upper)
-}
-
-fn index_query(
-    index_id: IndexId,
-    read_timestamp: Timestamp,
-    lower: Bound<SqlKey>,
-    upper: Bound<SqlKey>,
-    order: Order,
-    batch_size: usize,
-) -> (&'static str, Vec<mysql_async::Value>) {
-    let mut params = vec![];
-
-    let mut map_bound = |b: Bound<SqlKey>| -> BoundType {
-        match b {
-            Bound::Unbounded => BoundType::Unbounded,
-            Bound::Excluded(sql_key) => {
-                params.push(sql_key.prefix.clone());
-                params.push(sql_key.prefix);
-                params.push(sql_key.sha256);
-                BoundType::Excluded
-            },
-            Bound::Included(sql_key) => {
-                params.push(sql_key.prefix.clone());
-                params.push(sql_key.prefix);
-                params.push(sql_key.sha256);
-                BoundType::Included
-            },
-        }
-    };
-
-    let lt = map_bound(lower);
-    let ut = map_bound(upper);
-
-    let query = INDEX_QUERIES.get(&(lt, ut, order)).unwrap();
-    // Substitutions are {where_clause}, ts, {where_clause}, ts, limit.
-    let mut all_params = vec![];
-    all_params.push(internal_id_param(index_id).into());
-    all_params.push(i64::from(read_timestamp).into());
-    for param in params {
-        all_params.push(param.into());
-    }
-    all_params.push((batch_size as i64).into());
-    (query, all_params)
-}
-
-#[cfg(any(test, feature = "testing"))]
-pub mod itest {
-    use std::path::Path;
-
-    use mysql_async::{
-        prelude::Queryable,
-        Conn,
-        Params,
-    };
-    use rand::Rng;
-    use url::Url;
-
-    // Returns a url to connect to the test cluster. The URL includes username and
-    // password but no dbname.
-    pub fn cluster_opts() -> String {
-        let mysql_host = if Path::new("/convex.ro").exists() {
-            // itest
-            "mysql"
-        } else {
-            // local
-            "localhost"
-        };
-        format!("mysql://root:@{mysql_host}:3306")
-    }
-
-    pub struct MySqlOpts {
-        pub db_name: String,
-        pub url: Url,
-    }
-
-    /// Returns connection options for a guaranteed-fresh Postgres database.
-    pub async fn new_db_opts() -> anyhow::Result<MySqlOpts> {
-        let cluster_url = cluster_opts();
-        let id: [u8; 16] = rand::rng().random();
-        let db_name = "test_db_".to_string() + &hex::encode(&id[..]);
-
-        // Connect using db `mysql`, create a fresh DB, and then return the connection
-        // options for that one.
-        let mut conn = Conn::from_url(format!("{cluster_url}/mysql")).await?;
-        let query = "CREATE DATABASE ".to_string() + &db_name;
-        conn.exec_drop(query.as_str(), Params::Empty).await?;
-
-        println!("DBNAME @{db_name}");
-        Ok(MySqlOpts {
-            // We use the cluster URL to connect to connect to persistence and
-            // then pass the db_name in the query themselves.
-            url: cluster_url.parse()?,
-            db_name,
-        })
-    }
 }

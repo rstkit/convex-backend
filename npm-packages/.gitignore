@@ -43,9 +43,6 @@ jspm_packages/
 # Optional npm cache directory
 .npm
 
-# Optional eslint cache
-.eslintcache
-
 # Optional REPL history
 .node_repl_history
 
@@ -72,9 +69,6 @@ common/autoinstallers/*/.npmrc
 
 # Heft
 .heft
-
-# NPM lockfile (not needed with rush)
-package-lock.json
 
 # Rush changelog
 common/changes

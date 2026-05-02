@@ -1,64 +1,103 @@
 import {
   ArrowDownIcon,
   CaretDownIcon,
-  CaretUpIcon,
   HamburgerMenuIcon,
-  InfoCircledIcon,
   QuestionMarkCircledIcon,
 } from "@radix-ui/react-icons";
-import { Fragment, memo, useCallback, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { FixedSizeList, ListOnScrollProps, areEqual } from "react-window";
-import { useDebounce, useMeasure } from "react-use";
-import { Transition, Dialog } from "@headlessui/react";
-import isEqual from "lodash/isEqual";
+import { useMeasure } from "react-use";
 import { PauseCircleIcon, PlayCircleIcon } from "@heroicons/react/24/outline";
 import { DeploymentEventListItem } from "@common/features/logs/components/DeploymentEventListItem";
 import {
   ITEM_SIZE,
   LogListItem,
 } from "@common/features/logs/components/LogListItem";
-import { LogToolbar } from "@common/features/logs/components/LogToolbar";
-import { filterLogs } from "@common/features/logs/lib/filterLogs";
 import { UdfLog } from "@common/lib/useLogs";
 import {
   InterleavedLog,
   interleaveLogs,
+  getLogKey,
 } from "@common/features/logs/lib/interleaveLogs";
 import { DeploymentAuditLogEvent } from "@common/lib/useDeploymentAuditLog";
-import { NENT_APP_PLACEHOLDER, Nent } from "@common/lib/useNents";
 import { Sheet } from "@ui/Sheet";
 import { Tooltip } from "@ui/Tooltip";
+import { HelpTooltip } from "@ui/HelpTooltip";
 import { InfiniteScrollList } from "@common/elements/InfiniteScrollList";
 import { Button } from "@ui/Button";
-import { ClosePanelButton } from "@ui/ClosePanelButton";
-import { CopyTextButton } from "@common/elements/CopyTextButton";
-import { TextInput } from "@ui/TextInput";
-import { MultiSelectValue } from "@ui/MultiSelectCombobox";
+import { Panel, PanelGroup } from "react-resizable-panels";
+import { cn } from "@ui/cn";
+import { ResizeHandle } from "@common/layouts/SidebarDetailLayout";
+import { LogDrilldown } from "./LogDrilldown";
 
 export type LogListProps = {
   logs?: UdfLog[];
+  pausedLogs?: UdfLog[];
   filteredLogs?: UdfLog[];
   deploymentAuditLogs?: DeploymentAuditLogEvent[];
-  filter: string;
+  setFilter?: (filter: string) => void;
   clearedLogs: number[];
   setClearedLogs: (clearedLogs: number[]) => void;
-  nents: Nent[];
   paused: boolean;
   setPaused: (paused: boolean) => void;
   setManuallyPaused: (paused: boolean) => void;
 };
 
+/**
+ * Hook to manage hit boundary state with automatic timeout reset.
+ * When a boundary is hit, it will automatically reset to null after 750ms.
+ */
+export function useHitBoundary() {
+  const [hitBoundary, setHitBoundaryState] = useState<"top" | "bottom" | null>(
+    null,
+  );
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const setHitBoundary = useCallback((boundary: "top" | "bottom" | null) => {
+    // Clear any existing timeout
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+
+    setHitBoundaryState(boundary);
+
+    // If setting a boundary (not null), schedule auto-reset
+    if (boundary !== null) {
+      timeoutRef.current = setTimeout(() => {
+        setHitBoundaryState(null);
+        timeoutRef.current = null;
+      }, 750);
+    }
+  }, []);
+
+  // Cleanup timeout on unmount
+  useEffect(
+    () => () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    },
+    [],
+  );
+
+  return { hitBoundary, setHitBoundary };
+}
+
 export function LogList({
   logs,
+  pausedLogs,
   filteredLogs,
   deploymentAuditLogs,
   clearedLogs,
   setClearedLogs,
-  nents,
   paused,
   setPaused,
   setManuallyPaused,
+  setFilter,
 }: LogListProps) {
+  const focusTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   const interleavedLogs = interleaveLogs(
     filteredLogs ?? [],
     deploymentAuditLogs ?? [],
@@ -68,51 +107,149 @@ export function LogList({
   const [sheetRef, { height: heightOfListContainer }] =
     useMeasure<HTMLDivElement>();
 
-  const [shownLog, setShownLog] = useState<UdfLog>();
+  // Local state for hit boundary with automatic timeout reset
+  const { hitBoundary, setHitBoundary } = useHitBoundary();
+
+  // Local state for shown log
+  const [shownLog, setShownLog] = useState<InterleavedLog | undefined>(
+    undefined,
+  );
+
+  // Ref to the virtualized list for programmatic scrolling
+  const listRef = useRef<FixedSizeList>(null);
+
+  // Ref to the outer div container for calculating page size
+  const outerRef = useRef<HTMLDivElement>(null);
+
+  const handleSelectLog = useCallback(
+    (log: InterleavedLog) => {
+      setShownLog(log);
+
+      // Scroll to the log in the virtualized list
+      if (listRef.current && interleavedLogs) {
+        const index = interleavedLogs.findIndex(
+          (l) => getLogKey(l) === getLogKey(log),
+        );
+        if (index !== -1) {
+          listRef.current.scrollToItem(index, "smart");
+
+          // Clear any existing focus timeout
+          if (focusTimeoutRef.current) {
+            clearTimeout(focusTimeoutRef.current);
+            focusTimeoutRef.current = null;
+          }
+
+          // Focus the button element after scroll completes
+          // Use a short timeout to allow the scroll to complete
+          focusTimeoutRef.current = setTimeout(() => {
+            const logKey = getLogKey(log);
+            const button = document.querySelector(
+              `[data-log-key="${logKey}"]`,
+            ) as HTMLButtonElement;
+            if (button && document.activeElement !== button) {
+              button.focus();
+            }
+          }, 50);
+        }
+      }
+    },
+    [interleavedLogs],
+  );
 
   const hasFilters =
     !!logs && !!filteredLogs && filteredLogs.length !== logs.length;
 
   const onScroll = useCallback(
     ({ scrollOffset }: ListOnScrollProps) => {
-      if (scrollOffset === 0) {
+      if (scrollOffset === 0 && !shownLog) {
         setPaused(false);
-      } else {
-        !paused && setPaused(true);
+      } else if (!paused) {
+        setPaused(true);
       }
     },
-    [paused, setPaused],
+    [paused, setPaused, shownLog],
   );
 
   return (
-    <div className="flex h-full w-full flex-auto flex-col gap-2 overflow-hidden">
-      {shownLog && logs && (
-        <RequestIdLogs
-          requestId={shownLog}
-          logs={logs.filter((log) => log.requestId === shownLog?.requestId)}
-          onClose={() => setShownLog(undefined)}
-          nents={nents}
-        />
-      )}
-      {interleavedLogs !== undefined && (
-        <Sheet className="min-h-full w-full" padding={false} ref={sheetRef}>
-          {heightOfListContainer !== 0 && (
+    <Sheet
+      className="h-full w-full overflow-hidden"
+      padding={false}
+      ref={sheetRef}
+    >
+      <PanelGroup
+        direction="horizontal"
+        className="flex h-full w-full flex-auto overflow-hidden"
+        autoSaveId="logs-content"
+      >
+        <Panel
+          id="log-list-panel"
+          order={0}
+          className={cn(
+            "flex shrink flex-col",
+            "max-w-full",
+            shownLog ? "min-w-[16rem]" : "min-w-[20rem]",
+          )}
+          defaultSize={100}
+          minSize={10}
+        >
+          {interleavedLogs !== undefined && heightOfListContainer !== 0 && (
             <WindowedLogList
               {...{
                 onScroll,
                 interleavedLogs,
                 setClearedLogs,
                 clearedLogs,
-                setShownLog,
+                setShownLog: handleSelectLog,
                 hasFilters,
                 paused,
                 setManuallyPaused,
+                hitBoundary,
+                shownLog,
+                listRef,
+                outerRef,
               }}
             />
           )}
-        </Sheet>
-      )}
-    </div>
+        </Panel>
+        {shownLog && logs && (
+          <>
+            <ResizeHandle collapsed={false} direction="left" />
+            <Panel
+              id="log-drilldown-panel"
+              order={1}
+              defaultSize={10}
+              minSize={10}
+              className="flex min-w-[24rem] flex-col"
+            >
+              <LogDrilldown
+                requestId={
+                  shownLog.kind === "ExecutionLog"
+                    ? shownLog.executionLog.requestId
+                    : undefined
+                }
+                shownInterleavedLogs={interleavedLogs}
+                allUdfLogs={
+                  shownLog.kind === "ExecutionLog"
+                    ? [...logs, ...(pausedLogs ?? [])].filter(
+                        (log) =>
+                          log.requestId === shownLog.executionLog.requestId,
+                      )
+                    : []
+                }
+                onClose={() => setShownLog(undefined)}
+                selectedLog={shownLog}
+                onFilterByRequestId={(requestId) => {
+                  setFilter?.(requestId);
+                }}
+                onSelectLog={handleSelectLog}
+                onHitBoundary={setHitBoundary}
+                logListContainerRef={outerRef}
+              />
+            </Panel>
+          </>
+        )}
+      </PanelGroup>
+    </Sheet>
   );
 }
 
@@ -125,74 +262,79 @@ function WindowedLogList({
   hasFilters,
   paused,
   setManuallyPaused,
+  shownLog,
+  hitBoundary,
+  listRef,
+  outerRef,
 }: {
   interleavedLogs: InterleavedLog[];
   setClearedLogs: (clearedLogs: number[]) => void;
   clearedLogs: number[];
   onScroll: (e: ListOnScrollProps) => void;
-  setShownLog(shown: UdfLog | undefined): void;
+  setShownLog(shown: InterleavedLog | undefined): void;
   hasFilters: boolean;
   paused: boolean;
   setManuallyPaused(paused: boolean): void;
+  shownLog?: InterleavedLog;
+  hitBoundary: "top" | "bottom" | null;
+  listRef: React.RefObject<FixedSizeList>;
+  outerRef: React.RefObject<HTMLDivElement>;
 }) {
-  const listRef = useRef<FixedSizeList>(null);
-  const outerRef = useRef<HTMLDivElement>(null);
-
   return (
-    <div className="flex h-full flex-col">
-      <LogListHeader
-        paused={paused}
-        setManuallyPaused={setManuallyPaused}
-        listRef={listRef}
-        outerRef={outerRef}
-      />
-      {interleavedLogs.length === 0 ? (
-        <div className="ml-2 mt-2 animate-fadeInFromLoading text-sm text-content-secondary">
-          {hasFilters && (
-            <p className="mb-2 flex items-center gap-1">
-              No logs match your filters{" "}
-              <Tooltip
-                tip="The logs page is a realtime stream of events in this deployment. To store a longer history of logs, you may
-configure a log stream."
-              >
-                <InfoCircledIcon />
-              </Tooltip>
-            </p>
-          )}
-          <p className="animate-blink">Waiting for new logs...</p>
-        </div>
-      ) : (
-        <div className="grow">
-          <InfiniteScrollList
-            className="rounded-b bg-background-secondary scrollbar"
-            overscanCount={25}
-            onScroll={onScroll}
-            outerRef={outerRef}
-            listRef={listRef}
-            itemKey={(index) => {
-              const log = interleavedLogs[index];
-              switch (log.kind) {
-                case "ExecutionLog":
-                  return log.executionLog.id;
-                case "DeploymentEvent":
-                  return log.deploymentEvent._id;
-                default:
-                  return "clearedLogs";
-              }
-            }}
-            items={interleavedLogs}
-            totalNumItems={interleavedLogs.length}
-            itemSize={ITEM_SIZE}
-            itemData={{
-              interleavedLogs,
-              setClearedLogs,
-              clearedLogs,
-              setShownLog,
-            }}
-            RowOrLoading={LogListRow}
-          />
-        </div>
-      )}
+    <div className="scrollbar flex h-full min-w-0 flex-col overflow-x-auto overflow-y-hidden">
+      <div className="flex h-full min-w-fit flex-col">
+        <LogListHeader
+          hasLogOpen={shownLog !== undefined}
+          paused={paused}
+          setManuallyPaused={setManuallyPaused}
+          listRef={listRef}
+          outerRef={outerRef}
+        />
+        {interleavedLogs.length === 0 ? (
+          <div className="mt-2 ml-2 animate-fadeInFromLoading text-sm text-content-secondary">
+            {hasFilters && (
+              <p className="mb-2 flex items-center gap-1">
+                No logs match your filters{" "}
+                <HelpTooltip>
+                  The logs page is a realtime stream of events in this
+                  deployment. To store a longer history of logs, you may
+                  configure a log stream.
+                </HelpTooltip>
+              </p>
+            )}
+            <p className="animate-blink">Waiting for new logs...</p>
+          </div>
+        ) : (
+          <div className="grow rounded-b-lg">
+            <InfiniteScrollList
+              className="scrollbar bg-background-secondary"
+              style={{
+                overflowX: "hidden",
+              }}
+              overscanCount={25}
+              onScroll={onScroll}
+              outerRef={outerRef}
+              listRef={listRef}
+              itemKey={(index) => {
+                const log = interleavedLogs[index];
+                return getLogKey(log);
+              }}
+              items={interleavedLogs}
+              totalNumItems={interleavedLogs.length}
+              itemSize={ITEM_SIZE}
+              itemData={{
+                interleavedLogs,
+                setClearedLogs,
+                clearedLogs,
+                setShownLog,
+                selectedLog: shownLog,
+                hitBoundary,
+              }}
+              RowOrLoading={LogListRow}
+            />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -218,8 +360,10 @@ type LogItemProps = {
   data: {
     interleavedLogs: InterleavedLog[];
     setClearedLogs: (clearedLogs: number[]) => void;
-    setShownLog(shown: UdfLog | undefined): void;
+    setShownLog(shown: InterleavedLog | undefined): void;
     clearedLogs: number[];
+    selectedLog?: InterleavedLog;
+    hitBoundary?: "top" | "bottom" | null;
   };
   index: number;
   style: any;
@@ -228,35 +372,60 @@ type LogItemProps = {
 const LogListRow = memo(LogListRowImpl, areEqual);
 
 function LogListRowImpl({ data, index, style }: LogItemProps) {
-  const { setClearedLogs, clearedLogs, interleavedLogs, setShownLog } = data;
+  const {
+    setClearedLogs,
+    clearedLogs,
+    interleavedLogs,
+    setShownLog,
+    selectedLog,
+    hitBoundary,
+  } = data;
   const log = interleavedLogs[index];
+
+  const isFocused = selectedLog
+    ? getLogKey(log) === getLogKey(selectedLog)
+    : false;
+
+  const logKey = getLogKey(log);
 
   let item: React.ReactNode = null;
 
   switch (log.kind) {
     case "ClearedLogs":
       item = (
-        <div style={{ height: CLEARED_LOGS_BUTTON_HEIGHT }}>
-          <Button
-            icon={<ArrowDownIcon />}
-            inline
-            size="xs"
-            className="w-full rounded-none pl-2"
-            style={{ height: ITEM_SIZE }}
-            onClick={() => {
-              setClearedLogs(clearedLogs.slice(0, clearedLogs.length - 1));
-            }}
-          >
-            Show previous logs
-          </Button>
-        </div>
+        <ClearedLogsButton
+          focused={isFocused}
+          hitBoundary={hitBoundary}
+          onClick={() => {
+            setClearedLogs(clearedLogs.slice(0, clearedLogs.length - 1));
+            setShownLog(undefined);
+          }}
+          onFocus={() => setShownLog(log)}
+          logKey={logKey}
+        />
       );
       break;
     case "DeploymentEvent":
-      item = <DeploymentEventListItem event={log.deploymentEvent} />;
+      item = (
+        <DeploymentEventListItem
+          event={log.deploymentEvent}
+          focused={isFocused}
+          hitBoundary={hitBoundary}
+          setShownLog={() => setShownLog(log)}
+          logKey={logKey}
+        />
+      );
       break;
     default:
-      item = <LogListItem log={log.executionLog} setShownLog={setShownLog} />;
+      item = (
+        <LogListItem
+          log={log.executionLog}
+          setShownLog={() => setShownLog(log)}
+          focused={isFocused}
+          hitBoundary={hitBoundary}
+          logKey={logKey}
+        />
+      );
       break;
   }
 
@@ -273,169 +442,68 @@ function LogListRowImpl({ data, index, style }: LogItemProps) {
   );
 }
 
-const CLEARED_LOGS_BUTTON_HEIGHT = 36;
+const CLEARED_LOGS_BUTTON_HEIGHT = 24;
 
-function RequestIdLogs({
-  requestId,
-  logs,
-  onClose,
-  nents,
+function ClearedLogsButton({
+  focused,
+  hitBoundary,
+  onClick,
+  onFocus,
+  logKey,
 }: {
-  requestId: { requestId: string; executionId: string };
-  logs: UdfLog[];
-  onClose: () => void;
-  nents: Nent[];
+  focused: boolean;
+  hitBoundary?: "top" | "bottom" | null;
+  onClick: () => void;
+  onFocus: () => void;
+  logKey?: string;
 }) {
-  const [filter, setFilter] = useState("");
-
-  const functions = Array.from(
-    new Set(
-      logs.flatMap((log) => {
-        const logFunctions = [log.call];
-        if (log.kind === "log" && log.output.subfunction !== undefined) {
-          logFunctions.push(log.output.subfunction);
-        }
-        return logFunctions;
-      }),
-    ),
-  );
-  const [selectedFunctions, setSelectedFunctions] =
-    useState<MultiSelectValue>("all");
-
-  const [selectedLevels, setSelectedLevels] = useState<MultiSelectValue>("all");
-
-  const filters = {
-    logTypes: selectedLevels,
-    functions,
-    selectedFunctions,
-    selectedNents: "all" as MultiSelectValue,
-    filter,
+  const handleClick = () => {
+    onFocus();
+    onClick();
   };
 
-  const [innerFilter, setInnerFilter] = useState(filter);
-  useDebounce(
-    () => {
-      setFilter(innerFilter);
-    },
-    200,
-    [innerFilter],
-  );
-
-  const filteredLogs = filterLogs(filters, logs);
+  // Only show boundary animation on the focused item
+  const showBoundary = focused && hitBoundary;
 
   return (
-    <Transition.Root show as={Fragment} appear afterLeave={onClose}>
-      <Dialog
-        as="div"
-        className="fixed inset-0 z-40 overflow-hidden"
-        onClose={onClose}
+    <div
+      style={{ height: CLEARED_LOGS_BUTTON_HEIGHT }}
+      className={cn(
+        showBoundary === "top" && "animate-[bounceTop_0.375s_ease-out]",
+        showBoundary === "bottom" && "animate-[bounceBottom_0.375s_ease-out]",
+      )}
+    >
+      <Button
+        data-log-key={logKey}
+        icon={<ArrowDownIcon />}
+        inline
+        size="xs"
+        className="w-full rounded-none pl-2"
+        style={{ height: ITEM_SIZE }}
+        onClick={handleClick}
+        tabIndex={0}
       >
-        <div className="absolute inset-0 overflow-hidden">
-          <Transition.Child
-            as={Fragment}
-            enter="ease-in-out duration-300"
-            enterFrom="opacity-0"
-            enterTo="opacity-100"
-            leave="ease-in-out duration-300"
-            leaveFrom="opacity-100"
-            leaveTo="opacity-0"
-          >
-            <Dialog.Overlay className="absolute inset-0" />
-          </Transition.Child>
-
-          <div className="fixed inset-y-0 right-0 flex max-w-full pl-10">
-            <Transition.Child
-              as={Fragment}
-              enter="transform transition ease-in-out duration-300"
-              enterFrom="translate-x-full"
-              enterTo="translate-x-0"
-              leave="transform transition ease-in-out duration-300"
-              leaveFrom="translate-x-0"
-              leaveTo="translate-x-full"
-            >
-              <div className="w-screen max-w-md sm:max-w-lg md:max-w-xl lg:max-w-3xl xl:max-w-5xl">
-                <div className="flex h-full max-h-full flex-col bg-background-secondary shadow-xl dark:border">
-                  {/* Header */}
-                  <div className="mb-1 px-6 pt-6">
-                    <div className="flex items-center justify-between gap-4">
-                      <Dialog.Title as="h4">Request logs</Dialog.Title>
-                      <ClosePanelButton onClose={onClose} />
-                    </div>
-                  </div>
-
-                  <div className="mx-6 flex flex-col gap-2">
-                    <LogToolbar
-                      firstItem={
-                        <span className="flex grow items-center gap-2 text-sm text-content-secondary">
-                          Logs filtered to request:{" "}
-                          <CopyTextButton
-                            className="font-mono text-xs font-semibold"
-                            text={requestId.requestId}
-                          />
-                        </span>
-                      }
-                      functions={functions}
-                      selectedFunctions={selectedFunctions}
-                      setSelectedFunctions={setSelectedFunctions}
-                      selectedLevels={selectedLevels}
-                      setSelectedLevels={setSelectedLevels}
-                      selectedNents={[
-                        ...nents.map((n) => n.path),
-                        NENT_APP_PLACEHOLDER,
-                      ]}
-                      // Nents are not used in this view
-                      setSelectedNents={() => {}}
-                    />
-                    <TextInput
-                      id="Search logs"
-                      outerClassname="w-full"
-                      placeholder="Filter logs..."
-                      value={innerFilter}
-                      onChange={(e) => setInnerFilter(e.target.value)}
-                      type="search"
-                    />
-                  </div>
-                  {filteredLogs && filteredLogs.length > 0 ? (
-                    <div className="mx-6 my-4 flex grow flex-col overflow-y-hidden rounded border text-xs">
-                      <RequestIdLogsHeader />
-                      <div className="flex grow flex-col divide-y overflow-y-auto font-mono scrollbar">
-                        {filteredLogs.map((log, idx) => (
-                          <LogListItem
-                            key={idx}
-                            log={log}
-                            focused={isEqual(log, requestId)}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="mx-6 mt-4 text-sm text-content-secondary">
-                      No logs match your filters.
-                    </div>
-                  )}
-                </div>
-              </div>
-            </Transition.Child>
-          </div>
-        </div>
-      </Dialog>
-    </Transition.Root>
+        Show previous logs
+      </Button>
+    </div>
   );
 }
 
 function LogListHeader({
+  hasLogOpen,
   paused,
   setManuallyPaused,
   listRef,
   outerRef,
 }: {
+  hasLogOpen: boolean;
   paused: boolean;
   setManuallyPaused(paused: boolean): void;
   listRef: React.RefObject<FixedSizeList>;
   outerRef: React.RefObject<HTMLDivElement>;
 }) {
   return (
-    <div className="flex items-center gap-4 border-b p-1 pl-2.5 text-xs text-content-secondary">
+    <div className="flex w-full items-center gap-4 border-b p-1 pl-2.5 text-xs text-content-secondary">
       <TimestampColumn />
       <div className="flex min-w-8 items-center gap-1 text-center">
         ID
@@ -446,7 +514,7 @@ function LogListHeader({
       <StatusColumn />
       <FunctionColumn />
 
-      <div className="ml-auto">
+      <div className={cn("sticky right-1", hasLogOpen ? "shadow-lg" : "")}>
         <Button
           size="xs"
           className="text-xs"
@@ -478,20 +546,6 @@ function LogListHeader({
   );
 }
 
-function RequestIdLogsHeader() {
-  return (
-    <div className="flex items-center gap-4 border-b py-2 pl-2 text-xs text-content-secondary">
-      <div className="flex min-w-[9.25rem] items-center gap-1">
-        Timestamp
-        <Tooltip tip="Logs are sorted by timestamp, with the oldest logs appearing first.">
-          <CaretUpIcon />
-        </Tooltip>
-      </div>
-      {/* Not showing any other columns except timestamp for now because of the varied content shown in LogListItem in the RequestIdLogsView */}
-    </div>
-  );
-}
-
 function TimestampColumn() {
   return (
     <div className="flex min-w-[9.25rem] items-center gap-1">
@@ -503,7 +557,7 @@ function TimestampColumn() {
   );
 }
 function FunctionColumn() {
-  return <div className="flex min-w-60 items-center gap-1">Function</div>;
+  return <div className="flex min-w-60 grow items-center gap-1">Function</div>;
 }
 
 function StatusColumn() {

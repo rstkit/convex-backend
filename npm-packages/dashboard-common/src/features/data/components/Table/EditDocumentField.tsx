@@ -4,7 +4,7 @@ import { useId, useState } from "react";
 import udfs from "@common/udfs";
 import { ValidatorJSON, Value } from "convex/values";
 import isEqual from "lodash/isEqual";
-import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/patchDocumentsFields";
+import { UNDEFINED_PLACEHOLDER } from "system-udfs/convex/_system/frontend/lib/values";
 import { ObjectEditor } from "@common/elements/ObjectEditor/ObjectEditor";
 import { Button } from "@ui/Button";
 
@@ -67,7 +67,7 @@ export function EditDocumentField({
     >
       {/* Monaco editor cannot show a placeholder, so render our own. */}
       {!innerText && editedValue === UNDEFINED_PLACEHOLDER && (
-        <div className="absolute left-2.5 top-2.5 z-50 select-none font-mono text-xs italic text-content-secondary">
+        <div className="absolute top-2.5 left-2.5 z-50 font-mono text-xs text-content-secondary italic select-none">
           {value.length > 1 ? "enter a value to save" : "unset"}
         </div>
       )}
@@ -79,7 +79,7 @@ export function EditDocumentField({
         onChange={setEditedValue}
         onChangeInnerText={setInnerText}
         onError={(errors) => {
-          errors.length > 0 ? setEditError(errors[0]) : setEditError(undefined);
+          setEditError(errors.length > 0 ? errors[0] : undefined);
         }}
         disableFolding
         className="border-border-selected bg-background-secondary px-2"
@@ -90,7 +90,7 @@ export function EditDocumentField({
       />
       {editError && (
         <p
-          className="overflow-y-auto truncate font-mono text-xs text-content-errorSecondary"
+          className="truncate overflow-y-auto font-mono text-xs text-content-errorSecondary"
           role="alert"
         >
           {editError}

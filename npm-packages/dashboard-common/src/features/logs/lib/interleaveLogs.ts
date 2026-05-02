@@ -15,6 +15,42 @@ export type InterleavedLog =
       timestamp: number;
     };
 
+// Helper to get timestamp from InterleavedLog
+export function getTimestamp(log: InterleavedLog): number {
+  if (!log) {
+    return 0;
+  }
+  switch (log.kind) {
+    case "ExecutionLog":
+      return log.executionLog.timestamp;
+    case "DeploymentEvent":
+      return log.deploymentEvent._creationTime;
+    case "ClearedLogs":
+      return log.timestamp;
+    default:
+      log satisfies never;
+      return 0;
+  }
+}
+
+/**
+ * Get a unique key for an InterleavedLog that can be used for comparison.
+ * Uses kind, timestamp, and id (if available) to ensure uniqueness.
+ */
+export function getLogKey(log: InterleavedLog): string {
+  if (!log) {
+    return "";
+  }
+  const timestamp = getTimestamp(log);
+  if (log.kind === "ExecutionLog") {
+    return `${log.kind}-${timestamp}-${log.executionLog.id}`;
+  }
+  if (log.kind === "DeploymentEvent") {
+    return `${log.kind}-${timestamp}-${log.deploymentEvent._id}`;
+  }
+  return `${log.kind}-${timestamp}`;
+}
+
 /**
  * Given two arrays of logs sorted from least recent to most recent, interleave
  * them based on time.

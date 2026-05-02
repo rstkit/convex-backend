@@ -133,7 +133,7 @@ export function FilesList({
     }
   }, [allSelected, someSelected, files, setSelectedFiles]);
 
-  // Setup Tanstack table
+  // Setup TanStack table
   const columns = useFileColumns();
 
   const tableInstance = useReactTable({
@@ -161,12 +161,12 @@ export function FilesList({
 
   return (
     <div
-      className="flex min-w-[37.5rem] max-w-[60rem] grow flex-col gap-4"
+      className="flex max-w-[60rem] min-w-[37.5rem] grow flex-col gap-4"
       ref={containerRef}
     >
       <Sheet
         padding={false}
-        className="flex grow animate-fadeInFromLoading flex-col scrollbar"
+        className="flex grow animate-fadeInFromLoading flex-col overflow-hidden"
       >
         <div className="flex max-h-full grow flex-col">
           <FileStorageListHeader
@@ -204,7 +204,7 @@ export function FilesList({
           ) : (
             <div className="h-full">
               <InfiniteScrollList
-                className="min-w-[36.25rem] scrollbar"
+                className="scrollbar min-w-[36.25rem]"
                 style={{
                   scrollbarGutter: "stable",
                 }}

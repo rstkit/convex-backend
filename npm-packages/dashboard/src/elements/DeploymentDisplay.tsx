@@ -1,25 +1,97 @@
-import { CommandLineIcon, SignalIcon } from "@heroicons/react/20/solid";
-import { GearIcon, GlobeIcon, Pencil2Icon } from "@radix-ui/react-icons";
+import {
+  CommandLineIcon,
+  SignalIcon,
+  WrenchIcon,
+} from "@heroicons/react/24/outline";
+import { CaretSortIcon, GearIcon, Pencil2Icon } from "@radix-ui/react-icons";
 import { useCurrentDeployment, useDeployments } from "api/deployments";
-import { useCurrentTeam, useTeamMembers } from "api/teams";
-import { useProjectById } from "api/projects";
+import { useCurrentTeam, useTeamEntitlements, useTeamMembers } from "api/teams";
 import { useProfile } from "api/profile";
-import { useRememberLastViewedDeployment } from "hooks/useLastViewed";
+import { useRememberLastViewedDeploymentForProject } from "hooks/useLastViewed";
 import { cn } from "@ui/cn";
 import { useRouter } from "next/router";
+import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
+import { ProjectDetails, DeploymentResponse, TeamResponse } from "generatedApi";
+import { Button } from "@ui/Button";
+import { ContextMenu } from "@common/features/data/components/ContextMenu";
+import { DeploymentMenuOptions } from "components/header/ProjectSelector/DeploymentMenuOptions";
+import { useCurrentProject } from "api/projects";
+import { useRef, useState, useEffect } from "react";
 import {
-  DeploymentResponse,
-  ProjectDetails,
-  DeploymentType,
-} from "generatedApi";
+  PROVISION_DEV_PAGE_NAME,
+  PROVISION_PROD_PAGE_NAME,
+} from "@common/lib/deploymentContext";
+import { deploymentTypeColorClasses } from "@common/lib/deploymentTypeColorClasses";
+import { useHotkeys } from "react-hotkeys-hook";
+import { useListVanityDomains } from "api/vanityDomains";
+import { useQuery } from "convex/react";
+import udfs from "@common/udfs";
+import { DeploymentProvider } from "components/projectSettings/CustomDomains";
+import { useContainerWidth } from "../hooks/useContainerWidth";
 
+function DeploymentDomainInfo({
+  deployment,
+  deployments,
+  whoseName,
+}: {
+  deployment: PlatformDeploymentResponse;
+  deployments: PlatformDeploymentResponse[];
+  whoseName: string | null;
+}) {
+  const team = useCurrentTeam();
+  const hasEntitlement = !!useTeamEntitlements(team?.id)?.customDomainsEnabled;
+  const domains = useListVanityDomains(
+    hasEntitlement ? deployment?.name : undefined,
+  );
+  const vanityCloudDomains = domains?.filter(
+    (d) => d.requestDestination === "convexCloud",
+  );
+  const canonicalCloudUrl = useQuery(udfs.convexCloudUrl.default);
+  const vanityDomain =
+    vanityCloudDomains?.find((d) => d.domain === canonicalCloudUrl) ||
+    vanityCloudDomains?.[0];
+  return (
+    <DeploymentLabel
+      deployment={deployment}
+      whoseName={whoseName}
+      deployments={deployments}
+      vanityUrl={
+        vanityDomain?.verificationTime ? vanityDomain.domain : undefined
+      }
+    />
+  );
+}
+
+function DeploymentLabelWrapper({
+  deployment,
+  whoseName,
+  deployments,
+  deploymentName,
+}: {
+  deployment: PlatformDeploymentResponse;
+  whoseName: string | null;
+  deployments: PlatformDeploymentResponse[];
+  deploymentName: string;
+}) {
+  return (
+    <DeploymentProvider deploymentName={deploymentName}>
+      <DeploymentDomainInfo
+        deployment={deployment}
+        whoseName={whoseName}
+        deployments={deployments}
+      />
+    </DeploymentProvider>
+  );
+}
+
+// TODO(ENG-10340) Use references here to disambiguate non-default dev/prod deployments
 export function DeploymentDisplay({ project }: { project: ProjectDetails }) {
   const router = useRouter();
 
   const deployment = useCurrentDeployment();
   const member = useProfile();
 
-  useRememberLastViewedDeployment(deployment?.name);
+  useRememberLastViewedDeploymentForProject(project.slug, deployment?.name);
 
   const teamMembers = useTeamMembers(project.teamId);
 
@@ -36,97 +108,391 @@ export function DeploymentDisplay({ project }: { project: ProjectDetails }) {
   const profile = useProfile();
   const whoseName =
     whose?.email === profile?.email
-      ? profile?.name || profile?.email
+      ? null
       : whose?.name || whose?.email || "Teammate";
 
   const isProjectSettings = router.route.endsWith("/[project]/settings");
+  const isProvisionProd = router.route.endsWith(
+    `/[project]/${PROVISION_PROD_PAGE_NAME}`,
+  );
+  const isProvisionDev = router.route.endsWith(
+    `/[project]/${PROVISION_DEV_PAGE_NAME}`,
+  );
+  const isProvisionPage = isProvisionProd || isProvisionDev;
+  const team = useCurrentTeam();
+  const currentProject = useCurrentProject();
+
+  const { deployments: deploymentData } = useDeployments(currentProject?.id);
+  const deployments = deploymentData || [];
+  const projectSlug = currentProject?.slug;
+  const selectedTeamSlug = team?.slug;
+  const projectsURI = `/t/${selectedTeamSlug}/${projectSlug}`;
+  const currentView = router.asPath.split("/").slice(5).join("/");
+  const devDeployments = deployments.filter(
+    (d) => d.deploymentType === "dev" && d.creator === member?.id,
+  );
+  const defaultProd = deployments.find(
+    (d) => d.kind === "cloud" && d.deploymentType === "prod" && d.isDefault,
+  );
+
+  // Hotkeys
+  useHotkeys(
+    "ctrl+alt+1",
+    () => {
+      if (defaultProd) {
+        void router.push(`${projectsURI}/${defaultProd.name}/${currentView}`);
+      } else {
+        void router.push(`${projectsURI}/${PROVISION_PROD_PAGE_NAME}`);
+      }
+    },
+    [defaultProd, projectsURI, currentView],
+  );
+  useHotkeys(
+    devDeployments.length === 0 ? [`ctrl+alt+2`] : [],
+    () => {
+      void router.push(`${projectsURI}/${PROVISION_DEV_PAGE_NAME}`);
+    },
+    [devDeployments, projectsURI],
+  );
+  useHotkeys(
+    Array.from({ length: devDeployments.length }, (_, idx) => [
+      `ctrl+alt+${idx + 2}`,
+    ]).flat(),
+    (event, handler) => {
+      const keyStr = handler.keys?.[0] || "";
+      if (keyStr) {
+        const devIdx = parseInt(keyStr.split("+").pop() || "", 10) - 2;
+        if (devIdx >= 0 && devIdx < devDeployments.length) {
+          void router.push(
+            `${projectsURI}/${devDeployments[devIdx].name}/${currentView}`,
+          );
+        }
+      }
+    },
+    [devDeployments, projectsURI, currentView],
+  );
+  useHotkeys(
+    "ctrl+alt+s",
+    () => {
+      void router.push(`${projectsURI}/settings`);
+    },
+    [projectsURI],
+  );
 
   return isProjectSettings ? (
-    <div className="flex items-center gap-2">
-      <GearIcon />
-      <span className="hidden sm:block">Project settings</span>
-    </div>
-  ) : !isDoneLoading ? null : whoseName ? (
-    <DeploymentLabel deployment={deployment} whoseName={whoseName} />
-  ) : null;
+    team && currentProject ? (
+      <DeploymentLabelProjectSettings
+        team={team}
+        currentProject={currentProject}
+        deployments={deployments}
+      />
+    ) : null
+  ) : isProvisionPage ? (
+    team && currentProject ? (
+      <DeploymentLabelProvisionDeployment
+        team={team}
+        currentProject={currentProject}
+        deployments={deployments}
+        isProvisionProd={isProvisionProd}
+      />
+    ) : null
+  ) : !isDoneLoading ? null : (
+    <DeploymentLabelWrapper
+      deployment={deployment}
+      whoseName={whoseName}
+      deployments={deployments}
+      deploymentName={deployment.name}
+    />
+  );
 }
 
 export function DeploymentLabel({
   whoseName,
   deployment,
-  inline = false,
+  deployments,
+  vanityUrl,
 }: {
-  deployment: DeploymentResponse;
+  deployment: PlatformDeploymentResponse;
+  deployments: PlatformDeploymentResponse[];
   whoseName: string | null;
-  inline?: boolean;
+  vanityUrl?: string;
 }) {
   const team = useCurrentTeam();
-  const project = useProjectById(team?.id, deployment.projectId);
-  const { deployments } = useDeployments(project?.id);
-  const hasMultipleActiveLocalDeployments =
-    deployments !== undefined &&
-    deployments.filter(
-      (d) => d.deploymentType === "dev" && d.kind === "local" && d.isActive,
-    ).length > 1;
+  const project = useCurrentProject();
+  const { openMenu, closeMenu, menuTarget, buttonRef } =
+    useContextMenuTrigger();
+
+  const [containerRef, containerWidth] = useContainerWidth<HTMLDivElement>();
+
+  // Hysteresis buffer for domain display
+  const DOMAIN_SHOW_THRESHOLD = 350;
+  const DOMAIN_HIDE_THRESHOLD = 320;
+  const [showDomain, setShowDomain] = useState(
+    containerWidth > DOMAIN_SHOW_THRESHOLD,
+  );
+  const prevShowDomain = useRef(showDomain);
+
+  useEffect(() => {
+    if (showDomain && containerWidth < DOMAIN_HIDE_THRESHOLD) {
+      setShowDomain(false);
+    }
+    if (!showDomain && containerWidth > DOMAIN_SHOW_THRESHOLD) {
+      setShowDomain(true);
+    }
+    prevShowDomain.current = showDomain;
+  }, [containerWidth, showDomain]);
+
+  // Estimate minimum widths (adjust as needed)
+  const minTypeWidth = 100;
+  const minDomainWidth = 180;
+  const minNameWidth = 120;
+  const padding = 48; // for icons, gaps, caret, etc.
+
+  // Decide what to show
+  const showType = true;
+  const showName =
+    containerWidth > minTypeWidth + minDomainWidth + minNameWidth + padding;
+
+  if (!team || !project) {
+    return null;
+  }
   return (
     <div
+      ref={containerRef}
       className={cn(
-        "flex items-center gap-2 rounded-md",
-        !inline &&
-          getBackgroundColor(deployment.deploymentType, deployment.kind),
-        !inline && "p-1",
+        "my-2 flex min-w-24 grow overflow-visible p-px",
+        "overflow-auto",
       )}
     >
-      {deployment.deploymentType === "dev" ? (
-        deployment.kind === "local" ? (
-          <CommandLineIcon className="size-4" />
-        ) : (
-          <GlobeIcon className="size-4" />
-        )
-      ) : deployment.deploymentType === "prod" ? (
-        <SignalIcon className="size-4" />
-      ) : deployment.deploymentType === "preview" ? (
-        <Pencil2Icon className="size-4" />
-      ) : null}
-      {getDeploymentLabel({
-        deployment,
-        whoseName,
-        hasMultipleActiveLocalDeployments,
-      })}
+      <Button
+        variant="unstyled"
+        id="select-deployment"
+        data-testid="select-deployment"
+        className={cn(
+          "flex h-[2.3125rem] items-center gap-2 truncate rounded-full border text-sm font-medium transition-opacity hover:opacity-80",
+          menuTarget && "opacity-80",
+          "focus-visible:ring-1 focus-visible:ring-border-selected focus-visible:outline-hidden",
+          deploymentTypeColorClasses(deployment.deploymentType),
+        )}
+        type="button"
+        ref={buttonRef}
+        aria-haspopup="menu"
+        aria-expanded={!!menuTarget}
+        tabIndex={0}
+        onClick={openMenu}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") openMenu(e as any);
+        }}
+      >
+        <div className="flex h-full w-full animate-fadeInFromLoading cursor-pointer items-center gap-1 px-4">
+          {showType && (
+            <>
+              {deployment.deploymentType === "dev" ? (
+                <CommandLineIcon className="size-4 min-w-4" />
+              ) : deployment.deploymentType === "prod" ? (
+                <SignalIcon className="size-4 min-w-4" />
+              ) : deployment.deploymentType === "preview" ? (
+                <Pencil2Icon className="size-4 min-w-4" />
+              ) : deployment.deploymentType === "custom" ? (
+                <WrenchIcon className="size-4 min-w-4" />
+              ) : null}
+              <span className="max-w-24 truncate sm:contents">
+                {getDeploymentLabel({
+                  deployment,
+                  whoseName,
+                })}
+              </span>
+            </>
+          )}
+          {showDomain && deployment.kind === "cloud" && vanityUrl && (
+            <>
+              <span
+                className="animate-fadeInFromLoading px-0.5 font-normal"
+                role="separator"
+              >
+                •
+              </span>
+              <span
+                className="block max-w-60 animate-fadeInFromLoading truncate font-mono font-normal"
+                title={vanityUrl}
+              >
+                {vanityUrl}
+              </span>
+            </>
+          )}
+          {showName && deployment.kind === "cloud" && (
+            <>
+              <span
+                className="animate-fadeInFromLoading px-0.5 font-normal"
+                role="separator"
+              >
+                •
+              </span>
+              <span className="animate-fadeInFromLoading font-mono font-normal">
+                {deployment.name}
+              </span>
+            </>
+          )}
+          {showName && deployment.kind === "local" && (
+            <>
+              <span
+                className="animate-fadeInFromLoading px-0.5 font-normal"
+                role="separator"
+              >
+                •
+              </span>
+              <span className="animate-fadeInFromLoading font-mono text-sm font-normal">
+                Port {deployment.port}
+              </span>
+            </>
+          )}
+          <CaretSortIcon
+            className={cn(
+              "ml-auto size-5 shrink-0",
+              deploymentTypeColorClasses(deployment.deploymentType),
+              "bg-transparent",
+            )}
+          />
+          <ContextMenu target={menuTarget} onClose={closeMenu}>
+            <DeploymentMenuOptions
+              team={team}
+              project={project}
+              deployments={deployments}
+            />
+          </ContextMenu>
+        </div>
+      </Button>
     </div>
   );
 }
 
-function getBackgroundColor(
-  type: DeploymentType,
-  kind: "local" | "cloud",
-): string {
-  if (kind === "local") {
-    return "border border-cyan-700 bg-cyan-200/50 text-cyan-700 dark:bg-cyan-900/50 dark:text-cyan-500";
-  }
-  switch (type) {
-    case "prod":
-      return "border border-purple-600 dark:border-purple-900 bg-purple-100/50 text-purple-600 dark:bg-purple-900/50 dark:text-purple-400";
-    case "preview":
-      return "border border-orange-400 bg-orange-100/50 text-orange-600 dark:bg-orange-900/50 dark:text-orange-400";
-    case "dev":
-      return "border border-green-600 bg-green-100/50 text-green-600 dark:bg-green-900/50 dark:text-green-400";
-    default: {
-      const _typecheck: never = type;
-      return "";
-    }
-  }
+export function DeploymentLabelProjectSettings({
+  team,
+  currentProject,
+  deployments,
+}: {
+  team: TeamResponse;
+  currentProject: ProjectDetails;
+  deployments: PlatformDeploymentResponse[];
+}) {
+  const { openMenu, closeMenu, menuTarget, buttonRef } =
+    useContextMenuTrigger();
+
+  return (
+    <div
+      key="projectSettings"
+      className="my-2 mr-px flex grow items-stretch overflow-visible p-px"
+    >
+      <Button
+        variant="unstyled"
+        className={cn(
+          "flex h-[2.3125rem] items-center gap-2 rounded-full px-3",
+          "border bg-background-secondary text-content-primary",
+          "truncate text-sm font-medium transition-opacity hover:bg-background-tertiary",
+          menuTarget && "border-border-selected bg-background-tertiary",
+        )}
+        ref={buttonRef}
+        tabIndex={0}
+        role="button"
+        aria-haspopup="menu"
+        aria-expanded={!!menuTarget}
+        onClick={openMenu}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") openMenu(e as any);
+        }}
+      >
+        <GearIcon className="size-4 min-w-4" />
+        <span className="max-w-24 truncate sm:contents">Project settings</span>
+        <CaretSortIcon className="ml-auto size-5 bg-transparent" />
+        <ContextMenu target={menuTarget} onClose={closeMenu}>
+          <DeploymentMenuOptions
+            team={team}
+            project={currentProject}
+            deployments={deployments}
+          />
+        </ContextMenu>
+      </Button>
+    </div>
+  );
 }
 
-function getDeploymentLabel({
+export function DeploymentLabelProvisionDeployment({
+  team,
+  currentProject,
+  deployments,
+  isProvisionProd,
+}: {
+  team: TeamResponse;
+  currentProject: ProjectDetails;
+  deployments: PlatformDeploymentResponse[];
+  isProvisionProd: boolean;
+}) {
+  const { openMenu, closeMenu, menuTarget, buttonRef } =
+    useContextMenuTrigger();
+
+  return (
+    <div
+      key="provisionDeployment"
+      className="my-2 mr-px flex grow items-stretch overflow-visible p-px"
+    >
+      <Button
+        variant="unstyled"
+        className={cn(
+          "flex h-[2.3125rem] items-center gap-2 rounded-full px-3",
+          "border border-dashed",
+          "truncate text-sm font-medium transition-opacity hover:opacity-80",
+          menuTarget && "opacity-80",
+          deploymentTypeColorClasses(isProvisionProd ? "prod" : "dev"),
+          "[--bg-opacity:50%]",
+        )}
+        ref={buttonRef}
+        tabIndex={0}
+        role="button"
+        aria-haspopup="menu"
+        aria-expanded={!!menuTarget}
+        onClick={openMenu}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") openMenu(e as any);
+        }}
+      >
+        {isProvisionProd ? (
+          <SignalIcon className="size-4 min-w-4" />
+        ) : (
+          <CommandLineIcon className="size-4 min-w-4" />
+        )}
+        <span className="max-w-32 truncate sm:contents">
+          {isProvisionProd ? "Production" : "Development (Cloud)"}
+        </span>
+        <CaretSortIcon className="ml-auto size-5 bg-transparent" />
+        <ContextMenu target={menuTarget} onClose={closeMenu}>
+          <DeploymentMenuOptions
+            team={team}
+            project={currentProject}
+            deployments={deployments}
+          />
+        </ContextMenu>
+      </Button>
+    </div>
+  );
+}
+
+export function getDeploymentLabel({
   deployment,
   whoseName,
-  hasMultipleActiveLocalDeployments,
 }: {
-  deployment: DeploymentResponse;
+  deployment: PlatformDeploymentResponse | DeploymentResponse;
   whoseName: string | null; // null = mine
-  hasMultipleActiveLocalDeployments: boolean;
 }): string {
+  if (
+    (deployment.deploymentType === "custom" ||
+      ("isDefault" in deployment &&
+        !deployment.isDefault &&
+        deployment.deploymentType !== "preview")) &&
+    "reference" in deployment
+  ) {
+    return deployment.reference;
+  }
+
   switch (deployment.deploymentType) {
     case "prod":
       return "Production";
@@ -134,15 +500,32 @@ function getDeploymentLabel({
       return `Preview: ${deployment.previewIdentifier || "Unknown"}`;
     case "dev": {
       if (deployment.kind === "local") {
-        return `${deployment.deviceName} ${hasMultipleActiveLocalDeployments ? `(Port ${deployment.port})` : ""}`;
+        return deployment.deviceName;
       }
-      return whoseName === null
-        ? "Development (Cloud)"
-        : `${whoseName}’s Cloud Dev`;
+      return whoseName === null ? "Development (Cloud)" : `${whoseName}’s Dev`;
     }
+    case "custom":
+      return "Custom";
     default: {
-      const _typecheck: never = deployment.deploymentType;
+      deployment.deploymentType satisfies never;
       return "";
     }
   }
+}
+
+function useContextMenuTrigger() {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [menuTarget, setMenuTarget] = useState<{ x: number; y: number } | null>(
+    null,
+  );
+  const openMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (buttonRef.current) {
+      const rect = buttonRef.current.getBoundingClientRect();
+      setMenuTarget({ x: rect.left, y: rect.bottom });
+    }
+  };
+  const closeMenu = () => setMenuTarget(null);
+
+  return { openMenu, closeMenu, menuTarget, buttonRef };
 }

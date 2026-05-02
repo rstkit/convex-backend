@@ -21,7 +21,6 @@ export type DataToolbarProps = {
   allRowsSelected: boolean;
   deleteRows: (rowIds: Set<string>) => Promise<void>;
   isLoadingMore: boolean;
-  isProd: boolean;
   tableSchemaStatus: TableSchemaStatus | undefined;
   numRows?: number;
   selectedRowsIds: Set<string>;
@@ -34,7 +33,6 @@ export function DataToolbar({
   allRowsSelected,
   deleteRows,
   isLoadingMore,
-  isProd,
   tableSchemaStatus,
   numRows,
   selectedRowsIds,
@@ -67,15 +65,20 @@ export function DataToolbar({
     useLogDeploymentEvent,
     useCurrentDeployment,
     useHasProjectAdminPermissions,
+    useIsProtectedDeployment,
+    useIsOperationAllowed,
   } = useContext(DeploymentInfoContext);
+  const isProtectedDeployment = useIsProtectedDeployment();
   const log = useLogDeploymentEvent();
 
   const deployment = useCurrentDeployment();
   const hasAdminPermissions = useHasProjectAdminPermissions(
     deployment?.projectId,
   );
+  const canWriteData = useIsOperationAllowed("WriteData");
   const canManageTable =
-    deployment?.deploymentType !== "prod" || hasAdminPermissions;
+    (deployment?.deploymentType !== "prod" || hasAdminPermissions) &&
+    canWriteData;
 
   return (
     <div className="flex flex-col">
@@ -151,7 +154,7 @@ export function DataToolbar({
               allRowsSelected={allRowsSelected}
               numRowsSelected={numRowsSelected}
               selectedRowsIds={selectedRowsIds}
-              isProd={isProd}
+              isProtectedDeployment={isProtectedDeployment}
               deleteRows={deleteRows}
             />
           )}
@@ -173,11 +176,17 @@ export function DataToolbar({
                 });
                 setPopup({ type: "clearTable", tableName });
               }}
-              onClickSchemaIndexes={() => {
+              onClickSchema={() => {
                 log("view table schema", {
                   how: "toolbar",
                 });
                 setPopup({ type: "viewSchema", tableName });
+              }}
+              onClickIndexes={() => {
+                log("view table indexes", {
+                  how: "toolbar",
+                });
+                setPopup({ type: "viewIndexes", tableName });
               }}
               onClickMetrics={() => {
                 log("view table metrics", {
@@ -264,7 +273,7 @@ function AddDocumentButton({
         isInUnmountedComponent
           ? "Cannot add documents in an unmounted component."
           : !canManageTable &&
-            "You do not have permission to add documents in production."
+            "You do not have permission to add documents in this deployment."
       }
     >
       Add
@@ -333,7 +342,7 @@ function EditDocumentButton({
         isInUnmountedComponent
           ? "Cannot edit documents in an unmounted component."
           : !canManageTable &&
-            "You do not have permission to edit documents in production."
+            "You do not have permission to edit documents in this deployment."
       }
       size="sm"
       variant="neutral"
@@ -380,7 +389,7 @@ type DeleteDocumentButtonProps = {
   allRowsSelected: boolean;
   numRowsSelected: number;
   selectedRowsIds: Set<string>;
-  isProd: boolean;
+  isProtectedDeployment: boolean;
   deleteRows: (rowIds: Set<string>) => Promise<void>;
 };
 
@@ -395,7 +404,7 @@ function DeleteDocumentButton({
   allRowsSelected,
   numRowsSelected,
   selectedRowsIds,
-  isProd,
+  isProtectedDeployment,
   deleteRows,
 }: DeleteDocumentButtonProps) {
   return (
@@ -405,7 +414,7 @@ function DeleteDocumentButton({
         isInUnmountedComponent
           ? "Cannot delete documents in an unmounted component."
           : !canManageTable &&
-            "You do not have permission to delete documents in production."
+            "You do not have permission to delete documents in this deployment."
       }
       onClick={async () => {
         log("open delete document panel", {
@@ -415,7 +424,7 @@ function DeleteDocumentButton({
 
         if (isEditingAllAndMoreThanOne) {
           setPopup({ type: "clearTable", tableName });
-        } else if (isProd) {
+        } else if (isProtectedDeployment) {
           setPopup({
             type: "deleteRows",
             rowIds: selectedRowsIds,

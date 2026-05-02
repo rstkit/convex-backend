@@ -6,11 +6,10 @@ pub mod components;
 pub mod defaults;
 pub mod import_facing;
 pub mod index;
+pub mod index_backfills;
 pub mod index_workers;
 pub mod schema;
+pub mod schema_validation_progress;
 pub mod system_metadata;
 pub mod table;
 pub mod user_facing;
-
-#[cfg(any(test, feature = "testing"))]
-pub mod test_facing;

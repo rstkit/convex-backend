@@ -1,7 +1,7 @@
 import { CheerioAPI, load } from "cheerio";
 import { v } from "convex/values";
 import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
-import { map } from "modern-async";
+import { asyncMap } from "modern-async";
 import { internal } from "../_generated/api";
 import { internalAction, internalMutation } from "../_generated/server";
 
@@ -18,7 +18,7 @@ export const scrapeSite = internalAction({
       .map((i, elem) => $(elem).text())
       .get()
       .slice(0, limit);
-    await map(urls, (url) =>
+    await asyncMap(urls, (url) =>
       ctx.scheduler.runAfter(0, internal.ingest.load.fetchSingle, { url }),
     );
   },
@@ -37,8 +37,12 @@ export const fetchSingle = internalAction({
   },
 });
 
-export const updateDocument = internalMutation(
-  async (ctx, { url, text }: { url: string; text: string }) => {
+export const updateDocument = internalMutation({
+  args: {
+    url: v.string(),
+    text: v.string(),
+  },
+  handler: async (ctx, { url, text }) => {
     const latestVersion = await ctx.db
       .query("documents")
       .withIndex("byUrl", (q) => q.eq("url", url))
@@ -53,7 +57,7 @@ export const updateDocument = internalMutation(
         chunkOverlap: 100,
       });
       const chunks = await splitter.splitText(text);
-      await map(chunks, async (chunk) => {
+      await asyncMap(chunks, async (chunk) => {
         await ctx.db.insert("chunks", {
           documentId,
           text: chunk,
@@ -62,7 +66,7 @@ export const updateDocument = internalMutation(
       });
     }
   },
-);
+});
 
 function parsePage(text: string) {
   const $ = load(text);

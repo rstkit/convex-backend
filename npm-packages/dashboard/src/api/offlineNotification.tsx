@@ -1,5 +1,5 @@
 import { toast } from "@common/lib/utils";
-import Link from "next/link";
+import { Link } from "@ui/Link";
 import React from "react";
 import { captureException } from "@sentry/nextjs";
 
@@ -14,11 +14,7 @@ export const createOfflineToastContent = () => (
   <p>
     Something seems wrong. The dashboard will attempt to reconnect
     automatically. Check{" "}
-    <Link
-      href="https://status.convex.dev/"
-      className="text-content-link hover:underline"
-      target="_blank"
-    >
+    <Link href="https://status.convex.dev/" target="_blank">
       Convex status
     </Link>{" "}
     for details and updates.
@@ -30,7 +26,7 @@ export const createOfflineToastContent = () => (
  * @param error Optional error to capture in Sentry
  */
 export const showOfflineToast = (error?: Error) => {
-  toast("error", createOfflineToastContent(), OFFLINE_TOAST_ID);
+  toast("error", createOfflineToastContent(), OFFLINE_TOAST_ID, false);
 
   // Log the error to Sentry if provided
   if (error) {

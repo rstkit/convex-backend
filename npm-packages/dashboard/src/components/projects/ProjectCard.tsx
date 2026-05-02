@@ -12,9 +12,18 @@ import { ReactNode, useState } from "react";
 import { ProjectDetails } from "generatedApi";
 import { useHasProjectAdminPermissions } from "api/roles";
 import { useCurrentTeam } from "api/teams";
+import { HighlightMatch } from "elements/HighlightMatch";
 import { DeleteProjectModal } from "./modals/DeleteProjectModal";
 
-export function ProjectCard({ project }: { project: ProjectDetails }) {
+export function ProjectCard({
+  project,
+  listItem,
+  searchQuery,
+}: {
+  project: ProjectDetails;
+  listItem?: boolean;
+  searchQuery?: string;
+}) {
   const router = useRouter();
   const { id, slug, name } = project;
   const team = useCurrentTeam();
@@ -26,6 +35,9 @@ export function ProjectCard({ project }: { project: ProjectDetails }) {
     prodHref,
     devHref,
     isProdDefault,
+    defaultHref,
+    hasDefaultProdDeployment,
+    hasDefaultDevDeployment,
     isLoading: isLoadingDeployments,
   } = useDeploymentUris(id, slug);
 
@@ -62,22 +74,20 @@ export function ProjectCard({ project }: { project: ProjectDetails }) {
   return (
     <Card
       cardClassName="group animate-fadeInFromLoading"
-      href={
-        deleteModal || lostAccessModal
-          ? undefined
-          : isProdDefault
-            ? prodHref
-            : devHref
-      }
+      listItem={listItem}
+      linkLabel={name?.length ? name : "Untitled Project"}
+      href={deleteModal || lostAccessModal ? undefined : defaultHref}
       dropdownItems={dropdownItems}
       overlayed={
-        <div className="flex gap-1">
+        <div className="relative z-10 flex gap-1">
           {!isLoadingDeployments ? (
             <div className="flex flex-col items-end">
               <DeploymentLinks
                 isProdDefault={isProdDefault}
-                devHref={devHref ?? null}
+                devHref={devHref}
                 prodHref={prodHref}
+                hasDefaultDevDeployment={hasDefaultDevDeployment}
+                hasDefaultProdDeployment={hasDefaultProdDeployment}
               />
               <TimestampDistance
                 date={new Date(project.createTime)}
@@ -100,12 +110,16 @@ export function ProjectCard({ project }: { project: ProjectDetails }) {
         >
           <span className="flex items-center gap-2 text-content-primary">
             <span className="shrink truncate">
-              {name?.length ? name : "Untitled Project"}
+              {name?.length ? (
+                <HighlightMatch text={name} query={searchQuery} />
+              ) : (
+                "Untitled Project"
+              )}
             </span>
           </span>
         </div>
         <div className="mb-1 h-4 truncate text-xs text-content-secondary">
-          {slug}
+          <HighlightMatch text={slug} query={searchQuery} />
         </div>
         {team && deleteModal && (
           <DeleteProjectModal
@@ -137,27 +151,39 @@ function DeploymentLinks({
   devHref,
   prodHref,
   isProdDefault,
+  hasDefaultDevDeployment,
+  hasDefaultProdDeployment,
 }: {
   isProdDefault: boolean;
-  devHref: string | null;
+  devHref: string;
   prodHref: string;
+  hasDefaultDevDeployment: boolean;
+  hasDefaultProdDeployment: boolean;
 }) {
   const prod = (
     <DeploymentLabel
       href={prodHref}
       isDefault={isProdDefault}
       title="Production"
+      showTip={!hasDefaultProdDeployment}
+      tip={
+        <>
+          You do not have a production deployment for this project yet. Click to
+          provision one.
+        </>
+      }
     />
   );
   const dev = (
     <DeploymentLabel
       href={devHref}
       isDefault={!isProdDefault}
+      showTip={!hasDefaultDevDeployment}
       tip={
         <>
           You do not have a personal development deployment for this project
-          yet. Run <code className="px-1">npx convex dev</code> to provision
-          one.
+          yet. Click to provision one, or run{" "}
+          <code className="px-1">npx convex dev</code>.
         </>
       }
       title="Development"
@@ -171,7 +197,7 @@ function DeploymentLinks({
         } h-6 items-center justify-end gap-1 truncate text-xs`}
       >
         {isProdDefault ? dev : prod}
-        <div className="text-[8px] text-neutral-4">●</div>
+        <div className="text-neutral-4">•</div>
         {isProdDefault ? prod : dev}
       </div>
     </div>
@@ -183,24 +209,15 @@ function DeploymentLabel({
   isDefault,
   title,
   tip,
-}:
-  | {
-      href: string | null;
-      isDefault: boolean;
-      tip: ReactNode;
-      title: string;
-    }
-  | {
-      href: string;
-      isDefault: boolean;
-      title: string;
-      tip?: never;
-    }) {
-  return href === null ? (
-    <Tooltip tip={tip}>
-      <div className="select-none text-xs text-content-secondary">{title}</div>
-    </Tooltip>
-  ) : (
+  showTip,
+}: {
+  href: string;
+  isDefault?: boolean;
+  title: string;
+  tip?: ReactNode;
+  showTip?: boolean;
+}) {
+  const linkContent = (
     <Link
       passHref
       href={href}
@@ -211,4 +228,10 @@ function DeploymentLabel({
       {title}
     </Link>
   );
+
+  if (showTip && tip) {
+    return <Tooltip tip={tip}>{linkContent}</Tooltip>;
+  }
+
+  return linkContent;
 }

@@ -15,6 +15,7 @@ import RemixLogo from "@site/static/img/remix-logo.svg";
 import RustLogo from "@site/static/img/rust-logo.svg";
 import SvelteLogo from "@site/static/img/svelte-logo.svg";
 import VueLogo from "@site/static/img/vue-logo.svg";
+import NuxtLogo from "@site/static/img/nuxt-logo.svg";
 import AndroidLogo from "@site/static/img/android-logo.svg";
 import SwiftLogo from "@site/static/img/swift-logo.svg";
 import TanStackLogo from "@site/static/img/tanstack-logo.svg";
@@ -119,7 +120,7 @@ export function QuickFrameworksList() {
           label: "Remix",
         },
         {
-          icon: <TanStackLogo height={40} />,
+          icon: <TanStackLogo height={40} width={40} />,
           href: "/quickstart/tanstack-start",
           docId: "quickstart/tanstack-start",
           label: "TanStack Start",
@@ -136,6 +137,12 @@ export function QuickFrameworksList() {
           href: "/quickstart/vue",
           docId: "quickstart/vue",
           label: "Vue",
+        },
+        {
+          icon: <NuxtLogo height={40} />,
+          href: "/quickstart/nuxt",
+          docId: "quickstart/nuxt",
+          label: "Nuxt",
         },
         {
           icon: <SvelteLogo height={40} />,
@@ -157,7 +164,6 @@ export function QuickFrameworksList() {
         },
         {
           icon: <HtmlLogo height={40} />,
-          invertIcon: true,
           href: "/quickstart/script-tag",
           docId: "quickstart/script-tag",
           label: "Script tag",
@@ -173,7 +179,6 @@ export function QuickLanguagesList() {
       items={[
         {
           icon: <JsLogo height={40} />,
-          invertIcon: true,
           href: "/client/javascript",
           docId: "client/javascript",
           label: "JavaScript",

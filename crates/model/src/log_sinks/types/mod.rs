@@ -9,6 +9,8 @@ use value::codegen_convex_serialization;
 pub mod axiom;
 pub mod datadog;
 pub mod mock_sink;
+pub mod posthog_error_tracking;
+pub mod posthog_logs;
 pub mod sentry;
 pub mod webhook;
 
@@ -17,7 +19,6 @@ pub const LOG_SINKS_LIMIT: usize = 5;
 
 /// Data model for an entry in the LOG_SINKS_TABLE
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct LogSinksRow {
     pub status: SinkState,
     pub config: SinkConfig,
@@ -57,19 +58,29 @@ codegen_convex_serialization!(LogSinksRow, SerializedLogSinksRow);
 /// Status of a configured LogSink
 /// LogSink SinkState state machine:
 /// ```text
-/// +---------+          +--------+
-/// | Pending | -------> | Active |
-/// +---------+          +--------+
-///     |                     |
-///     v                     v
-/// +--------+         +------------+
-/// | Failed |         | Tombstoned | ---> Removed
-/// +--------+         +------------+
+/// +---------+
+/// | Pending |
+/// +---------+
+///      |     |
+///      |     v
+///      |  +--------+
+///      |  | Failed |
+///      |  +--------+
+///      v
+/// +--------+          +------------+
+/// | Active | -------> | Tombstoned | ---> Removed
+/// +--------+          +------------+
+///      |
+///      | (on restart)
+///      v
+/// +------------+
+/// | Restarting | -----> Active
+/// +------------+
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum SinkState {
     Pending,
+    Restarting,
     Failed { reason: String },
     Active, // TODO: add health statistics under Active
     Tombstoned,
@@ -80,6 +91,7 @@ pub enum SinkState {
 #[serde(rename_all = "camelCase")]
 pub enum SerializedSinkState {
     Pending,
+    Restarting,
     #[serde(rename_all = "camelCase")]
     Failed {
         reason: String,
@@ -93,6 +105,7 @@ impl From<SinkState> for SerializedSinkState {
     fn from(value: SinkState) -> Self {
         match value {
             SinkState::Pending => SerializedSinkState::Pending,
+            SinkState::Restarting => SerializedSinkState::Restarting,
             SinkState::Failed { reason } => SerializedSinkState::Failed { reason },
             SinkState::Active => SerializedSinkState::Active,
             SinkState::Tombstoned => SerializedSinkState::Tombstoned,
@@ -104,6 +117,7 @@ impl From<SerializedSinkState> for SinkState {
     fn from(value: SerializedSinkState) -> Self {
         match value {
             SerializedSinkState::Pending => SinkState::Pending,
+            SerializedSinkState::Restarting => SinkState::Restarting,
             SerializedSinkState::Failed { reason } => SinkState::Failed { reason },
             SerializedSinkState::Active => SinkState::Active,
             SerializedSinkState::Tombstoned => SinkState::Tombstoned,
@@ -122,7 +136,6 @@ codegen_convex_serialization!(SinkState, SerializedSinkState);
 /// https://www.notion.so/convex-dev/Log-streams-round-2-da990dc843e24e13b4a2051f51d0bb9c
 /// They will eventually replace `Datadog` and `Axiom`
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[serde(rename_all = "camelCase")]
 pub enum SinkType {
     Local,
@@ -132,26 +145,37 @@ pub enum SinkType {
     Axiom,
     AxiomV2,
     Sentry,
-    #[cfg(any(test, feature = "testing"))]
-    Mock,
-    #[cfg(any(test, feature = "testing"))]
-    Mock2,
+    PostHogLogs,
+    PostHogErrorTracking,
+}
+
+impl SinkType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SinkType::Local => "local",
+            SinkType::Datadog => "datadog",
+            SinkType::DatadogV2 => "datadog",
+            SinkType::Webhook => "webhook",
+            SinkType::Axiom => "axiom",
+            SinkType::AxiomV2 => "axiom",
+            SinkType::Sentry => "sentry",
+            SinkType::PostHogLogs => "postHogLogs",
+            SinkType::PostHogErrorTracking => "postHogErrorTracking",
+        }
+    }
 }
 
 /// The configurations associated with each LogSinkType above.
 /// Meant to be used for the subscription API.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub enum SinkConfig {
     Local(String),
     Datadog(datadog::DatadogConfig),
     Webhook(webhook::WebhookConfig),
     Axiom(axiom::AxiomConfig),
     Sentry(sentry::SentryConfig),
-    #[cfg(any(test, feature = "testing"))]
-    Mock,
-    #[cfg(any(test, feature = "testing"))]
-    Mock2,
+    PostHogLogs(posthog_logs::PostHogLogsConfig),
+    PostHogErrorTracking(posthog_error_tracking::PostHogErrorTrackingConfig),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,10 +189,8 @@ pub enum SerializedSinkConfig {
     Webhook(webhook::SerializedWebhookConfig),
     Axiom(axiom::SerializedAxiomConfig),
     Sentry(sentry::SerializedSentryConfig),
-    #[cfg(any(test, feature = "testing"))]
-    Mock,
-    #[cfg(any(test, feature = "testing"))]
-    Mock2,
+    PostHogLogs(posthog_logs::SerializedPostHogLogsConfig),
+    PostHogErrorTracking(posthog_error_tracking::SerializedPostHogErrorTrackingConfig),
 }
 
 impl TryFrom<SerializedSinkConfig> for SinkConfig {
@@ -189,10 +211,10 @@ impl TryFrom<SerializedSinkConfig> for SinkConfig {
             SerializedSinkConfig::Sentry(config) => {
                 Ok(SinkConfig::Sentry(sentry::SentryConfig::try_from(config)?))
             },
-            #[cfg(any(test, feature = "testing"))]
-            SerializedSinkConfig::Mock => Ok(SinkConfig::Mock),
-            #[cfg(any(test, feature = "testing"))]
-            SerializedSinkConfig::Mock2 => Ok(SinkConfig::Mock2),
+            SerializedSinkConfig::PostHogLogs(config) => Ok(SinkConfig::PostHogLogs(config.into())),
+            SerializedSinkConfig::PostHogErrorTracking(config) => {
+                Ok(SinkConfig::PostHogErrorTracking(config.into()))
+            },
         }
     }
 }
@@ -215,10 +237,10 @@ impl TryFrom<SinkConfig> for SerializedSinkConfig {
             SinkConfig::Sentry(config) => Ok(SerializedSinkConfig::Sentry(
                 sentry::SerializedSentryConfig::try_from(config)?,
             )),
-            #[cfg(any(test, feature = "testing"))]
-            SinkConfig::Mock => Ok(SerializedSinkConfig::Mock),
-            #[cfg(any(test, feature = "testing"))]
-            SinkConfig::Mock2 => Ok(SerializedSinkConfig::Mock2),
+            SinkConfig::PostHogLogs(config) => Ok(SerializedSinkConfig::PostHogLogs(config.into())),
+            SinkConfig::PostHogErrorTracking(config) => {
+                Ok(SerializedSinkConfig::PostHogErrorTracking(config.into()))
+            },
         }
     }
 }
@@ -228,15 +250,13 @@ codegen_convex_serialization!(SinkConfig, SerializedSinkConfig);
 impl fmt::Display for SinkConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Local(config) => write!(f, "Local({})", config),
-            Self::Datadog(config) => write!(f, "Datadog({})", config),
-            Self::Webhook(config) => write!(f, "Webhook({})", config),
-            Self::Axiom(config) => write!(f, "Axiom({})", config),
-            Self::Sentry(config) => write!(f, "Sentry({})", config),
-            #[cfg(any(test, feature = "testing"))]
-            Self::Mock => write!(f, "Mock"),
-            #[cfg(any(test, feature = "testing"))]
-            Self::Mock2 => write!(f, "Mock2"),
+            Self::Local(config) => write!(f, "Local({config})"),
+            Self::Datadog(config) => write!(f, "Datadog({config})"),
+            Self::Webhook(config) => write!(f, "Webhook({config})"),
+            Self::Axiom(config) => write!(f, "Axiom({config})"),
+            Self::Sentry(config) => write!(f, "Sentry({config})"),
+            Self::PostHogLogs(config) => write!(f, "PostHogLogs({config})"),
+            Self::PostHogErrorTracking(config) => write!(f, "PostHogErrorTracking({config})"),
         }
     }
 }
@@ -249,10 +269,8 @@ impl SinkConfig {
             Self::Webhook(_) => SinkType::Webhook,
             Self::Axiom(_) => SinkType::Axiom,
             Self::Sentry(_) => SinkType::Sentry,
-            #[cfg(any(test, feature = "testing"))]
-            Self::Mock => SinkType::Mock,
-            #[cfg(any(test, feature = "testing"))]
-            Self::Mock2 => SinkType::Mock2,
+            Self::PostHogLogs(_) => SinkType::PostHogLogs,
+            Self::PostHogErrorTracking(_) => SinkType::PostHogErrorTracking,
         }
     }
 }

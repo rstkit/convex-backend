@@ -1,5 +1,12 @@
-import { Fragment, ReactNode } from "react";
-import { Dialog, Transition } from "@headlessui/react";
+import { ReactNode } from "react";
+import {
+  Dialog,
+  DialogPanel,
+  DialogTitle,
+  Description,
+  Transition,
+  TransitionChild,
+} from "@headlessui/react";
 import { classNames } from "../utils";
 
 type ModalProps = {
@@ -18,16 +25,15 @@ export default function Modal({
   large = false,
 }: ModalProps) {
   return (
-    <Transition.Root show as={Fragment} appear afterLeave={onClose}>
+    <Transition show appear afterLeave={onClose}>
       <Dialog
         as="div"
         data-testid="modal"
-        className="fixed inset-0 z-40 overflow-y-auto"
+        className="fixed inset-0 z-[100] overflow-y-auto"
         onClose={onClose}
       >
         <div className="flex min-h-screen items-end justify-center px-4 pb-20 pt-4 text-center sm:block sm:p-0">
-          <Transition.Child
-            as={Fragment}
+          <TransitionChild
             enter="ease-out duration-300"
             enterFrom="opacity-0"
             enterTo="opacity-100"
@@ -35,8 +41,8 @@ export default function Modal({
             leaveFrom="opacity-100"
             leaveTo="opacity-0"
           >
-            <Dialog.Overlay className="fixed inset-0 bg-neutral-8/75 transition-opacity" />
-          </Transition.Child>
+            <div className="fixed inset-0 bg-neutral-8/75 transition-opacity z-[100]" />
+          </TransitionChild>
 
           {/* This element is to trick the browser into centering the modal contents. */}
           <span
@@ -45,8 +51,7 @@ export default function Modal({
           >
             &#8203;
           </span>
-          <Transition.Child
-            as={Fragment}
+          <TransitionChild
             enter="ease-out duration-300"
             enterFrom="opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95"
             enterTo="opacity-100 translate-y-0 sm:scale-100"
@@ -54,12 +59,12 @@ export default function Modal({
             leaveFrom="opacity-100 translate-y-0 sm:scale-100"
             leaveTo="opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95"
           >
-            <div
+            <DialogPanel
               className={classNames(
                 "inline-block bg-light-background-secondary dark:bg-dark-background-secondary rounded",
                 "text-light-content-primary dark:text-dark-content-primary",
                 "text-left overflow-hidden shadow-4 dark:border transform",
-                "transition-all align-middle",
+                "transition-all align-middle relative z-[101]",
                 large ? "sm:max-w-6xl" : "sm:max-w-xl",
                 "w-full",
               )}
@@ -68,22 +73,22 @@ export default function Modal({
               <div className="px-4 pt-6 sm:px-6">
                 <div className="flex items-start justify-between">
                   <div className="mb-2">
-                    <Dialog.Title className="text-lg font-semibold">
+                    <DialogTitle className="text-lg font-semibold">
                       {title}
-                    </Dialog.Title>
-                    <Dialog.Title className="mt-1 text-xs">
+                    </DialogTitle>
+                    <Description className="mt-1 text-xs">
                       {description}
-                    </Dialog.Title>
+                    </Description>
                   </div>
                 </div>
               </div>
 
               {/* Contents */}
               <div className="mx-6 mb-6">{children}</div>
-            </div>
-          </Transition.Child>
+            </DialogPanel>
+          </TransitionChild>
         </div>
       </Dialog>
-    </Transition.Root>
+    </Transition>
   );
 }

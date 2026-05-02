@@ -4,9 +4,11 @@ slug: "occ"
 hidden: false
 sidebar_position: 500
 todo: Push under mutations, or inline, or kill (move to Stack)
+description:
+  "Optimistic concurrency control and transaction atomicity in Convex"
 ---
 
-In [Queries](/functions/query-functions.mdx), we mentioned that determinism as
+In [Queries](/functions/query-functions.mdx), we mentioned that determinism was
 important in the way optimistic concurrency control (OCC) was used within
 Convex. In this section, we'll dive much deeper into _why_.
 

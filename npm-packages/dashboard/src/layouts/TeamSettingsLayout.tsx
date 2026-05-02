@@ -5,7 +5,7 @@ import { useCurrentTeam, useTeamEntitlements } from "api/teams";
 import startCase from "lodash/startCase";
 import Head from "next/head";
 import React from "react";
-import { Team } from "generatedApi";
+import { TeamResponse } from "generatedApi";
 import { SidebarLink } from "@common/elements/Sidebar";
 import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 
@@ -20,24 +20,28 @@ export function TeamSettingsLayout({
     | "billing"
     | "usage"
     | "audit-log"
+    | "referrals"
     | "access-tokens"
-    | "referrals";
-  Component: React.FunctionComponent<{ team: Team }>;
+    | "applications"
+    | "sso";
+  Component: React.FunctionComponent<{ team: TeamResponse }>;
   title: string;
 }) {
   const selectedTeam = useCurrentTeam();
-  const { referralsPage } = useLaunchDarkly();
 
-  const auditLogsEnabled = useTeamEntitlements(
-    selectedTeam?.id,
-  )?.auditLogsEnabled;
+  const entitlements = useTeamEntitlements(selectedTeam?.id);
+  const auditLogsEnabled = entitlements?.auditLogRetentionDays !== 0;
+
+  const { singleSignOn } = useLaunchDarkly();
 
   const pages = [
     "general",
     "members",
     "billing",
     "usage",
-    ...(referralsPage ? ["referrals"] : []),
+    "referrals",
+    "access-tokens",
+    "applications",
   ];
 
   return (
@@ -64,7 +68,7 @@ export function TeamSettingsLayout({
               "px-3 py-2",
               "overflow-x-auto scrollbar-none",
               "bg-background-secondary",
-              "sm:shadow sm:border-r",
+              "sm:shadow-sm sm:border-r",
               "border-b sm:border-b-0",
             )}
           >
@@ -87,9 +91,17 @@ export function TeamSettingsLayout({
             >
               Audit Log
             </SidebarLink>
+            {singleSignOn && (
+              <SidebarLink
+                isActive={selectedPage === "sso"}
+                href={`/t/${selectedTeam?.slug}/settings/sso`}
+              >
+                Single Sign-On
+              </SidebarLink>
+            )}
           </aside>
-          <div className="w-full overflow-y-auto scrollbar">
-            <div className="flex h-full max-w-[65rem] flex-col gap-6 p-6">
+          <div className="scrollbar w-full overflow-y-auto">
+            <div className="flex max-w-[80rem] flex-col gap-6 p-6">
               {selectedTeam ? (
                 <Component team={selectedTeam} key={selectedTeam.id} />
               ) : (

@@ -15,9 +15,12 @@ libraries. It makes it easy to build and scale dynamic live-updating apps.
 [Read the docs to learn more](https://docs.convex.dev/understanding/).
 
 Development of the Convex backend is led by the Convex team. We
-[welcome bug fixes](./CONTRIBUTING.md) and
+[welcome small bug fixes](./CONTRIBUTING.md) and
 [love receiving feedback](https://discord.gg/convex). We keep this repository
-synced with any internal development work within a handful of days.
+synced with any internal development work within a handful of days. Convex is a
+well tested piece of software, with several well designed test frameworks
+including randomized testing. Those tests are not provided as part of the open
+source offering.
 
 ## Getting Started
 
@@ -47,6 +50,8 @@ instructions. Community support for self-hosting is available in the
   discussions.
 - Report issues when building and using the open source Convex backend through
   [GitHub Issues](https://github.com/get-convex/convex-backend/issues)
+- By submitting pull requests, you confirm that Convex can use, modify, copy,
+  and redistribute the contribution, under the terms of its choice.
 
 ## Building from source
 
@@ -81,6 +86,4 @@ See [BUILD.md](./BUILD.md).
   - Internal packages
     - `udf-runtime/` sets up the user-defined functions JS environment for
       queries and mutations
-    - `udf-tests/` is a collection of functions used in testing the isolate
-      layer
     - `system-udfs/` contains functions used by the Convex system e.g. the CLI

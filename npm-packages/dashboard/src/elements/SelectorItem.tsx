@@ -35,14 +35,14 @@ export function SelectorItem({
 }) {
   const fullClassName = cn(
     className,
-    "w-full SelectorItem flex text-sm items-center",
-    "p-2 rounded text-left transition",
+    "SelectorItem flex w-full items-center text-sm",
+    "rounded-sm p-2 text-left transition",
     "text-content-primary",
     "hover:bg-background-tertiary",
-    active && "bg-background-tertiary SelectorItem-active",
+    active && "SelectorItem-active bg-background-tertiary",
     selected && "bg-background-tertiary/60",
     disabled === true
-      ? "text-content-tertiary cursor-not-allowed"
+      ? "cursor-not-allowed text-content-tertiary"
       : "cursor-pointer",
   );
 
@@ -58,7 +58,9 @@ export function SelectorItem({
       href={href}
       className={fullClassName}
       onClick={() => {
-        eventName && logEvent(eventName);
+        if (eventName) {
+          logEvent(eventName);
+        }
         close();
       }}
       target={target}
@@ -84,8 +86,8 @@ export function selectorButtonComponent(
         variant="unstyled"
         type="button"
         className={cn(
-          "h-10 rounded outline-none focus-visible:ring",
-          "px-3 py-2 w-fit flex gap-2 items-center select-none",
+          "h-10 rounded-sm outline-hidden focus-visible:ring-2 focus-visible:ring-util-accent",
+          "flex w-fit items-center gap-2 px-3 py-2 select-none",
           ...(className !== undefined
             ? [className]
             : [
@@ -95,7 +97,7 @@ export function selectorButtonComponent(
               ]),
         )}
       >
-        <div className="flex select-none items-center gap-2 truncate text-sm">
+        <div className="flex items-center gap-2 truncate text-sm select-none">
           {selected}
         </div>
         {open ? <ChevronUpIcon /> : <ChevronDownIcon />}

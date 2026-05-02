@@ -23,8 +23,12 @@ use async_broadcast::{
     Sender,
 };
 use common::{
+    audit_log_lines::AuditLogVars,
     components::PublicFunctionPath,
-    execution_context::ExecutionContext,
+    execution_context::{
+        ExecutionContext,
+        RequestContext,
+    },
     identity::IdentityCacheKey,
     knobs::{
         DATABASE_UDF_SYSTEM_TIMEOUT,
@@ -40,8 +44,6 @@ use common::{
         Timestamp,
         UdfType,
     },
-    value::ConvexArray,
-    RequestId,
 };
 use database::{
     Database,
@@ -80,6 +82,7 @@ use smallvec::{
     smallvec,
     SmallVec,
 };
+use sync_types::types::SerializedArgs;
 use udf::{
     validation::ValidatedPathAndArgs,
     FunctionOutcome,
@@ -93,17 +96,21 @@ use value::{
 
 use crate::{
     application_function_runner::FunctionRouter,
+    audit_logging::AuditLogClient,
     function_log::FunctionExecutionLog,
     QueryReturn,
 };
 
 mod metrics;
 
-// Maximum age of results to tolerate if they're time-dependent.
-pub const MAX_CACHE_AGE: Duration = Duration::from_secs(5);
-
 static TOTAL_QUERY_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| *DATABASE_UDF_USER_TIMEOUT + *DATABASE_UDF_SYSTEM_TIMEOUT);
+
+/// Maximum age of results to tolerate if they're time-dependent.
+/// This should be at least `TOTAL_QUERY_TIMEOUT` or else long queries will
+/// loop.
+static MAX_CACHE_AGE: LazyLock<Duration> =
+    LazyLock::new(|| *TOTAL_QUERY_TIMEOUT + Duration::from_secs(1));
 
 #[derive(Clone)]
 pub struct CacheManager<RT: Runtime> {
@@ -111,6 +118,7 @@ pub struct CacheManager<RT: Runtime> {
     database: Database<RT>,
     function_router: FunctionRouter<RT>,
     udf_execution: FunctionExecutionLog<RT>,
+    audit_log_client: AuditLogClient,
 
     instance_id: InstanceId,
     cache: QueryCache,
@@ -136,7 +144,7 @@ impl InstanceId {
 pub struct RequestedCacheKey {
     instance: InstanceId,
     path: PublicFunctionPath,
-    args: ConvexArray,
+    args: SerializedArgs,
     identity: IdentityCacheKey,
     journal: QueryJournal,
     allowed_visibility: AllowedVisibility,
@@ -234,7 +242,7 @@ impl RequestedCacheKey {
 pub struct StoredCacheKey {
     instance: InstanceId,
     path: PublicFunctionPath,
-    args: ConvexArray,
+    args: SerializedArgs,
     // None means that the query did not read `ctx.auth`.
     identity: Option<IdentityCacheKey>,
     journal: QueryJournal,
@@ -270,7 +278,7 @@ impl CacheEntry {
     fn size(&self) -> usize {
         mem::size_of::<Self>()
             + match self {
-                CacheEntry::Ready(ref result) => result.heap_size(),
+                CacheEntry::Ready(result) => result.heap_size(),
                 // This is an under count since there might be something in the receiver.
                 // However, this is kind of hard to measure, and we expect this to
                 // be the exception, not the rule.
@@ -298,6 +306,7 @@ impl<RT: Runtime> CacheManager<RT> {
         database: Database<RT>,
         function_router: FunctionRouter<RT>,
         udf_execution: FunctionExecutionLog<RT>,
+        audit_log_client: AuditLogClient,
         cache: QueryCache,
     ) -> Self {
         // each `CacheManager` (for a different instance) gets its own cache key space
@@ -308,6 +317,7 @@ impl<RT: Runtime> CacheManager<RT> {
             database,
             function_router,
             udf_execution,
+            audit_log_client,
             instance_id,
             cache,
         }
@@ -320,9 +330,9 @@ impl<RT: Runtime> CacheManager<RT> {
     #[fastrace::trace]
     pub async fn get(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         path: PublicFunctionPath,
-        args: ConvexArray,
+        args: SerializedArgs,
         identity: Identity,
         ts: Timestamp,
         journal: Option<QueryJournal>,
@@ -332,7 +342,7 @@ impl<RT: Runtime> CacheManager<RT> {
         let timer = get_timer();
         let result = self
             ._get(
-                request_id,
+                request_context,
                 path,
                 args,
                 identity,
@@ -359,9 +369,9 @@ impl<RT: Runtime> CacheManager<RT> {
 
     async fn _get(
         &self,
-        request_id: RequestId,
+        request_context: RequestContext,
         path: PublicFunctionPath,
-        args: ConvexArray,
+        args: SerializedArgs,
         identity: Identity,
         ts: Timestamp,
         journal: Option<QueryJournal>,
@@ -378,7 +388,7 @@ impl<RT: Runtime> CacheManager<RT> {
             journal: journal.unwrap_or_else(QueryJournal::new),
             allowed_visibility: caller.allowed_visibility(),
         };
-        let context = ExecutionContext::new(request_id, &caller);
+        let context = ExecutionContext::new(request_context, &caller);
         // If the query exists at some cache key, but the cached entry is invalid,
         // create a Waiting entry at that key, even if it's not the most precise for the
         // request. e.g. if the query was cached with identity:None, create a
@@ -389,6 +399,7 @@ impl<RT: Runtime> CacheManager<RT> {
         let mut stored_key_hint = None;
 
         let mut num_attempts = 0;
+        let mut retry_description = vec![];
         'top: loop {
             num_attempts += 1;
             let now = self.rt.monotonic_now();
@@ -399,7 +410,8 @@ impl<RT: Runtime> CacheManager<RT> {
             let elapsed = now - start;
             anyhow::ensure!(
                 elapsed <= *TOTAL_QUERY_TIMEOUT,
-                "Query execution time out: {elapsed:?}",
+                "Query execution time out: {elapsed:?} after {num_attempts} attempts. Attempts: \
+                 {retry_description:?}",
             );
 
             // Step 1: Decide what we're going to do this iteration: use a cached value,
@@ -415,7 +427,10 @@ impl<RT: Runtime> CacheManager<RT> {
             );
             let (op, stored_key) = match maybe_op {
                 Some(op_key) => op_key,
-                None => continue 'top,
+                None => {
+                    retry_description.push(format!("plan_cache_op_failed ({elapsed:?})"));
+                    continue 'top;
+                },
             };
             stored_key_hint = Some(stored_key.clone());
 
@@ -440,12 +455,16 @@ impl<RT: Runtime> CacheManager<RT> {
                 // We are executing ourselves.
                 CacheOp::Go { .. } => false,
             };
+            let op_type = op.to_string();
             let (result, table_stats) = match self
                 .perform_cache_op(&requested_key, &stored_key, op, usage_tracker.clone())
                 .await?
             {
                 Some(r) => r,
-                None => continue 'top,
+                None => {
+                    retry_description.push(format!("perform_op_{op_type}_failed ({elapsed:?})"));
+                    continue 'top;
+                },
             };
 
             // Step 3: Validate that the cache result we got is good enough. Is our desired
@@ -453,7 +472,10 @@ impl<RT: Runtime> CacheManager<RT> {
             // too old?
             let cache_result = match self.validate_cache_result(&stored_key, ts, result).await? {
                 Some(r) => r,
-                None => continue 'top,
+                None => {
+                    retry_description.push(format!("validate_cache_result_failed ({elapsed:?})"));
+                    continue 'top;
+                },
             };
 
             // Step 4: Rewrite the value into the cache. If this was a cache hit, this will
@@ -471,11 +493,7 @@ impl<RT: Runtime> CacheManager<RT> {
             // Step 5: Log some stuff and return.
             log_success(num_attempts);
             let usage_stats = usage_tracker.clone().gather_user_stats();
-            let database_bandwidth_bytes = usage_stats
-                .database_egress_size
-                .iter()
-                .map(|(_, size)| size)
-                .sum();
+            let database_bandwidth_bytes = usage_stats.database_egress.values().sum();
             log_query_bandwidth_bytes(
                 cache_result.outcome.journal.end_cursor.is_some(),
                 database_bandwidth_bytes,
@@ -491,6 +509,11 @@ impl<RT: Runtime> CacheManager<RT> {
                     context.clone(),
                 )
                 .await;
+
+            let vars = AuditLogVars::from_context(context, &self.rt);
+            self.audit_log_client
+                .send_logs(cache_result.outcome.audit_log_lines.resolve_bodies(&vars)?)
+                .await?;
 
             let result = QueryReturn {
                 result: cache_result.outcome.result.clone(),
@@ -515,10 +538,7 @@ impl<RT: Runtime> CacheManager<RT> {
         let r = match op {
             CacheOp::Ready { result } => {
                 if result.outcome.result.is_err() {
-                    panic!(
-                        "Developer error: Cache contained failed execution for {:?}",
-                        key
-                    )
+                    panic!("Developer error: Cache contained failed execution for {key:?}")
                 }
                 (result, BTreeMap::new())
             },
@@ -548,10 +568,7 @@ impl<RT: Runtime> CacheManager<RT> {
                     },
                 };
                 if result.outcome.result.is_err() {
-                    panic!(
-                        "Developer error: CacheOp::Go sent failed execution for {:?}",
-                        key
-                    )
+                    panic!("Developer error: CacheOp::Go sent failed execution for {key:?}")
                 }
                 (result, BTreeMap::new())
             },
@@ -610,8 +627,10 @@ impl<RT: Runtime> CacheManager<RT> {
                         let FunctionOutcome::Query(mut query_outcome) = outcome else {
                             anyhow::bail!("Received non-query outcome when executing a query")
                         };
-                        if let Ok(ref json_packed_value) = &query_outcome.result {
-                            let output: ConvexValue = json_packed_value.unpack();
+                        if let Ok(json_packed_value) = &query_outcome.result
+                            && returns_validator.needs_validation()
+                        {
+                            let output: ConvexValue = json_packed_value.unpack()?;
                             let table_mapping = tx.table_mapping().namespace(component.into());
                             let virtual_system_mapping = tx.virtual_system_mapping();
                             let returns_validation_error = returns_validator.check_output(
@@ -665,8 +684,8 @@ impl<RT: Runtime> CacheManager<RT> {
             return Ok(None);
         }
         result.token = match self.database.refresh_token(result.token, ts).await? {
-            Some(t) => t,
-            None => {
+            Ok(t) => t,
+            Err(_invalid_ts) => {
                 tracing::debug!(
                     "Couldn't refresh cache entry from {} to {}, retrying...",
                     result.original_ts,
@@ -681,7 +700,7 @@ impl<RT: Runtime> CacheManager<RT> {
             let sys_now = self.rt.unix_timestamp();
             let cached_time = result.outcome.unix_timestamp;
             match sys_now.checked_sub(cached_time) {
-                Some(entry_age) if entry_age > MAX_CACHE_AGE => {
+                Some(entry_age) if entry_age > *MAX_CACHE_AGE => {
                     tracing::debug!(
                         "Log entry for {:?} used system time and is too old ({:?}), retrying...",
                         key,
@@ -899,7 +918,7 @@ impl Inner {
     // `original_ts` matching.
     fn remove_ready(&mut self, key: &StoredCacheKey, original_ts: Timestamp) {
         match self.cache.get(key) {
-            Some(CacheEntry::Ready(ref result)) if result.original_ts == original_ts => {
+            Some(CacheEntry::Ready(result)) if result.original_ts == original_ts => {
                 let (actual_key, entry) = self.cache.pop_entry(key).unwrap();
                 self.size -= actual_key.size() + entry.size();
             },
@@ -950,7 +969,7 @@ impl Inner {
                 self.size += new_entry.size();
                 *entry = new_entry;
             },
-            Some(CacheEntry::Ready(ref mut existing_result)) => {
+            Some(CacheEntry::Ready(existing_result)) => {
                 if existing_result.original_ts < result.original_ts
                     || (existing_result.original_ts == result.original_ts
                         && existing_result.token.ts() < result.token.ts())
@@ -996,6 +1015,7 @@ impl Inner {
     }
 }
 
+#[derive(strum::Display)]
 enum CacheOp<'a> {
     Ready {
         result: CacheResult,
@@ -1009,146 +1029,11 @@ enum CacheOp<'a> {
         waiting_entry_id: Option<u64>,
         sender: Sender<CacheResult>,
         path: &'a PublicFunctionPath,
-        args: &'a ConvexArray,
+        args: &'a SerializedArgs,
         identity: &'a Identity,
         ts: Timestamp,
         journal: &'a QueryJournal,
         allowed_visibility: AllowedVisibility,
         context: ExecutionContext,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        path::PathBuf,
-        sync::Arc,
-    };
-
-    use common::{
-        components::{
-            ExportPath,
-            PublicFunctionPath,
-        },
-        identity::IdentityCacheKey,
-        index::IndexKeyBytes,
-        query::{
-            Cursor,
-            CursorPosition,
-        },
-        query_journal::QueryJournal,
-        types::AllowedVisibility,
-    };
-    use database::Token;
-    use proptest::{
-        prelude::{
-            Arbitrary,
-            Strategy,
-        },
-        strategy::ValueTree,
-        test_runner::TestRunner,
-    };
-    use smallvec::smallvec;
-    use sync_types::{
-        CanonicalizedModulePath,
-        CanonicalizedUdfPath,
-        Timestamp,
-    };
-    use tokio::time::Instant;
-    use udf::UdfOutcome;
-    use value::{
-        ConvexArray,
-        ConvexValue,
-    };
-
-    use super::{
-        CacheResult,
-        InstanceId,
-        QueryCache,
-        StoredCacheKey,
-    };
-
-    // Construct a cache key where as many fields as possible have extra capacity in
-    // them
-    fn make_cache_key() -> StoredCacheKey {
-        macro_rules! with_extra_capacity {
-            ($e:expr) => {{
-                let mut r = $e;
-                r.reserve(100);
-                r
-            }};
-        }
-        StoredCacheKey {
-            instance: InstanceId(0),
-            path: PublicFunctionPath::RootExport(ExportPath::from(CanonicalizedUdfPath::new(
-                CanonicalizedModulePath::new(
-                    PathBuf::with_capacity(1 << 10),
-                    false,
-                    false,
-                    false,
-                    false,
-                ),
-                "function_name".parse().unwrap(),
-            ))),
-            args: ConvexArray::try_from(with_extra_capacity!(vec![ConvexValue::from(100.)]))
-                .unwrap(),
-            identity: Some(IdentityCacheKey::InstanceAdmin(with_extra_capacity!(
-                "admin".to_string()
-            ))),
-            journal: QueryJournal {
-                end_cursor: Some(Cursor {
-                    position: CursorPosition::After(IndexKeyBytes(with_extra_capacity!(
-                        b"key".to_vec()
-                    ))),
-                    query_fingerprint: with_extra_capacity!(b"fingerprint".to_vec()),
-                }),
-            },
-            allowed_visibility: AllowedVisibility::All,
-        }
-    }
-
-    fn make_cache_result() -> CacheResult {
-        let mut test_runner = TestRunner::deterministic();
-        CacheResult {
-            outcome: Arc::new(
-                UdfOutcome::arbitrary()
-                    .new_tree(&mut test_runner)
-                    .unwrap()
-                    .current(),
-            ),
-            original_ts: Timestamp::MIN,
-            token: Token::arbitrary()
-                .new_tree(&mut test_runner)
-                .unwrap()
-                .current(),
-        }
-    }
-
-    #[test]
-    fn test_put_waiting_excess_capacity() {
-        let cache = QueryCache::new(usize::MAX);
-        let cache_key = make_cache_key();
-        // Cloning the key effectively shrinks away the excess capacity
-        let cloned_key = cache_key.clone();
-        assert_ne!(cache_key.size(), cloned_key.size());
-        let (_, id) = cache
-            .inner
-            .lock()
-            .put_waiting(cloned_key, Instant::now(), Timestamp::MIN);
-        assert!(cache.inner.lock().size > 0);
-        cache.remove_waiting(&cache_key, id);
-        assert_eq!(cache.inner.lock().size, 0);
-    }
-
-    #[test]
-    fn test_put_ready_excess_capacity() {
-        let cache = QueryCache::new(usize::MAX);
-        let cache_key = make_cache_key();
-        let cloned_key = cache_key.clone();
-        assert_ne!(cache_key.size(), cloned_key.size());
-        cache.put_ready(smallvec![cloned_key], make_cache_result());
-        assert!(cache.inner.lock().size > 0);
-        cache.remove_ready(&cache_key, Timestamp::MIN);
-        assert_eq!(cache.inner.lock().size, 0);
-    }
 }

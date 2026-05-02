@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* eslint-disable @typescript-eslint/no-var-requires */
+/* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require("fs");
 const path = require("path");
 const process = require("process");
@@ -152,6 +152,8 @@ if (process.argv.includes("standalone-cli")) {
         // prettier 3 is more difficult to bundle into a CJS bundle.
         // TODO figure out how to do this (making import.meta work?)
         "prettier",
+        // Bundling ws externally seems to fix some issues with Bun compatibility
+        "ws",
       ],
       outfile: tempDir + "/cli.bundle.cjs",
       logLevel: "warning",

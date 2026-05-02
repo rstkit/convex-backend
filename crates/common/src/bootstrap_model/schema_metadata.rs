@@ -1,3 +1,4 @@
+use json_trait::JsonForm as _;
 use serde::{
     Deserialize,
     Serialize,
@@ -8,13 +9,9 @@ use super::schema_state::{
     SchemaState,
     SerializedSchemaState,
 };
-use crate::{
-    json::JsonSerializable,
-    schemas::DatabaseSchema,
-};
+use crate::schemas::DatabaseSchema;
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 pub struct SchemaMetadata {
     pub state: SchemaState,
     pub raw_schema: String,

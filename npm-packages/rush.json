@@ -15,7 +15,7 @@
    * path segment in the "$schema" field for all your Rush config files.  This will ensure
    * correct error-underlining and tab-completion for editors such as VS Code.
    */
-  "rushVersion": "5.147.1",
+  "rushVersion": "5.173.0",
   /**
    * The next field selects which package manager should be installed and determines its version.
    * Rush installs its own local copy of the package manager to ensure that your build process
@@ -24,7 +24,7 @@
    * Specify one of: "pnpmVersion", "npmVersion", or "yarnVersion".  See the Rush documentation
    * for details about these alternatives.
    */
-  "pnpmVersion": "10.11.0",
+  "pnpmVersion": "10.33.0",
   // "npmVersion": "4.5.0",
   // "yarnVersion": "1.9.4",
   /**
@@ -38,7 +38,7 @@
    * LTS schedule: https://nodejs.org/en/about/releases/
    * LTS versions: https://nodejs.org/en/download/releases/
    */
-  "nodeSupportedVersionRange": ">=18.0.0 <23.0.0",
+  "nodeSupportedVersionRange": ">=22.0.0 <25.0.0",
   /**
    * Odd-numbered major versions of Node.js are experimental.  Even-numbered releases
    * spend six months in a stabilization period before the first Long Term Support (LTS) version.
@@ -87,7 +87,7 @@
    * and set projectFolderMaxDepth to a large number.
    */
   // "projectFolderMinDepth": 2,
-  "projectFolderMaxDepth": 3,
+  "projectFolderMaxDepth": 5,
   /**
    * Today the npmjs.com registry enforces fairly strict naming rules for packages, but in the early
    * days there was no standard and hardly any enforcement.  A few large legacy projects are still using
@@ -260,25 +260,48 @@
     {
       "packageName": "convex",
       "projectFolder": "convex",
-      "versionPolicyName": "convex"
+      "versionPolicyName": "convex",
+      "decoupledLocalDependencies": ["@convex-dev/platform"]
     },
     {
       "packageName": "@convex-dev/react-query",
       "projectFolder": "@convex-dev/react-query"
-      // move to `"versionPolicyName": "convex"` once this is stable
     },
     {
       "packageName": "@convex-dev/eslint-plugin",
       "projectFolder": "@convex-dev/eslint-plugin"
-      // move to `"versionPolicyName": "convex"` once this is stable
+    },
+    {
+      "packageName": "@convex-dev/codemod",
+      "projectFolder": "@convex-dev/codemod"
+    },
+    {
+      "packageName": "codemod-test-custom-convex-folder",
+      "projectFolder": "@convex-dev/codemod/test/explicit-ids/custom-convex-folder"
+    },
+    {
+      "packageName": "codemod-test-sample-convex-project",
+      "projectFolder": "@convex-dev/codemod/test/explicit-ids/sample-convex-project"
+    },
+    {
+      "packageName": "@convex-dev/workos",
+      "projectFolder": "@convex-dev/workos"
     },
     {
       "packageName": "publishing-tests",
-      "projectFolder": "publishing-tests"
+      "projectFolder": "tests/publishing-tests"
     },
     {
       "packageName": "package-tests",
-      "projectFolder": "package-tests"
+      "projectFolder": "tests/package-tests"
+    },
+    {
+      "packageName": "@convex-dev/platform",
+      "projectFolder": "@convex-dev/platform"
+    },
+    {
+      "packageName": "clerk-initial-auth",
+      "projectFolder": "private-demos/clerk-initial-auth"
     },
     {
       "packageName": "bundle-size",
@@ -293,20 +316,44 @@
       "projectFolder": "private-demos/tanstack-start-clerk"
     },
     {
+      "packageName": "tanstack-start-workos",
+      "projectFolder": "private-demos/tanstack-start-workos"
+    },
+    {
       "packageName": "test-data",
       "projectFolder": "private-demos/test-data"
+    },
+    {
+      "packageName": "private-demos-e2e",
+      "projectFolder": "private-demos/e2e"
     },
     {
       "packageName": "typescript-demo",
       "projectFolder": "demos/typescript"
     },
     {
+      "packageName": "convex-test-demo",
+      "projectFolder": "demos/convex-test"
+    },
+    {
+      "packageName": "prewarming-demo",
+      "projectFolder": "demos/prewarming"
+    },
+    {
       "packageName": "typescript-demo-old",
       "projectFolder": "private-demos/typescript-old"
     },
     {
+      "packageName": "typescript-exact-optional-property-types",
+      "projectFolder": "private-demos/typescript-exact-optional-property-types"
+    },
+    {
       "packageName": "typescript-modern",
       "projectFolder": "private-demos/typescript-modern"
+    },
+    {
+      "packageName": "tsgo-test",
+      "projectFolder": "private-demos/tsgo-test"
     },
     {
       "packageName": "middleware",
@@ -317,8 +364,44 @@
       "projectFolder": "private-demos/snippets"
     },
     {
+      "packageName": "static-codegen",
+      "projectFolder": "private-demos/static-codegen"
+    },
+    {
+      "packageName": "static-codegen-ts",
+      "projectFolder": "private-demos/static-codegen-ts"
+    },
+    {
+      "packageName": "components-api-import",
+      "projectFolder": "private-demos/components-api-import"
+    },
+    {
+      "packageName": "components-api-import-ts",
+      "projectFolder": "private-demos/components-api-import-ts"
+    },
+    {
+      "packageName": "components-legacy",
+      "projectFolder": "private-demos/components-legacy"
+    },
+    {
+      "packageName": "components-legacy-ts",
+      "projectFolder": "private-demos/components-legacy-ts"
+    },
+    {
       "packageName": "components-poc",
       "projectFolder": "private-demos/components-poc"
+    },
+    {
+      "packageName": "components-npm",
+      "projectFolder": "private-demos/components-npm"
+    },
+    {
+      "packageName": "components-ts-alias",
+      "projectFolder": "private-demos/components-ts-alias"
+    },
+    {
+      "packageName": "uses-ents",
+      "projectFolder": "private-demos/uses-ents"
     },
     {
       "packageName": "@convex-dev/ratelimiter",
@@ -338,7 +421,7 @@
     },
     {
       "packageName": "js-integration-tests",
-      "projectFolder": "js-integration-tests"
+      "projectFolder": "tests/js-integration-tests"
     },
     {
       "packageName": "react-query-demo",
@@ -363,6 +446,10 @@
     {
       "packageName": "convex-tutorial-original",
       "projectFolder": "demos/tutorial"
+    },
+    {
+      "packageName": "test-project",
+      "projectFolder": "private-demos/test-project"
     },
     {
       "packageName": "convex-analytics",
@@ -415,6 +502,10 @@
     {
       "packageName": "pagination-adversarial",
       "projectFolder": "private-demos/pagination-adversarial"
+    },
+    {
+      "packageName": "pagination-visualization",
+      "projectFolder": "private-demos/pagination-visualization"
     },
     {
       "packageName": "presence-facepile",
@@ -513,6 +604,10 @@
       "projectFolder": "private-demos/http"
     },
     {
+      "packageName": "ctx-meta",
+      "projectFolder": "private-demos/ctx-meta"
+    },
+    {
       "packageName": "waitlist",
       "projectFolder": "private-demos/waitlist"
     },
@@ -537,12 +632,16 @@
       "projectFolder": "@convex-dev/design-system"
     },
     {
+      "packageName": "dashboard-storybook",
+      "projectFolder": "dashboard-storybook"
+    },
+    {
       "packageName": "udf-runtime",
       "projectFolder": "udf-runtime"
     },
     {
       "packageName": "simulation",
-      "projectFolder": "simulation"
+      "projectFolder": "tests/simulation"
     },
     {
       "packageName": "system-udfs",
@@ -554,31 +653,51 @@
     },
     {
       "packageName": "udf-tests",
-      "projectFolder": "udf-tests"
+      "projectFolder": "tests/udf-tests"
     },
     {
       "packageName": "component-tests",
-      "projectFolder": "component-tests"
+      "projectFolder": "tests/component-tests"
     },
     {
       "packageName": "component-tests-empty",
-      "projectFolder": "component-tests/projects/empty"
+      "projectFolder": "tests/component-tests/projects/empty"
     },
     {
       "packageName": "component-tests-mounted",
-      "projectFolder": "component-tests/projects/mounted"
+      "projectFolder": "tests/component-tests/projects/mounted"
     },
     {
       "packageName": "component-tests-with-schema",
-      "projectFolder": "component-tests/projects/with-schema"
+      "projectFolder": "tests/component-tests/projects/with-schema"
+    },
+    {
+      "packageName": "component-tests-schema-with-index",
+      "projectFolder": "tests/component-tests/projects/schema_with_index"
     },
     {
       "packageName": "component-tests-basic",
-      "projectFolder": "component-tests/projects/basic"
+      "projectFolder": "tests/component-tests/projects/basic"
     },
     {
       "packageName": "component-tests-http-actions",
-      "projectFolder": "component-tests/projects/http_actions"
+      "projectFolder": "tests/component-tests/projects/http_actions"
+    },
+    {
+      "packageName": "component-tests-http-mount-routing",
+      "projectFolder": "tests/component-tests/projects/http_mount_routing"
+    },
+    {
+      "packageName": "component-tests-http-prefix-and-mount-routing",
+      "projectFolder": "tests/component-tests/projects/http_prefix_and_mount_routing"
+    },
+    {
+      "packageName": "component-tests-http-legacy-routes",
+      "projectFolder": "tests/component-tests/projects/http_legacy_routes"
+    },
+    {
+      "packageName": "component-tests-http-no-prefix-mounting",
+      "projectFolder": "tests/component-tests/projects/http_no_prefix_mounting"
     },
     {
       "packageName": "scenario-runner",
@@ -590,7 +709,7 @@
     },
     {
       "packageName": "retention-tester",
-      "projectFolder": "retention-tester"
+      "projectFolder": "tests/retention-tester"
     },
     {
       "packageName": "shapes",
@@ -637,8 +756,80 @@
       "projectFolder": "private-demos/openauth-react"
     },
     {
+      "packageName": "quickstart-bun",
+      "projectFolder": "private-demos/quickstarts/bun"
+    },
+    {
+      "packageName": "quickstart-expo",
+      "projectFolder": "private-demos/quickstarts/expo"
+    },
+    {
+      "packageName": "quickstart-nextjs",
+      "projectFolder": "private-demos/quickstarts/nextjs"
+    },
+    {
+      "packageName": "quickstart-nextjs-app-dir",
+      "projectFolder": "private-demos/quickstarts/nextjs-app-dir"
+    },
+    {
+      "packageName": "quickstart-nextjs-app-dir-14",
+      "projectFolder": "private-demos/quickstarts/nextjs-app-dir-14"
+    },
+    {
+      "packageName": "quickstart-nextjs-app-dir-js",
+      "projectFolder": "private-demos/quickstarts/nextjs-app-dir-js"
+    },
+    {
+      "packageName": "quickstart-nodejs",
+      "projectFolder": "private-demos/quickstarts/nodejs"
+    },
+    {
+      "packageName": "quickstart-nuxt",
+      "projectFolder": "private-demos/quickstarts/nuxt"
+    },
+    {
+      "packageName": "quickstart-react-vite",
+      "projectFolder": "private-demos/quickstarts/react-vite"
+    },
+    {
+      "packageName": "quickstart-react-vite-ts",
+      "projectFolder": "private-demos/quickstarts/react-vite-ts"
+    },
+    {
+      "packageName": "quickstart-remix",
+      "projectFolder": "private-demos/quickstarts/remix"
+    },
+    {
+      "packageName": "quickstart-sveltekit",
+      "projectFolder": "private-demos/quickstarts/sveltekit"
+    },
+    {
+      "packageName": "quickstart-tanstack-start",
+      "projectFolder": "private-demos/quickstarts/tanstack-start"
+    },
+    {
+      "packageName": "quickstart-vue",
+      "projectFolder": "private-demos/quickstarts/vue"
+    },
+    {
       "packageName": "local-store",
       "projectFolder": "local-store"
+    },
+    {
+      "packageName": "version",
+      "projectFolder": "version"
+    },
+    {
+      "packageName": "lint",
+      "projectFolder": "lint"
+    },
+    {
+      "packageName": "demo_browser_tests",
+      "projectFolder": "demo_browser_tests"
+    },
+    {
+      "packageName": "react-native-demo",
+      "projectFolder": "demos/react-native"
     }
     // {
     //   /**

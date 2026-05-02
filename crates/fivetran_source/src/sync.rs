@@ -4,7 +4,7 @@ use std::collections::{
 };
 
 use anyhow::Context;
-use convex_fivetran_common::fivetran_sdk::{
+use fivetran_common::fivetran_sdk::{
     self,
     update_response,
     value_type,
@@ -25,17 +25,19 @@ use serde::{
 use value_type::Inner as FivetranValue;
 
 use crate::{
+    api_types::selection::Selection,
     convert::to_fivetran_row,
     convex_api::{
         DocumentDeltasCursor,
         ListSnapshotCursor,
+        SnapshotValue,
         Source,
     },
     log::log,
 };
 
 /// The value currently used for the `version` field of [`State`].
-const CURSOR_VERSION: i64 = 1;
+const CURSOR_VERSION: i64 = 2;
 
 /// Stores the current synchronization state of a destination. A state will be
 /// send (as JSON) to Fivetran every time we perform a checkpoint, and will be
@@ -44,7 +46,6 @@ const CURSOR_VERSION: i64 = 1;
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub struct State {
     /// The version of the connector that emitted this checkpoint. Could be used
     /// in the future to support backward compatibility with older state
@@ -59,6 +60,9 @@ pub struct State {
     ///
     /// Older versions of state.json do not have this field set. Once all
     /// state.json have this field, we can make this non-optional.
+    ///
+    /// The format of this string is `{table_name}` for the root component,
+    /// or `{component_path}/{table_name}` for tables in other components.
     pub tables_seen: Option<BTreeSet<String>>,
 }
 
@@ -74,7 +78,6 @@ impl State {
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub enum Checkpoint {
     /// A checkpoint emitted during the initial synchonization.
     InitialSync {
@@ -86,6 +89,7 @@ pub enum Checkpoint {
 }
 
 /// A simplification of the messages sent to Fivetran in the `update` endpoint.
+#[derive(Debug)]
 pub enum UpdateMessage {
     Update {
         schema_name: Option<String>,
@@ -136,9 +140,10 @@ impl From<UpdateMessage> for FivetranUpdateResponse {
 pub fn sync(
     source: impl Source + 'static,
     state: Option<State>,
+    selection: Selection,
 ) -> BoxStream<'static, anyhow::Result<UpdateMessage>> {
     let Some(state) = state else {
-        return initial_sync(source, None, Some(BTreeSet::new())).boxed();
+        return initial_sync(source, None, Some(BTreeSet::new()), selection).boxed();
     };
 
     let State {
@@ -148,9 +153,11 @@ pub fn sync(
     } = state;
     match checkpoint {
         Checkpoint::InitialSync { snapshot, cursor } => {
-            initial_sync(source, Some((snapshot, cursor)), tables_seen).boxed()
+            initial_sync(source, Some((snapshot, cursor)), tables_seen, selection).boxed()
         },
-        Checkpoint::DeltaUpdates { cursor } => delta_sync(source, cursor, tables_seen).boxed(),
+        Checkpoint::DeltaUpdates { cursor } => {
+            delta_sync(source, cursor, tables_seen, selection).boxed()
+        },
     }
 }
 
@@ -160,6 +167,7 @@ async fn initial_sync(
     source: impl Source,
     mut checkpoint: Option<(i64, ListSnapshotCursor)>,
     mut tables_seen: Option<BTreeSet<String>>,
+    selection: Selection,
 ) {
     let log_msg = if let Some((snapshot, _)) = checkpoint {
         format!("Resuming an initial sync from {source} at {snapshot}")
@@ -171,16 +179,19 @@ async fn initial_sync(
     let snapshot = loop {
         let snapshot = checkpoint.as_ref().map(|c| c.0);
         let cursor = checkpoint.as_ref().map(|c| c.1.clone());
-        let res = source.list_snapshot(snapshot, cursor.clone()).await?;
+        let res = source
+            .list_snapshot(snapshot, cursor.clone(), selection.clone())
+            .await?;
 
         for value in res.values {
             if let Some(ref mut tables_seen) = tables_seen {
                 // Issue truncates if we see a table for the first time.
                 // Skip the behavior for legacy state.json - where tables_seen wasn't tracked.
-                if !tables_seen.contains(&value.table) {
-                    tables_seen.insert(value.table.clone());
+                let table_seen_key = value.table_path_for_state();
+                if !tables_seen.contains(&table_seen_key) {
+                    tables_seen.insert(table_seen_key);
                     yield UpdateMessage::Update {
-                        schema_name: None,
+                        schema_name: Some(value.fivetran_schema_name()),
                         table_name: value.table.clone(),
                         op_type: RecordType::Truncate,
                         row: BTreeMap::new(),
@@ -188,7 +199,7 @@ async fn initial_sync(
                 }
             }
             yield UpdateMessage::Update {
-                schema_name: None,
+                schema_name: Some(value.fivetran_schema_name()),
                 table_name: value.table,
                 op_type: RecordType::Upsert,
                 row: to_fivetran_row(value.fields)?,
@@ -230,22 +241,24 @@ async fn delta_sync(
     source: impl Source,
     cursor: DocumentDeltasCursor,
     mut tables_seen: Option<BTreeSet<String>>,
+    selection: Selection,
 ) {
     log(&format!("Delta sync from {source} starting at {cursor}."));
 
     let mut cursor = cursor;
     let mut has_more = true;
     while has_more {
-        let response = source.document_deltas(cursor).await?;
+        let response = source.document_deltas(cursor, selection.clone()).await?;
 
         for value in response.values {
             if let Some(ref mut tables_seen) = tables_seen {
                 // Issue truncates if we see a table for the first time.
                 // Skip the behavior for legacy state.json - where tables_seen wasn't tracked.
-                if !tables_seen.contains(&value.table) {
-                    tables_seen.insert(value.table.clone());
+                let table_seen_key = value.table_path_for_state();
+                if !tables_seen.contains(&table_seen_key) {
+                    tables_seen.insert(table_seen_key);
                     yield UpdateMessage::Update {
-                        schema_name: None,
+                        schema_name: Some(value.fivetran_schema_name()),
                         table_name: value.table.clone(),
                         op_type: RecordType::Truncate,
                         row: BTreeMap::new(),
@@ -254,7 +267,7 @@ async fn delta_sync(
             }
 
             yield UpdateMessage::Update {
-                schema_name: None,
+                schema_name: Some(value.fivetran_schema_name()),
                 table_name: value.table,
                 op_type: if value.deleted {
                     RecordType::Delete
@@ -279,74 +292,4 @@ async fn delta_sync(
     log(&format!(
         "Delta sync changes applied from {source}. Final cursor {cursor}"
     ));
-}
-
-#[cfg(test)]
-mod state_serialization_tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-
-    use crate::sync::{
-        Checkpoint,
-        State,
-    };
-
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1),
-            failure_persistence: None, ..ProptestConfig::default()
-        })]
-        #[test]
-        fn state_json_roundtrips(value in any::<State>()) {
-            let json = serde_json::to_string(&value).unwrap();
-            prop_assert_eq!(value, serde_json::from_str(&json).unwrap());
-        }
-    }
-
-    #[test]
-    fn refuses_unknown_state_object() {
-        assert!(serde_json::from_str::<State>("{\"a\": \"b\"}").is_err());
-    }
-
-    #[test]
-    fn refuses_unknown_checkpoint_object() {
-        assert!(serde_json::from_str::<State>(
-            "{ \"version\": 1, \"snapshot\": { \"NewState\": { \"cursor\": 42 } } }"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn deserializes_v1_initial_sync_checkpoints() {
-        assert_eq!(
-            serde_json::from_str::<State>(
-                "{ \"version\": 1, \"checkpoint\": { \"InitialSync\": { \"snapshot\": 42, \
-                 \"cursor\": \"abc123\" } } }"
-            )
-            .unwrap(),
-            State {
-                version: 1,
-                checkpoint: Checkpoint::InitialSync {
-                    snapshot: 42,
-                    cursor: String::from("abc123").into(),
-                },
-                tables_seen: None,
-            },
-        );
-    }
-
-    #[test]
-    fn deserializes_v1_delta_update_checkpoints() {
-        assert_eq!(
-            serde_json::from_str::<State>(
-                "{ \"version\": 1, \"checkpoint\": { \"DeltaUpdates\": { \"cursor\": 42 } } }"
-            )
-            .unwrap(),
-            State {
-                version: 1,
-                checkpoint: Checkpoint::DeltaUpdates { cursor: 42.into() },
-                tables_seen: None,
-            },
-        );
-    }
 }

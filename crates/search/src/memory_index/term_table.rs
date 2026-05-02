@@ -124,7 +124,7 @@ impl TermTable {
         term: &Term,
         max_distance: u8,
         prefix: bool,
-    ) -> impl Iterator<Item = (TermId, EditDistance, Term)> + '_ {
+    ) -> impl Iterator<Item = (TermId, EditDistance, Term)> + use<'_> {
         assert!(max_distance <= 2);
         let term = term.as_str().expect("Term must be string for get_fuzzy");
         let dfa = build_fuzzy_dfa(term, max_distance, prefix);
@@ -217,48 +217,5 @@ impl TermTable {
         }
         anyhow::ensure!(self.size == expected_size);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use itertools::Itertools;
-
-    use crate::{
-        memory_index::term_table::TermTable,
-        scoring::term_from_str,
-    };
-
-    #[test]
-    fn test_get_fuzzy() {
-        let mut tt = TermTable::new();
-        tt.incref(&term_from_str("brow"));
-
-        let results = tt.get_fuzzy(&term_from_str("brow"), 0, false).collect_vec();
-        assert_eq!(results.len(), 1);
-
-        let results = tt
-            .get_fuzzy(&term_from_str("brown"), 0, false)
-            .collect_vec();
-        assert_eq!(results.len(), 0);
-
-        let results = tt
-            .get_fuzzy(&term_from_str("brown"), 1, false)
-            .collect_vec();
-        assert_eq!(results.len(), 1);
-
-        tt.incref(&term_from_str("aaaaaaaaaaa"));
-        let results = tt.get_fuzzy(&term_from_str("aaa"), 0, true).collect_vec();
-        assert_eq!(results.len(), 1);
-        let results = tt.get_fuzzy(&term_from_str("baa"), 0, true).collect_vec();
-        assert_eq!(results.len(), 0);
-        let results = tt.get_fuzzy(&term_from_str("baa"), 1, true).collect_vec();
-        assert_eq!(results.len(), 1);
-        let results = tt.get_fuzzy(&term_from_str("bab"), 1, true).collect_vec();
-        assert_eq!(results.len(), 0);
-
-        // This actually also matches brow since bro <-> bab are distance 2
-        let results = tt.get_fuzzy(&term_from_str("bab"), 2, true).collect_vec();
-        assert_eq!(results.len(), 2);
     }
 }

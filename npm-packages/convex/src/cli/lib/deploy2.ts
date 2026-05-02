@@ -1,15 +1,21 @@
+import { Context } from "../../bundler/context.js";
 import {
   changeSpinner,
-  Context,
   logError,
   logFailure,
   logFinishedStep,
   logVerbose,
   showSpinner,
-} from "../../bundler/context.js";
+} from "../../bundler/log.js";
 import { spawnSync } from "child_process";
-import { deploymentFetch, logAndHandleFetchError } from "./utils/utils.js";
 import {
+  deploymentFetch,
+  logAndHandleFetchError,
+  typedDeploymentClient,
+} from "./utils/utils.js";
+import {
+  EvaluatePushResponse,
+  evaluatePushResponse,
   schemaStatus,
   SchemaStatus,
   StartPushRequest,
@@ -20,16 +26,23 @@ import {
   AppDefinitionConfig,
   ComponentDefinitionConfig,
 } from "./deployApi/definitionConfig.js";
-import chalk from "chalk";
+import { chalkStderr } from "chalk";
 import { finishPushDiff, FinishPushDiff } from "./deployApi/finishPush.js";
 import { Reporter, Span } from "./tracing.js";
 import { promisify } from "node:util";
 import zlib from "node:zlib";
-import { PushOptions } from "./push.js";
+import { PushOptions } from "./components.js";
+import { DeploymentType } from "./api.js";
 import { runPush } from "./components.js";
-import { suggestedEnvVarName } from "./envvars.js";
-import { runSystemQuery } from "./run.js";
-import { handlePushConfigError } from "./config.js";
+import { suggestedEnvVarNames } from "./envvars.js";
+import {
+  handlePushConfigError,
+  readProjectConfig,
+  getAuthKitConfig,
+} from "./config.js";
+import { deploymentDashboardUrlPage } from "./dashboard.js";
+import { addProgressLinkIfSlow } from "./indexes.js";
+import { ensureAuthKitProvisionedBeforeBuild } from "./workos/workos.js";
 
 const brotli = promisify(zlib.brotliCompress);
 
@@ -44,7 +57,6 @@ async function brotliCompress(ctx: Context, data: string): Promise<Buffer> {
   const end = performance.now();
   const duration = end - start;
   logVerbose(
-    ctx,
     `Compressed ${(data.length / 1024).toFixed(2)}KiB to ${(result.length / 1024).toFixed(2)}KiB (${((result.length / data.length) * 100).toFixed(2)}%) in ${duration.toFixed(2)}ms`,
   );
   return result;
@@ -58,17 +70,66 @@ export async function startPush(
   options: {
     url: string;
     deploymentName: string | null;
+    deploymentType?: DeploymentType;
   },
 ): Promise<StartPushResponse> {
-  const custom = (_k: string | number, s: any) =>
-    typeof s === "string" ? s.slice(0, 40) + (s.length > 40 ? "..." : "") : s;
-  logVerbose(ctx, JSON.stringify(request, custom, 2));
+  const response = await pushCode(
+    ctx,
+    span,
+    request,
+    options,
+    "/api/deploy2/start_push",
+  );
+  return startPushResponse.parse(response);
+}
+
+export async function evaluatePush(
+  ctx: Context,
+  span: Span,
+  request: StartPushRequest,
+  options: {
+    url: string;
+    deploymentName: string | null;
+    deploymentType?: DeploymentType;
+  },
+): Promise<EvaluatePushResponse> {
+  const response = await pushCode(
+    ctx,
+    span,
+    request,
+    options,
+    "/api/deploy2/evaluate_push",
+  );
+  return evaluatePushResponse.parse(response);
+}
+
+async function pushCode(
+  ctx: Context,
+  span: Span,
+  request: StartPushRequest,
+  options: {
+    url: string;
+    deploymentName: string | null;
+    deploymentType?: DeploymentType;
+  },
+  endpoint: "/api/deploy2/start_push" | "/api/deploy2/evaluate_push",
+): Promise<unknown> {
+  // Log a summary of the push request instead of the full object
+  const unchangedModuleCount =
+    request.appDefinition?.unchangedModuleHashes?.length ?? 0;
+  const changedModuleCount = request.appDefinition?.changedModules?.length ?? 0;
+  const requestSummary = {
+    hasAppDefinition: request.appDefinition !== undefined,
+    appFunctionCount: unchangedModuleCount + changedModuleCount,
+    hasAppSchema: request.appDefinition?.schema !== null,
+    componentCount: request.componentDefinitions?.length ?? 0,
+    hasDependencies: request.nodeDependencies?.length > 0,
+    dryRun: request.dryRun,
+  };
+  logVerbose(`Push request summary: ${JSON.stringify(requestSummary)}`);
   const onError = (err: any) => {
     if (err.toString() === "TypeError: fetch failed") {
-      changeSpinner(
-        ctx,
-        `Fetch failed, is ${options.url} correct? Retrying...`,
-      );
+      changeSpinner(`Fetch failed, is ${options.url} correct? Retrying...`);
     }
   };
   const fetch = deploymentFetch(ctx, {
@@ -76,9 +137,8 @@ export async function startPush(
     adminKey: request.adminKey,
     onError,
   });
-  changeSpinner(ctx, "Analyzing source code...");
   try {
-    const response = await fetch("/api/deploy2/start_push", {
+    const response = await fetch(endpoint, {
       body: await brotliCompress(ctx, JSON.stringify(request)),
       method: "POST",
       headers: {
@@ -87,13 +147,19 @@ export async function startPush(
         traceparent: span.encodeW3CTraceparent(),
       },
     });
-    return startPushResponse.parse(await response.json());
+    return await response.json();
   } catch (error: unknown) {
     return await handlePushConfigError(
       ctx,
       error,
       "Error: Unable to start push to " + options.url,
       options.deploymentName,
+      {
+        adminKey: request.adminKey,
+        deploymentUrl: options.url,
+        deploymentNotice: "",
+      },
+      options.deploymentType,
     );
   }
 }
@@ -109,6 +175,7 @@ export async function waitForSchema(
     adminKey: string;
     url: string;
     dryRun: boolean;
+    deploymentName: string | null;
   },
 ) {
   const fetch = deploymentFetch(ctx, {
@@ -116,10 +183,8 @@ export async function waitForSchema(
     adminKey: options.adminKey,
   });
 
-  changeSpinner(
-    ctx,
-    "Backfilling indexes and checking that documents match your schema...",
-  );
+  const start = Date.now();
+  changeSpinner("Pushing code to your Convex deployment...");
 
   while (true) {
     let currentStatus: SchemaStatus;
@@ -138,7 +203,7 @@ export async function waitForSchema(
       });
       currentStatus = schemaStatus.parse(await response.json());
     } catch (error: unknown) {
-      logFailure(ctx, "Error: Unable to wait for schema from " + options.url);
+      logFailure("Error: Unable to wait for schema from " + options.url);
       return await logAndHandleFetchError(ctx, error);
     }
     switch (currentStatus.type) {
@@ -156,13 +221,36 @@ export async function waitForSchema(
         const indexesDone = indexesComplete === indexesTotal;
         let msg: string;
         if (!indexesDone && !schemaDone) {
-          msg = `Backfilling indexes (${indexesComplete}/${indexesTotal} ready) and checking that documents match your schema...`;
+          msg = addProgressLinkIfSlow(
+            `Backfilling indexes (${indexesComplete}/${indexesTotal} ready) and checking that documents match your schema...`,
+            options.deploymentName,
+            start,
+          );
         } else if (!indexesDone) {
           msg = `Backfilling indexes (${indexesComplete}/${indexesTotal} ready)...`;
+          // Set a more specific message if the backfill is taking a long time
+          if (Date.now() - start > 10_000) {
+            const rootDiff = startPush.schemaChange.indexDiffs?.[""];
+            const indexName = (
+              rootDiff?.added_indexes[0] || rootDiff?.enabled_indexes?.[0]
+            )?.name;
+            if (indexName) {
+              const table = indexName.split(".")[0];
+              const dashboardUrl = deploymentDashboardUrlPage(
+                options.deploymentName,
+                `/data?table=${table}&showIndexes=true`,
+              );
+              msg = `Backfilling index ${indexName} (${indexesComplete}/${indexesTotal} ready), see progress here: ${dashboardUrl}`;
+            }
+          }
         } else {
-          msg = "Checking that documents match your schema...";
+          msg = addProgressLinkIfSlow(
+            "Checking that documents match your schema...",
+            options.deploymentName,
+            start,
+          );
         }
-        changeSpinner(ctx, msg);
+        changeSpinner(msg);
         break;
       }
       case "failed": {
@@ -174,8 +262,8 @@ export async function waitForSchema(
           msg += ` in component "${currentStatus.componentPath}"`;
         }
         msg += ".";
-        logFailure(ctx, msg);
-        logError(ctx, chalk.red(`${currentStatus.error}`));
+        logFailure(msg);
+        logError(chalkStderr.red(`${currentStatus.error}`));
         return await ctx.crash({
           exitCode: 1,
           errorType: {
@@ -197,7 +285,7 @@ export async function waitForSchema(
         });
       }
       case "complete": {
-        changeSpinner(ctx, "Schema validation complete.");
+        changeSpinner("Schema validation complete.");
         return;
       }
     }
@@ -213,9 +301,12 @@ export async function finishPush(
     url: string;
     dryRun: boolean;
     verbose?: boolean;
+    deploymentName: string | null;
+    deploymentType?: DeploymentType;
+    message: string | null;
   },
 ): Promise<FinishPushDiff> {
-  changeSpinner(ctx, "Finalizing push...");
+  changeSpinner("Finalizing push...");
   const fetch = deploymentFetch(ctx, {
     deploymentUrl: options.url,
     adminKey: options.adminKey,
@@ -224,6 +315,7 @@ export async function finishPush(
     adminKey: options.adminKey,
     startPush,
     dryRun: options.dryRun,
+    message: options.message,
   };
   try {
     const response = await fetch("/api/deploy2/finish_push", {
@@ -237,8 +329,18 @@ export async function finishPush(
     });
     return finishPushDiff.parse(await response.json());
   } catch (error: unknown) {
-    logFailure(ctx, "Error: Unable to finish push to " + options.url);
-    return await logAndHandleFetchError(ctx, error);
+    return await handlePushConfigError(
+      ctx,
+      error,
+      "Error: Unable to finish push to " + options.url,
+      options.deploymentName,
+      {
+        adminKey: options.adminKey,
+        deploymentUrl: options.url,
+        deploymentNotice: "",
+      },
+      options.deploymentType,
+    );
   }
 }
 
@@ -272,7 +374,6 @@ export async function reportPushCompleted(
     await response.json();
   } catch (error: unknown) {
     logFailure(
-      ctx,
       "Error: Unable to report push completed to " + url + ": " + error,
     );
   }
@@ -284,6 +385,7 @@ export async function deployToDeployment(
     url: string;
     adminKey: string;
     deploymentName: string | null;
+    deploymentType?: DeploymentType;
   },
   options: {
     verbose?: boolean | undefined;
@@ -294,15 +396,43 @@ export async function deployToDeployment(
     codegen: "enable" | "disable";
     cmd?: string | undefined;
     cmdUrlEnvVarName?: string | undefined;
+    pushAllModules?: boolean;
 
     debugBundlePath?: string | undefined;
     debug?: boolean | undefined;
     writePushRequest?: string | undefined;
     liveComponentSources?: boolean | undefined;
-    partitionId?: string | undefined;
+    skipWorkosCheck?: boolean | undefined;
+    allowDeletingLargeIndexes: boolean;
+    message: string | null;
   },
 ) {
   const { url, adminKey } = credentials;
+
+  // Pre-flight check: Ensure AuthKit is provisioned before building client bundle
+  if (!options.skipWorkosCheck) {
+    const { projectConfig } = await readProjectConfig(ctx);
+    const authKitConfig = await getAuthKitConfig(ctx, projectConfig);
+
+    if (authKitConfig && credentials.deploymentName) {
+      // Only provision for cloud deployments (dev/preview/prod)
+      // Skip for local and anonymous deployments
+      const deploymentType = credentials.deploymentType;
+      if (
+        deploymentType === "dev" ||
+        deploymentType === "preview" ||
+        deploymentType === "prod"
+      ) {
+        await ensureAuthKitProvisionedBeforeBuild(
+          ctx,
+          credentials.deploymentName,
+          { deploymentUrl: url, adminKey },
+          deploymentType,
+        );
+      }
+    }
+  }
+
   await runCommand(ctx, { ...options, url, adminKey });
 
   const pushOptions: PushOptions = {
@@ -314,18 +444,20 @@ export async function deployToDeployment(
     typecheckComponents: options.typecheckComponents,
     debug: !!options.debug,
     debugBundlePath: options.debugBundlePath,
+    debugNodeApis: false,
     codegen: options.codegen === "enable",
     url,
     writePushRequest: options.writePushRequest,
     liveComponentSources: !!options.liveComponentSources,
+    pushAllModules: !!options.pushAllModules,
+    largeIndexDeletionCheck: options.allowDeletingLargeIndexes
+      ? "has confirmation"
+      : "ask for confirmation",
+    message: options.message,
   };
-  showSpinner(
-    ctx,
-    `Deploying to ${url}...${options.dryRun ? " [dry run]" : ""}`,
-  );
+  showSpinner(`Deploying to ${url}...${options.dryRun ? " [dry run]" : ""}`);
   await runPush(ctx, pushOptions);
   logFinishedStep(
-    ctx,
     `${
       options.dryRun ? "Would have deployed" : "Deployed"
     } Convex functions to ${url}`,
@@ -346,22 +478,27 @@ export async function runCommand(
     return;
   }
 
-  const urlVar =
-    options.cmdUrlEnvVarName ?? (await suggestedEnvVarName(ctx)).envVar;
+  const suggestedEnvVars = await suggestedEnvVarNames(ctx);
+  const urlVar = options.cmdUrlEnvVarName ?? suggestedEnvVars.convexUrlEnvVar;
+  const siteVar = suggestedEnvVars.convexSiteEnvVar;
   showSpinner(
-    ctx,
-    `Running '${options.cmd}' with environment variable "${urlVar}" set...${
+    `Running '${options.cmd}' with environment variables "${urlVar}" and "${siteVar}" set...${
       options.dryRun ? " [dry run]" : ""
     }`,
   );
   if (!options.dryRun) {
-    const canonicalCloudUrl = await fetchDeploymentCanonicalCloudUrl(ctx, {
+    const deployment = {
       deploymentUrl: options.url,
       adminKey: options.adminKey,
-    });
+    };
+    const {
+      convexCloudUrl: canonicalCloudUrl,
+      convexSiteUrl: canonicalSiteUrl,
+    } = await fetchDeploymentCanonicalUrls(ctx, deployment);
 
     const env = { ...process.env };
     env[urlVar] = canonicalCloudUrl;
+    env[siteVar] = canonicalSiteUrl;
     const result = spawnSync(options.cmd, {
       env,
       stdio: "inherit",
@@ -376,29 +513,17 @@ export async function runCommand(
     }
   }
   logFinishedStep(
-    ctx,
     `${options.dryRun ? "Would have run" : "Ran"} "${
       options.cmd
-    }" with environment variable "${urlVar}" set`,
+    }" with environment variables "${urlVar}" and "${siteVar}" set`,
   );
 }
 
-export async function fetchDeploymentCanonicalCloudUrl(
+export async function fetchDeploymentCanonicalUrls(
   ctx: Context,
   options: { deploymentUrl: string; adminKey: string },
-): Promise<string> {
-  const result = await runSystemQuery(ctx, {
-    ...options,
-    functionName: "_system/cli/convexUrl:cloudUrl",
-    componentPath: undefined,
-    args: {},
-  });
-  if (typeof result !== "string") {
-    return await ctx.crash({
-      exitCode: 1,
-      errorType: "invalid filesystem or env vars",
-      printedMessage: "Invalid process.env.CONVEX_CLOUD_URL",
-    });
-  }
-  return result;
+): Promise<{ convexCloudUrl: string; convexSiteUrl: string }> {
+  const client = typedDeploymentClient(ctx, options);
+  const result = await client.GET("/get_canonical_urls");
+  return result.data!;
 }

@@ -3,6 +3,7 @@ use std::{
         BTreeMap,
         BTreeSet,
     },
+    ops::RangeToInclusive,
     path::PathBuf,
     sync::Arc,
 };
@@ -12,12 +13,10 @@ use async_trait::async_trait;
 use common::{
     bootstrap_model::index::{
         text_index::{
-            DeveloperTextIndexConfig,
             FragmentedTextSegment,
-            TextBackfillCursor,
-            TextIndexBackfillState,
             TextIndexSnapshot,
             TextIndexSnapshotData,
+            TextIndexSpec,
             TextIndexState,
             TextSnapshotVersion,
         },
@@ -28,24 +27,33 @@ use common::{
         ParsedDocument,
         ResolvedDocument,
     },
+    index::{
+        IndexKey,
+        IndexKeyBytes,
+    },
     persistence::{
+        DocumentRevisionStream,
         DocumentStream,
         RepeatablePersistence,
+        TimestampRange,
     },
     persistence_helpers::{
-        stream_revision_pairs,
         DocumentRevision,
         RevisionPair,
     },
     query::Order,
     runtime::{
         try_join_buffer_unordered,
+        RateLimiter,
         Runtime,
     },
-    types::IndexId,
+    types::{
+        IndexId,
+        SearchIndexMetricLabels,
+    },
 };
 use futures::{
-    StreamExt,
+    StreamExt as _,
     TryStreamExt,
 };
 use search::{
@@ -66,21 +74,23 @@ use search::{
 };
 use storage::Storage;
 use sync_types::Timestamp;
+use value::{
+    DeveloperDocumentId,
+    TableNumber,
+    TabletId,
+};
 
 use crate::{
-    index_workers::{
-        index_meta::{
-            BackfillState,
-            SearchIndex,
-            SearchIndexConfig,
-            SearchOnDiskState,
-            SearchSnapshot,
-            SegmentStatistics,
-            SegmentType,
-            SnapshotData,
-        },
-        search_flusher::MultipartBuildType,
+    search_index_workers::index_meta::{
+        SearchIndex,
+        SearchIndexConfig,
+        SearchOnDiskState,
+        SearchSnapshot,
+        SegmentStatistics,
+        SegmentType,
+        SnapshotData,
     },
+    Database,
     Snapshot,
 };
 
@@ -101,7 +111,7 @@ impl SegmentType<TextSearchIndex> for FragmentedTextSegment {
 
     fn total_size_bytes(
         &self,
-        _config: &<TextSearchIndex as SearchIndex>::DeveloperConfig,
+        _config: &<TextSearchIndex as SearchIndex>::Spec,
     ) -> anyhow::Result<u64> {
         Ok(self.size_bytes_total)
     }
@@ -116,29 +126,29 @@ pub struct BuildTextIndexArgs {
 #[async_trait]
 impl SearchIndex for TextSearchIndex {
     type BuildIndexArgs = BuildTextIndexArgs;
-    type DeveloperConfig = DeveloperTextIndexConfig;
+    type DocStream<'a> = DocumentRevisionStream<'a>;
     type NewSegment = NewTextSegment;
     type PreviousSegments = PreviousTextSegments;
     type Schema = TantivySearchIndexSchema;
     type Segment = FragmentedTextSegment;
+    type Spec = TextIndexSpec;
     type Statistics = TextStatistics;
 
-    fn get_config(config: IndexConfig) -> Option<SearchIndexConfig<Self>> {
+    fn get_config(config: &IndexConfig) -> Option<SearchIndexConfig<Self>> {
         let IndexConfig::Text {
             on_disk_state,
-            developer_config,
+            spec,
         } = config
         else {
             return None;
         };
         Some(SearchIndexConfig {
-            developer_config,
-            on_disk_state: match on_disk_state {
-                TextIndexState::Backfilling(snapshot) => {
-                    SearchOnDiskState::Backfilling(snapshot.into())
-                },
-                TextIndexState::Backfilled(snapshot) => {
-                    SearchOnDiskState::Backfilled(snapshot.into())
+            spec: spec.clone(),
+            on_disk_state: match on_disk_state.clone() {
+                TextIndexState::Backfilling(state) => SearchOnDiskState::Backfilling(state),
+                TextIndexState::Backfilled { snapshot, staged } => SearchOnDiskState::Backfilled {
+                    snapshot: snapshot.into(),
+                    staged,
                 },
                 TextIndexState::SnapshottedAt(snapshot) => {
                     SearchOnDiskState::SnapshottedAt(snapshot.into())
@@ -167,7 +177,7 @@ impl SearchIndex for TextSearchIndex {
         snapshot.data.is_version_current()
     }
 
-    fn new_schema(config: &Self::DeveloperConfig) -> Self::Schema {
+    fn new_schema(config: &Self::Spec) -> Self::Schema {
         TantivySearchIndexSchema::new(config)
     }
 
@@ -207,41 +217,69 @@ impl SearchIndex for TextSearchIndex {
         schema.estimate_size(doc)
     }
 
+    fn load_doc_stream<'a, RT: Runtime>(
+        database: &'a Database<RT>,
+        tablet_id: TabletId,
+        range: TimestampRange,
+        order: Order,
+        rate_limiter: &'a RateLimiter<RT>,
+    ) -> DocumentRevisionStream<'a> {
+        database.load_revision_pairs_in_table(tablet_id, range, order, rate_limiter)
+    }
+
+    fn table_scan_stream_to_doc_stream<'a>(
+        documents: DocumentStream<'a>,
+    ) -> DocumentRevisionStream<'a> {
+        documents
+            .map(|result| {
+                let entry = result?;
+                anyhow::ensure!(entry.value.is_some(), "Document must exist");
+                Ok(RevisionPair {
+                    id: entry.id,
+                    rev: DocumentRevision {
+                        ts: entry.ts,
+                        document: entry.value,
+                    },
+                    prev_rev: None,
+                })
+            })
+            .boxed()
+    }
+
+    fn walk_document_log_for_updates<'a>(
+        scan_doc_stream: DocumentRevisionStream<'a>,
+        reader: &'a RepeatablePersistence,
+        tablet_id: TabletId,
+        table_number: TableNumber,
+        range: TimestampRange,
+        filter_id_range: RangeToInclusive<IndexKeyBytes>,
+    ) -> DocumentRevisionStream<'a> {
+        let log_stream = reader
+            .load_revision_pairs(Some(tablet_id), range, Order::Desc)
+            .try_filter(move |revision_pair| {
+                let doc_id_index_key = IndexKey::new(
+                    vec![],
+                    DeveloperDocumentId::new(table_number, revision_pair.id.internal_id()),
+                );
+                futures::future::ready(filter_id_range.contains(&doc_id_index_key.to_bytes()))
+            })
+            .boxed();
+        scan_doc_stream.chain(log_stream).boxed()
+    }
+
     async fn build_disk_index(
         schema: &Self::Schema,
         index_path: &PathBuf,
-        documents: DocumentStream<'_>,
-        reader: RepeatablePersistence,
+        documents: DocumentRevisionStream<'_>,
         previous_segments: &mut Self::PreviousSegments,
         lower_bound_ts: Option<Timestamp>,
         BuildTextIndexArgs {
             search_storage,
             segment_term_metadata_fetcher,
         }: BuildTextIndexArgs,
-        multipart_build_type: MultipartBuildType,
     ) -> anyhow::Result<Option<Self::NewSegment>> {
-        let revision_stream = match multipart_build_type {
-            MultipartBuildType::Partial(_) => Box::pin(stream_revision_pairs(documents, &reader)),
-            // Create a fake revision stream for complete builds because we are building from
-            // scratch so we don't need to look up previous revisions. We know there are no deletes.
-            MultipartBuildType::IncrementalComplete { .. } => documents
-                .map(|result| {
-                    let entry = result?;
-                    anyhow::ensure!(entry.value.is_some(), "Document must exist");
-                    Ok(RevisionPair {
-                        id: entry.id,
-                        rev: DocumentRevision {
-                            ts: entry.ts,
-                            document: entry.value,
-                        },
-                        prev_rev: None,
-                    })
-                })
-                .boxed(),
-        };
-
         build_new_segment(
-            revision_stream,
+            documents,
             schema.clone(),
             index_path,
             previous_segments,
@@ -262,28 +300,25 @@ impl SearchIndex for TextSearchIndex {
 
     fn extract_metadata(
         metadata: ParsedDocument<TabletIndexMetadata>,
-    ) -> anyhow::Result<(Self::DeveloperConfig, SearchOnDiskState<Self>)> {
-        let (on_disk_state, developer_config) = match metadata.into_value().config {
+    ) -> anyhow::Result<(Self::Spec, SearchOnDiskState<Self>)> {
+        let (on_disk_state, spec) = match metadata.into_value().config {
             IndexConfig::Database { .. } | IndexConfig::Vector { .. } => {
                 anyhow::bail!("Index type changed!")
             },
             IndexConfig::Text {
-                developer_config,
+                spec,
                 on_disk_state,
-            } => (on_disk_state, developer_config),
+            } => (on_disk_state, spec),
         };
-        Ok((developer_config, SearchOnDiskState::from(on_disk_state)))
+        Ok((spec, SearchOnDiskState::from(on_disk_state)))
     }
 
-    fn new_index_config(
-        developer_config: Self::DeveloperConfig,
-        new_state: SearchOnDiskState<Self>,
-    ) -> anyhow::Result<IndexConfig> {
+    fn new_index_config(spec: Self::Spec, new_state: SearchOnDiskState<Self>) -> IndexConfig {
         let on_disk_state = TextIndexState::from(new_state);
-        Ok(IndexConfig::Text {
+        IndexConfig::Text {
             on_disk_state,
-            developer_config,
-        })
+            spec,
+        }
     }
 
     fn search_type() -> SearchType {
@@ -293,7 +328,7 @@ impl SearchIndex for TextSearchIndex {
     async fn execute_compaction(
         searcher: Arc<dyn Searcher>,
         search_storage: Arc<dyn Storage>,
-        _config: &Self::DeveloperConfig,
+        _config: &Self::Spec,
         segments: Vec<Self::Segment>,
     ) -> anyhow::Result<Self::Segment> {
         searcher
@@ -303,19 +338,18 @@ impl SearchIndex for TextSearchIndex {
                     .into_iter()
                     .map(FragmentedTextStorageKeys::from)
                     .collect(),
+                SearchIndexMetricLabels::unknown(),
             )
             .await
     }
 
     async fn merge_deletes(
         previous_segments: &mut Self::PreviousSegments,
-        documents: DocumentStream<'_>,
-        repeatable_persistence: &RepeatablePersistence,
+        revision_stream: DocumentRevisionStream<'_>,
         build_index_args: Self::BuildIndexArgs,
         schema: Self::Schema,
         document_log_lower_bound: Timestamp,
     ) -> anyhow::Result<()> {
-        let revision_stream = stream_revision_pairs(documents, repeatable_persistence);
         // Keep track of the document IDs we've either added to our new segment or
         // deleted from a previous segment. Because we process in reverse order, we
         // may encounter each document id multiple times, but we only want to add or
@@ -390,6 +424,7 @@ impl SearchIndex for TextSearchIndex {
             build_index_args.search_storage.clone(),
             build_index_args.segment_term_metadata_fetcher.clone(),
             segment_statistics_updates.term_deletes_by_segment,
+            SearchIndexMetricLabels::unknown(),
         )
         .await?;
         previous_segments.update_term_deletion_metadata(segments_term_metadata)?;
@@ -406,8 +441,11 @@ pub struct TextStatistics {
 impl From<SearchOnDiskState<TextSearchIndex>> for TextIndexState {
     fn from(value: SearchOnDiskState<TextSearchIndex>) -> Self {
         match value {
-            SearchOnDiskState::Backfilling(state) => Self::Backfilling(state.into()),
-            SearchOnDiskState::Backfilled(snapshot) => Self::Backfilled(snapshot.into()),
+            SearchOnDiskState::Backfilling(state) => Self::Backfilling(state),
+            SearchOnDiskState::Backfilled { snapshot, staged } => Self::Backfilled {
+                snapshot: snapshot.into(),
+                staged,
+            },
             SearchOnDiskState::SnapshottedAt(snapshot) => Self::SnapshottedAt(snapshot.into()),
         }
     }
@@ -416,8 +454,11 @@ impl From<SearchOnDiskState<TextSearchIndex>> for TextIndexState {
 impl From<TextIndexState> for SearchOnDiskState<TextSearchIndex> {
     fn from(value: TextIndexState) -> Self {
         match value {
-            TextIndexState::Backfilling(state) => Self::Backfilling(state.into()),
-            TextIndexState::Backfilled(snapshot) => Self::Backfilled(snapshot.into()),
+            TextIndexState::Backfilling(state) => Self::Backfilling(state),
+            TextIndexState::Backfilled { snapshot, staged } => Self::Backfilled {
+                snapshot: snapshot.into(),
+                staged,
+            },
             TextIndexState::SnapshottedAt(snapshot) => Self::SnapshottedAt(snapshot.into()),
         }
     }
@@ -439,35 +480,6 @@ impl SegmentStatistics for TextStatistics {
 
     fn num_non_deleted_documents(&self) -> u64 {
         self.num_indexed_documents - self.num_deleted_documents
-    }
-}
-
-impl From<TextIndexBackfillState> for BackfillState<TextSearchIndex> {
-    fn from(value: TextIndexBackfillState) -> Self {
-        Self {
-            segments: value.segments,
-            cursor: value.cursor.clone().map(|value| value.cursor),
-            backfill_snapshot_ts: value.cursor.map(|value| value.backfill_snapshot_ts),
-        }
-    }
-}
-
-impl From<BackfillState<TextSearchIndex>> for TextIndexBackfillState {
-    fn from(value: BackfillState<TextSearchIndex>) -> Self {
-        let cursor = if let Some(cursor) = value.cursor
-            && let Some(backfill_snapshot_ts) = value.backfill_snapshot_ts
-        {
-            Some(TextBackfillCursor {
-                cursor,
-                backfill_snapshot_ts,
-            })
-        } else {
-            None
-        };
-        Self {
-            segments: value.segments,
-            cursor,
-        }
     }
 }
 

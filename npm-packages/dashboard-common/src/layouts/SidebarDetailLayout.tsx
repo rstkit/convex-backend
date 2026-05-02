@@ -1,7 +1,7 @@
 import classNames from "classnames";
 import { useQuery } from "convex/react";
-import Link from "next/link";
-import { ReactNode, useContext, useEffect, useRef, useState } from "react";
+import { Link } from "@ui/Link";
+import { ReactNode, useContext, useRef, useState } from "react";
 import { useLocalStorage } from "react-use";
 import { gt } from "semver";
 import udfs from "@common/udfs";
@@ -12,7 +12,7 @@ import {
   PanelGroup,
   PanelResizeHandle,
 } from "react-resizable-panels";
-import { DragHandleDots2Icon } from "@radix-ui/react-icons";
+import { DotFilledIcon, DragHandleDots2Icon } from "@radix-ui/react-icons";
 import { cn } from "@ui/cn";
 
 import { PageContent } from "@common/elements/PageContent";
@@ -37,9 +37,6 @@ export function SidebarDetailLayout({
   const cleanPath = router.asPath.split("?")[0];
 
   const [collapsed, setCollapsed] = useState(false);
-  useEffect(() => {
-    window.innerWidth < 768 && panelRef.current?.collapse();
-  }, []);
   const panelRef = useRef<ImperativePanelHandle>(null);
 
   const { ErrorBoundary } = useContext(DeploymentInfoContext);
@@ -59,7 +56,7 @@ export function SidebarDetailLayout({
           maxSize={75}
           className={classNames(
             "h-full flex",
-            !collapsed && "border-r min-w-[10rem] max-w-[26rem]",
+            !collapsed && "min-w-[10rem] max-w-[26rem]",
           )}
           collapsedSize={0}
           onCollapse={() => setCollapsed(true)}
@@ -111,13 +108,12 @@ function NpmConvexServerVersionBanner() {
   const isProd = deployment?.deploymentType === "prod";
 
   return isProd && newVersionAvailable ? (
-    <div className="absolute bottom-0 right-0 flex w-full items-center justify-between border-b bg-background-warning px-5 py-2 text-sm text-content-primary">
+    <div className="absolute right-0 bottom-0 flex w-full items-center justify-between border-b bg-background-warning px-5 py-2 text-sm text-content-primary">
       <div>
         This deployment's{" "}
         <Link
           href="https://www.npmjs.com/package/convex"
           passHref
-          className="text-content-link"
           target="_blank"
         >
           convex package
@@ -127,7 +123,6 @@ function NpmConvexServerVersionBanner() {
         <Link
           href="https://news.convex.dev/tag/releases/"
           passHref
-          className="text-content-link"
           target="_blank"
         >
           release notes.
@@ -136,7 +131,7 @@ function NpmConvexServerVersionBanner() {
       <Tooltip
         tip="Dismiss this notification until the next update is available."
         side="left"
-        wrapsButton
+        asChild
       >
         <ClosePanelButton
           onClose={() => setDismissedVersion(upgradeRequiredVersion)}
@@ -164,39 +159,47 @@ export function ResizeHandle({
     <PanelResizeHandle
       className={cn("relative", className)}
       onDragging={setDragging}
-      hitAreaMargins={{ coarse: 32, fine: 20 }}
+      hitAreaMargins={{ coarse: 4, fine: 3 }}
     >
-      <div
-        className={cn(
-          "w-0 h-full transition-all duration-300",
-          !collapsed && dragging && "bg-util-accent w-1",
-        )}
-      />
-      <Button
-        variant="unstyled"
-        onClick={() => panelRef?.current?.expand()}
-        disabled={!collapsed}
-        className={cn(
-          "absolute flex flex-col items-center gap-1 text-xs top-1/2 -translate-y-1/2 left-0 z-20 bg-background-secondary py-2 px-0.5 border transition-all",
-          dragging && "text-content-primary border-util-accent border-4",
-          direction === "right"
-            ? "rounded-r-md border-l-0"
-            : "rounded-l-md ml-[-1.25rem] border-r-0",
-        )}
-        icon={<DragHandleDots2Icon className="text-content-secondary" />}
-      >
-        {handleTitle && collapsed && (
-          <span
-            style={{ writingMode: "vertical-rl" }}
-            className={cn(
-              direction === "right" && "rotate-180",
-              dragging ? "text-content-primary" : "text-content-secondary",
-            )}
-          >
-            {handleTitle}
-          </span>
-        )}
-      </Button>
+      {!collapsed ? (
+        <div
+          className={cn(
+            "flex h-full w-2 items-center justify-center border-l bg-background-secondary/70 transition-all duration-300",
+            direction === "right" ? "border-r" : "border-l",
+            dragging && "bg-util-accent/10",
+          )}
+        >
+          <div className="flex flex-col gap-0">
+            <DotFilledIcon className="text-content-tertiary/50" />
+          </div>
+        </div>
+      ) : (
+        <Button
+          variant="unstyled"
+          onClick={() => panelRef?.current?.expand()}
+          disabled={!collapsed}
+          className={cn(
+            "absolute top-1/2 left-0 z-20 flex -translate-y-1/2 flex-col items-center gap-1 border bg-background-secondary px-0.5 py-2 text-xs transition-all",
+            dragging && "border-4 border-util-accent text-content-primary",
+            direction === "right"
+              ? "rounded-r-md border-l-0"
+              : "ml-[-1.25rem] rounded-l-md border-r-0",
+          )}
+          icon={<DragHandleDots2Icon className="text-content-secondary" />}
+        >
+          {handleTitle && collapsed && (
+            <span
+              style={{ writingMode: "vertical-rl" }}
+              className={cn(
+                direction === "right" && "rotate-180",
+                dragging ? "text-content-primary" : "text-content-secondary",
+              )}
+            >
+              {handleTitle}
+            </span>
+          )}
+        </Button>
+      )}
     </PanelResizeHandle>
   );
 }

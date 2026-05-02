@@ -4,25 +4,37 @@ import {
   useDeleteTeam,
   useUpdateTeam,
 } from "api/teams";
-import { useProjects } from "api/projects";
+import { usePaginatedProjects } from "api/projects";
 import { useTeamOrbSubscription } from "api/billing";
 import { useIsCurrentMemberTeamAdmin } from "api/roles";
-import { Team } from "generatedApi";
+import { TeamResponse } from "generatedApi";
 import { Sheet } from "@ui/Sheet";
 import { Button } from "@ui/Button";
 import { ConfirmationDialog } from "@ui/ConfirmationDialog";
-import { useState } from "react";
+import { useCallback, useState } from "react";
+import startCase from "lodash/startCase";
+import { OpenInVercel } from "components/OpenInVercel";
 import { TeamForm } from "./TeamForm";
 
-export function TeamSettings({ team }: { team: Team }) {
+export function TeamSettings({ team }: { team: TeamResponse }) {
   const updateTeam = useUpdateTeam(team.id);
   const hasAdminPermissions = useIsCurrentMemberTeamAdmin();
   const { teams } = useTeams();
   const teamMembers = useTeamMembers(team.id);
-  const projects = useProjects(team.id);
+  const firstPageOfProjects = usePaginatedProjects(team.id, {});
+  const hasProjects =
+    firstPageOfProjects && firstPageOfProjects.items.length > 0;
+
   const [showDeleteTeamModal, setShowDeleteTeamModal] = useState(false);
-  const deleteTeam = useDeleteTeam(team.id);
   const { subscription } = useTeamOrbSubscription(team.id);
+
+  const deleteTeam = useDeleteTeam(team.id);
+  const deleteTeamAndRedirect = useCallback(async () => {
+    await deleteTeam();
+    // Completely reload the page to avoid race conditions
+    window.location.href = "/";
+  }, [deleteTeam]);
+
   return (
     <>
       <h2>Team Settings</h2>
@@ -34,9 +46,13 @@ export function TeamSettings({ team }: { team: Team }) {
       <Sheet>
         <h3 className="mb-4">Delete Team</h3>
         <p className="mb-4">
-          Permanently delete this team. To delete your team, you must first
-          remove all team members and delete all projects associated with the
-          team.
+          Permanently deletes this team.{" "}
+          {team.managedBy !== "vercel" && (
+            <>
+              To delete your team, you must first remove all team members and
+              delete all projects associated with the team.
+            </>
+          )}
         </p>
         {subscription && (
           <p className="mb-4">
@@ -45,36 +61,50 @@ export function TeamSettings({ team }: { team: Team }) {
             subscription.
           </p>
         )}
-        <Button
-          variant="danger"
-          onClick={() => setShowDeleteTeamModal(true)}
-          disabled={
-            !hasAdminPermissions ||
-            !teams ||
-            teams.length === 1 ||
-            !teamMembers ||
-            teamMembers.length > 1 ||
-            !projects ||
-            projects.length > 0
-          }
-          tip={
-            !hasAdminPermissions
-              ? "You do not have permission to delete this team."
-              : teams && teams.length === 1
-                ? "You cannot delete your last team."
-                : teamMembers && teamMembers.length > 1
-                  ? "You must remove all other team members before deleting the team."
-                  : projects && projects.length > 0
-                    ? "You must delete all projects before deleting the team."
-                    : undefined
-          }
-        >
-          Delete Team
-        </Button>
+        {team.managedBy === "vercel" && (
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              This team is managed by {startCase(team.managedBy)}. You may
+              delete this Convex team by deleting your Convex integration in{" "}
+              {startCase(team.managedBy)}.
+            </div>
+            <OpenInVercel team={team} />
+          </div>
+        )}
+        {team.managedBy !== "vercel" && (
+          <Button
+            variant="danger"
+            onClick={() => setShowDeleteTeamModal(true)}
+            disabled={
+              // TODO: what to do about team lifecycle and Expo?
+              !!team.managedBy ||
+              !hasAdminPermissions ||
+              !teams ||
+              teams.length === 1 ||
+              !teamMembers ||
+              teamMembers.length > 1 ||
+              !firstPageOfProjects ||
+              hasProjects
+            }
+            tip={
+              !hasAdminPermissions
+                ? "You do not have permission to delete this team."
+                : teams && teams.length === 1
+                  ? "You cannot delete your last team."
+                  : teamMembers && teamMembers.length > 1
+                    ? "You must remove all other team members before deleting the team."
+                    : hasProjects
+                      ? "You must delete all projects before deleting the team."
+                      : undefined
+            }
+          >
+            Delete Team
+          </Button>
+        )}
         {showDeleteTeamModal && (
           <ConfirmationDialog
             onClose={() => setShowDeleteTeamModal(false)}
-            onConfirm={deleteTeam}
+            onConfirm={deleteTeamAndRedirect}
             validationText={team.slug}
             confirmText="Delete"
             dialogTitle="Delete Team"

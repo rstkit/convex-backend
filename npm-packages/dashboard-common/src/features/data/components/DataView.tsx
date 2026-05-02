@@ -1,4 +1,4 @@
-import React, { useContext, useMemo, useState } from "react";
+import React, { useContext, useEffect, useMemo, useState } from "react";
 import { useQuery } from "convex/react";
 import udfs from "@common/udfs";
 import { SidebarDetailLayout } from "@common/layouts/SidebarDetailLayout";
@@ -20,16 +20,47 @@ import { useTableShapes } from "@common/lib/deploymentApi";
 import { Modal } from "@ui/Modal";
 import { LoadingTransition } from "@ui/Loading";
 import { DeploymentPageTitle } from "@common/elements/DeploymentPageTitle";
+import { NoPermissionMessage } from "@common/elements/NoPermissionMessage";
+import { useRouter } from "next/router";
+import omit from "lodash/omit";
+import { useDataPageSize } from "./Table/utils/useQueryFilteredTable";
 
-export function DataView() {
-  const { useCurrentDeployment } = useContext(DeploymentInfoContext);
-  const deploymentId = useCurrentDeployment()?.id;
+export function DataView({
+  onTableCreated,
+  onDocumentsAdded,
+}: {
+  onTableCreated?: () => void;
+  onDocumentsAdded?: (count: number) => void;
+}) {
+  const { useCurrentDeployment, useIsOperationAllowed, ErrorBoundary } =
+    useContext(DeploymentInfoContext);
+  const deployment = useCurrentDeployment() ?? {
+    id: undefined,
+    kind: undefined,
+  };
+
+  const deploymentId = deployment && "id" in deployment ? deployment.id : null;
+
+  const router = useRouter();
   const tableMetadata = useTableMetadataAndUpdateURL();
 
+  const canViewData = useIsOperationAllowed("ViewData");
+
   const componentId = useNents().selectedNent?.id;
-  const schemas = useQuery(udfs.getSchemas.default, {
-    componentId: componentId ?? null,
-  });
+  const schemas = useQuery(
+    udfs.getSchemas.default,
+    canViewData ? { componentId: componentId ?? null } : "skip",
+  );
+
+  const [currentPageSize, setPageSize] = useDataPageSize(
+    componentId ?? null,
+    tableMetadata?.name ?? "",
+  );
+
+  const schemaValidationProgress = useQuery(
+    udfs.getSchemas.schemaValidationProgress,
+    canViewData ? { componentId: componentId ?? null } : "skip",
+  );
 
   const { activeSchema, inProgressSchema } = useMemo(() => {
     if (!schemas) return {};
@@ -58,6 +89,29 @@ export function DataView() {
     [activeSchema, inProgressSchema, setIsShowingSchema],
   );
 
+  useEffect(() => {
+    if (router.query.showSchema === "true") {
+      setIsShowingSchema(true);
+      void router.push(
+        {
+          pathname: router.pathname,
+          query: omit(router.query, "showSchema"),
+        },
+        undefined,
+        { shallow: true },
+      );
+    }
+  }, [router.query.showSchema, router]);
+
+  if (!canViewData) {
+    return (
+      <>
+        <DeploymentPageTitle title="Data" />
+        <NoPermissionMessage message="You do not have permission to view data in this deployment." />
+      </>
+    );
+  }
+
   return (
     <>
       <DeploymentPageTitle
@@ -75,6 +129,7 @@ export function DataView() {
             inProgressSchema={inProgressSchema}
             shapes={tables}
             hasShapeError={hadError}
+            schemaValidationProgress={schemaValidationProgress}
           />
         </Modal>
       )}
@@ -100,6 +155,7 @@ export function DataView() {
               <DataSidebar
                 tableData={tableMetadata}
                 showSchema={showSchemaProps}
+                onTableCreated={onTableCreated}
               />
             }
             resizeHandleTitle="Tables"
@@ -112,15 +168,26 @@ export function DataView() {
                   loadingProps={{ shimmer: false }}
                 >
                   {activeSchema !== undefined && (
-                    <DataContent
-                      key={tableMetadata.name}
-                      tableName={tableMetadata.name}
-                      componentId={componentId ?? null}
-                      shape={
-                        tableMetadata.tables.get(tableMetadata.name) ?? null
-                      }
-                      activeSchema={activeSchema}
-                    />
+                    <ErrorBoundary
+                      fallback={(props) => (
+                        <HandleTimeout
+                          {...props}
+                          setPageSize={setPageSize}
+                          currentPageSize={currentPageSize}
+                        />
+                      )}
+                    >
+                      <DataContent
+                        key={tableMetadata.name}
+                        tableName={tableMetadata.name}
+                        componentId={componentId ?? null}
+                        shape={
+                          tableMetadata.tables.get(tableMetadata.name) ?? null
+                        }
+                        activeSchema={activeSchema}
+                        onDocumentsAdded={onDocumentsAdded}
+                      />
+                    </ErrorBoundary>
                   )}
                 </LoadingTransition>
               )
@@ -130,4 +197,30 @@ export function DataView() {
       </LoadingTransition>
     </>
   );
+}
+
+function HandleTimeout({
+  error,
+  resetError,
+  setPageSize,
+  currentPageSize,
+}: {
+  error: Error;
+  resetError(): void;
+  currentPageSize: number;
+  setPageSize: (pageSize: number) => void;
+}) {
+  if (
+    error.message.startsWith(
+      "[CONVEX Q(_system/frontend/paginatedTableDocuments:default)]",
+    ) &&
+    error.message.includes("Function execution timed out") &&
+    currentPageSize !== 1
+  ) {
+    setPageSize(Math.floor(Math.max(currentPageSize / 2, 1)));
+    resetError();
+  } else {
+    throw error;
+  }
+  return null;
 }

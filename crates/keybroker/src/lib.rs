@@ -6,13 +6,9 @@ mod broker;
 mod encryptor;
 mod legacy_encryptor;
 mod metrics;
+mod operations;
 mod secret;
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
-
-#[cfg(test)]
-mod tests;
-
+pub use pb::convex_identity::DeploymentOperation;
 pub use sync_types::UserIdentityAttributes;
 
 pub use self::{
@@ -21,6 +17,7 @@ pub use self::{
         AdminIdentityPrincipal,
         CoreIdTokenWithCustomClaims,
         CustomClaims,
+        FunctionRunnerKeyBroker,
         GetFileAuthorization,
         Identity,
         KeyBroker,
@@ -28,9 +25,16 @@ pub use self::{
         SystemKey,
         UserIdentity,
     },
+    encryptor::Encryptor,
     legacy_encryptor::LegacyEncryptor,
+    operations::{
+        bad_admin_key_error,
+        operations_for_deploy_key,
+        read_only_operations,
+        DeploymentOp,
+    },
     secret::{
-        InstanceSecret,
+        DeploymentSecret,
         Secret,
     },
 };

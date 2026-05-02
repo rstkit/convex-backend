@@ -34,6 +34,7 @@ use futures::{
     select_biased,
     stream,
     FutureExt,
+    Stream,
     StreamExt,
     TryStreamExt,
 };
@@ -49,8 +50,7 @@ use governor::{
 };
 use metrics::CONVEX_METRICS_REGISTRY;
 use parking_lot::Mutex;
-#[cfg(any(test, feature = "testing"))]
-use proptest::prelude::*;
+use pin_project::pin_project;
 use rand::RngCore;
 use sentry::SentryFutureExt;
 use serde::Serialize;
@@ -65,7 +65,10 @@ use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use value::heap_size::HeapSize;
 
-pub use self::join_set::JoinSet;
+pub use self::{
+    join_map::JoinMap,
+    join_set::JoinSet,
+};
 use crate::{
     errors::recapture_stacktrace,
     is_canceled::IsCanceled,
@@ -73,10 +76,8 @@ use crate::{
     types::Timestamp,
 };
 
+mod join_map;
 mod join_set;
-
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
 
 #[derive(Error, Debug)]
 pub enum JoinError {
@@ -200,10 +201,10 @@ impl Drop for TokioSpawnHandle {
 /// join on its result.
 pub async fn shutdown_and_join(mut handle: Box<dyn SpawnHandle>) -> anyhow::Result<()> {
     handle.shutdown();
-    if let Err(e) = handle.join().await {
-        if !matches!(e, JoinError::Canceled) {
-            return Err(e.into());
-        }
+    if let Err(e) = handle.join().await
+        && !matches!(e, JoinError::Canceled)
+    {
+        return Err(e.into());
     }
     Ok(())
 }
@@ -262,7 +263,10 @@ pub async fn try_join<T: Send + 'static>(
         name,
         fut.in_span(Span::enter_with_local_parent(name)),
     ));
-    handle.await?.map_err(recapture_stacktrace)
+    match handle.await? {
+        Ok(result) => Ok(result),
+        Err(e) => Err(recapture_stacktrace(e).await),
+    }
 }
 
 /// A Runtime can be considered somewhat like an operating system abstraction
@@ -349,8 +353,8 @@ pub trait Runtime: Clone + Sync + Send + 'static {
 pub struct UnixTimestamp(Duration);
 
 impl UnixTimestamp {
-    pub fn from_secs_f64(secs: f64) -> Self {
-        UnixTimestamp(Duration::from_secs_f64(secs))
+    pub fn from_secs_f64(secs: f64) -> anyhow::Result<Self> {
+        Ok(UnixTimestamp(Duration::try_from_secs_f64(secs)?))
     }
 
     pub fn from_nanos(nanos: u64) -> Self {
@@ -377,6 +381,11 @@ impl UnixTimestamp {
         UNIX_EPOCH + self.0
     }
 
+    /// Returns `None` if `time` predates the Unix epoch
+    pub fn from_system_time(time: SystemTime) -> Option<Self> {
+        time.duration_since(SystemTime::UNIX_EPOCH).ok().map(Self)
+    }
+
     pub fn checked_sub(&self, rhs: UnixTimestamp) -> Option<Duration> {
         self.0.checked_sub(rhs.0)
     }
@@ -392,19 +401,6 @@ impl UnixTimestamp {
 impl HeapSize for UnixTimestamp {
     fn heap_size(&self) -> usize {
         0
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Arbitrary for UnixTimestamp {
-    type Parameters = ();
-
-    type Strategy = impl Strategy<Value = UnixTimestamp>;
-
-    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        use proptest::prelude::*;
-        (0..=i64::MAX as u64, 0..i32::MAX as u32)
-            .prop_map(|(secs, nanos)| Self(Duration::new(secs, nanos)))
     }
 }
 
@@ -475,6 +471,14 @@ pub type KeyedRateLimiter<K, RT> = governor::RateLimiter<
 
 pub fn new_rate_limiter<RT: Runtime>(runtime: RT, quota: Quota) -> RateLimiter<RT> {
     RateLimiter::direct_with_clock(quota, RuntimeClock { runtime })
+}
+
+/// Creates a rate limiter that is *nearly* unlimited, useful for testing.
+pub fn new_unlimited_rate_limiter<RT: Runtime>(runtime: RT) -> RateLimiter<RT> {
+    new_rate_limiter(
+        runtime,
+        Quota::with_period(Duration::from_nanos(1)).unwrap(),
+    )
 }
 
 pub fn new_keyed_rate_limiter<RT: Runtime, K: Hash + Eq + Clone>(
@@ -560,30 +564,6 @@ impl<RT: Runtime> WithTimeout for RT {
 pub struct TimeoutError {
     description: &'static str,
     duration: Duration,
-}
-
-pub struct MutexWithTimeout<T: Send> {
-    timeout: Duration,
-    mutex: tokio::sync::Mutex<T>,
-}
-
-impl<T: Send> MutexWithTimeout<T> {
-    pub fn new(timeout: Duration, value: T) -> Self {
-        Self {
-            timeout,
-            mutex: tokio::sync::Mutex::new(value),
-        }
-    }
-
-    pub async fn acquire_lock_with_timeout(&self) -> anyhow::Result<tokio::sync::MutexGuard<T>> {
-        let acquire_lock = async { Ok(self.mutex.lock().await) };
-        select_biased! {
-            result = acquire_lock.fuse() => result,
-            _ = tokio::time::sleep(self.timeout).fuse() => {
-                anyhow::bail!(TimeoutError{description: "acquire_lock", duration: self.timeout});
-            },
-        }
-    }
 }
 
 /// Binds the current tracing & sentry contexts to the provided future.
@@ -676,5 +656,55 @@ where
         f()
     } else {
         tokio::task::block_in_place(f)
+    }
+}
+
+#[pin_project]
+pub struct CoopStream<S> {
+    #[pin]
+    inner: S,
+    /// If false, we need to consume budget before proceeding
+    proceed: bool,
+}
+
+pub trait CoopStreamExt: Sized {
+    /// Wraps `self` in a stream that participates in Tokio's cooperative
+    /// scheduling system.
+    /// If the current task is out of budget, the stream may yield
+    /// `Poll::Pending` even if the underlying stream still has elements to
+    /// yield.
+    fn cooperative(self) -> CoopStream<Self>;
+}
+
+impl<S: Stream> CoopStreamExt for S {
+    fn cooperative(self) -> CoopStream<Self> {
+        CoopStream {
+            inner: self,
+            proceed: false,
+        }
+    }
+}
+
+impl<S: Stream> Stream for CoopStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        if !*this.proceed {
+            std::task::ready!(tokio::task::coop::poll_proceed(cx)).made_progress();
+            *this.proceed = true;
+        }
+        let r = this.inner.poll_next(cx);
+        if r.is_ready() {
+            *this.proceed = false;
+        }
+        r
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
     }
 }

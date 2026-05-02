@@ -1,6 +1,9 @@
-use std::collections::{
-    BTreeMap,
-    VecDeque,
+use std::{
+    collections::{
+        BTreeMap,
+        VecDeque,
+    },
+    future::Future,
 };
 
 use anyhow::Context;
@@ -15,7 +18,11 @@ use common::{
         DocumentUpdateRef,
         ResolvedDocument,
     },
-    knobs::MAX_TRANSACTION_WINDOW,
+    knobs::{
+        MAX_BYTES_WRITTEN_PER_SECOND,
+        MAX_TRANSACTION_WINDOW,
+        WRITE_THROUGHPUT_WINDOW,
+    },
     runtime::block_in_place,
     types::{
         DatabaseIndexUpdate,
@@ -24,6 +31,7 @@ use common::{
         Timestamp,
         WriteTimestamp,
     },
+    virtual_system_mapping::VirtualSystemMapping,
 };
 use errors::ErrorMetadata;
 use imbl::OrdMap;
@@ -31,7 +39,12 @@ use indexing::{
     backend_in_memory_indexes::BackendInMemoryIndexes,
     index_registry::IndexRegistry,
 };
-use search::TextIndexManager;
+use parking_lot::Mutex;
+use search::{
+    TextIndexManager,
+    TextIndexWriteSize,
+};
+use tokio::sync::oneshot;
 use value::{
     ResolvedDocumentId,
     TableMapping,
@@ -40,8 +53,8 @@ use value::{
     TabletId,
 };
 use vector::{
-    DocInVectorIndex,
     VectorIndexManager,
+    VectorIndexWriteSize,
 };
 
 use crate::{
@@ -56,6 +69,7 @@ use crate::{
     },
     transaction::TableCountSnapshot,
     write_log::PendingWrites,
+    write_throughput_limiter::WriteThroughputLimiter,
     ComponentRegistry,
     TableRegistry,
     TableSummary,
@@ -74,6 +88,8 @@ use crate::{
 pub struct SnapshotManager {
     persisted_max_repeatable_ts: Timestamp,
     versions: VecDeque<(Timestamp, Snapshot)>,
+    write_throughput_limiter: WriteThroughputLimiter,
+    waiters: Mutex<VecDeque<(Timestamp, oneshot::Sender<()>)>>,
 }
 
 #[derive(Clone)]
@@ -82,7 +98,10 @@ pub struct SnapshotManager {
 pub struct TableSummaries {
     pub tables: OrdMap<TabletId, TableSummary>,
     pub num_user_documents: u64,
-    pub user_size: u64,
+    /// Size of user documents in user tables
+    pub user_tables_size: u64,
+    /// Size of user documents in user tables and virtual tables
+    pub user_docs_size: u64,
 }
 
 #[async_trait]
@@ -106,14 +125,15 @@ impl TableSummaries {
     pub fn new(
         TableSummarySnapshot { tables, ts: _ }: TableSummarySnapshot,
         table_mapping: &TableMapping,
-    ) -> Self {
+        virtual_table_mapping: &VirtualSystemMapping,
+    ) -> anyhow::Result<Self> {
         // Filter out non-existent tables before counting. Otherwise is_system_table
         // will return false and count non-existent tables toward user document counts.
         let tables: OrdMap<TabletId, TableSummary> = tables
             .into_iter()
             .filter(|(table_id, _table_summary)| table_mapping.tablet_id_exists(*table_id))
             .collect::<OrdMap<_, _>>();
-        let (num_user_documents, user_size) = tables
+        let (num_user_documents, user_tables_size) = tables
             .iter()
             .filter(|(table_id, _summary)| !table_mapping.is_system_tablet(**table_id))
             .fold((0, 0), |(acc_docs, acc_size), (_, summary)| {
@@ -122,11 +142,22 @@ impl TableSummaries {
                     acc_size + summary.total_size(),
                 )
             });
-        Self {
+        let user_docs_size = tables.iter().try_fold(0, |acc_size, (table_id, summary)| {
+            let is_system_table = table_mapping.is_system_tablet(*table_id);
+            let has_virtual_table =
+                virtual_table_mapping.has_virtual_table(&table_mapping.tablet_name(*table_id)?);
+            anyhow::Ok(if has_virtual_table || !is_system_table {
+                acc_size + summary.total_size()
+            } else {
+                acc_size
+            })
+        })?;
+        Ok(Self {
             tables,
             num_user_documents,
-            user_size,
-        }
+            user_tables_size,
+            user_docs_size,
+        })
     }
 
     pub fn tablet_summary(&self, table: &TabletId) -> TableSummary {
@@ -143,6 +174,7 @@ impl TableSummaries {
         new: Option<&ResolvedDocument>,
         table_update: Option<&TableUpdate>,
         table_mapping: &TableMapping,
+        virtual_system_mapping: &VirtualSystemMapping,
     ) -> anyhow::Result<()> {
         let mut table_summary = self
             .tables
@@ -163,12 +195,11 @@ impl TableSummaries {
             namespace: _,
             table_id_and_number,
             table_name: _,
-            state: _,
             mode,
         }) = table_update
         {
             match mode {
-                TableUpdateMode::Create => {
+                TableUpdateMode::Create(_) => {
                     assert!(self
                         .tables
                         .insert(table_id_and_number.tablet_id, TableSummary::empty())
@@ -178,17 +209,32 @@ impl TableSummaries {
                 TableUpdateMode::Drop => {
                     self.tables.remove(&table_id_and_number.tablet_id);
                 },
+                TableUpdateMode::HardDelete => {
+                    assert!(
+                        self.tables.remove(&table_id_and_number.tablet_id).is_none(),
+                        "Hard-deleted tablet found in table summaries, but it should have already \
+                         been removed when it was marked Deleting"
+                    );
+                },
             }
         }
         let new_info_num_values = table_summary.num_values();
         let new_info_total_size = table_summary.total_size();
         match self.tables.insert(document_id.tablet_id, table_summary) {
             Some(old_summary) => {
-                if !table_mapping.is_system_tablet(document_id.tablet_id) {
+                let is_system_table = table_mapping.is_system_tablet(document_id.tablet_id);
+                if !is_system_table {
                     self.num_user_documents =
                         self.num_user_documents + new_info_num_values - old_summary.num_values();
-                    self.user_size =
-                        self.user_size + new_info_total_size - old_summary.total_size();
+                    self.user_tables_size =
+                        self.user_tables_size + new_info_total_size - old_summary.total_size();
+                }
+                if virtual_system_mapping
+                    .has_virtual_table(&table_mapping.tablet_name(document_id.tablet_id)?)
+                    || !is_system_table
+                {
+                    self.user_docs_size =
+                        self.user_docs_size + new_info_total_size - old_summary.total_size();
                 }
             },
             None => panic!("Applying update for non-existent table!"),
@@ -205,16 +251,21 @@ pub struct Snapshot {
     pub table_summaries: Option<TableSummaries>,
     pub index_registry: IndexRegistry,
     pub in_memory_indexes: BackendInMemoryIndexes,
+    pub virtual_system_mapping: VirtualSystemMapping,
     pub text_indexes: TextIndexManager,
     pub vector_indexes: VectorIndexManager,
 }
 
 impl Snapshot {
-    pub(crate) fn update(
+    pub fn update(
         &mut self,
         document_update: &impl DocumentUpdateRef,
         commit_ts: Timestamp,
-    ) -> anyhow::Result<(Vec<DatabaseIndexUpdate>, DocInVectorIndex)> {
+    ) -> anyhow::Result<(
+        Vec<DatabaseIndexUpdate>,
+        VectorIndexWriteSize,
+        TextIndexWriteSize,
+    )> {
         block_in_place(|| {
             let removal = document_update.old_document();
             let insertion = document_update.new_document();
@@ -248,6 +299,7 @@ impl Snapshot {
                         insertion,
                         table_update.as_ref(),
                         self.table_registry.table_mapping(),
+                        &self.virtual_system_mapping,
                     )
                     .context("Table summaries update failed")?;
             };
@@ -262,7 +314,8 @@ impl Snapshot {
                 insertion.cloned(),
             );
 
-            self.text_indexes
+            let text_index_write_size = self
+                .text_indexes
                 .update(
                     &self.index_registry,
                     removal,
@@ -271,7 +324,7 @@ impl Snapshot {
                 )
                 .context("Search index update failed")?;
 
-            let doc_in_vector_index = self
+            let vector_index_write_size = self
                 .vector_indexes
                 .update(
                     &self.index_registry,
@@ -280,7 +333,11 @@ impl Snapshot {
                     WriteTimestamp::Committed(commit_ts),
                 )
                 .context("Vector index update failed")?;
-            Ok((in_memory_index_updates, doc_in_vector_index))
+            Ok((
+                in_memory_index_updates,
+                vector_index_write_size,
+                text_index_write_size,
+            ))
         })
     }
 
@@ -292,8 +349,16 @@ impl Snapshot {
 
     pub fn iter_table_summaries(
         &self,
-    ) -> anyhow::Result<impl Iterator<Item = ((TableNamespace, TableName), &'_ TableSummary)> + '_>
-    {
+    ) -> anyhow::Result<
+        impl Iterator<
+                Item = anyhow::Result<(
+                    TableNamespace,
+                    Option<ComponentPath>,
+                    TableName,
+                    &'_ TableSummary,
+                )>,
+            > + '_,
+    > {
         let result = self
             .must_table_summaries()?
             .tables
@@ -305,17 +370,41 @@ impl Snapshot {
                 )
             })
             .map(|(table_id, summary)| {
-                (
-                    (
-                        self.table_mapping()
-                            .tablet_namespace(*table_id)
-                            .expect("active table should have namespace"),
-                        self.table_mapping()
-                            .tablet_name(*table_id)
-                            .expect("active table should have name"),
-                    ),
-                    summary,
-                )
+                let namespace = self
+                    .table_mapping()
+                    .tablet_namespace(*table_id)
+                    .expect("active table should have namespace");
+                let table_name = self
+                    .table_mapping()
+                    .tablet_name(*table_id)
+                    .expect("active table should have name");
+                let component_path = self.component_registry.get_component_path(
+                    ComponentId::from(namespace),
+                    &mut TransactionReadSet::new(),
+                );
+
+                if component_path.is_none() && !table_name.is_system() {
+                    let count = summary.num_values();
+                    let table_size = summary.total_size();
+                    if count != 0 {
+                        // If there is no component path for this table namespace, this must be an
+                        // empty user table left over from incomplete
+                        // components push. System tables may be created
+                        // earlier (e.g. `_schemas`), so they may be
+                        // legitimately nonempty in that case.
+                        anyhow::bail!(
+                            "Table {table_name} is in an orphaned TableNamespace without a \
+                             component, but has document count {count}",
+                        );
+                    }
+                    if table_size != 0 {
+                        anyhow::bail!(
+                            "Table {table_name} is in an orphaned TableNamespace without a \
+                             component, but has document size {table_size}",
+                        );
+                    }
+                }
+                Ok((namespace, component_path, table_name, summary))
             });
         Ok(result)
     }
@@ -343,51 +432,86 @@ impl Snapshot {
         table: &TableName,
     ) -> anyhow::Result<TableSummary> {
         self.table_summary(namespace, table)
-            .ok_or_else(|| table_summary_bootstrapping_error(None))
+            .context(table_summary_bootstrapping_error(None))
     }
 
     /// Counts storage space used by all tables, including system tables
-    pub fn get_document_and_index_storage(
-        &self,
-    ) -> anyhow::Result<TablesUsage<(TableNamespace, TableName)>> {
+    pub fn get_document_and_index_storage(&self) -> anyhow::Result<TablesUsage> {
         let table_mapping: TableMapping = self.table_mapping().clone();
 
-        let mut document_storage_by_table = BTreeMap::new();
-        for (table_name, summary) in self.iter_table_summaries()? {
-            let table_size = summary.total_size();
-            document_storage_by_table.insert(
-                table_name,
-                TableUsage {
-                    document_size: table_size,
-                    index_size: 0,
-                    system_index_size: 0,
-                },
-            );
+        let mut user_document_storage_by_table = BTreeMap::new();
+        let mut system_document_storage_by_table = BTreeMap::new();
+        let mut orphaned_document_storage_by_table = BTreeMap::new();
+        for entry in self.iter_table_summaries()? {
+            let (namespace, component_path, table_name, summary) = entry?;
+            let usage = TableUsage {
+                document_size: summary.total_size(),
+                index_size: 0,
+                system_index_size: 0,
+            };
+            if let Some(component_path) = component_path {
+                if table_name.is_system() {
+                    system_document_storage_by_table
+                        .insert((namespace, table_name), (usage, component_path));
+                } else {
+                    user_document_storage_by_table
+                        .insert((namespace, table_name), (usage, component_path));
+                }
+            } else {
+                orphaned_document_storage_by_table.insert((namespace, table_name), usage);
+            }
         }
 
         // TODO: We are currently using document size * index count as a rough
         // approximation for how much storage indexes use, but we should fix this to
         // only charge for the fields that are indexed.
-        for index in self.index_registry.all_enabled_indexes() {
-            // Only count storage for active tables, and avoid an error below
-            // where `document_storage_by_table` is missing hidden tables.
-            if !table_mapping.is_active(*index.name.table()) {
-                continue;
-            }
+        for index in self.index_registry.all_indexes().filter(|index| {
+            // Only count storage for active tables (not hidden)
+            // Only count storage for indexes that are fully backfilled or enabled.
+            let active = table_mapping.is_active(*index.name.table());
+            let enabled = index.config.is_enabled();
+            let backfilled_staged = index.config.is_backfilled() && index.config.is_staged();
+            active && (enabled || backfilled_staged)
+        }) {
             let table_namespace = table_mapping.tablet_namespace(*index.name.table())?;
             let index_name = index
                 .name
                 .clone()
                 .map_table(&table_mapping.tablet_to_name())
                 .unwrap();
-            let key = (table_namespace, index_name.table().clone());
-            let table_usage = document_storage_by_table.get_mut(&key).with_context(|| {
-                format!(
-                    "Index {index_name} on a nonexistent table {table_name} in namespace \
-                     {table_namespace:?}",
-                    table_name = key.1
-                )
-            })?;
+            let table_usage = if let Some(component_path) =
+                self.component_registry.get_component_path(
+                    ComponentId::from(table_namespace),
+                    &mut TransactionReadSet::new(),
+                ) {
+                let key = (table_namespace, index_name.table().clone());
+                let document_storage_by_table = if index_name.table().is_system() {
+                    &mut system_document_storage_by_table
+                } else {
+                    &mut user_document_storage_by_table
+                };
+                let table_usage = document_storage_by_table.get_mut(&key).with_context(|| {
+                    format!(
+                        "Index {index_name} on a nonexistent table {:?} in namespace \
+                         {table_namespace:?}",
+                        index_name.table(),
+                    )
+                })?;
+                anyhow::ensure!(table_usage.1 == component_path);
+                &mut table_usage.0
+            } else {
+                // This can happen if component push did not complete. Becomes orphaned.
+                let key = (table_namespace, index_name.table().clone());
+                orphaned_document_storage_by_table
+                    .get_mut(&key)
+                    .with_context(|| {
+                        format!(
+                            "Index {index_name} on a nonexistent table {table_name} in namespace \
+                             {table_namespace:?}",
+                            table_name = key.1
+                        )
+                    })?
+            };
             if index_name.is_system_owned() {
                 table_usage.system_index_size += table_usage.document_size;
             } else {
@@ -395,7 +519,30 @@ impl Snapshot {
             }
         }
 
-        Ok(TablesUsage(document_storage_by_table))
+        let mut virtual_tables = BTreeMap::new();
+        for ((table_namespace, table_name), (usage, component_path)) in
+            &system_document_storage_by_table
+        {
+            if let Some(virtual_table_name) = self
+                .virtual_system_mapping
+                .associated_virtual_table_name(table_name)
+            {
+                let key = (*table_namespace, virtual_table_name.clone());
+                virtual_tables
+                    .entry(key)
+                    .and_modify(|(existing_usage, _): &mut (TableUsage, ComponentPath)| {
+                        *existing_usage += *usage
+                    })
+                    .or_insert_with(|| (*usage, component_path.clone()));
+            }
+        }
+
+        Ok(TablesUsage {
+            user_tables: user_document_storage_by_table,
+            system_tables: system_document_storage_by_table,
+            orphaned_tables: orphaned_document_storage_by_table,
+            virtual_tables,
+        })
     }
 
     pub fn component_ids_to_paths(&self) -> BTreeMap<ComponentId, ComponentPath> {
@@ -411,6 +558,8 @@ impl SnapshotManager {
         Self {
             versions,
             persisted_max_repeatable_ts: initial_ts,
+            write_throughput_limiter: WriteThroughputLimiter::new(),
+            waiters: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -448,6 +597,41 @@ impl SnapshotManager {
             .map(|(ts, ..)| *ts)
             .expect("snapshot versions empty");
         RepeatableTimestamp::new_validated(ts, RepeatableReason::SnapshotManagerLatest)
+    }
+
+    fn notify_waiters(&self) {
+        let ts = *self.latest_ts();
+        let mut waiters = self.waiters.lock();
+        let mut i = 0;
+        while i < waiters.len() {
+            if ts > waiters[i].0 || waiters[i].1.is_closed() {
+                let w = waiters.swap_remove_back(i).expect("checked above");
+                let _ = w.1.send(());
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    /// Returns a future that blocks until the snapshot manager has advanced
+    /// past the given timestamp.
+    pub fn wait_for_higher_ts(&self, target_ts: Timestamp) -> impl Future<Output = ()> + use<> {
+        // Clean up waiters that are canceled.
+        self.notify_waiters();
+
+        let receiver = if *self.latest_ts() <= target_ts {
+            let (sender, receiver) = oneshot::channel();
+            self.waiters.lock().push_back((target_ts, sender));
+            Some(receiver)
+        } else {
+            None
+        };
+
+        async move {
+            if let Some(receiver) = receiver {
+                _ = receiver.await;
+            }
+        }
     }
 
     /// While latest_ts has been part of some commit and the backend process is
@@ -489,7 +673,7 @@ impl SnapshotManager {
             "Timestamp {ts} is more recent than latest_ts {}",
             self.latest_ts(),
         );
-        let i = match self.versions.binary_search_by_key(&ts, |&(ts, ..)| ts) {
+        let i = match self.versions.binary_search_by_key(&ts, |(ts, ..)| *ts) {
             Ok(i) => i,
             // This is the index where insertion would preserve sorted order. That is, it's the
             // first index that has a timestamp greater than `ts`. So, we'd like the immediately
@@ -519,7 +703,7 @@ impl SnapshotManager {
         vector_indexes: VectorIndexManager,
         pending_writes: &mut PendingWrites,
     ) {
-        let (_ts, ref mut snapshot) = self.versions.back_mut().expect("snapshot versions empty");
+        let (_ts, snapshot) = self.versions.back_mut().expect("snapshot versions empty");
         snapshot.text_indexes = text_indexes;
         snapshot.vector_indexes = vector_indexes;
         pending_writes.recompute_pending_snapshots(snapshot.clone());
@@ -529,12 +713,17 @@ impl SnapshotManager {
         &mut self,
         table_summary: TableSummarySnapshot,
         pending_writes: &mut PendingWrites,
-    ) {
-        let (_ts, ref mut snapshot) = self.versions.back_mut().expect("snapshot versions empty");
+    ) -> anyhow::Result<()> {
+        let (_ts, snapshot) = self.versions.back_mut().expect("snapshot versions empty");
         let table_mapping = snapshot.table_mapping();
-        let table_summaries = TableSummaries::new(table_summary, table_mapping);
+        let table_summaries = TableSummaries::new(
+            table_summary,
+            table_mapping,
+            &snapshot.virtual_system_mapping,
+        )?;
         snapshot.table_summaries = Some(table_summaries);
         pending_writes.recompute_pending_snapshots(snapshot.clone());
+        Ok(())
     }
 
     /// Overwrites the in-memory indexes for the latest snapshot.
@@ -552,17 +741,40 @@ impl SnapshotManager {
         in_memory_indexes: BackendInMemoryIndexes,
         pending_writes: &mut PendingWrites,
     ) {
-        let (_ts, ref mut snapshot) = self.versions.back_mut().expect("snapshot versions empty");
+        let (_ts, snapshot) = self.versions.back_mut().expect("snapshot versions empty");
         snapshot.in_memory_indexes = in_memory_indexes;
         pending_writes.recompute_pending_snapshots(snapshot.clone());
     }
 
-    pub fn push(&mut self, ts: Timestamp, snapshot: Snapshot) {
+    pub fn push(&mut self, ts: Timestamp, snapshot: Snapshot, write_bytes: u64) {
         assert!(*self.latest_ts() < ts);
-        while self.versions.len() > 1 && (ts - self.earliest_ts()) > *MAX_TRANSACTION_WINDOW {
+        // Note that we only drop a version if its *successor* leaves the transaction
+        // window. That's because the gap between versions could be significant,
+        // and we want any call to `latest_ts()` to return a timestamp that is
+        // still valid for at least `MAX_TRANSACTION_WINDOW`.
+        while let Some((successor_ts, _)) = self.versions.get(1)
+            && (ts - *successor_ts) > *MAX_TRANSACTION_WINDOW
+        {
             self.versions.pop_front();
         }
         self.versions.push_back((ts, snapshot));
+        self.notify_waiters();
+        self.write_throughput_limiter.record_write(ts, write_bytes);
+    }
+
+    pub fn check_write_throughput_limit(&self, ts: Timestamp) -> anyhow::Result<()> {
+        if !self.write_throughput_limiter.check_limit(ts) {
+            anyhow::bail!(ErrorMetadata::rate_limited(
+                "TooManyWrites",
+                format!(
+                    "Too many writes per second. Your deployment is limited to {} bytes written \
+                     per {}. Reduce your write rate or upgrade to a larger deployment.",
+                    common::fmt::format_bytes(*MAX_BYTES_WRITTEN_PER_SECOND),
+                    common::fmt::format_duration(*WRITE_THROUGHPUT_WINDOW),
+                )
+            ));
+        }
+        Ok(())
     }
 
     pub fn bump_persisted_max_repeatable_ts(&mut self, ts: Timestamp) -> anyhow::Result<bool> {
@@ -575,7 +787,7 @@ impl SnapshotManager {
         self.persisted_max_repeatable_ts = ts;
         let (latest_ts, snapshot) = self.latest();
         if ts > *latest_ts {
-            self.push(ts, snapshot);
+            self.push(ts, snapshot, 0);
             Ok(true)
         } else {
             Ok(false)

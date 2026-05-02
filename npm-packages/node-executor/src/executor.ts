@@ -8,7 +8,7 @@ import { inspect } from "node:util";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-import { UserIdentity } from "convex/server";
+import { DeploymentMetadata, UserIdentity } from "convex/server";
 
 import {
   CanonicalizedModulePath,
@@ -28,6 +28,8 @@ import { SourcePackage, maybeDownloadAndLinkPackages } from "./source_package";
 import { buildDeps, BuildDepsRequest } from "./build_deps";
 import { ConvexError, JSONValue } from "convex/values";
 import { log, logDebug, logDurationMs } from "./log";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { countEgressBytes } from "./bytesCounter";
 
 // Small hack to detect if we're running in the dynamic or static lambda.
 const AWS_LAMBDA_EXECUTOR_TYPE = (
@@ -70,11 +72,22 @@ export function setupGlobals(modulePath: string) {
 
 let numInvocations = 0;
 
-export function setEnvironmentVariables(envs: EnvironmentVariable[]) {
+async function runWithEnvironmentVariables<T>(
+  envs: EnvironmentVariable[],
+  fn: (envHash: string) => Promise<T>,
+): Promise<T> {
+  const savedEnv = process.env;
+
   // AWS Lambda populates a number of environment variables, like Lambda version,
   // handler name, session, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, etc. We
   // don't want to expose any of that. Only expose variables that are common
   // between local Node.js and AWS Lambda.
+  //
+  // Note: This sanitization is for consistency between environments, not for security.
+  // While user code can still access underlying environment variables through
+  // other means, sensitive variables (such as AWS credentials) are protected
+  // through restrictive IAM policies that limit what the Lambda function can do
+  // with those credentials.
   const allowedEnvs = ["PATH", "PWD", "LANG", "NODE_PATH", "TZ", "UTC"];
   const sanitized: { [name: string]: string } = {};
   for (const name of allowedEnvs) {
@@ -92,20 +105,43 @@ export function setEnvironmentVariables(envs: EnvironmentVariable[]) {
   }
 
   // Compute a hash based on the user defined environment variables.
-  return createHash("md5").update(JSON.stringify(envs)).digest("hex");
+  const envHash = createHash("md5").update(JSON.stringify(envs)).digest("hex");
+
+  try {
+    return await fn(envHash);
+  } finally {
+    // Restore the initial environment when we’re done.
+    // This is helpful to bypass a AWS Lambda bug affecting Node.js 24 where the lambda
+    // would crash when AWS’s own env vars are missing after a second function execution.
+    process.env = savedEnv;
+  }
 }
 
-function unhandledRejectionHandler(responseStream: Writable, e: unknown) {
+export const ogProcessExit = process.exit;
+
+function unhandledRejectionHandler(
+  responseStream: Writable,
+  event: "unhandledRejection" | "uncaughtException" | "process.exit",
+  e: unknown,
+) {
   // Respond with a user error.
-  log("handling unhandledRejection");
+  log(`handling ${event}`);
+  const egressBytes = countEgressBytes();
   const response = {
     type: "error",
-    message: `Unhandled promise rejection: ${extractErrorMessage(e)}`,
+    message: extractErrorMessage(e),
+    name: event,
     frames: [],
-    syscallTrace: (globalSyscalls as SyscallsImpl | null)?.syscallTrace,
+    syscallTrace:
+      (globalSyscalls.getStore() as SyscallsImpl | null)?.syscallTrace ?? {},
     memoryAllocatedMb: AWS_LAMBDA_FUNCTION_MEMORY_SIZE,
+    egressBytes,
+    numInvocations,
+    totalExecutorTimeMs: 0,
+    exitingProcess: true,
   };
   if (e instanceof Error) {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
     e.stack; // calls overridden prepareStackTrace
     if ((e as any).__frameData) {
       response.frames = JSON.parse((e as any).__frameData);
@@ -116,32 +152,55 @@ function unhandledRejectionHandler(responseStream: Writable, e: unknown) {
   // Use `.end()` to make sure that no other finish message makes it into the
   // stream, then exit the process to prevent any ongoing async work from
   // leaking into the next invocation.
-  responseStream.on("finish", () => process.exit(1));
+  responseStream.on("finish", () => ogProcessExit(1));
   responseStream.end(json);
 }
 
 export async function invoke(
   request: ExecuteRequest | AnalyzeRequest | BuildDepsRequest,
   responseStream: Writable,
-) {
+): Promise<number> {
   process.removeAllListeners("unhandledRejection");
+  process.removeAllListeners("uncaughtException");
   process.on("unhandledRejection", (e: unknown) =>
-    unhandledRejectionHandler(responseStream, e),
+    unhandledRejectionHandler(responseStream, "unhandledRejection", e),
   );
+  process.on("uncaughtException", (e: unknown) =>
+    unhandledRejectionHandler(responseStream, "uncaughtException", e),
+  );
+  process.exit = function processExit(code?: number): never {
+    unhandledRejectionHandler(
+      responseStream,
+      "process.exit",
+      new Error(
+        `process.exit() called ${code === undefined ? "with no exit code" : `with exit code ${code}`}`,
+      ),
+    );
+    throw new Error("unreachable (unhandledRejectionHandler never returns)");
+  };
+
   const start = performance.now();
-  setupConsole(responseStream);
   numInvocations += 1;
   logDebug(`Environment numInvocations=${numInvocations}`);
-  let result;
-  if (request.type === "execute") {
-    result = await execute(request);
-  } else if (request.type === "analyze") {
-    result = await analyze(request);
-  } else if (request.type === "build_deps") {
-    result = await buildDeps(request);
-  } else {
-    throw new Error(`Unknown request type ${request}`);
-  }
+  const result = await globalConsoleState.run(
+    defaultConsoleState(),
+    async () => {
+      const devConsole = setupConsole(responseStream);
+      return await globalDevConsole.run(devConsole, async () => {
+        let result;
+        if (request.type === "execute") {
+          result = await execute(request);
+        } else if (request.type === "analyze") {
+          result = await analyze(request);
+        } else if (request.type === "build_deps") {
+          result = await buildDeps(request);
+        } else {
+          throw new Error(`Unknown request type ${request}`);
+        }
+        return result;
+      });
+    },
+  );
 
   logDurationMs("Total invocation time", start);
   logDebug(`Memory allocated: ${AWS_LAMBDA_FUNCTION_MEMORY_SIZE}MB`);
@@ -154,6 +213,7 @@ export async function invoke(
     );
   }
   responseStream.write(JSON.stringify(result));
+  return numInvocations;
 }
 
 export type ExecuteRequest = {
@@ -176,6 +236,7 @@ export type ExecuteRequest = {
   npmVersion: string | null;
   executionContext: ExecutionContext;
   encodedParentTrace: string | null;
+  deployment: DeploymentMetadata;
 };
 
 export type ExecutionContext = {
@@ -184,13 +245,14 @@ export type ExecutionContext = {
   isRoot: boolean | undefined;
   parentScheduledJob: string | null;
   parentScheduledJobComponentId: string | null;
+  ip: string | null;
+  userAgent: string | null;
 };
 
 export type ExecuteResponseInner =
   | {
       type: "success";
       udfReturn: string;
-      logLines: string[];
       udfTimeMs: number;
       importTimeMs: number;
     }
@@ -200,9 +262,9 @@ export type ExecuteResponseInner =
       name: string;
       data?: string;
       frames?: FrameData[];
-      logLines: string[];
       udfTimeMs?: number;
       importTimeMs?: number;
+      exitingProcess: boolean;
     };
 
 export type SyscallStats = {
@@ -226,6 +288,8 @@ export type ExecuteResponse = ExecuteResponseInner & {
 
   // The amount of memory allocated to the executor environment. This is constant for the lifetime of the environment.
   memoryAllocatedMb: number;
+  // The number of bytes of egress during this request.
+  egressBytes: number;
 };
 
 export async function execute(
@@ -246,7 +310,10 @@ export async function execute(
     request.userIdentity,
     request.executionContext,
     request.encodedParentTrace,
+    request.deployment,
   );
+
+  countEgressBytes(); // reset egressBytes counter
 
   let innerResult: ExecuteResponseInner;
   try {
@@ -270,12 +337,12 @@ export async function execute(
       type: "error",
       message: extractErrorMessage(e),
       name: e.name,
-      // Log lines should be streamed, but send an empty array for backwards compatibility
-      logLines: [],
+      exitingProcess: false,
     };
   }
 
   const totalExecutorTimeMs = logDurationMs("totalExecutorTime", start);
+  const egressBytes = countEgressBytes();
 
   return {
     ...innerResult,
@@ -284,6 +351,7 @@ export async function execute(
     totalExecutorTimeMs,
     syscallTrace: syscalls.syscallTrace,
     memoryAllocatedMb: AWS_LAMBDA_BILLED_MEMORY_SIZE,
+    egressBytes,
   };
 }
 
@@ -303,92 +371,93 @@ export async function executeInner(
   const start = performance.now();
   // We have to reevaluate the module if the envs change since they can be used
   // in global scope. We add them as query argument to achieve this behavior.
-  const envHash = setEnvironmentVariables(environmentVariables);
+  return await runWithEnvironmentVariables(
+    environmentVariables,
+    async (envHash) => {
+      setupGlobals(`${modulesDir}/${relPath}`);
+      const module = await import(
+        path.join(modulesDir, `${relPath}?envHash=${envHash}`)
+      );
+      const importTimeMs = logDurationMs("importTimeMs", start);
 
-  setupGlobals(`${modulesDir}/${relPath}`);
-  const module = await import(
-    path.join(modulesDir, `${relPath}?envHash=${envHash}`)
-  );
-  const importTimeMs = logDurationMs("importTimeMs", start);
+      const userFunction = module[name];
+      if (!userFunction) {
+        throw new Error(`Couldn't find action \`${name}\` in \`${relPath}\``);
+      }
+      if (!isConvexAction(userFunction)) {
+        throw new Error(
+          `\`${name}\` wasn't registered as a Convex action in \`${relPath}\``,
+        );
+      }
+      const invoke = userFunction.invokeAction;
+      const startExecute = performance.now();
 
-  const userFunction = module[name];
-  if (!userFunction) {
-    throw new Error(`Couldn't find action \`${name}\` in \`${relPath}\``);
-  }
-  if (!isConvexAction(userFunction)) {
-    throw new Error(
-      `\`${name}\` wasn't registered as a Convex action in \`${relPath}\``,
-    );
-  }
-  const invoke = userFunction.invokeAction;
-  const startExecute = performance.now();
+      // Use this symbol to determine if the result of the Promise.race
+      // was a timeout or not.
+      const timeoutError = Symbol();
+      let udfReturn: string | symbol;
+      try {
+        let timer: NodeJS.Timeout | null = null;
 
-  // Use this symbol to determine if the result of the Promise.race
-  // was a timeout or not.
-  const timeoutError = Symbol();
-  let udfReturn;
-  try {
-    let timer: NodeJS.Timeout | null = null;
+        const timeout = new Promise<symbol>((res) => {
+          timer = setTimeout(() => res(timeoutError), timeoutSecs * 1000);
+        });
 
-    const timeout = new Promise<symbol>((res) => {
-      timer = setTimeout(() => res(timeoutError), timeoutSecs * 1000);
-    });
+        udfReturn = await globalSyscalls.run(syscalls, () => {
+          return Promise.race<string | symbol>([
+            invoke(lambdaExecuteId, args),
+            timeout,
+          ]).finally(() => {
+            // Always clear the timeout after the promise is settled.
+            // There shouldn't be a race because the timeout promise is created first.
+            // But it's also fine because with Promise.race the timeout promise should be swallowed
+            if (timer) {
+              clearTimeout(timer);
+            }
+          });
+        });
+      } catch (e: any) {
+        // Accessing `e.stack` is important! Without it e.__frameData
+        // is not generated!
+        // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+        e?.stack;
 
-    globalSyscalls = syscalls;
-    udfReturn = await Promise.race<string | symbol>([
-      invoke(lambdaExecuteId, args),
-      timeout,
-    ]).finally(() => {
-      // Always clear the timeout after the promise is settled.
-      // There shouldn't be a race because the timeout promise is created first.
-      // But it's also fine because with Promise.race the timeout promise should be swallowed
-      timer && clearTimeout(timer);
-    });
-  } catch (e: any) {
-    // Accessing `e.stack` is important! Without it e.__frameData
-    // is not generated!
-    e?.stack;
+        const udfTimeMs = logDurationMs("executeUdf", startExecute);
+        return {
+          type: "error",
+          message: extractErrorMessage(e),
+          name: e?.name ?? "",
+          data: getConvexErrorData(e),
+          frames: e?.__frameData ? JSON.parse(e.__frameData) : [],
+          udfTimeMs,
+          importTimeMs,
+          exitingProcess: false,
+        };
+      }
 
-    const udfTimeMs = logDurationMs("executeUdf", startExecute);
-    return {
-      type: "error",
-      message: e?.message ?? "",
-      name: e?.name ?? "",
-      data: getConvexErrorData(e),
-      frames: e?.__frameData ? JSON.parse(e.__frameData) : [],
-      // Log lines should be streamed, but send an empty array for backwards compatibility
-      logLines: [],
-      udfTimeMs,
-      importTimeMs,
-    };
-  } finally {
-    globalSyscalls = null;
-    globalConsoleState = defaultConsoleState();
-  }
-
-  if (udfReturn === timeoutError) {
-    throw new Error(
-      `Action \`${name}\` execution timed out (maximum duration ${timeoutSecs}s)`,
-    );
-  }
-  if (typeof udfReturn !== "string") {
-    throw new Error(
-      // Need to cast to a string here to make TS happy.
-      `Action \`${name}\` did not return a string (returned \`${String(
+      if (udfReturn === timeoutError) {
+        throw new Error(
+          `Action \`${name}\` execution timed out (maximum duration ${timeoutSecs}s)`,
+        );
+      }
+      if (typeof udfReturn !== "string") {
+        throw new Error(
+          // Need to cast to a string here to make TS happy.
+          `Action \`${name}\` did not return a string (returned \`${String(
+            udfReturn,
+          )}\`)`,
+        );
+      }
+      syscalls.assertNoPendingSyscalls();
+      const udfTimeMs = logDurationMs("executeUdf", startExecute);
+      return {
+        type: "success",
         udfReturn,
-      )}\`)`,
-    );
-  }
-  syscalls.assertNoPendingSyscalls();
-  const udfTimeMs = logDurationMs("executeUdf", startExecute);
-  return {
-    type: "success",
-    udfReturn,
-    // Log lines should be streamed, but send an empty array for backwards compatibility
-    logLines: [],
-    udfTimeMs,
-    importTimeMs,
-  };
+        udfTimeMs,
+        importTimeMs,
+      };
+    },
+  );
 }
 
 // Keep in sync with registration_impl
@@ -429,26 +498,31 @@ export type AnalyzeResponse =
 export async function analyze(
   request: AnalyzeRequest,
 ): Promise<AnalyzeResponse> {
-  setEnvironmentVariables(request.environmentVariables);
-  const local = await maybeDownloadAndLinkPackages(request.sourcePackage);
-  const modulesDir = path.join(local.dir, "modules");
-  registerPrepareStackTrace(modulesDir);
-  const modules: Record<CanonicalizedModulePath, AnalyzedFunctions> = {};
-  for (const modulePath of local.modules) {
-    try {
-      const filePath = path.join(modulesDir, modulePath);
-      modules[modulePath] = await analyzeModule(filePath);
-    } catch (e: any) {
-      e.stack;
-      return {
-        type: "error",
-        message: `Failed to analyze ${modulePath}: ${extractErrorMessage(e)}`,
-        frames: e.__frameData ? JSON.parse(e.__frameData) : [],
-      };
-    }
-  }
+  return await runWithEnvironmentVariables(
+    request.environmentVariables,
+    async () => {
+      const local = await maybeDownloadAndLinkPackages(request.sourcePackage);
+      const modulesDir = path.join(local.dir, "modules");
+      registerPrepareStackTrace(modulesDir);
+      const modules: Record<CanonicalizedModulePath, AnalyzedFunctions> = {};
+      for (const modulePath of local.modules) {
+        try {
+          const filePath = path.join(modulesDir, modulePath);
+          modules[modulePath] = await analyzeModule(filePath);
+        } catch (e: any) {
+          // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+          e.stack;
+          return {
+            type: "error",
+            message: `Failed to analyze ${modulePath}: ${extractErrorMessage(e)}`,
+            frames: e.__frameData ? JSON.parse(e.__frameData) : [],
+          };
+        }
+      }
 
-  return { type: "success", modules };
+      return { type: "success", modules };
+    },
+  );
 }
 
 type Visibility = { kind: "public" } | { kind: "internal" };
@@ -580,28 +654,40 @@ async function analyzeModule(filePath: string): Promise<AnalyzedFunctions> {
   return analyzed;
 }
 
-let globalSyscalls: Syscalls | null = null;
+const globalSyscalls = new AsyncLocalStorage<Syscalls>();
+export const globalConsoleState = new AsyncLocalStorage<ConsoleState>();
+export const globalDevConsole = new AsyncLocalStorage<Console>();
 
 (globalThis as any).Convex = {
   syscall: (op: string, jsonArgs: string) => {
-    if (!globalSyscalls) {
+    const syscalls = globalSyscalls.getStore();
+    if (!syscalls) {
       throw new Error(`Cannot invoke syscall during module imports`);
     }
-    return globalSyscalls.syscall(op, jsonArgs);
+    return syscalls.syscall(op, jsonArgs);
   },
   asyncSyscall: (op: string, jsonArgs: string) => {
-    if (!globalSyscalls) {
+    const syscalls = globalSyscalls.getStore();
+    if (!syscalls) {
       throw new Error(`Cannot invoke syscall during module imports`);
     }
-    return globalSyscalls.asyncSyscall(op, jsonArgs);
+    return syscalls.asyncSyscall(op, jsonArgs);
   },
   jsSyscall: (op: string, args: Record<string, any>) => {
-    if (!globalSyscalls) {
+    const syscalls = globalSyscalls.getStore();
+    if (!syscalls) {
       throw new Error(`Cannot invoke syscall during module imports`);
     }
-    return globalSyscalls.asyncJsSyscall(op, args);
+    return syscalls.asyncJsSyscall(op, args);
   },
 };
+
+export const ogConsole = globalThis.console;
+Object.defineProperty(globalThis, "console", {
+  get() {
+    return globalDevConsole.getStore()!;
+  },
+});
 
 function toString(value: unknown, defaultValue: string) {
   return value === undefined
@@ -618,9 +704,7 @@ type ConsoleState = {
   timers: Map<string, number>;
 };
 
-let globalConsoleState: ConsoleState;
-
-function defaultConsoleState(): ConsoleState {
+export function defaultConsoleState(): ConsoleState {
   return {
     sentLines: 0,
     totalSentLineLength: 0,
@@ -650,7 +734,7 @@ export function setupConsole(responseStream: Writable) {
 
   // TODO: This code is copy & pasted from setup.ts in v8. We should
   // probably unify it at some points.
-  globalConsoleState = defaultConsoleState();
+  const consoleState = globalConsoleState.getStore()!;
   function consoleMessage(level: string, ...args: any[]) {
     // TODO: Support string substitution.
     // TODO: Implement the rest of the Console API.
@@ -671,24 +755,21 @@ export function setupConsole(responseStream: Writable) {
     //   maximum 2MB of logs, one ~million UTF16 code units (UTF16
     //   code unit is 2 bytes).
     // - we only allow max 256 logs, see MAX_LOG_LINES
-    if (globalConsoleState.logLimitHit === true) {
+    if (consoleState.logLimitHit === true) {
       return;
     }
     const totalMessageLength =
       messages.reduce((acc, current) => acc + current.length + 1, 0) - 1;
-    if (
-      globalConsoleState.totalSentLineLength + totalMessageLength >
-      1_048_576
-    ) {
+    if (consoleState.totalSentLineLength + totalMessageLength > 1_048_576) {
       level = "ERROR";
       messages = [
         "Log overflow (maximum 1M characters). Remaining log lines omitted.",
       ];
-      globalConsoleState.logLimitHit = true;
-    } else if (globalConsoleState.sentLines >= 256) {
+      consoleState.logLimitHit = true;
+    } else if (consoleState.sentLines >= 256) {
       level = "ERROR";
       messages = ["Log overflow (maximum 256). Remaining log lines omitted."];
-      globalConsoleState.logLimitHit = true;
+      consoleState.logLimitHit = true;
     }
     responseStream.write(
       JSON.stringify({
@@ -701,9 +782,10 @@ export function setupConsole(responseStream: Writable) {
         },
       }) + "\n",
     );
-    globalConsoleState.totalSentLineLength += totalMessageLength;
-    globalConsoleState.sentLines += 1;
+    consoleState.totalSentLineLength += totalMessageLength;
+    consoleState.sentLines += 1;
   }
+
   devConsole.debug = function (...args) {
     consoleMessage("DEBUG", ...args);
   };
@@ -721,15 +803,15 @@ export function setupConsole(responseStream: Writable) {
   };
   devConsole.time = function (label: unknown) {
     const labelStr = toString(label, "default");
-    if (globalConsoleState.timers.has(labelStr)) {
+    if (consoleState.timers.has(labelStr)) {
       consoleMessage("WARN", `Timer '${labelStr}' already exists`);
     } else {
-      globalConsoleState.timers.set(labelStr, Date.now());
+      consoleState.timers.set(labelStr, Date.now());
     }
   };
   devConsole.timeLog = function (label: unknown, ...args: any[]) {
     const labelStr = toString(label, "default");
-    const time = globalConsoleState.timers.get(labelStr);
+    const time = consoleState.timers.get(labelStr);
     if (time === undefined) {
       consoleMessage("WARN", `Timer '${labelStr}' does not exist`);
     } else {
@@ -739,14 +821,14 @@ export function setupConsole(responseStream: Writable) {
   };
   devConsole.timeEnd = function (label: unknown) {
     const labelStr = toString(label, "default");
-    const time = globalConsoleState.timers.get(labelStr);
+    const time = consoleState.timers.get(labelStr);
     if (time === undefined) {
       consoleMessage("WARN", `Timer '${labelStr}' does not exist`);
     } else {
       const duration = Date.now() - time;
-      globalConsoleState.timers.delete(labelStr);
+      consoleState.timers.delete(labelStr);
       consoleMessage("INFO", `${labelStr}: ${duration}ms`);
     }
   };
-  globalThis.console = devConsole;
+  return devConsole;
 }

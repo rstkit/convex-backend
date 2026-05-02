@@ -1,37 +1,75 @@
 use std::{
-    collections::BTreeMap,
     fmt::Formatter,
+    str::FromStr,
 };
 
-use common::{
-    obj,
-    types::ObjectKey,
-};
+use common::types::ObjectKey;
 use errors::ErrorMetadata;
 use humansize::{
     FormatSize,
     BINARY,
 };
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_bytes::ByteBuf;
 use value::{
+    codegen_convex_serialization,
     heap_size::HeapSize,
     id_v6::DeveloperDocumentId,
     sha256::Sha256Digest,
-    ConvexObject,
     ConvexValue,
 };
 
 use crate::external_packages::types::ExternalDepsPackageId;
 
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum NodeVersion {
+    /// Node 18 is deprecated in AWS, so customers with it set will
+    /// no longer be able to update their static lambdas. This is okay because
+    /// users can update their Node version to unblock themselves. This also
+    /// means that new deployments with Node 18 will fail.
+    V18x,
+    V20x,
+    V22x,
+    V24x,
+}
+
+impl FromStr for NodeVersion {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "18" => Ok(NodeVersion::V18x),
+            "20" => Ok(NodeVersion::V20x),
+            "22" => Ok(NodeVersion::V22x),
+            "24" => Ok(NodeVersion::V24x),
+            _ => anyhow::bail!("Invalid node version: {value}"),
+        }
+    }
+}
+
+impl From<NodeVersion> for String {
+    fn from(value: NodeVersion) -> String {
+        match value {
+            NodeVersion::V18x => "18".to_string(),
+            NodeVersion::V20x => "20".to_string(),
+            NodeVersion::V22x => "22".to_string(),
+            NodeVersion::V24x => "24".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourcePackage {
     pub storage_key: ObjectKey,
     pub sha256: Sha256Digest,
     pub external_deps_package_id: Option<ExternalDepsPackageId>,
     pub package_size: PackageSize,
+    pub node_version: Option<NodeVersion>,
 }
 
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
 pub struct PackageSize {
     pub zipped_size_bytes: usize,
@@ -95,20 +133,19 @@ impl PackageSize {
     }
 }
 
-impl TryFrom<ConvexObject> for PackageSize {
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializedPackageSize {
+    zipped_size_bytes: i64,
+    unzipped_size_bytes: i64,
+}
+
+impl TryFrom<SerializedPackageSize> for PackageSize {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
-        let mut fields = BTreeMap::from(value);
-
-        let zipped_size_bytes: usize = match fields.remove("zippedSizeBytes") {
-            Some(ConvexValue::Int64(i)) => i as usize,
-            _ => anyhow::bail!("Missing or invalid 'zippedSize' in {fields:?}"),
-        };
-        let unzipped_size_bytes: usize = match fields.remove("unzippedSizeBytes") {
-            Some(ConvexValue::Int64(i)) => i as usize,
-            _ => anyhow::bail!("Missing or invalid 'unzippedSizeBytes' in {fields:?}"),
-        };
+    fn try_from(value: SerializedPackageSize) -> Result<Self, Self::Error> {
+        let zipped_size_bytes: usize = value.zipped_size_bytes.try_into()?;
+        let unzipped_size_bytes: usize = value.unzipped_size_bytes.try_into()?;
         Ok(PackageSize {
             zipped_size_bytes,
             unzipped_size_bytes,
@@ -116,18 +153,19 @@ impl TryFrom<ConvexObject> for PackageSize {
     }
 }
 
-impl TryFrom<PackageSize> for ConvexObject {
+impl TryFrom<PackageSize> for SerializedPackageSize {
     type Error = anyhow::Error;
 
     fn try_from(value: PackageSize) -> Result<Self, Self::Error> {
-        obj!(
-            "zippedSizeBytes" => ConvexValue::Int64(value.zipped_size_bytes as i64),
-            "unzippedSizeBytes" => ConvexValue::Int64(value.unzipped_size_bytes as i64),
-        )
+        Ok(SerializedPackageSize {
+            zipped_size_bytes: value.zipped_size_bytes.try_into()?,
+            unzipped_size_bytes: value.unzipped_size_bytes.try_into()?,
+        })
     }
 }
 
-#[cfg_attr(any(test, feature = "testing"), derive(proptest_derive::Arbitrary))]
+codegen_convex_serialization!(PackageSize, SerializedPackageSize);
+
 #[derive(Debug, Clone, PartialEq, Eq, Copy, PartialOrd, Ord, Hash)]
 pub struct SourcePackageId(DeveloperDocumentId);
 
@@ -165,79 +203,58 @@ impl From<SourcePackageId> for DeveloperDocumentId {
     }
 }
 
-impl TryFrom<SourcePackage> for ConvexObject {
-    type Error = anyhow::Error;
-
-    fn try_from(
-        SourcePackage {
-            storage_key,
-            sha256,
-            external_deps_package_id,
-            package_size,
-        }: SourcePackage,
-    ) -> Result<Self, Self::Error> {
-        let storage_key: String = storage_key.into();
-        obj!(
-            "storageKey" => storage_key,
-            "sha256" => sha256,
-            "externalPackageId" => external_deps_package_id
-                .map(ConvexValue::try_from)
-                .transpose()?
-                .unwrap_or(ConvexValue::Null),
-            "packageSize" => ConvexValue::Object(package_size.try_into()?),
-        )
-    }
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerializedSourcePackage {
+    storage_key: String,
+    sha256: ByteBuf,
+    external_package_id: Option<String>,
+    package_size: Option<SerializedPackageSize>,
+    node_version: Option<String>,
 }
 
-impl TryFrom<ConvexObject> for SourcePackage {
+impl TryFrom<SourcePackage> for SerializedSourcePackage {
     type Error = anyhow::Error;
 
-    fn try_from(value: ConvexObject) -> Result<Self, Self::Error> {
-        let mut object_fields: BTreeMap<_, _> = value.into();
-        let storage_key = match object_fields.remove("storageKey") {
-            Some(ConvexValue::String(key)) => String::from(key).try_into()?,
-            _ => anyhow::bail!("Missing 'storageKey' in {object_fields:?}"),
+    fn try_from(value: SourcePackage) -> anyhow::Result<Self> {
+        Ok(SerializedSourcePackage {
+            storage_key: value.storage_key.into(),
+            sha256: ByteBuf::from(value.sha256.to_vec()),
+            external_package_id: value
+                .external_deps_package_id
+                .map(|id| DeveloperDocumentId::from(id).encode()),
+            package_size: Some(value.package_size.try_into()?),
+            node_version: value.node_version.map(String::from),
+        })
+    }
+}
+impl TryFrom<SerializedSourcePackage> for SourcePackage {
+    type Error = anyhow::Error;
+
+    fn try_from(value: SerializedSourcePackage) -> Result<Self, Self::Error> {
+        let storage_key = value.storage_key.try_into()?;
+        let sha256 = value.sha256.into_vec().try_into()?;
+        let external_package_id = match value.external_package_id {
+            None => None,
+            Some(s) => Some(DeveloperDocumentId::decode(&s)?.into()),
         };
-        let sha256 = match object_fields.remove("sha256") {
-            Some(sha256) => sha256.try_into()?,
-            _ => anyhow::bail!("Missing 'sha256' in {object_fields:?}"),
-        };
-        let external_package_id = match object_fields.remove("externalPackageId") {
-            Some(ConvexValue::Null) | None => None,
-            Some(ConvexValue::String(s)) => Some(DeveloperDocumentId::decode(&s)?.into()),
-            _ => anyhow::bail!("Invalid 'externalPackageId' in {object_fields:?}"),
-        };
-        let package_size: PackageSize = match object_fields.remove("packageSize") {
-            Some(ConvexValue::Object(o)) => o.try_into()?,
+        let package_size: PackageSize = match value.package_size {
+            Some(o) => o.try_into()?,
             // Just use default for old source packages
             None => PackageSize::default(),
-            _ => anyhow::bail!("Invalid 'packageSize' in {object_fields:?}"),
+        };
+        let node_version = match value.node_version {
+            None => None,
+            Some(s) => Some(s.parse()?),
         };
         Ok(Self {
             storage_key,
             sha256,
             external_deps_package_id: external_package_id,
             package_size,
+            node_version,
         })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use common::testing::assert_roundtrips;
-    use proptest::prelude::*;
-    use value::ConvexObject;
-
-    use super::SourcePackage;
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-        #[test]
-        fn test_source_package_roundtrip(v in any::<SourcePackage>()) {
-            assert_roundtrips::<SourcePackage, ConvexObject>(v);
-        }
-    }
-}
+codegen_convex_serialization!(SourcePackage, SerializedSourcePackage);

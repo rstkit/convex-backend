@@ -1,7 +1,7 @@
 import { usePaginatedQuery } from "convex/react";
 import udfs from "@common/udfs";
 import { Doc } from "system-udfs/convex/_generated/dataModel";
-import { useEffect, useContext } from "react";
+import { useEffect, useContext, useRef } from "react";
 import { DeploymentInfoContext } from "@common/lib/deploymentContext";
 
 export type DeploymentAuditLogEvent = Doc<"_deployment_audit_log"> & {
@@ -46,9 +46,29 @@ function processDeploymentAuditLogEvent(
     case "push_config":
     case "push_config_with_components":
     case "change_deployment_state":
+    case "pause_deployment":
+    case "unpause_deployment":
+    case "change_system_stop_state":
     case "build_indexes":
     case "clear_tables":
     case "snapshot_import":
+    case "delete_scheduled_jobs_table":
+    case "delete_tables":
+    case "delete_component":
+    case "cancel_all_scheduled_functions":
+    case "cancel_scheduled_function":
+    case "request_export":
+    case "cancel_export":
+    case "set_export_expiration":
+    case "create_integration":
+    case "update_integration":
+    case "delete_integration":
+    case "add_documents":
+    case "delete_documents":
+    case "update_documents":
+    case "create_table":
+    case "delete_files":
+    case "generate_upload_url":
       break;
     default:
       return null;
@@ -95,13 +115,48 @@ export function useDeploymentAuditLogs(
     initialNumItems,
   );
 
-  // Load items until we've exhuasted the results.
+  // Cache the longest (most complete) result set we've seen for the current
+  // team, time window, and filters. After a deploy the paginated query may
+  // briefly return only the newest page, making older events disappear and then
+  // reappear as pagination catches up; keeping the longest results avoids this
+  // flicker. When any of those inputs change we clear the cache and start over.
+  const longestResultsRef = useRef<DeploymentAuditLogEvent[] | undefined>();
+  const resetKeyRef = useRef<string | undefined>();
+  const resetKey = [
+    team?.id ?? "no-team",
+    fromTimestamp ?? "no-timestamp",
+    filters?.actions?.join(",") ?? "no-actions",
+  ].join("|");
+  if (resetKeyRef.current !== resetKey) {
+    longestResultsRef.current = undefined;
+    resetKeyRef.current = resetKey;
+  }
+
+  // Load items until we've exhausted the results.
   useEffect(() => {
     if (status === "CanLoadMore") {
       loadMore(initialNumItems);
     }
   }, [loadMore, status]);
-  return results ? results.reverse() : undefined;
+
+  // Update the longest results if current results are the same or longer.
+  if (results) {
+    const currentLongest = longestResultsRef.current;
+    if (!currentLongest || results.length >= currentLongest.length) {
+      // New results are at least as complete as what we had before.
+      longestResultsRef.current = results;
+    }
+  }
+
+  // Return the longest results we've seen so far, with `build_indexes` events removed.
+  return longestResultsRef.current
+    ? longestResultsRef.current
+        .slice()
+        .reverse()
+        .filter(
+          (event: DeploymentAuditLogEvent) => event.action !== "build_indexes",
+        )
+    : undefined;
 }
 
 export type DeploymentAuditLogFilters = {

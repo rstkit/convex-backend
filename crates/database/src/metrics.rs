@@ -15,10 +15,13 @@ use metrics::{
     log_distribution,
     log_distribution_with_labels,
     register_convex_counter,
+    register_convex_gauge,
     register_convex_histogram,
+    register_convex_int_gauge,
     IntoLabel,
     StaticMetricLabel,
     StatusTimer,
+    Subgauge,
     Timer,
     STATUS_LABEL,
 };
@@ -35,10 +38,18 @@ use crate::{
 
 register_convex_histogram!(
     DOCUMENTS_SIZE_BYTES,
-    "Total size of document store in bytes"
+    "Total size of documents in user tables in bytes"
 );
-pub fn log_document_store_size(total_size: u64) {
+pub fn log_user_table_documents_size(total_size: u64) {
     log_distribution(&DOCUMENTS_SIZE_BYTES, total_size as f64);
+}
+
+register_convex_int_gauge!(
+    USER_DOCUMENTS_SIZE_BYTES,
+    "Total size of user documents including virtual tables in bytes"
+);
+pub fn user_documents_size_subgauge() -> Subgauge {
+    Subgauge::new(USER_DOCUMENTS_SIZE_BYTES.clone())
 }
 
 register_convex_histogram!(DOCUMENTS_KEYS_TOTAL, "Total number of document keys");
@@ -57,6 +68,20 @@ pub fn log_num_indexes_to_backfill(num_indexes: usize) {
 register_convex_counter!(INDEXES_BACKFILLED_TOTAL, "Number of indexes backfilled");
 pub fn log_index_backfilled() {
     log_counter(&INDEXES_BACKFILLED_TOTAL, 1);
+}
+
+register_convex_histogram!(
+    DB_INDEX_BACKFILL_SECONDS,
+    "Time for database indexes to backfill",
+    &STATUS_LABEL
+);
+
+register_convex_histogram!(
+    TABLET_DB_INDEX_BACKFILL_SECONDS,
+    "Time for database indexes to backfill",
+);
+pub fn tablet_index_backfill_timer() -> Timer<VMHistogram> {
+    Timer::new(&TABLET_DB_INDEX_BACKFILL_SECONDS)
 }
 
 register_convex_histogram!(
@@ -147,6 +172,26 @@ register_convex_histogram!(
 );
 pub fn subscription_timer() -> Timer<VMHistogram> {
     Timer::new(&DATABASE_SUBSCRIPTION_SECONDS)
+}
+
+register_convex_histogram!(
+    DATABASE_SUBSCRIPTION_INVALIDATION_LAG_SECONDS,
+    "Time between the commit ts of the invalidating write and the ts the invalidation was sent",
+);
+register_convex_counter!(
+    DATABASE_SUBSCRIPTION_INVALIDATION_UNKNOWN_TOTAL,
+    "Count of query subscriptions invalidated where the correspoding invalidating write timestamp \
+     was unknown",
+);
+pub fn log_subscription_invalidation_lag(invalid_ts: Option<Timestamp>, current_ts: Timestamp) {
+    if let Some(invalid_ts) = invalid_ts {
+        log_distribution(
+            &DATABASE_SUBSCRIPTION_INVALIDATION_LAG_SECONDS,
+            current_ts.secs_since_f64(invalid_ts),
+        );
+    } else {
+        log_counter(&DATABASE_SUBSCRIPTION_INVALIDATION_UNKNOWN_TOTAL, 1);
+    }
 }
 
 register_convex_histogram!(
@@ -289,6 +334,22 @@ pub fn write_log_append_timer() -> Timer<VMHistogram> {
     Timer::new(&DATABASE_APPLY_DOCUMENT_STORE_APPEND_SECONDS)
 }
 
+register_convex_histogram!(
+    DATABASE_PENDING_WRITES_TO_WRITE_LOG_SECONDS,
+    "Time to convert writes from PendingWrites to WriteLog"
+);
+pub fn pending_writes_to_write_log_timer() -> Timer<VMHistogram> {
+    Timer::new(&DATABASE_PENDING_WRITES_TO_WRITE_LOG_SECONDS)
+}
+
+register_convex_histogram!(
+    DATABASE_WRITE_LOG_COMMIT_BYTES,
+    "Total size of all write log entries for a commit"
+);
+pub fn write_log_commit_bytes(bytes: usize) {
+    log_distribution(&DATABASE_WRITE_LOG_COMMIT_BYTES, bytes as f64);
+}
+
 register_convex_counter!(DATABASE_COMMIT_ROWS, "Number of commits to database");
 pub fn commit_rows(num_rows: u64) {
     log_counter(&DATABASE_COMMIT_ROWS, num_rows);
@@ -309,7 +370,8 @@ pub fn committer_full_error() -> ErrorMetadata {
 
     ErrorMetadata::overloaded(
         "CommitterFullError",
-        "Too many concurrent commits, backoff and try again",
+        "Too many concurrent commits in a short period of time. Spread your writes out over time \
+         or throttle them to avoid errors.",
     )
 }
 
@@ -321,7 +383,8 @@ pub fn subscriptions_worker_full_error() -> ErrorMetadata {
     log_counter(&SUBSCRIPTIONS_WORKER_FULL_TOTAL, 1);
     ErrorMetadata::overloaded(
         "SubscriptionsWorkerFullError",
-        "Too many concurrent subscription messages, backoff and try again",
+        "Too many concurrent subscription requests in a short period of time. Reduce the number \
+         of subscriptions or throttle them to avoid errors.",
     )
 }
 
@@ -370,11 +433,11 @@ pub fn retention_advance_timestamp_timer() -> Timer<VMHistogram> {
 }
 
 register_convex_histogram!(
-    RETENTION_DELETE_SECONDS,
-    "Time for retention to complete deletions"
+    INDEX_RETENTION_DELETE_SECONDS,
+    "Time for index retention to complete deletions"
 );
-pub fn retention_delete_timer() -> Timer<VMHistogram> {
-    Timer::new(&RETENTION_DELETE_SECONDS)
+pub fn index_retention_delete_timer() -> Timer<VMHistogram> {
+    Timer::new(&INDEX_RETENTION_DELETE_SECONDS)
 }
 
 register_convex_histogram!(
@@ -386,11 +449,11 @@ pub fn retention_delete_documents_timer() -> Timer<VMHistogram> {
 }
 
 register_convex_histogram!(
-    RETENTION_DELETE_CHUNK_SECONDS,
-    "Time for retention to delete one chunk"
+    INDEX_RETENTION_DELETE_CHUNK_SECONDS,
+    "Time for index retention to delete one chunk"
 );
-pub fn retention_delete_chunk_timer() -> Timer<VMHistogram> {
-    Timer::new(&RETENTION_DELETE_CHUNK_SECONDS)
+pub fn index_retention_delete_chunk_timer() -> Timer<VMHistogram> {
+    Timer::new(&INDEX_RETENTION_DELETE_CHUNK_SECONDS)
 }
 
 register_convex_histogram!(
@@ -401,17 +464,20 @@ pub fn retention_delete_document_chunk_timer() -> Timer<VMHistogram> {
     Timer::new(&RETENTION_DELETE_DOCUMENT_CHUNK_SECONDS)
 }
 
-register_convex_histogram!(RETENTION_CURSOR_AGE_SECONDS, "Age of the retention cursor");
-pub fn log_retention_cursor_age(age_secs: f64) {
-    log_distribution(&RETENTION_CURSOR_AGE_SECONDS, age_secs)
+register_convex_histogram!(
+    INDEX_RETENTION_CURSOR_AGE_SECONDS,
+    "Age of the index retention cursor"
+);
+pub fn log_index_retention_cursor_age(age_secs: f64) {
+    log_distribution(&INDEX_RETENTION_CURSOR_AGE_SECONDS, age_secs)
 }
 
 register_convex_histogram!(
-    RETENTION_CURSOR_LAG_SECONDS,
-    "Lag between the retention cursor and the min index snapshot"
+    INDEX_RETENTION_CURSOR_LAG_SECONDS,
+    "Lag between the index retention cursor and the min index snapshot"
 );
-pub fn log_retention_cursor_lag(age_secs: f64) {
-    log_distribution(&RETENTION_CURSOR_LAG_SECONDS, age_secs)
+pub fn log_index_retention_cursor_lag(age_secs: f64) {
+    log_distribution(&INDEX_RETENTION_CURSOR_LAG_SECONDS, age_secs)
 }
 
 register_convex_histogram!(
@@ -431,11 +497,11 @@ pub fn log_document_retention_cursor_lag(age_secs: f64) {
 }
 
 register_convex_counter!(
-    RETENTION_MISSING_CURSOR_INFO,
+    INDEX_RETENTION_MISSING_CURSOR_INFO,
     "Index retention has no cursor"
 );
-pub fn log_retention_no_cursor() {
-    log_counter(&RETENTION_MISSING_CURSOR_INFO, 1)
+pub fn log_index_retention_no_cursor() {
+    log_counter(&INDEX_RETENTION_MISSING_CURSOR_INFO, 1)
 }
 
 register_convex_counter!(
@@ -447,13 +513,13 @@ pub fn log_document_retention_no_cursor() {
 }
 
 register_convex_counter!(
-    RETENTION_SCANNED_DOCUMENT_TOTAL,
-    "Count of documents scanned by retention",
+    INDEX_RETENTION_SCANNED_DOCUMENT_TOTAL,
+    "Count of documents scanned by index retention",
     &["tombstone", "prev_rev"]
 );
-pub fn log_retention_scanned_document(is_tombstone: bool, has_prev_rev: bool) {
+pub fn log_index_retention_scanned_document(is_tombstone: bool, has_prev_rev: bool) {
     log_counter_with_labels(
-        &RETENTION_SCANNED_DOCUMENT_TOTAL,
+        &INDEX_RETENTION_SCANNED_DOCUMENT_TOTAL,
         1,
         vec![
             StaticMetricLabel::new(
@@ -545,6 +611,18 @@ register_convex_counter!(
 );
 pub fn log_retention_documents_deleted(deleted_rows: usize) {
     log_counter(&RETENTION_DOCUMENTS_DELETED_TOTAL, deleted_rows as u64)
+}
+
+register_convex_counter!(
+    RETENTION_DOCUMENTS_DELETED_FROM_DELETED_TABLETS_TOTAL,
+    "The total number of documents deleted from tablets deleted outside the document retention \
+     window."
+);
+pub fn log_deleted_tablet_documents_deleted(rows_deleted: usize) {
+    log_counter(
+        &RETENTION_DOCUMENTS_DELETED_FROM_DELETED_TABLETS_TOTAL,
+        rows_deleted as u64,
+    )
 }
 
 register_convex_counter!(
@@ -1038,4 +1116,101 @@ register_convex_histogram!(
 );
 pub fn log_list_snapshot_page_documents(num_docs: usize) {
     log_distribution(&LIST_SNAPSHOT_PAGE_DOCUMENTS, num_docs as f64);
+}
+
+register_convex_histogram!(
+    SUBSCRIPTION_INVALIDATION_UPDATES,
+    "Number of subscriptions invalidated when advancing the log",
+);
+pub fn log_subscriptions_invalidated(num: usize) {
+    log_distribution(&SUBSCRIPTION_INVALIDATION_UPDATES, num as f64);
+}
+
+register_convex_histogram!(
+    SUBSCRIPTION_LOG_ITERATE_SECONDS,
+    "Time to iterate over the write log when advancing subscriptions",
+);
+pub fn subscriptions_log_iterate_timer() -> Timer<VMHistogram> {
+    Timer::new(&SUBSCRIPTION_LOG_ITERATE_SECONDS)
+}
+
+register_convex_histogram!(
+    SUBSCRIPTION_PROCESS_WRITE_LOG_ENTRY_SECONDS,
+    "Time to process one write log entry when advancing subscriptions",
+);
+pub fn subscription_process_write_log_entry_timer() -> Timer<VMHistogram> {
+    Timer::new(&SUBSCRIPTION_PROCESS_WRITE_LOG_ENTRY_SECONDS)
+}
+
+register_convex_histogram!(
+    SUBSCRIPTION_LOG_INVALIDATE_SECONDS,
+    "Time to invalidate segsstiptions when edvancing rh_ log",
+);
+pub fn subscriptions_invalidate_timer() -> Timer<VMHistogram> {
+    Timer::new(&SUBSCRIPTION_LOG_INVALIDATE_SECONDS)
+}
+
+register_convex_histogram!(
+    SUBSCRIPTION_LOG_ENFORCE_RETENTION_SECONDS,
+    "Time to enforce retention policy when advancing subscriptions",
+);
+pub fn subscriptions_log_enforce_retention_timer() -> Timer<VMHistogram> {
+    Timer::new(&SUBSCRIPTION_LOG_ENFORCE_RETENTION_SECONDS)
+}
+
+register_convex_histogram!(
+    SUBSCRIPTION_LOG_PROCESSED_UPDATES,
+    "Total number of index updates in the write log processed during one advance_log",
+);
+pub fn log_subscriptions_processed_index_updates(num_writes: usize) {
+    log_distribution(&SUBSCRIPTION_LOG_PROCESSED_UPDATES, num_writes as f64);
+}
+
+register_convex_counter!(
+    INDEX_TOO_LARGE_BLOCKING_WRITES,
+    "Number of transactions that failed because search indexes hadn't flushed",
+    &[SEARCH_TYPE_LABEL]
+);
+pub fn log_index_too_large_blocking_writes(index_type: SearchType) {
+    log_counter_with_labels(&INDEX_TOO_LARGE_BLOCKING_WRITES, 1, vec![index_type.tag()]);
+}
+
+register_convex_histogram!(
+    SUBSCRIPTION_QUEUE_LAG_SECONDS,
+    "How long subscription requests wait in the subscription worker queue",
+);
+pub fn log_subscription_queue_lag(seconds: f64) {
+    log_distribution(&SUBSCRIPTION_QUEUE_LAG_SECONDS, seconds);
+}
+
+register_convex_gauge!(
+    SUBSCRIPTION_QUEUE_LENGTH_INFO,
+    "The number of items in subscription queues",
+);
+pub fn log_subscription_queue_length_delta(delta: i64) {
+    SUBSCRIPTION_QUEUE_LENGTH_INFO.add(delta as f64);
+}
+
+register_convex_counter!(
+    WRITE_THROUGHPUT_LIMIT_EXCEEDED_TOTAL,
+    "Total number of times mutation execution was rejected due to write throughput limit"
+);
+pub fn log_write_throughput_limit_exceeded() {
+    log_counter(&WRITE_THROUGHPUT_LIMIT_EXCEEDED_TOTAL, 1);
+}
+
+register_convex_counter!(
+    WRITE_THROUGHPUT_LIMIT_WOULD_BE_EXCEEDED_TOTAL,
+    "Total number of times mutation execution would be rejected due to write throughput limit"
+);
+pub fn log_write_throughput_limit_would_be_exceeded() {
+    log_counter(&WRITE_THROUGHPUT_LIMIT_WOULD_BE_EXCEEDED_TOTAL, 1);
+}
+
+register_convex_histogram!(
+    WRITE_THROUGHPUT_BYTES,
+    "Total bytes written in the current window",
+);
+pub fn log_write_throughput(bytes: u64) {
+    log_distribution(&WRITE_THROUGHPUT_BYTES, bytes as f64);
 }

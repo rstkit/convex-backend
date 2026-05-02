@@ -11,9 +11,11 @@ export function Tooltip({
   align = "center",
   className,
   contentClassName,
-  wrapsButton = false,
+  asChild = false,
   delayDuration = 0,
   maxWidthClassName = "max-w-[16rem]",
+  disableHoverableContent = false,
+  ["aria-label"]: ariaLabel,
 }: {
   children: React.ReactNode;
   tip: React.ReactNode | undefined;
@@ -22,19 +24,29 @@ export function Tooltip({
   className?: string;
   contentClassName?: string;
   maxWidthClassName?: string;
-  wrapsButton?: boolean;
+  asChild?: boolean;
   delayDuration?: number;
+  disableHoverableContent?: boolean;
+  "aria-label"?: string;
 }) {
   // Some existing callsites pass in boolean so we do a truthy check
   if (!tip) {
     return <>{children}</>;
   }
   return (
-    <RadixTooltip.Provider delayDuration={delayDuration}>
+    <RadixTooltip.Provider
+      delayDuration={delayDuration}
+      disableHoverableContent={disableHoverableContent}
+    >
       <RadixTooltip.Root>
         <RadixTooltip.Trigger
-          asChild={wrapsButton}
-          className={classNames("focus-visible:outline-0", className)}
+          asChild={asChild}
+          className={classNames(
+            "focus-visible:outline-0 cursor-default",
+            className,
+          )}
+          type="button" // don’t make the tooltip trigger submit forms
+          aria-label={ariaLabel}
         >
           {children}
         </RadixTooltip.Trigger>
@@ -43,7 +55,7 @@ export function Tooltip({
             side={side}
             align={align}
             className={classNames(
-              "z-50 break-words rounded border bg-background-secondary shadow-sm p-1 text-center text-xs",
+              "z-50 break-words rounded-sm border bg-background-secondary shadow-xs p-1 text-center text-xs",
               maxWidthClassName,
               contentClassName,
             )}

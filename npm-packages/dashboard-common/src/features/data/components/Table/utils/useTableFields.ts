@@ -1,38 +1,58 @@
 import { useMemo } from "react";
-import { Shape, topLevelFieldsFromShape } from "shapes";
 import { GenericDocument } from "convex/server";
-import {
-  topLevelFieldsForValidator,
-  useSingleTableEnforcedSchema,
-} from "@common/features/data/components/TableSchema";
+import { Shape, topLevelFieldsFromShape } from "shapes";
+import { topLevelFieldsForValidator } from "@common/features/data/components/TableSchema";
 import { sortColumns } from "@common/features/data/lib/helpers";
+import { SchemaJson } from "@common/lib/format";
 
 export function useTableFields(
   tableName: string,
   shape: Shape | null,
-  data?: GenericDocument[],
+  activeSchema: SchemaJson | null,
+  data: GenericDocument[],
 ) {
-  const tableSchema = useSingleTableEnforcedSchema(tableName);
-  return useMemo(() => {
+  const shapeAndSchemaFields = useMemo(() => {
     const allFields = new Set<string>();
-    if (tableSchema !== null) {
-      const result = topLevelFieldsForValidator(
-        tableSchema.documentType ?? { type: "any" },
-      );
-      // If schema is enforced and the list of fields is complete, use these.
-      if (result.areFieldsComplete) {
-        return sortColumns(result.fields);
-      }
-      result.fields.forEach((f) => allFields.add(f));
-    }
 
-    // TODO: Do we really need to look at the data to get all fields?
-    // The schema + shape should be enough.
-    data?.forEach((d) => Object.keys(d).forEach((f) => allFields.add(f)));
+    // Extract fields from the active schema
+    if (activeSchema) {
+      const tableSchema = activeSchema.tables.find(
+        (table) => table.tableName === tableName,
+      );
+      if (tableSchema) {
+        const result = topLevelFieldsForValidator(
+          tableSchema.documentType ?? { type: "any" },
+        );
+        // If schema validation is enforced and fields are complete, use only these fields
+        if (activeSchema.schemaValidation && result.areFieldsComplete) {
+          return sortColumns(result.fields, { maintainOrder: true });
+        }
+        result.fields.forEach((f) => allFields.add(f));
+      }
+    }
 
     // Add fields from shape
     const shapeFields = shape === null ? [] : topLevelFieldsFromShape(shape);
     shapeFields.forEach((f) => allFields.add(f));
+
     return sortColumns(Array.from(allFields));
-  }, [tableSchema, data, shape]);
+  }, [tableName, shape, activeSchema]);
+
+  return useMemo(() => {
+    // If we have data from schema or shapes, use it
+    if (shapeAndSchemaFields.length > 0) {
+      return shapeAndSchemaFields;
+    }
+
+    // No shape available — compute from the data itself.
+    // This can happen when there is no schema and the computed shape
+    // is a Record<string, …>, because there are two many fields or
+    // some field names are invalid identifiers
+    const allFields = new Set<string>();
+    data.forEach((document) => {
+      Object.keys(document).forEach((field) => allFields.add(field));
+    });
+
+    return sortColumns(Array.from(allFields));
+  }, [shapeAndSchemaFields, data]);
 }

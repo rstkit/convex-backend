@@ -61,7 +61,7 @@ impl DeveloperDocumentId {
         base32::encoded_len(byte_length)
     }
 
-    pub fn encode(&self) -> String {
+    pub fn encode_into<'a>(&self, out: &'a mut EncodedDocumentIdBuffer) -> &'a str {
         let mut buf = [0; MAX_BINARY_LEN];
 
         let mut pos = 0;
@@ -75,7 +75,13 @@ impl DeveloperDocumentId {
         buf[pos..(pos + 2)].copy_from_slice(&footer.to_le_bytes());
         pos += 2;
 
-        base32::encode(&buf[..pos])
+        base32::encode_into(&mut out.0, &buf[..pos]);
+
+        std::str::from_utf8(&out.0[..base32::encoded_len(pos)]).expect("base32 wasn't valid UTF8?")
+    }
+
+    pub fn encode(&self) -> String {
+        self.encode_into(&mut Default::default()).to_owned()
     }
 
     /// Is the given string an ID that's not in its canonical encoding?
@@ -167,6 +173,13 @@ impl FromStr for DeveloperDocumentId {
     }
 }
 
+pub struct EncodedDocumentIdBuffer([u8; base32::encoded_buffer_len(MAX_BINARY_LEN)]);
+impl Default for EncodedDocumentIdBuffer {
+    fn default() -> Self {
+        Self([0; base32::encoded_buffer_len(MAX_BINARY_LEN)])
+    }
+}
+
 // Encode `n` with VInt encoding to `out`, returning the number of bytes
 // written.
 fn vint_encode(mut n: u32, out: &mut [u8]) -> usize {
@@ -252,104 +265,4 @@ fn fletcher16(buf: &[u8]) -> u16 {
         c1 = c1.wrapping_add(c0);
     }
     ((c1 as u16) << 8) | (c0 as u16)
-}
-
-#[cfg(test)]
-mod tests {
-    use cmd_util::env::env_config;
-    use proptest::prelude::*;
-
-    use crate::{
-        id_v6::{
-            vint_decode,
-            vint_encode,
-            vint_len,
-        },
-        DeveloperDocumentId,
-        InternalId,
-    };
-
-    #[test]
-    fn test_document_id_stability() {
-        let mut internal_id = [251u8; 16];
-        for i in 1..16 {
-            internal_id[i] = internal_id[i - 1].wrapping_mul(251);
-        }
-        let document_id =
-            DeveloperDocumentId::new(1017.try_into().unwrap(), InternalId::from(internal_id));
-        assert_eq!(
-            document_id.encode(),
-            "z43zp6c3e75gkmz1kfwj6mbbx5sw281h".to_string()
-        );
-    }
-
-    #[test]
-    fn test_invalid_table_code() {
-        // This string happens to look like an ID with a one byte table code, but the
-        // table code ends up taking two bytes, which then causes parsing to
-        // fail downstream. This is a regression test where we used to panic in
-        // this condition.
-        let _ = DeveloperDocumentId::decode("sssswsgggggggggsgcsssfafffsffks");
-    }
-
-    proptest! {
-        #![proptest_config(
-            ProptestConfig { cases: 256 * env_config("CONVEX_PROPTEST_MULTIPLIER", 1), failure_persistence: None, ..ProptestConfig::default() }
-        )]
-
-        #[test]
-        fn test_vint_encode(n in any::<u32>()) {
-            let mut buf = [0; 6];
-            let written = vint_encode(n, &mut buf);
-            assert_eq!(written, vint_len(n));
-
-            let (parsed, read) = vint_decode(&buf).unwrap();
-            assert_eq!(read, written);
-            assert_eq!(parsed, n);
-        }
-
-        #[test]
-        fn test_vint_decode(buf in any::<Vec<u8>>()) {
-            // Check that decoding never panics.
-            let _ = vint_decode(&buf);
-        }
-
-        #[test]
-        fn proptest_document_idv6(id in any::<DeveloperDocumentId>()) {
-            assert_eq!(DeveloperDocumentId::decode(&id.encode()).unwrap(), id);
-        }
-
-        #[test]
-        fn proptest_encoded_len(id in any::<DeveloperDocumentId>()) {
-            assert_eq!(id.encode().len(), id.encoded_len());
-        }
-
-        #[test]
-        fn proptest_decode_invalid_string(s in any::<String>()) {
-            // Check that we don't panic on any input string.
-            let _ = DeveloperDocumentId::decode(&s);
-        }
-
-        #[test]
-        fn proptest_decode_invalid_bytes(bytes in prop::collection::vec(any::<u8>(), 19..=23)) {
-            // Generate bytestrings that pass the first few checks in decode to get more code
-            // coverage for later panics.
-            let _ = DeveloperDocumentId::decode(&crate::base32::encode(&bytes));
-        }
-
-        #[test]
-        fn proptest_id_decoding_one_to_one(
-            s in "[0123456789abcdefghjkmnpqrstvwxyz]{31,37}"
-        ) {
-            if let Ok(id) = DeveloperDocumentId::decode(&s) {
-                assert_eq!(id.encode(), s);
-            }
-        }
-    }
-
-    #[test]
-    fn test_id_decoding_one_to_one() {
-        let s = "mz1xn7tymdnktmmzqy5xxhn7tjs2nkkfmtjjr";
-        DeveloperDocumentId::decode(s).unwrap_err();
-    }
 }

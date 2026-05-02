@@ -20,12 +20,13 @@ import {
   Address,
   BillingContactResponse,
   OrbSubscriptionResponse,
-  Team,
+  TeamResponse,
 } from "generatedApi";
-import { Tooltip } from "@ui/Tooltip";
-import { QuestionMarkCircledIcon } from "@radix-ui/react-icons";
+import { HelpTooltip } from "@ui/HelpTooltip";
 import { Callout } from "@ui/Callout";
 import { formatUsd } from "@common/lib/utils";
+import { planNameMap } from "components/billing/planCards/PlanCard";
+import startCase from "lodash/startCase";
 import { BillingContactInputs } from "./BillingContactInputs";
 import { CreateSubscriptionSchema } from "./UpgradePlanContent";
 import { PaymentDetailsForm } from "./PaymentDetailsForm";
@@ -36,14 +37,13 @@ import {
   SpendingLimitsValue,
   useSubmitSpendingLimits,
 } from "./SpendingLimits";
-import { useLaunchDarkly } from "../../hooks/useLaunchDarkly";
 
 export function SubscriptionOverview({
   team,
   hasAdminPermissions,
   subscription,
 }: {
-  team: Team;
+  team: TeamResponse;
   hasAdminPermissions: boolean;
   subscription?: OrbSubscriptionResponse | null;
 }) {
@@ -51,7 +51,6 @@ export function SubscriptionOverview({
   const resumeSubscription = useResumeSubscription(team.id);
   const [isResuming, setIsResuming] = useState(false);
   const { invoices, isLoading: isLoadingInvoices } = useListInvoices(team.id);
-  const { spendingLimits } = useLaunchDarkly();
 
   if (isLoading || isLoadingInvoices) {
     return <Loading className="h-60 w-full" fullHeight={false} />;
@@ -66,7 +65,12 @@ export function SubscriptionOverview({
           <h3>Subscription</h3>
           <div className="text-sm">
             Current Plan:{" "}
-            <span className="font-semibold">{subscription.plan.name}</span>
+            <span className="font-semibold">
+              {subscription.plan.planType
+                ? planNameMap[subscription.plan.planType] ||
+                  subscription.plan.name
+                : subscription.plan.name}
+            </span>
           </div>
           {typeof subscription.endDate === "number" ? (
             <>
@@ -105,38 +109,41 @@ export function SubscriptionOverview({
             </div>
           ) : null}
           <hr />
-          {spendingLimits && (
+          <SpendingLimitsSectionContainer
+            subscription={subscription}
+            team={team}
+            hasAdminPermissions={hasAdminPermissions}
+          />
+          {team.managedBy !== "vercel" && subscription.billingContact && (
             <>
-              <SpendingLimitsSectionContainer
-                subscription={subscription}
+              <hr />
+              <BillingContactForm
+                billingContact={subscription.billingContact}
                 team={team}
                 hasAdminPermissions={hasAdminPermissions}
               />
               <hr />
+              <BillingAddressForm
+                subscription={subscription}
+                billingContact={subscription.billingContact}
+                team={team}
+                hasAdminPermissions={hasAdminPermissions}
+              />
+              <hr />
+              <PaymentMethodForm
+                subscription={subscription}
+                team={team}
+                hasAdminPermissions={hasAdminPermissions}
+              />
             </>
           )}
-          <BillingContactForm
-            subscription={subscription}
-            team={team}
-            hasAdminPermissions={hasAdminPermissions}
-          />
-          <hr />
-          <BillingAddressForm
-            subscription={subscription}
-            team={team}
-            hasAdminPermissions={hasAdminPermissions}
-          />
-          <hr />
-          <PaymentMethodForm
-            subscription={subscription}
-            team={team}
-            hasAdminPermissions={hasAdminPermissions}
-          />
         </Sheet>
       )}
-      {invoices && (invoices.length > 0 || subscription) && (
-        <Invoices invoices={invoices} />
-      )}
+      {team.managedBy !== "vercel" &&
+        invoices &&
+        (invoices.length > 0 || subscription) && (
+          <Invoices invoices={invoices} />
+        )}
     </>
   );
 }
@@ -147,7 +154,7 @@ function SpendingLimitsSectionContainer({
   hasAdminPermissions,
 }: {
   subscription: OrbSubscriptionResponse;
-  team: Team;
+  team: TeamResponse;
   hasAdminPermissions: boolean;
 }) {
   const submitSpendingLimits = useSubmitSpendingLimits(team);
@@ -300,9 +307,7 @@ function CostLabel({
     <div className="flex flex-col gap-0.5">
       <span className="flex items-center gap-1 text-content-secondary">
         {label}
-        <Tooltip tip={tooltip} side="top">
-          <QuestionMarkCircledIcon className="text-content-tertiary" />
-        </Tooltip>
+        <HelpTooltip tipSide="top">{tooltip}</HelpTooltip>
       </span>
       <span className="flex items-baseline gap-1">
         {/* eslint-disable-next-line no-restricted-syntax */}
@@ -314,20 +319,20 @@ function CostLabel({
 }
 
 function BillingContactForm({
-  subscription,
+  billingContact,
   team,
   hasAdminPermissions,
 }: {
-  subscription: OrbSubscriptionResponse;
-  team: Team;
+  billingContact: BillingContactResponse;
+  team: TeamResponse;
   hasAdminPermissions: boolean;
 }) {
   const [showForm, setShowForm] = useState(false);
   const updateBillingContact = useUpdateBillingContact(team.id);
   const formState = useFormik<BillingContactResponse>({
     initialValues: {
-      name: subscription.billingContact.name,
-      email: subscription.billingContact.email,
+      name: billingContact.name,
+      email: billingContact.email,
     },
     validationSchema: CreateSubscriptionSchema,
     onSubmit: async (v) => {
@@ -345,11 +350,9 @@ function BillingContactForm({
         <>
           <div className="text-sm">
             <div>
-              <span className="font-semibold">
-                {subscription.billingContact.name}
-              </span>
+              <span className="font-semibold">{billingContact.name}</span>
             </div>
-            <div>{subscription.billingContact.email}</div>
+            <div>{billingContact.email}</div>
           </div>
           <Button
             className="w-fit"
@@ -410,16 +413,20 @@ function BillingContactForm({
 function BillingAddressForm({
   team,
   subscription,
+  billingContact,
   hasAdminPermissions,
 }: {
-  team: Team;
+  team: TeamResponse;
   subscription: OrbSubscriptionResponse;
+  billingContact: BillingContactResponse;
   hasAdminPermissions: boolean;
 }) {
   const [showForm, setShowForm] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useMount(() => {
-    window.location.hash === "#billingAddress" && ref.current?.scrollIntoView();
+    if (window.location.hash === "#billingAddress") {
+      ref.current?.scrollIntoView();
+    }
   });
 
   const updateBillingAddress = useUpdateBillingAddress(team.id);
@@ -452,6 +459,14 @@ function BillingAddressForm({
   return (
     <div className="flex flex-col gap-4" ref={ref}>
       <h4>Billing Address</h4>
+      {team.managedBy === "vercel" && (
+        <Callout>
+          <div>
+            This team is managed by {startCase(team.managedBy)}. You may add a
+            billing address if you wish to upgrade to the Professional plan.
+          </div>
+        </Callout>
+      )}
       {!showForm ? (
         <>
           <div className="text-sm">
@@ -505,7 +520,7 @@ function BillingAddressForm({
                   existingBillingAddress={
                     subscription.billingAddress || undefined
                   }
-                  name={subscription.billingContact.name}
+                  name={billingContact.name}
                 />
               </Elements>
             ) : null
@@ -572,7 +587,7 @@ function PaymentMethodForm({
   subscription,
   hasAdminPermissions,
 }: {
-  team: Team;
+  team: TeamResponse;
   subscription: OrbSubscriptionResponse;
   hasAdminPermissions: boolean;
 }) {
@@ -583,12 +598,22 @@ function PaymentMethodForm({
 
   const ref = useRef<HTMLDivElement>(null);
   useMount(() => {
-    window.location.hash === "#paymentMethod" && ref.current?.scrollIntoView();
+    if (window.location.hash === "#paymentMethod") {
+      ref.current?.scrollIntoView();
+    }
   });
 
   return (
     <div className="flex flex-col gap-4">
       <h4>Payment Method</h4>
+      {team.managedBy === "vercel" && (
+        <Callout>
+          <div>
+            This team is managed by {startCase(team.managedBy)}. You may add a
+            payment method if you wish to upgrade to the Professional plan.
+          </div>
+        </Callout>
+      )}
       {subscription.paymentMethod && (
         <div className="text-sm">
           Current payment method:{" "}
@@ -623,7 +648,7 @@ function UpdatePaymentMethod({
   team,
   onSave,
 }: {
-  team: Team;
+  team: TeamResponse;
   onSave: () => void;
 }) {
   const updatePaymentMethod = useUpdatePaymentMethod(team.id);
